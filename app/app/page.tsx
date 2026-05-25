@@ -57,6 +57,21 @@ const EMPTY: Record<string, string> = {
   other: "",
 };
 
+const eyeIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M1.5 12s4-7.5 10.5-7.5S22.5 12 22.5 12 18.5 19.5 12 19.5 1.5 12 1.5 12z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
+const eyeOffIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M9.9 5.1A11.7 11.7 0 0 1 12 4.5C18.5 4.5 22.5 12 22.5 12a18 18 0 0 1-3.3 4.3M6.3 6.3A18 18 0 0 0 1.5 12s4 7.5 10.5 7.5a11.7 11.7 0 0 0 4.8-1" />
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+    <line x1="3" y1="3" x2="21" y2="21" />
+  </svg>
+);
+
 export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
@@ -67,6 +82,14 @@ export default function AppPage() {
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
   const [authMessage, setAuthMessage] = useState("");
+  const [ozonClientId, setOzonClientId] = useState("");
+  const [ozonApiKey, setOzonApiKey] = useState("");
+  const [wbApiKey, setWbApiKey] = useState("");
+  const [apiSaveStatus, setApiSaveStatus] = useState<"idle" | "ok" | "err" | "saving">("idle");
+  const [apiSaveMessage, setApiSaveMessage] = useState("");
+  const [showOzonKey, setShowOzonKey] = useState(false);
+  const [showWbKey, setShowWbKey] = useState(false);
+  const [tariffMessage, setTariffMessage] = useState("");
 
   const totalRevenue = history.reduce((sum, h) => sum + h.revenue, 0);
   const totalProfit = history.reduce((sum, h) => sum + h.profit, 0);
@@ -75,11 +98,14 @@ export default function AppPage() {
       ? history.reduce((sum, h) => sum + h.margin, 0) / history.length
       : 0;
 
-  // Получаем пользователя, затем сразу грузим его историю
+  // Получаем пользователя, затем сразу грузим его историю и API-ключи
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
       setUser(data.user);
       loadHistory(data.user?.id ?? null);
+      if (data.user?.id) {
+        loadApiKeys(data.user.id);
+      }
     });
   }, []);
 
@@ -108,6 +134,65 @@ export default function AppPage() {
     setUser(null);
     setHistory([]);
     setResult(null);
+    setOzonClientId("");
+    setOzonApiKey("");
+    setWbApiKey("");
+    setApiSaveMessage("");
+    setApiSaveStatus("idle");
+  };
+
+  const loadApiKeys = async (userId: string) => {
+    const { data, error } = await supabase
+      .from("api_keys")
+      .select("ozon_client_id, ozon_api_key, wb_api_key")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("loadApiKeys error:", error);
+      return;
+    }
+
+    if (data) {
+      setOzonClientId(data.ozon_client_id ?? "");
+      setOzonApiKey(data.ozon_api_key ?? "");
+      setWbApiKey(data.wb_api_key ?? "");
+    }
+  };
+
+  const saveApiKeys = async () => {
+    if (!user?.id) {
+      setApiSaveStatus("err");
+      setApiSaveMessage("Войдите в аккаунт, чтобы сохранить ключи");
+      return;
+    }
+
+    setApiSaveStatus("saving");
+    setApiSaveMessage("");
+
+    const { error } = await supabase
+      .from("api_keys")
+      .upsert(
+        [
+          {
+            user_id: user.id,
+            ozon_client_id: ozonClientId.trim() || null,
+            ozon_api_key: ozonApiKey.trim() || null,
+            wb_api_key: wbApiKey.trim() || null,
+          },
+        ],
+        { onConflict: "user_id" }
+      );
+
+    if (error) {
+      console.error("saveApiKeys error:", error);
+      setApiSaveStatus("err");
+      setApiSaveMessage("Ошибка: " + error.message);
+      return;
+    }
+
+    setApiSaveStatus("ok");
+    setApiSaveMessage("Ключи сохранены");
   };
 
   const clearHistory = async () => {
@@ -264,6 +349,14 @@ export default function AppPage() {
     setHistory((prev) => [res, ...prev].slice(0, 8));
   };
 
+  const handleTariff = (tier: "single" | "unlimited") => {
+    setTariffMessage(
+      tier === "single"
+        ? "Оплата разового расчёта скоро будет доступна"
+        : "Оформление безлимита скоро будет доступно"
+    );
+  };
+
   const clearForm = () => {
     setForm({ ...EMPTY });
     setResult(null);
@@ -361,6 +454,108 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .auth-btn:hover{transform:translateY(-1px);box-shadow:0 14px 38px rgba(201,168,76,.38)}
 .auth-msg{margin:.8rem 0 0;font-family:var(--mono);font-size:.72rem;color:var(--txt2);letter-spacing:.02em}
 @media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}}
+
+.api-card{margin-top:1.25rem}
+.api-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem}
+.api-fld{display:flex;flex-direction:column;gap:6px}
+.api-fld.api-fld-full{grid-column:1 / -1}
+.api-fld label{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.1em;color:var(--txt3)}
+.api-fld .api-hint{font-size:.62rem;color:var(--txt3);font-weight:300}
+.api-input{width:100%;background:rgba(255,255,255,.04);border:1px solid var(--edge2);border-radius:8px;
+  color:var(--txt);font-family:var(--mono);font-size:.88rem;padding:11px 12px;outline:none;
+  transition:border .18s,box-shadow .18s,background .18s;
+  -webkit-text-fill-color:var(--txt);caret-color:var(--gold);
+  appearance:none;-webkit-appearance:none}
+.api-input::placeholder{color:var(--txt3);opacity:1}
+.api-input::-webkit-input-placeholder{color:var(--txt3)}
+.api-input:hover{border-color:var(--smoke)}
+.api-input:focus,
+.api-input:focus-visible{
+  background:rgba(255,255,255,.04);
+  border-color:var(--gold);
+  box-shadow:0 0 0 3px rgba(201,168,76,.18);
+  color:var(--txt);
+  -webkit-text-fill-color:var(--txt);
+  outline:none
+}
+.api-input:-webkit-autofill,
+.api-input:-webkit-autofill:hover,
+.api-input:-webkit-autofill:focus{
+  -webkit-text-fill-color:var(--txt) !important;
+  -webkit-box-shadow:0 0 0 1000px #0d1020 inset !important;
+  caret-color:var(--gold) !important;
+  transition:background-color 9999s ease-out 0s
+}
+.api-secret{position:relative}
+.api-secret .api-input{padding-right:44px;font-family:var(--mono);letter-spacing:.04em}
+.api-eye{position:absolute;top:50%;right:6px;transform:translateY(-50%);
+  width:32px;height:32px;border-radius:7px;border:1px solid transparent;background:transparent;
+  color:var(--txt3);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+  padding:0;transition:all .18s}
+.api-eye:hover{color:var(--gold2);border-color:var(--edge2);background:rgba(255,255,255,.04)}
+.api-eye:focus-visible{outline:none;color:var(--gold2);border-color:var(--gold);box-shadow:0 0 0 3px rgba(201,168,76,.18)}
+.api-eye svg{width:16px;height:16px;display:block}
+.api-foot{display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  margin-top:1.4rem;flex-wrap:wrap}
+.api-msg{font-family:var(--mono);font-size:.72rem;color:var(--txt2);letter-spacing:.02em;margin:0;flex:1;min-width:0}
+.api-msg.ok{color:var(--green)}
+.api-msg.err{color:var(--red)}
+.api-save{font-family:var(--sans);font-size:.9rem;font-weight:600;
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);color:var(--void);
+  padding:12px 24px;border:none;border-radius:9px;cursor:pointer;letter-spacing:.02em;
+  transition:all .18s;box-shadow:0 8px 28px rgba(201,168,76,.28)}
+.api-save:hover{transform:translateY(-1px);box-shadow:0 14px 38px rgba(201,168,76,.38)}
+.api-save:disabled{opacity:.6;cursor:not-allowed;transform:none;box-shadow:none}
+.api-locked{padding:2.2rem 1.5rem;text-align:center;color:var(--txt3)}
+.api-locked-icon{font-size:1.6rem;opacity:.4;margin-bottom:.6rem;display:block}
+.api-locked-title{font-family:var(--display);font-size:1rem;font-weight:700;color:var(--txt2);margin-bottom:.3rem}
+.api-locked-sub{font-size:.8rem;font-weight:300}
+@media(max-width:480px){
+  .api-grid{grid-template-columns:1fr}
+  .api-foot{flex-direction:column;align-items:stretch}
+  .api-save{width:100%;padding:13px}
+}
+
+.tariff-card{margin-top:1.25rem}
+.tariff-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;padding:1.5rem}
+.tariff-item{position:relative;background:rgba(255,255,255,.025);border:1px solid var(--edge);
+  border-radius:13px;padding:1.4rem 1.3rem;display:flex;flex-direction:column;gap:.7rem;
+  transition:all .22s ease;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+.tariff-item:hover{transform:translateY(-2px);border-color:var(--smoke);background:rgba(255,255,255,.04)}
+.tariff-item.featured{
+  border-color:rgba(201,168,76,.4);
+  background:linear-gradient(150deg,rgba(201,168,76,.07) 0%,rgba(255,255,255,.025) 60%);
+  box-shadow:0 14px 38px rgba(0,0,0,.3),0 0 38px rgba(201,168,76,.08)
+}
+.tariff-item.featured:hover{border-color:rgba(201,168,76,.6);box-shadow:0 18px 46px rgba(0,0,0,.32),0 0 50px rgba(201,168,76,.14)}
+.tariff-badge{position:absolute;top:-10px;right:14px;font-family:var(--mono);font-size:.55rem;
+  font-weight:600;text-transform:uppercase;letter-spacing:.14em;color:var(--void);
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  padding:4px 12px;border-radius:100px;box-shadow:0 4px 14px rgba(201,168,76,.35)}
+.tariff-name{font-family:var(--display);font-size:1.05rem;font-weight:700;color:var(--txt);letter-spacing:-.005em}
+.tariff-price{font-family:var(--display);font-size:2.1rem;font-weight:700;letter-spacing:-.03em;
+  color:var(--txt);line-height:1;display:flex;align-items:baseline;gap:.25rem}
+.tariff-price em{font-style:normal;color:var(--gold)}
+.tariff-price .tariff-month{font-family:var(--mono);font-size:.7rem;font-weight:400;color:var(--txt3);letter-spacing:.04em}
+.tariff-period{font-family:var(--mono);font-size:.6rem;text-transform:uppercase;letter-spacing:.12em;color:var(--txt3);margin-top:-.2rem}
+.tariff-list{list-style:none;padding:0;margin:.5rem 0;display:flex;flex-direction:column;gap:.5rem;flex:1}
+.tariff-list li{font-size:.81rem;color:var(--txt2);display:flex;gap:.55rem;line-height:1.45;font-weight:300}
+.tariff-list li::before{content:"";flex-shrink:0;margin-top:.45rem;width:5px;height:5px;border-radius:50%;background:var(--gold);box-shadow:0 0 6px rgba(201,168,76,.6)}
+.tariff-btn{font-family:var(--sans);font-size:.85rem;font-weight:600;background:transparent;
+  border:1px solid var(--edge2);color:var(--txt);padding:11px 14px;border-radius:9px;cursor:pointer;
+  transition:all .18s;margin-top:auto;letter-spacing:.01em}
+.tariff-btn:hover{border-color:var(--gold);color:var(--gold2);background:var(--gold-bg)}
+.tariff-btn.primary{background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);border:none;box-shadow:0 8px 28px rgba(201,168,76,.28)}
+.tariff-btn.primary:hover{transform:translateY(-1px);box-shadow:0 14px 38px rgba(201,168,76,.38);color:var(--void)}
+.tariff-btn:disabled{opacity:.45;cursor:not-allowed;border-style:dashed}
+.tariff-btn:disabled:hover{border-color:var(--edge2);color:var(--txt);background:transparent}
+.tariff-msg{font-family:var(--mono);font-size:.72rem;color:var(--gold2);letter-spacing:.03em;
+  text-align:center;margin:0;padding:0 1.5rem 1.4rem}
+@media(max-width:900px){
+  .tariff-grid{grid-template-columns:1fr;gap:.85rem;padding:1.2rem}
+  .tariff-item{padding:1.2rem 1.2rem}
+}
 
 .dash-wrap{max-width:1100px;margin:0 auto;padding:2.5rem 2rem 5rem}
 .dash-h1{font-family:var(--display);font-size:clamp(1.8rem,3vw,2.4rem);font-weight:700;letter-spacing:-.02em;margin:0 0 .4rem}
@@ -686,6 +881,71 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
         </div>
 
+        <div className="card tariff-card">
+          <div className="card-head">
+            <div className="card-title">Тарифы</div>
+          </div>
+
+          <div className="tariff-grid">
+            <div className="tariff-item">
+              <div className="tariff-name">Старт</div>
+              <div className="tariff-price">Бесплатно</div>
+              <div className="tariff-period">Первый расчёт</div>
+              <ul className="tariff-list">
+                <li>Один расчёт для оценки сервиса</li>
+                <li>Все функции калькулятора</li>
+                <li>Сохранение результата в историю</li>
+              </ul>
+              <button type="button" className="tariff-btn" disabled>
+                Уже доступно
+              </button>
+            </div>
+
+            <div className="tariff-item">
+              <div className="tariff-name">Разовый расчёт</div>
+              <div className="tariff-price">
+                <em>149</em> ₽
+              </div>
+              <div className="tariff-period">Один платёж</div>
+              <ul className="tariff-list">
+                <li>Дополнительный расчёт по любому товару</li>
+                <li>Без подписки и автосписаний</li>
+                <li>Подходит, если расчёты нужны редко</li>
+              </ul>
+              <button
+                type="button"
+                className="tariff-btn"
+                onClick={() => handleTariff("single")}
+              >
+                Купить расчёт 149₽
+              </button>
+            </div>
+
+            <div className="tariff-item featured">
+              <span className="tariff-badge">Выгодно</span>
+              <div className="tariff-name">Безлимит</div>
+              <div className="tariff-price">
+                <em>449</em> ₽<span className="tariff-month">/мес</span>
+              </div>
+              <div className="tariff-period">Подписка на 30 дней</div>
+              <ul className="tariff-list">
+                <li>Неограниченное число расчётов в месяц</li>
+                <li>Приоритетный доступ к новым функциям</li>
+                <li>Полная история без ограничений</li>
+              </ul>
+              <button
+                type="button"
+                className="tariff-btn primary"
+                onClick={() => handleTariff("unlimited")}
+              >
+                Оформить безлимит 449₽
+              </button>
+            </div>
+          </div>
+
+          {tariffMessage && <p className="tariff-msg">{tariffMessage}</p>}
+        </div>
+
         {isLoadingHistory && (
           <div className="card hist-card">
             <div className="card-head">
@@ -757,6 +1017,110 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
           </div>
         )}
+
+        <div className="card api-card">
+          <div className="card-head">
+            <div className="card-title">Подключение маркетплейсов</div>
+          </div>
+
+          {user ? (
+            <div className="card-body">
+              <div className="api-grid">
+                <div className="api-fld">
+                  <label>Ozon Client ID</label>
+                  <input
+                    className="api-input"
+                    type="text"
+                    placeholder="Например, 123456"
+                    value={ozonClientId}
+                    onChange={(e) => setOzonClientId(e.target.value)}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                </div>
+
+                <div className="api-fld">
+                  <label>Ozon API Key</label>
+                  <div className="api-secret">
+                    <input
+                      className="api-input"
+                      type={showOzonKey ? "text" : "password"}
+                      placeholder="Вставьте секретный ключ"
+                      value={ozonApiKey}
+                      onChange={(e) => setOzonApiKey(e.target.value)}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      className="api-eye"
+                      onClick={() => setShowOzonKey((v) => !v)}
+                      aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
+                      title={showOzonKey ? "Скрыть" : "Показать"}
+                    >
+                      {showOzonKey ? eyeOffIcon : eyeIcon}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="api-fld api-fld-full">
+                  <label>Wildberries API Key</label>
+                  <div className="api-secret">
+                    <input
+                      className="api-input"
+                      type={showWbKey ? "text" : "password"}
+                      placeholder="Вставьте токен из личного кабинета WB"
+                      value={wbApiKey}
+                      onChange={(e) => setWbApiKey(e.target.value)}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                    <button
+                      type="button"
+                      className="api-eye"
+                      onClick={() => setShowWbKey((v) => !v)}
+                      aria-label={showWbKey ? "Скрыть ключ" : "Показать ключ"}
+                      title={showWbKey ? "Скрыть" : "Показать"}
+                    >
+                      {showWbKey ? eyeOffIcon : eyeIcon}
+                    </button>
+                  </div>
+                  <span className="api-hint">
+                    Ключи хранятся только для вашего аккаунта и используются для загрузки данных с маркетплейсов.
+                  </span>
+                </div>
+              </div>
+
+              <div className="api-foot">
+                <p
+                  className={
+                    "api-msg" +
+                    (apiSaveStatus === "ok" ? " ok" : "") +
+                    (apiSaveStatus === "err" ? " err" : "")
+                  }
+                >
+                  {apiSaveMessage}
+                </p>
+                <button
+                  type="button"
+                  className="api-save"
+                  onClick={saveApiKeys}
+                  disabled={apiSaveStatus === "saving"}
+                >
+                  {apiSaveStatus === "saving" ? "Сохраняем…" : "Сохранить API"}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="api-locked">
+              <span className="api-locked-icon">◇</span>
+              <div className="api-locked-title">Войдите в аккаунт</div>
+              <div className="api-locked-sub">
+                API-ключи сохраняются индивидуально для каждого пользователя
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </>
   );
