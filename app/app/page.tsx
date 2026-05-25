@@ -1,6 +1,8 @@
 "use client";
-import { createClient } from "@supabase/supabase-js"
 
+import { createClient } from "@supabase/supabase-js"
+import { useEffect, useState } from "react"
+import { StatsCards } from "./components/StatsCards"
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
@@ -10,7 +12,6 @@ const supabase = createClient(
     },
   }
 )
-import { useEffect, useState } from "react";
 
 type Marketplace = "ozon" | "wb";
 
@@ -430,40 +431,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         <p className="dash-lead">
           Введите данные по товару или периоду — посчитаем чистую прибыль и маржинальность.
         </p>
-<div className="stats-grid">
-  <div className="stat-card">
-    <div className="stat-label">Общая выручка</div>
-    <div className="stat-value">
-      {fmt(totalRevenue)} ₽
-    </div>
-  </div>
+<StatsCards
+  totalRevenue={totalRevenue}
+  totalProfit={totalProfit}
+  avgMargin={avgMargin}
+  historyCount={history.length}
+/>
 
-  <div className="stat-card">
-    <div className="stat-label">Общая прибыль</div>
-    <div
-      className={
-        "stat-value " + (totalProfit >= 0 ? "pos" : "neg")
-      }
-    >
-      {totalProfit >= 0 ? "+" : "−"}
-      {fmt(Math.abs(totalProfit))} ₽
-    </div>
-  </div>
-
-  <div className="stat-card">
-    <div className="stat-label">Средняя маржа</div>
-    <div className="stat-value">
-      {avgMargin.toFixed(1)}%
-    </div>
-  </div>
-
-  <div className="stat-card">
-    <div className="stat-label">Всего расчётов</div>
-    <div className="stat-value">
-      {history.length}
-    </div>
-  </div>
-</div>
+ 
         <div className="dash-grid">
           <div className="card">
             <div className="card-head">
