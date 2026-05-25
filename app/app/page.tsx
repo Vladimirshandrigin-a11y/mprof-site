@@ -90,6 +90,7 @@ export default function AppPage() {
   const [showOzonKey, setShowOzonKey] = useState(false);
   const [showWbKey, setShowWbKey] = useState(false);
   const [tariffMessage, setTariffMessage] = useState("");
+  const [calcMode, setCalcMode] = useState<"manual" | "api">("manual");
 
   const totalRevenue = history.reduce((sum, h) => sum + h.revenue, 0);
   const totalProfit = history.reduce((sum, h) => sum + h.profit, 0);
@@ -516,6 +517,74 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .api-save{width:100%;padding:13px}
 }
 
+.calc-tabs{display:flex;gap:8px;background:var(--glass);border:1px solid var(--edge);
+  border-radius:14px;padding:6px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  margin-bottom:1.25rem;box-shadow:0 14px 38px rgba(0,0,0,.22)}
+.calc-tab{flex:1;font-family:var(--sans);font-size:.88rem;font-weight:600;padding:12px 16px;
+  border-radius:10px;cursor:pointer;letter-spacing:.01em;border:1px solid transparent;
+  background:transparent;color:var(--txt2);transition:all .22s ease;text-align:center;
+  display:inline-flex;align-items:center;justify-content:center;gap:9px}
+.calc-tab:hover{color:var(--txt);background:rgba(255,255,255,.03)}
+.calc-tab.active{
+  color:var(--void);
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  box-shadow:0 8px 26px rgba(201,168,76,.3),inset 0 1px 0 rgba(255,255,255,.22)
+}
+.calc-tab-ico{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;opacity:.9}
+.calc-tab-ico svg{width:16px;height:16px;display:block}
+@media(max-width:640px){
+  .calc-tabs{flex-direction:column;gap:6px}
+  .calc-tab{padding:11px}
+}
+
+.api-pro-card{margin-bottom:.25rem;position:relative;overflow:hidden;
+  box-shadow:0 24px 60px rgba(0,0,0,.35),0 0 50px rgba(201,168,76,.06)}
+.api-pro-card::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(520px 280px at 100% 0%, rgba(201,168,76,.10), transparent 60%);
+  z-index:0}
+.api-pro-card > *{position:relative;z-index:1}
+.api-pro-head{padding:1.5rem 1.7rem 1.1rem;border-bottom:1px solid var(--edge)}
+.api-pro-title{font-family:var(--display);font-size:1.15rem;font-weight:700;color:var(--txt);
+  margin-bottom:.35rem;letter-spacing:-.005em}
+.api-pro-sub{font-size:.85rem;color:var(--txt2);font-weight:300;line-height:1.5;margin:0}
+.api-pro-body{padding:1.5rem 1.7rem 1.7rem}
+.api-pro-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.api-pro-grid .api-fld.api-fld-full{grid-column:1 / -1}
+.api-pro-foot{display:flex;align-items:center;gap:1rem;margin-top:1.6rem;flex-wrap:wrap}
+.api-pro-btn{flex:1;min-width:240px;font-family:var(--sans);font-size:.95rem;font-weight:600;
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);color:var(--void);
+  padding:14px 22px;border:none;border-radius:11px;cursor:pointer;letter-spacing:.01em;
+  transition:all .22s ease;box-shadow:0 10px 30px rgba(201,168,76,.28);
+  display:inline-flex;align-items:center;justify-content:center;gap:8px}
+.api-pro-btn:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 18px 44px rgba(201,168,76,.42)}
+.api-pro-btn:disabled{opacity:.55;cursor:not-allowed;transform:none;
+  background:linear-gradient(135deg,rgba(58,74,96,.5) 0%,rgba(122,143,168,.4) 100%);
+  color:var(--txt2);box-shadow:none}
+.api-pro-btn.locked{cursor:not-allowed;opacity:.85;color:var(--txt);
+  background:rgba(255,255,255,.04);border:1px dashed var(--edge2);box-shadow:none}
+.api-pro-btn.locked:hover{transform:none;box-shadow:none}
+.api-pro-msg{font-family:var(--mono);font-size:.72rem;color:var(--txt2);letter-spacing:.02em;
+  margin:0;flex:1;min-width:0}
+.api-pro-msg.ok{color:var(--green)}
+.api-pro-msg.err{color:var(--red)}
+.api-pro-hint{margin-top:1.2rem;padding:.9rem 1.1rem;background:var(--gold-bg);
+  border:1px solid rgba(201,168,76,.18);border-radius:11px;font-size:.78rem;
+  color:var(--txt2);font-weight:300;line-height:1.55;display:flex;gap:.7rem;align-items:flex-start}
+.api-pro-hint-ico{color:var(--gold2);flex-shrink:0;margin-top:1px;display:inline-flex}
+.api-pro-hint-ico svg{width:16px;height:16px;display:block}
+.api-input:disabled,
+.api-input:disabled:hover{opacity:.5;cursor:not-allowed;background:rgba(255,255,255,.02);
+  border-color:var(--edge);box-shadow:none}
+.api-eye:disabled{opacity:.35;cursor:not-allowed}
+.api-eye:disabled:hover{color:var(--txt3);border-color:transparent;background:transparent}
+@media(max-width:640px){
+  .api-pro-head{padding:1.3rem 1.3rem 1rem}
+  .api-pro-body{padding:1.3rem}
+  .api-pro-grid{grid-template-columns:1fr;gap:.85rem}
+  .api-pro-foot{flex-direction:column;align-items:stretch;gap:.8rem}
+  .api-pro-btn{width:100%;min-width:0;padding:13px}
+}
+
 .tariff-card{margin-top:1.25rem}
 .tariff-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;padding:1.5rem}
 .tariff-item{position:relative;background:rgba(255,255,255,.025);border:1px solid var(--edge);
@@ -777,6 +846,39 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           historyCount={history.length}
         />
 
+        <div className="calc-tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={calcMode === "manual"}
+            className={"calc-tab" + (calcMode === "manual" ? " active" : "")}
+            onClick={() => setCalcMode("manual")}
+          >
+            <span className="calc-tab-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="4" y="3" width="16" height="18" rx="2.5" />
+                <path d="M8 7h8M8 11h8M8 15h5" />
+              </svg>
+            </span>
+            Ручной расчёт
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={calcMode === "api"}
+            className={"calc-tab" + (calcMode === "api" ? " active" : "")}
+            onClick={() => setCalcMode("api")}
+          >
+            <span className="calc-tab-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+              </svg>
+            </span>
+            Авторасчёт через API
+          </button>
+        </div>
+
+        {calcMode === "manual" ? (
         <div className="dash-grid">
           <div className="card">
             <div className="card-head">
@@ -880,6 +982,123 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             )}
           </div>
         </div>
+        ) : (
+        <div className="card api-pro-card">
+          <div className="api-pro-head">
+            <div className="api-pro-title">Подключение маркетплейсов</div>
+            <p className="api-pro-sub">
+              Подключите API и получайте автоматический расчёт прибыли
+            </p>
+          </div>
+
+          <div className="api-pro-body">
+            <div className="api-pro-grid">
+              <div className="api-fld">
+                <label>Ozon Client ID</label>
+                <input
+                  className="api-input"
+                  type="text"
+                  placeholder="Например, 123456"
+                  value={ozonClientId}
+                  onChange={(e) => setOzonClientId(e.target.value)}
+                  disabled={!user}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+
+              <div className="api-fld">
+                <label>Ozon API Key</label>
+                <div className="api-secret">
+                  <input
+                    className="api-input"
+                    type={showOzonKey ? "text" : "password"}
+                    placeholder="Вставьте секретный ключ"
+                    value={ozonApiKey}
+                    onChange={(e) => setOzonApiKey(e.target.value)}
+                    disabled={!user}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="api-eye"
+                    onClick={() => setShowOzonKey((v) => !v)}
+                    disabled={!user}
+                    aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
+                    title={showOzonKey ? "Скрыть" : "Показать"}
+                  >
+                    {showOzonKey ? eyeOffIcon : eyeIcon}
+                  </button>
+                </div>
+              </div>
+
+              <div className="api-fld api-fld-full">
+                <label>Wildberries API Key</label>
+                <div className="api-secret">
+                  <input
+                    className="api-input"
+                    type={showWbKey ? "text" : "password"}
+                    placeholder="Вставьте токен из личного кабинета WB"
+                    value={wbApiKey}
+                    onChange={(e) => setWbApiKey(e.target.value)}
+                    disabled={!user}
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="api-eye"
+                    onClick={() => setShowWbKey((v) => !v)}
+                    disabled={!user}
+                    aria-label={showWbKey ? "Скрыть ключ" : "Показать ключ"}
+                    title={showWbKey ? "Скрыть" : "Показать"}
+                  >
+                    {showWbKey ? eyeOffIcon : eyeIcon}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="api-pro-foot">
+              <p
+                className={
+                  "api-pro-msg" +
+                  (apiSaveStatus === "ok" ? " ok" : "") +
+                  (apiSaveStatus === "err" ? " err" : "")
+                }
+              >
+                {apiSaveMessage}
+              </p>
+              {user ? (
+                <button
+                  type="button"
+                  className="api-pro-btn"
+                  onClick={saveApiKeys}
+                  disabled={apiSaveStatus === "saving"}
+                >
+                  {apiSaveStatus === "saving" ? "Подключаем…" : "Подключить маркетплейс"}
+                </button>
+              ) : (
+                <button type="button" className="api-pro-btn locked" disabled>
+                  Войдите в аккаунт для подключения API
+                </button>
+              )}
+            </div>
+
+            <div className="api-pro-hint">
+              <span className="api-pro-hint-ico">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 8v5" />
+                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
+                </svg>
+              </span>
+              Ваши продажи, комиссии и расходы будут подтягиваться автоматически.
+            </div>
+          </div>
+        </div>
+        )}
 
         <div className="card tariff-card">
           <div className="card-head">
