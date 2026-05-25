@@ -2,7 +2,10 @@
 
 import { createClient } from "@supabase/supabase-js"
 import { useEffect, useState } from "react"
+
+import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
@@ -32,7 +35,6 @@ interface CalcResult {
   date: string;
 }
 
-
 const FIELDS: { key: string; label: string; hint?: string }[] = [
   { key: "revenue", label: "Выручка", hint: "Сумма продаж за период" },
   { key: "commission", label: "Комиссия маркетплейса" },
@@ -59,88 +61,134 @@ export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
   const [result, setResult] = useState<CalcResult | null>(null);
-  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [selectedId, setSelectedId] = useState<number | null>(null);
   const [history, setHistory] = useState<CalcResult[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const [user, setUser] = useState<User | null>(null);
+  const [email, setEmail] = useState("");
+  const [authMessage, setAuthMessage] = useState("");
+
   const totalRevenue = history.reduce((sum, h) => sum + h.revenue, 0);
-const totalProfit = history.reduce((sum, h) => sum + h.profit, 0);
-const avgMargin =
-  history.length > 0
-    ? history.reduce((sum, h) => sum + h.margin, 0) / history.length
-    : 0;
-useEffect(() => {
-  loadHistory()
-}, [])
-const clearHistory = async () => {
-  const ok = confirm("Удалить всю историю?")
+  const totalProfit = history.reduce((sum, h) => sum + h.profit, 0);
+  const avgMargin =
+    history.length > 0
+      ? history.reduce((sum, h) => sum + h.margin, 0) / history.length
+      : 0;
 
-  if (!ok) return
+  // Получаем пользователя, затем сразу грузим его историю
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data }) => {
+      setUser(data.user);
+      loadHistory(data.user?.id ?? null);
+    });
+  }, []);
 
-  setHistory([])
-  setSelectedId(null)
+  const signIn = async () => {
+    if (!email.trim()) {
+      setAuthMessage("Введите email");
+      return;
+    }
 
-  await supabase
-    .from("calculations")
-    .delete()
-    .neq("id", "")
-}
+    const { error } = await supabase.auth.signInWithOtp({
+      email: email.trim(),
+      options: {
+        emailRedirectTo: "http://localhost:3000/app",
+      },
+    });
 
-const deleteHistoryItem = async (id: number) => {
-  const { error } = await supabase
-    .from("calculations")
-    .delete()
-    .eq("id", id)
+    if (error) {
+      setAuthMessage(error.message);
+    } else {
+      setAuthMessage("Письмо для входа отправлено на email");
+    }
+  };
 
-  if (error) {
-    console.error(error)
-    return
-  }
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setHistory([]);
+    setResult(null);
+  };
 
-  setHistory(prev => prev.filter(h => h.id !== id))
+  const clearHistory = async () => {
+    const ok = confirm("Удалить всю историю?");
+    if (!ok) return;
 
-  if (selectedId === id) {
-    setSelectedId(null)
-  }
-}
-const loadHistory = async () => {
-  
-  const { data, error } = await supabase
-    .from("calculations")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(8)
+    setHistory([]);
+    setSelectedId(null);
 
-  if (error) {
-  console.error(error)
-  setIsLoadingHistory(false)
-  return
-}
+    if (user?.id) {
+      await supabase.from("calculations").delete().eq("user_id", user.id);
+    } else {
+      await supabase.from("calculations").delete().is("user_id", null);
+    }
+  };
 
-  const mapped: CalcResult[] = data.map((item: any) => ({
-    id: item.id,
-    marketplace: item.marketplace,
-    revenue: item.revenue,
-    commission: item.commission,
-logistics: item.logistics,
-storage: item.storage,
-ads: item.ads,
-cost: item.cost_price,
-tax: item.tax,
-other: item.other_expenses,
-    expenses: item.total_expenses,
-    profit: item.profit,
-    margin: item.margin,
-    date: new Date(item.created_at).toLocaleString("ru-RU", {
-      day: "2-digit",
-      month: "short",
-      hour: "2-digit",
-      minute: "2-digit",
-    }),
-  }))
+  const deleteHistoryItem = async (id: number) => {
+    const { error } = await supabase
+      .from("calculations")
+      .delete()
+      .eq("id", id);
 
-  setHistory(mapped)
-  setIsLoadingHistory(false)
-}
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setHistory(prev => prev.filter(h => h.id !== id));
+
+    if (selectedId === id) {
+      setSelectedId(null);
+    }
+  };
+
+  const loadHistory = async (userId: string | null) => {
+    let query = supabase
+      .from("calculations")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(8);
+
+    if (userId) {
+      query = query.eq("user_id", userId);
+    } else {
+      query = query.is("user_id", null);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error(error);
+      setIsLoadingHistory(false);
+      return;
+    }
+
+    const mapped: CalcResult[] = data.map((item: any) => ({
+      id: item.id,
+      marketplace: item.marketplace,
+      revenue: item.revenue,
+      commission: item.commission,
+      logistics: item.logistics,
+      storage: item.storage,
+      ads: item.ads,
+      cost: item.cost_price,
+      tax: item.tax,
+      other: item.other_expenses,
+      expenses: item.total_expenses,
+      profit: item.profit,
+      margin: item.margin,
+      date: new Date(item.created_at).toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    }));
+
+    setHistory(mapped);
+    setIsLoadingHistory(false);
+  };
+
   const num = (v: string) => {
     const n = parseFloat(String(v).replace(",", "."));
     return isNaN(n) ? 0 : n;
@@ -168,7 +216,6 @@ other: item.other_expenses,
     const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
 
     const res: CalcResult = {
-      
       id: Date.now(),
       marketplace,
       revenue,
@@ -189,40 +236,43 @@ other: item.other_expenses,
         minute: "2-digit",
       }),
     };
-    const { error } = await supabase.from("calculations").insert([
-  {
-    marketplace,
-    revenue,
-    commission: num(form.commission),
-    logistics: num(form.logistics),
-    storage: num(form.storage),
-    ads: num(form.ads),
-    cost_price: num(form.cost),
-    tax: num(form.tax),
-    other_expenses: num(form.other),
-    total_expenses: expenses,
-    profit,
-    margin,
-  },
-])
 
-if (error) {
-  alert(error.message)
-  console.error("Supabase save error:", error)
-}
+    const { error } = await supabase.from("calculations").insert([
+      {
+        marketplace,
+        revenue,
+        commission: num(form.commission),
+        logistics: num(form.logistics),
+        storage: num(form.storage),
+        ads: num(form.ads),
+        cost_price: num(form.cost),
+        tax: num(form.tax),
+        other_expenses: num(form.other),
+        total_expenses: expenses,
+        profit,
+        margin,
+        user_id: user?.id ?? null,
+      },
+    ]);
+
+    if (error) {
+      alert(error.message);
+      console.error("Supabase save error:", error);
+    }
+
     setResult(res);
     setHistory((prev) => [res, ...prev].slice(0, 8));
   };
 
   const clearForm = () => {
-  setForm({ ...EMPTY });
-  setResult(null);
+    setForm({ ...EMPTY });
+    setResult(null);
 
-  window.scrollTo({
-    top: 0,
-    behavior: "smooth",
-  });
-};
+    window.scrollTo({
+      top: 0,
+      behavior: "smooth",
+    });
+  };
 
   return (
     <>
@@ -258,6 +308,59 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .status-dot{width:6px;height:6px;border-radius:50%;background:var(--gold);
   animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.6)}}
+
+.dash-user{display:inline-flex;align-items:center;gap:10px}
+.dash-user-email{font-family:var(--mono);font-size:.63rem;color:var(--txt2);letter-spacing:.04em;
+  max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dash-signout{font-family:var(--sans);font-size:.75rem;font-weight:500;background:transparent;
+  border:1px solid var(--edge2);color:var(--txt2);padding:5px 13px;border-radius:8px;
+  cursor:pointer;transition:all .18s;line-height:1}
+.dash-signout:hover{border-color:rgba(224,85,102,.4);color:var(--red)}
+
+.auth-card{margin-bottom:1.4rem;padding:1.4rem 1.5rem}
+.auth-title{font-family:var(--display);font-size:1.05rem;font-weight:700;color:var(--txt);margin:0 0 .9rem}
+.auth-row{display:flex;gap:10px;align-items:stretch}
+.auth-input{flex:1;width:100%;background:rgba(255,255,255,.04);border:1px solid var(--edge2);
+  border-radius:9px;color:var(--txt);font-family:var(--mono);font-size:.92rem;padding:12px 14px;
+  outline:none;transition:border .18s,box-shadow .18s,background .18s;
+  -webkit-text-fill-color:var(--txt);caret-color:var(--gold);
+  appearance:none;-webkit-appearance:none}
+.auth-input::placeholder{color:var(--txt3);opacity:1}
+.auth-input::-webkit-input-placeholder{color:var(--txt3)}
+.auth-input:hover{border-color:var(--smoke)}
+.auth-input:focus,
+.auth-input:focus-visible,
+.auth-input:active{
+  background:rgba(255,255,255,.04);
+  border-color:var(--gold);
+  box-shadow:0 0 0 3px rgba(201,168,76,.18);
+  color:var(--txt);
+  -webkit-text-fill-color:var(--txt);
+  outline:none
+}
+.auth-input:-webkit-autofill,
+.auth-input:-webkit-autofill:hover,
+.auth-input:-webkit-autofill:focus,
+.auth-input:-webkit-autofill:active{
+  -webkit-text-fill-color:var(--txt) !important;
+  -webkit-box-shadow:0 0 0 1000px #0d1020 inset !important;
+  box-shadow:0 0 0 1000px #0d1020 inset !important;
+  caret-color:var(--gold) !important;
+  border:1px solid var(--edge2);
+  transition:background-color 9999s ease-out 0s,color 9999s ease-out 0s
+}
+.auth-input:-webkit-autofill:focus{
+  border-color:var(--gold);
+  -webkit-box-shadow:0 0 0 1000px #0d1020 inset,0 0 0 3px rgba(201,168,76,.18) !important;
+  box-shadow:0 0 0 1000px #0d1020 inset,0 0 0 3px rgba(201,168,76,.18) !important
+}
+.auth-btn{font-family:var(--sans);font-size:.9rem;font-weight:600;
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);color:var(--void);
+  padding:0 22px;border:none;border-radius:9px;cursor:pointer;letter-spacing:.02em;
+  transition:all .18s;box-shadow:0 8px 28px rgba(201,168,76,.28);white-space:nowrap}
+.auth-btn:hover{transform:translateY(-1px);box-shadow:0 14px 38px rgba(201,168,76,.38)}
+.auth-msg{margin:.8rem 0 0;font-family:var(--mono);font-size:.72rem;color:var(--txt2);letter-spacing:.02em}
+@media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}}
 
 .dash-wrap{max-width:1100px;margin:0 auto;padding:2.5rem 2rem 5rem}
 .dash-h1{font-family:var(--display);font-size:clamp(1.8rem,3vw,2.4rem);font-weight:700;letter-spacing:-.02em;margin:0 0 .4rem}
@@ -359,6 +462,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .hist-profit.pos{color:var(--green)}
 .hist-profit.neg{color:var(--red)}
 .hist-profit .hm{display:block;font-family:var(--mono);font-size:.6rem;font-weight:400;color:var(--txt3);letter-spacing:.04em}
+.hist-del{flex-shrink:0;width:28px;height:28px;border-radius:8px;border:1px solid var(--edge2);
+  background:transparent;color:var(--txt3);font-size:1.05rem;line-height:1;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;transition:all .18s;padding:0}
+.hist-del:hover{border-color:rgba(224,85,102,.4);color:var(--red);background:rgba(224,85,102,.08)}
 .stats-grid{
   display:grid;
   grid-template-columns:repeat(4,1fr);
@@ -405,6 +512,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .dash-status{font-size:.6rem;padding:5px 12px}
   .dash-wrap{padding:1.8rem 1.2rem 4rem}
   .dash-grid{grid-template-columns:1fr}
+  .dash-user-email{display:none}
 }
 @media(max-width:480px){
   .form-grid{grid-template-columns:1fr}
@@ -418,27 +526,62 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           M&#8209;<em>Prof</em>
           <span className="dash-brand-sub">Dashboard</span>
         </a>
-        <div className="dash-status">
-          <span className="status-dot"></span>
-          Первый расчёт бесплатно
-        </div>
+
+        {user ? (
+          <div className="dash-user">
+            <span className="dash-user-email">{user.email}</span>
+            <button className="dash-signout" onClick={signOut}>
+              Выйти
+            </button>
+          </div>
+        ) : (
+          <div className="dash-status">
+            <span className="status-dot"></span>
+            Первый расчёт бесплатно
+          </div>
+        )}
       </div>
 
       <div className="dash-wrap">
+        {!user && (
+          <div className="card auth-card">
+            <h3 className="auth-title">Вход в аккаунт</h3>
+
+            <div className="auth-row">
+              <input
+                className="auth-input"
+                type="email"
+                placeholder="Ваш email"
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") signIn();
+                }}
+              />
+              <button type="button" className="auth-btn" onClick={signIn}>
+                Войти
+              </button>
+            </div>
+
+            {authMessage && <p className="auth-msg">{authMessage}</p>}
+          </div>
+        )}
+
         <h1 className="dash-h1">
           Новый <em>расчёт</em>
         </h1>
         <p className="dash-lead">
           Введите данные по товару или периоду — посчитаем чистую прибыль и маржинальность.
         </p>
-<StatsCards
-  totalRevenue={totalRevenue}
-  totalProfit={totalProfit}
-  avgMargin={avgMargin}
-  historyCount={history.length}
-/>
 
- 
+        <StatsCards
+          totalRevenue={totalRevenue}
+          totalProfit={totalProfit}
+          avgMargin={avgMargin}
+          historyCount={history.length}
+        />
+
         <div className="dash-grid">
           <div className="card">
             <div className="card-head">
@@ -498,7 +641,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               <div className="card-title">Результат</div>
             </div>
             {result ? (
-              
               <>
                 <div className="res-hero">
                   <div className="res-hero-lbl">Чистая прибыль</div>
@@ -545,121 +687,77 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         </div>
 
         {isLoadingHistory && (
-  <div className="card hist-card">
-    <div className="card-head">
-      <div className="card-title">Последние расчёты</div>
-    </div>
-
-    <div className="card-body">
-      Загрузка истории...
-    </div>
-  </div>
-  )}
-
-
-
-
-
- {!isLoadingHistory && history.length > 0 && (
-  <div className="card hist-card">
-    <div className="card-head">
-  <div className="card-title">Последние расчёты</div>
-  <button
-  onClick={clearHistory}
-  style={{
-    boxShadow: "0 0 22px rgba(246,200,107,.22), inset 0 1px 0 rgba(255,255,255,.12)",
-backdropFilter: "blur(10px)",
-    all: "unset",
-    height: "42px",
-    padding: "0 18px",
-    borderRadius: "14px",
-    border: "1px solid rgba(255,255,255,.10)",
-    background: "linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.035))",
-    color: "#f6c86b",
-    textShadow: "0 0 10px rgba(246,200,107,.25)",
-    display: "inline-flex",
-    alignItems: "center",
-    justifyContent: "center",
-    cursor: "pointer",
-    fontSize: "14px",
-    fontWeight: 700,
-    transition: "all .2s ease",
-  }}
->
-  Очистить историю
-</button>
-  
-</div>
-
-    <div className="hist-list">
-      {history.map((h) => (
-        <div
-          className={`hist-item ${selectedId === h.id ? "active" : ""}`}
-          key={h.id}
-          onClick={() => {
-            setMarketplace(h.marketplace)
-            setForm({
-              revenue: String(h.revenue),
-              commission: String(h.commission),
-              logistics: String(h.logistics),
-              storage: String(h.storage),
-              ads: String(h.ads),
-              cost: String(h.cost),
-              tax: String(h.tax),
-              other: String(h.other),
-            })
-            setResult(h)
-            setSelectedId(h.id)
-          }}
-        >
-          <div className={"hist-mp " + h.marketplace}>
-            {h.marketplace === "ozon" ? "Ozon" : "WB"}
+          <div className="card hist-card">
+            <div className="card-head">
+              <div className="card-title">Последние расчёты</div>
+            </div>
+            <div className="card-body">
+              Загрузка истории...
+            </div>
           </div>
+        )}
 
-          <div className="hist-info">
-            <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
-            <div className="hist-date">{h.date}</div>
+        {!isLoadingHistory && history.length > 0 && (
+          <div className="card hist-card">
+            <div className="card-head">
+              <div className="card-title">Последние расчёты</div>
+              <button
+                onClick={clearHistory}
+                style={{
+                  boxShadow: "0 0 22px rgba(246,200,107,.22), inset 0 1px 0 rgba(255,255,255,.12)",
+                  backdropFilter: "blur(10px)",
+                  all: "unset",
+                  height: "42px",
+                  padding: "0 18px",
+                  borderRadius: "14px",
+                  border: "1px solid rgba(255,255,255,.10)",
+                  background: "linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.035))",
+                  color: "#f6c86b",
+                  textShadow: "0 0 10px rgba(246,200,107,.25)",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  cursor: "pointer",
+                  fontSize: "14px",
+                  fontWeight: 700,
+                  transition: "all .2s ease",
+                }}
+              >
+                Очистить историю
+              </button>
+            </div>
+
+            <div className="hist-list">
+              {history.map((h) => (
+                <div className="hist-item" key={h.id}>
+                  <div className={"hist-mp " + h.marketplace}>
+                    {h.marketplace === "ozon" ? "Ozon" : "WB"}
+                  </div>
+
+                  <div className="hist-info">
+                    <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
+                    <div className="hist-date">{h.date}</div>
+                  </div>
+
+                  <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
+                    {h.profit >= 0 ? "+" : "−"}
+                    {fmt(Math.abs(h.profit))} ₽
+                    <span className="hm">маржа {h.margin.toFixed(1)}%</span>
+                  </div>
+
+                  <button
+                    type="button"
+                    className="hist-del"
+                    onClick={() => deleteHistoryItem(h.id)}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
           </div>
-
-          <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
-            {h.profit >= 0 ? "+" : "-"}
-            {fmt(Math.abs(h.profit))} ₽
-            <span className="hm">маржа {h.margin.toFixed(1)}%</span>
-          </div>
-
-          <button
-  type="button"
-  className="hist-del"
-  onClick={(e) => {
-  e.stopPropagation()
-
-  const ok = confirm("Удалить этот расчёт?")
-
-  if (ok) {
-    deleteHistoryItem(h.id)
-  }
-}}
-  style={{
-    width: "32px",
-    height: "32px",
-    borderRadius: "10px",
-    border: "1px solid rgba(255,255,255,0.08)",
-    background: "rgba(255,255,255,0.04)",
-    color: "#c9a34f",
-    cursor: "pointer",
-    fontWeight: 700,
-    fontSize: "16px",
-    transition: "0.2s ease",
-  }}
->
-  ✕
-</button>
-        </div>
-      ))}
-    </div>
-  </div>
-)}
-</div>
-</>
-)
+        )}
+      </div>
+    </>
+  );
 }
