@@ -1,6 +1,16 @@
 "use client";
+import { createClient } from "@supabase/supabase-js"
 
-import { useState } from "react";
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
+  {
+    auth: {
+      persistSession: false,
+    },
+  }
+)
+import { useEffect, useState } from "react";
 
 type Marketplace = "ozon" | "wb";
 
@@ -8,11 +18,19 @@ interface CalcResult {
   id: number;
   marketplace: Marketplace;
   revenue: number;
+  commission: number;
+  logistics: number;
+  storage: number;
+  ads: number;
+  cost: number;
+  tax: number;
+  other: number;
   expenses: number;
   profit: number;
   margin: number;
   date: string;
 }
+
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
   { key: "revenue", label: "Выручка", hint: "Сумма продаж за период" },
@@ -40,8 +58,88 @@ export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
   const [result, setResult] = useState<CalcResult | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null)
   const [history, setHistory] = useState<CalcResult[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const totalRevenue = history.reduce((sum, h) => sum + h.revenue, 0);
+const totalProfit = history.reduce((sum, h) => sum + h.profit, 0);
+const avgMargin =
+  history.length > 0
+    ? history.reduce((sum, h) => sum + h.margin, 0) / history.length
+    : 0;
+useEffect(() => {
+  loadHistory()
+}, [])
+const clearHistory = async () => {
+  const ok = confirm("Удалить всю историю?")
 
+  if (!ok) return
+
+  setHistory([])
+  setSelectedId(null)
+
+  await supabase
+    .from("calculations")
+    .delete()
+    .neq("id", "")
+}
+
+const deleteHistoryItem = async (id: number) => {
+  const { error } = await supabase
+    .from("calculations")
+    .delete()
+    .eq("id", id)
+
+  if (error) {
+    console.error(error)
+    return
+  }
+
+  setHistory(prev => prev.filter(h => h.id !== id))
+
+  if (selectedId === id) {
+    setSelectedId(null)
+  }
+}
+const loadHistory = async () => {
+  
+  const { data, error } = await supabase
+    .from("calculations")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(8)
+
+  if (error) {
+  console.error(error)
+  setIsLoadingHistory(false)
+  return
+}
+
+  const mapped: CalcResult[] = data.map((item: any) => ({
+    id: item.id,
+    marketplace: item.marketplace,
+    revenue: item.revenue,
+    commission: item.commission,
+logistics: item.logistics,
+storage: item.storage,
+ads: item.ads,
+cost: item.cost_price,
+tax: item.tax,
+other: item.other_expenses,
+    expenses: item.total_expenses,
+    profit: item.profit,
+    margin: item.margin,
+    date: new Date(item.created_at).toLocaleString("ru-RU", {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }),
+  }))
+
+  setHistory(mapped)
+  setIsLoadingHistory(false)
+}
   const num = (v: string) => {
     const n = parseFloat(String(v).replace(",", "."));
     return isNaN(n) ? 0 : n;
@@ -55,7 +153,7 @@ export default function AppPage() {
     setForm((prev) => ({ ...prev, [key]: value }));
   };
 
-  const calculate = () => {
+  const calculate = async () => {
     const revenue = num(form.revenue);
     const expenses =
       num(form.commission) +
@@ -69,9 +167,17 @@ export default function AppPage() {
     const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
 
     const res: CalcResult = {
+      
       id: Date.now(),
       marketplace,
       revenue,
+      commission: num(form.commission),
+      logistics: num(form.logistics),
+      storage: num(form.storage),
+      ads: num(form.ads),
+      cost: num(form.cost),
+      tax: num(form.tax),
+      other: num(form.other),
       expenses,
       profit,
       margin,
@@ -82,14 +188,40 @@ export default function AppPage() {
         minute: "2-digit",
       }),
     };
+    const { error } = await supabase.from("calculations").insert([
+  {
+    marketplace,
+    revenue,
+    commission: num(form.commission),
+    logistics: num(form.logistics),
+    storage: num(form.storage),
+    ads: num(form.ads),
+    cost_price: num(form.cost),
+    tax: num(form.tax),
+    other_expenses: num(form.other),
+    total_expenses: expenses,
+    profit,
+    margin,
+  },
+])
+
+if (error) {
+  alert(error.message)
+  console.error("Supabase save error:", error)
+}
     setResult(res);
     setHistory((prev) => [res, ...prev].slice(0, 8));
   };
 
   const clearForm = () => {
-    setForm({ ...EMPTY });
-    setResult(null);
-  };
+  setForm({ ...EMPTY });
+  setResult(null);
+
+  window.scrollTo({
+    top: 0,
+    behavior: "smooth",
+  });
+};
 
   return (
     <>
@@ -198,7 +330,23 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
 .hist-card{margin-top:1.25rem}
 .hist-list{display:flex;flex-direction:column}
-.hist-item{display:flex;align-items:center;gap:1rem;padding:.85rem 1.5rem;border-bottom:1px solid var(--edge)}
+.hist-item{
+  display:flex;
+  align-items:center;
+  gap:1rem;
+  padding:.85rem 1.5rem;
+  border-bottom:1px solid var(--edge);
+  cursor:pointer;
+  transition:.2s ease;
+}
+
+.hist-item:hover{
+  background:rgba(255,255,255,.03);
+}
+  .hist-item.active{
+  background:rgba(255,255,255,.04);
+  border-left:2px solid var(--accent);
+}
 .hist-item:last-child{border-bottom:none}
 .hist-mp{font-family:var(--mono);font-size:.58rem;padding:3px 9px;border-radius:3px;border:1px solid;flex-shrink:0;letter-spacing:.06em}
 .hist-mp.ozon{border-color:rgba(61,123,255,.35);color:#7fb0ff;background:rgba(61,123,255,.08)}
@@ -210,7 +358,46 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .hist-profit.pos{color:var(--green)}
 .hist-profit.neg{color:var(--red)}
 .hist-profit .hm{display:block;font-family:var(--mono);font-size:.6rem;font-weight:400;color:var(--txt3);letter-spacing:.04em}
+.stats-grid{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:1rem;
+  margin-bottom:1.4rem;
+}
 
+.stat-card{
+  background:var(--glass);
+  border:1px solid var(--edge);
+  border-radius:14px;
+  padding:1rem 1.1rem;
+  backdrop-filter:blur(10px);
+  box-shadow:0 10px 30px rgba(0,0,0,.22);
+}
+
+.stat-label{
+  font-family:var(--mono);
+  font-size:.62rem;
+  text-transform:uppercase;
+  letter-spacing:.08em;
+  color:var(--txt3);
+  margin-bottom:.55rem;
+}
+
+.stat-value{
+  font-family:var(--display);
+  font-size:1.5rem;
+  font-weight:700;
+  letter-spacing:-.03em;
+  color:var(--txt);
+}
+
+.stat-value.pos{
+  color:var(--green);
+}
+
+.stat-value.neg{
+  color:var(--red);
+}
 @media(max-width:900px){
   .dash-top{padding:.85rem 1.2rem}
   .dash-brand-sub{display:none}
@@ -243,7 +430,40 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         <p className="dash-lead">
           Введите данные по товару или периоду — посчитаем чистую прибыль и маржинальность.
         </p>
+<div className="stats-grid">
+  <div className="stat-card">
+    <div className="stat-label">Общая выручка</div>
+    <div className="stat-value">
+      {fmt(totalRevenue)} ₽
+    </div>
+  </div>
 
+  <div className="stat-card">
+    <div className="stat-label">Общая прибыль</div>
+    <div
+      className={
+        "stat-value " + (totalProfit >= 0 ? "pos" : "neg")
+      }
+    >
+      {totalProfit >= 0 ? "+" : "−"}
+      {fmt(Math.abs(totalProfit))} ₽
+    </div>
+  </div>
+
+  <div className="stat-card">
+    <div className="stat-label">Средняя маржа</div>
+    <div className="stat-value">
+      {avgMargin.toFixed(1)}%
+    </div>
+  </div>
+
+  <div className="stat-card">
+    <div className="stat-label">Всего расчётов</div>
+    <div className="stat-value">
+      {history.length}
+    </div>
+  </div>
+</div>
         <div className="dash-grid">
           <div className="card">
             <div className="card-head">
@@ -303,6 +523,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               <div className="card-title">Результат</div>
             </div>
             {result ? (
+              
               <>
                 <div className="res-hero">
                   <div className="res-hero-lbl">Чистая прибыль</div>
@@ -348,32 +569,122 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
         </div>
 
-        {history.length > 0 && (
-          <div className="card hist-card">
-            <div className="card-head">
-              <div className="card-title">Последние расчёты</div>
-            </div>
-            <div className="hist-list">
-              {history.map((h) => (
-                <div className="hist-item" key={h.id}>
-                  <div className={"hist-mp " + h.marketplace}>
-                    {h.marketplace === "ozon" ? "Ozon" : "WB"}
-                  </div>
-                  <div className="hist-info">
-                    <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
-                    <div className="hist-date">{h.date}</div>
-                  </div>
-                  <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
-                    {h.profit >= 0 ? "+" : "−"}
-                    {fmt(Math.abs(h.profit))} ₽
-                    <span className="hm">маржа {h.margin.toFixed(1)}%</span>
-                  </div>
-                </div>
-              ))}
-            </div>
+        {isLoadingHistory && (
+  <div className="card hist-card">
+    <div className="card-head">
+      <div className="card-title">Последние расчёты</div>
+    </div>
+
+    <div className="card-body">
+      Загрузка истории...
+    </div>
+  </div>
+  )}
+
+
+
+
+
+ {!isLoadingHistory && history.length > 0 && (
+  <div className="card hist-card">
+    <div className="card-head">
+  <div className="card-title">Последние расчёты</div>
+  <button
+  onClick={clearHistory}
+  style={{
+    boxShadow: "0 0 22px rgba(246,200,107,.22), inset 0 1px 0 rgba(255,255,255,.12)",
+backdropFilter: "blur(10px)",
+    all: "unset",
+    height: "42px",
+    padding: "0 18px",
+    borderRadius: "14px",
+    border: "1px solid rgba(255,255,255,.10)",
+    background: "linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.035))",
+    color: "#f6c86b",
+    textShadow: "0 0 10px rgba(246,200,107,.25)",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
+    fontSize: "14px",
+    fontWeight: 700,
+    transition: "all .2s ease",
+  }}
+>
+  Очистить историю
+</button>
+  
+</div>
+
+    <div className="hist-list">
+      {history.map((h) => (
+        <div
+          className={`hist-item ${selectedId === h.id ? "active" : ""}`}
+          key={h.id}
+          onClick={() => {
+            setMarketplace(h.marketplace)
+            setForm({
+              revenue: String(h.revenue),
+              commission: String(h.commission),
+              logistics: String(h.logistics),
+              storage: String(h.storage),
+              ads: String(h.ads),
+              cost: String(h.cost),
+              tax: String(h.tax),
+              other: String(h.other),
+            })
+            setResult(h)
+            setSelectedId(h.id)
+          }}
+        >
+          <div className={"hist-mp " + h.marketplace}>
+            {h.marketplace === "ozon" ? "Ozon" : "WB"}
           </div>
-        )}
-      </div>
-    </>
-  );
+
+          <div className="hist-info">
+            <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
+            <div className="hist-date">{h.date}</div>
+          </div>
+
+          <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
+            {h.profit >= 0 ? "+" : "-"}
+            {fmt(Math.abs(h.profit))} ₽
+            <span className="hm">маржа {h.margin.toFixed(1)}%</span>
+          </div>
+
+          <button
+  type="button"
+  className="hist-del"
+  onClick={(e) => {
+  e.stopPropagation()
+
+  const ok = confirm("Удалить этот расчёт?")
+
+  if (ok) {
+    deleteHistoryItem(h.id)
+  }
+}}
+  style={{
+    width: "32px",
+    height: "32px",
+    borderRadius: "10px",
+    border: "1px solid rgba(255,255,255,0.08)",
+    background: "rgba(255,255,255,0.04)",
+    color: "#c9a34f",
+    cursor: "pointer",
+    fontWeight: 700,
+    fontSize: "16px",
+    transition: "0.2s ease",
+  }}
+>
+  ✕
+</button>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
+</div>
+</>
+)
 }

@@ -1,16 +1,11 @@
-@import "tailwindcss";
+@import "tailwindcss/preflight";
 
 :root {
   --background: #ffffff;
   --foreground: #171717;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+
 
 @media (prefers-color-scheme: dark) {
   :root {
@@ -23,4 +18,200 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+.hist-del,
+button.hist-del{
+  all: unset !important;
+  width: 28px !important;
+  height: 28px !important;
+  border-radius: 10px !important;
+  border: 1px solid rgba(255,255,255,.14) !important;
+  background: rgba(255,255,255,.06) !important;
+  color: #cbd5e1 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  font-size: 13px !important;
+  font-weight: 800 !important;
+  line-height: 1 !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.08), 0 8px 22px rgba(0,0,0,.25) !important;
+  transition: .18s ease !important;
+}
+
+.hist-del:hover,
+button.hist-del:hover{
+  background: rgba(239,68,68,.18) !important;
+  border-color: rgba(239,68,68,.45) !important;
+  color: #ff6b6b !important;
+  transform: scale(1.06) !important;
+}
+.hist-del{
+  width: 34px;
+  height: 34px;
+
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.08);
+
+  background: rgba(255,255,255,.04);
+  color: #f6c86b;
+
+  display:flex;
+  align-items:center;
+  justify-content:center;
+
+  cursor:pointer;
+  transition:.2s ease;
+
+  font-size:20px;
+  font-weight:700;
+
+  flex-shrink:0;
+}
+
+.hist-del:hover{
+  background: rgba(239,68,68,.14);
+  border-color: rgba(239,68,68,.35);
+  color:#ff6b6b;
+
+  transform: scale(1.05);
+}
+
+.hist-del:active{
+  transform: scale(.96);
+}
+
+.hist-clear{
+  all: unset;
+
+  height: 42px;
+  padding: 0 18px;
+
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.10);
+
+  background: rgba(255,255,255,.05);
+
+  color: #f6c86b;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  cursor: pointer;
+
+  font-size: 14px;
+  font-weight: 700;
+
+  transition: all .2s ease;
+}
+
+.hist-clear:hover{
+  background: rgba(239,68,68,.14);
+  border-color: rgba(239,68,68,.35);
+  color: #ff6b6b;
+
+  transform: translateY(-1px);
+}.hist-clear-btn{
+  all: unset !important;
+  height: 42px !important;
+  padding: 0 18px !important;
+  border-radius: 14px !important;
+  border: 1px solid rgba(255,255,255,.10) !important;
+  background: rgba(255,255,255,.05) !important;
+  color: #f6c86b !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  font-size: 14px !important;
+  font-weight: 700 !important;
+  transition: all .2s ease !important;
+}
+
+.hist-clear-btn:hover{
+  background: rgba(239,68,68,.14) !important;
+  border-color: rgba(239,68,68,.35) !important;
+  color: #ff6b6b !important;
+  transform: translateY(-1px);
+}
+.hist-clear{
+  all: unset;
+
+  height: 42px;
+  padding: 0 18px;
+
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.10);
+
+  background: rgba(255,255,255,.05);
+
+  color: #f6c86b;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+
+  cursor: pointer;
+
+  font-size: 14px;
+  font-weight: 700;
+
+  transition: all .2s ease;
+}
+
+.hist-clear:hover{
+  background: rgba(239,68,68,.14);
+  border-color: rgba(239,68,68,.35);
+  color: #ff6b6b;
+
+  transform: translateY(-1px);
+}
+
+.heroButtons{
+  display:flex;
+  gap:14px;
+  margin-top:28px;
+}
+
+.primaryBtn,.ghostBtn{
+  border-radius:14px;
+  padding:14px 22px;
+  font-weight:800;
+  cursor:pointer;
+}
+
+.primaryBtn{
+  background:#f6c86b;
+  color:#111326;
+  border:0;
+}
+
+.ghostBtn{
+  background:rgba(255,255,255,.05);
+  color:#f6c86b;
+  border:1px solid rgba(255,255,255,.12);
+}
+
+.heroStats{
+  display:flex;
+  gap:16px;
+  margin-top:46px;
+}
+
+.heroStats div{
+  padding:20px 24px;
+  border-radius:18px;
+  background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.10);
+}
+
+.heroStats strong{
+  display:block;
+  font-size:28px;
+  color:#f6c86b;
+}
+
+.heroStats span{
+  color:#cfd4e6;
 }
