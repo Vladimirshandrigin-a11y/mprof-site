@@ -1,17 +1,24 @@
 "use client";
 
 import { createClient } from "@supabase/supabase-js"
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
+import { AnalyticsBlock } from "./components/AnalyticsBlock"
+import { TariffModal, type TariffTier } from "../components/TariffModal"
+import { useEntitlements } from "./lib/entitlements"
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
   {
     auth: {
-      persistSession: false,
+      // Сохраняем сессию между перезагрузками + автообновление токенов +
+      // подбор session из URL после magic-link.
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
     },
   }
 )
@@ -33,6 +40,7 @@ interface CalcResult {
   profit: number;
   margin: number;
   date: string;
+  createdAt: string;
 }
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
@@ -44,6 +52,27 @@ const FIELDS: { key: string; label: string; hint?: string }[] = [
   { key: "cost", label: "Себестоимость" },
   { key: "tax", label: "Налог" },
   { key: "other", label: "Прочие расходы" },
+];
+
+const AI_STAGES = [
+  "Анализируем выручку…",
+  "Проверяем комиссии…",
+  "Считаем маржинальность…",
+  "Ищем слабые места…",
+  "Формируем рекомендации…",
+];
+
+const DEMO_HISTORY: {
+  id: number;
+  mp: "ozon" | "wb";
+  revenue: number;
+  profit: number;
+  margin: number;
+  date: string;
+}[] = [
+  { id: -101, mp: "ozon", revenue: 180000, profit: 32450, margin: 18.0, date: "пример" },
+  { id: -102, mp: "wb",   revenue:  95000, profit: 18200, margin: 19.2, date: "пример" },
+  { id: -103, mp: "ozon", revenue: 240000, profit: 54900, margin: 22.9, date: "пример" },
 ];
 
 const EMPTY: Record<string, string> = {
@@ -91,23 +120,175 @@ export default function AppPage() {
   const [showWbKey, setShowWbKey] = useState(false);
   const [tariffMessage, setTariffMessage] = useState("");
   const [calcMode, setCalcMode] = useState<"manual" | "api">("manual");
+  const [tariffModalOpen, setTariffModalOpen] = useState(false);
+  const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
+  const [isCalculating, setIsCalculating] = useState(false);
+  const [analysisStage, setAnalysisStage] = useState(0);
 
-  const totalRevenue = history.reduce((sum, h) => sum + h.revenue, 0);
-  const totalProfit = history.reduce((sum, h) => sum + h.profit, 0);
+  // циклируем стадии AI-анализа каждые ~700мс пока идёт расчёт
+  useEffect(() => {
+    if (!isCalculating) {
+      setAnalysisStage(0);
+      return;
+    }
+
+    const reduced =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduced) {
+      setAnalysisStage(AI_STAGES.length - 1);
+      return;
+    }
+
+    setAnalysisStage(0);
+    let i = 0;
+    const interval = window.setInterval(() => {
+      i++;
+      if (i < AI_STAGES.length) {
+        setAnalysisStage(i);
+      } else {
+        window.clearInterval(interval);
+      }
+    }, 700);
+
+    return () => window.clearInterval(interval);
+  }, [isCalculating]);
+  const [removingIds, setRemovingIds] = useState<Set<number>>(new Set());
+  const [toast, setToast] = useState<
+    { id: number; message: string; type: "ok" | "err" } | null
+  >(null);
+
+  const showToast = (message: string, type: "ok" | "err" = "ok") => {
+    setToast({ id: Date.now(), message, type });
+  };
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = window.setTimeout(() => setToast(null), 2500);
+    return () => clearTimeout(t);
+  }, [toast]);
+  const [justCalculated, setJustCalculated] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+
+  useEffect(() => {
+    try {
+      if (!localStorage.getItem("mprof_onboarded")) {
+        setShowOnboarding(true);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const dismissOnboarding = () => {
+    setShowOnboarding(false);
+    try {
+      localStorage.setItem("mprof_onboarded", "1");
+    } catch {
+      /* ignore */
+    }
+  };
+  const [ozonLoadStatus, setOzonLoadStatus] = useState<"idle" | "loading" | "ok" | "err">("idle");
+  const [ozonLoadMessage, setOzonLoadMessage] = useState("");
+
+  /* ===== Analytics filters ===== */
+  type FilterPeriod = "7" | "14" | "30" | "all";
+  type FilterMp = "all" | "ozon" | "wb";
+  type FilterResult = "all" | "profit" | "loss";
+  const [filterPeriod, setFilterPeriod] = useState<FilterPeriod>("all");
+  const [filterMp, setFilterMp] = useState<FilterMp>("all");
+  const [filterResult, setFilterResult] = useState<FilterResult>("all");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+
+  const filterPeriodLabel =
+    filterPeriod === "all" ? "всё время" : `${filterPeriod} дней`;
+  const filterMpLabel =
+    filterMp === "all"
+      ? "все маркетплейсы"
+      : filterMp === "ozon"
+      ? "Ozon"
+      : "Wildberries";
+  const filterResultLabel =
+    filterResult === "all"
+      ? "все результаты"
+      : filterResult === "profit"
+      ? "прибыльные"
+      : "убыточные";
+
+  const filtersActive =
+    filterPeriod !== "all" || filterMp !== "all" || filterResult !== "all";
+
+  const filteredHistory = useMemo(() => {
+    let arr = history;
+
+    if (filterPeriod !== "all") {
+      const days = parseInt(filterPeriod, 10);
+      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+      arr = arr.filter((h) => {
+        const t = h.createdAt ? new Date(h.createdAt).getTime() : 0;
+        return t >= cutoff;
+      });
+    }
+
+    if (filterMp !== "all") {
+      arr = arr.filter((h) => h.marketplace === filterMp);
+    }
+
+    if (filterResult !== "all") {
+      arr = arr.filter((h) =>
+        filterResult === "profit" ? h.profit >= 0 : h.profit < 0
+      );
+    }
+
+    return arr;
+  }, [history, filterPeriod, filterMp, filterResult]);
+
+  const totalRevenue = filteredHistory.reduce((sum, h) => sum + h.revenue, 0);
+  const totalProfit = filteredHistory.reduce((sum, h) => sum + h.profit, 0);
   const avgMargin =
-    history.length > 0
-      ? history.reduce((sum, h) => sum + h.margin, 0) / history.length
+    filteredHistory.length > 0
+      ? filteredHistory.reduce((sum, h) => sum + h.margin, 0) /
+        filteredHistory.length
       : 0;
 
-  // Получаем пользователя, затем сразу грузим его историю и API-ключи
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // 1) Восстанавливаем сессию из localStorage через Supabase getSession()
+  //    + слушаем все последующие изменения auth (SIGNED_IN / SIGNED_OUT / TOKEN_REFRESHED)
   useEffect(() => {
-    supabase.auth.getUser().then(({ data }) => {
-      setUser(data.user);
-      loadHistory(data.user?.id ?? null);
-      if (data.user?.id) {
-        loadApiKeys(data.user.id);
+    let mounted = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      const u = data.session?.user ?? null;
+      setUser(u);
+      setAuthLoading(false);
+      loadHistory(u?.id ?? null);
+      if (u?.id) loadApiKeys(u.id);
+    });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!mounted) return;
+      const u = session?.user ?? null;
+      setUser(u);
+
+      if (event === "SIGNED_IN" && u?.id) {
+        loadHistory(u.id);
+        loadApiKeys(u.id);
+      }
+      if (event === "SIGNED_OUT") {
+        setHistory([]);
+        setResult(null);
+        setOzonClientId("");
+        setOzonApiKey("");
+        setWbApiKey("");
       }
     });
+
+    return () => {
+      mounted = false;
+      sub.subscription.unsubscribe();
+    };
   }, []);
 
   const signIn = async () => {
@@ -200,32 +381,83 @@ export default function AppPage() {
     const ok = confirm("Удалить всю историю?");
     if (!ok) return;
 
+    const snapshot = history;
+
+    // optimistic: чистим UI сразу
     setHistory([]);
     setSelectedId(null);
 
+    let q = supabase.from("calculations").delete();
     if (user?.id) {
-      await supabase.from("calculations").delete().eq("user_id", user.id);
+      q = q.eq("user_id", user.id);
     } else {
-      await supabase.from("calculations").delete().is("user_id", null);
+      q = q.is("user_id", null);
     }
+
+    const { error } = await q;
+    if (error) {
+      console.error("clearHistory error:", error);
+      setHistory(snapshot); // откат
+      showToast("Ошибка удаления истории", "err");
+      return;
+    }
+    showToast("История очищена", "ok");
   };
 
   const deleteHistoryItem = async (id: number) => {
-    const { error } = await supabase
-      .from("calculations")
-      .delete()
-      .eq("id", id);
+    if (removingIds.has(id)) return;
 
-    if (error) {
-      console.error(error);
+    const item = history.find((h) => h.id === id);
+    if (!item) {
+      showToast("Расчёт не найден", "err");
       return;
     }
 
-    setHistory(prev => prev.filter(h => h.id !== id));
+    // 1) запускаем fade-out
+    setRemovingIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
 
-    if (selectedId === id) {
-      setSelectedId(null);
+    // 2) запрос в Supabase: фильтруем по id + user_id (для RLS-совместимости)
+    let q = supabase.from("calculations").delete().eq("id", id);
+    if (user?.id) {
+      q = q.eq("user_id", user.id);
+    } else {
+      q = q.is("user_id", null);
     }
+
+    // 3) параллельно даём анимации проиграться минимум 300мс
+    const [delResult] = await Promise.all([
+      q,
+      new Promise<void>((r) => setTimeout(r, 300)),
+    ]);
+
+    if (delResult.error) {
+      console.error("deleteHistoryItem error:", delResult.error);
+      setRemovingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      showToast("Ошибка удаления", "err");
+      return;
+    }
+
+    // 4) убираем из стейта — analytics/charts/insights пересчитаются автоматом
+    setHistory((prev) => prev.filter((h) => h.id !== id));
+    setRemovingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+    if (selectedId === id) setSelectedId(null);
+
+    // если открытый result соответствует удалённому id — закрываем
+    setResult((prev) => (prev && prev.id === id ? null : prev));
+
+    showToast("Расчёт удалён", "ok");
   };
 
   const loadHistory = async (userId: string | null) => {
@@ -269,6 +501,7 @@ export default function AppPage() {
         hour: "2-digit",
         minute: "2-digit",
       }),
+      createdAt: item.created_at,
     }));
 
     setHistory(mapped);
@@ -289,73 +522,176 @@ export default function AppPage() {
   };
 
   const calculate = async () => {
-    const revenue = num(form.revenue);
-    const expenses =
-      num(form.commission) +
-      num(form.logistics) +
-      num(form.storage) +
-      num(form.ads) +
-      num(form.cost) +
-      num(form.tax) +
-      num(form.other);
-    const profit = revenue - expenses;
-    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
+    if (isCalculating) return;
+    // Защита: UI подменяет кнопку на paywall, но на всякий случай.
+    if (!canCalculate) {
+      setSelectedTier("unlimited");
+      setTariffModalOpen(true);
+      return;
+    }
+    setIsCalculating(true);
 
-    const res: CalcResult = {
-      id: Date.now(),
-      marketplace,
-      revenue,
-      commission: num(form.commission),
-      logistics: num(form.logistics),
-      storage: num(form.storage),
-      ads: num(form.ads),
-      cost: num(form.cost),
-      tax: num(form.tax),
-      other: num(form.other),
-      expenses,
-      profit,
-      margin,
-      date: new Date().toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-    };
+    try {
+      const revenue = num(form.revenue);
+      const expenses =
+        num(form.commission) +
+        num(form.logistics) +
+        num(form.storage) +
+        num(form.ads) +
+        num(form.cost) +
+        num(form.tax) +
+        num(form.other);
+      const profit = revenue - expenses;
+      const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
 
-    const { error } = await supabase.from("calculations").insert([
-      {
+      const now = new Date();
+      const res: CalcResult = {
+        id: Date.now(),
         marketplace,
         revenue,
         commission: num(form.commission),
         logistics: num(form.logistics),
         storage: num(form.storage),
         ads: num(form.ads),
-        cost_price: num(form.cost),
+        cost: num(form.cost),
         tax: num(form.tax),
-        other_expenses: num(form.other),
-        total_expenses: expenses,
+        other: num(form.other),
+        expenses,
         profit,
         margin,
-        user_id: user?.id ?? null,
-      },
-    ]);
+        date: now.toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        createdAt: now.toISOString(),
+      };
 
-    if (error) {
-      alert(error.message);
-      console.error("Supabase save error:", error);
+      // Минимальная задержка, чтобы UX-состояние «Считаем…» не моргало
+      const insertPromise = supabase
+        .from("calculations")
+        .insert([
+          {
+            marketplace,
+            revenue,
+            commission: num(form.commission),
+            logistics: num(form.logistics),
+            storage: num(form.storage),
+            ads: num(form.ads),
+            cost_price: num(form.cost),
+            tax: num(form.tax),
+            other_expenses: num(form.other),
+            total_expenses: expenses,
+            profit,
+            margin,
+            user_id: user?.id ?? null,
+          },
+        ])
+        .select()
+        .single();
+      // 5 стадий × 700мс + небольшой буфер чтобы последняя стадия успела
+      // отрисоваться. reduced-motion обрабатывается в useEffect выше.
+      const minDelay = new Promise<void>((r) => setTimeout(r, 3600));
+      const [insertResult] = await Promise.all([insertPromise, minDelay]);
+      const { data: inserted, error } = insertResult;
+
+      if (error) {
+        console.error("Supabase save error:", error);
+        showToast("Не удалось сохранить расчёт", "err");
+      }
+
+      // Если БД вернула id/created_at — используем их. Иначе fallback на клиентские.
+      const dbRow =
+        inserted as { id?: number; created_at?: string } | null;
+      const dbId = dbRow?.id ?? res.id;
+      const dbCreatedAt = dbRow?.created_at ?? res.createdAt;
+      const resWithDbId: CalcResult = {
+        ...res,
+        id: dbId,
+        createdAt: dbCreatedAt,
+      };
+
+      setResult(resWithDbId);
+      setHistory((prev) => [resWithDbId, ...prev].slice(0, 8));
+
+      // persistent счётчик использованных бесплатных расчётов (не сбрасывается чисткой history)
+      incrementCalcCount();
+
+      // success state — короткий glow + бейдж-shine
+      setJustCalculated(true);
+      window.setTimeout(() => setJustCalculated(false), 2200);
+
+      // онбординг свернётся после первого успешного расчёта
+      dismissOnboarding();
+    } finally {
+      setIsCalculating(false);
+    }
+  };
+
+  const loadFromOzon = async () => {
+    const clientId = ozonClientId.trim();
+    const apiKey = ozonApiKey.trim();
+
+    if (!clientId || !apiKey) {
+      setOzonLoadStatus("err");
+      setOzonLoadMessage("Заполните Ozon Client ID и Ozon API Key");
+      return;
     }
 
-    setResult(res);
-    setHistory((prev) => [res, ...prev].slice(0, 8));
+    setOzonLoadStatus("loading");
+    setOzonLoadMessage("");
+
+    try {
+      const res = await fetch("/api/ozon/report", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId, apiKey, daysBack: 30 }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data?.ok) {
+        throw new Error(data?.error || "Не удалось получить данные");
+      }
+
+      // подставляем выручку и переключаем калькулятор на Ozon
+      setMarketplace("ozon");
+      setForm((prev) => ({
+        ...prev,
+        revenue: String(data.revenue ?? 0),
+      }));
+
+      const formattedRev = Number(data.revenue ?? 0).toLocaleString("ru-RU");
+      setOzonLoadStatus("ok");
+      setOzonLoadMessage(
+        `Продажи успешно загружены: ${formattedRev} ₽ за ${data?.period?.days ?? 30} дней`
+      );
+    } catch (e) {
+      console.error("loadFromOzon error:", e);
+      setOzonLoadStatus("err");
+      setOzonLoadMessage("Не удалось получить данные Ozon API");
+    }
   };
 
   const handleTariff = (tier: "single" | "unlimited") => {
-    setTariffMessage(
-      tier === "single"
-        ? "Оплата разового расчёта скоро будет доступна"
-        : "Оформление безлимита скоро будет доступно"
-    );
+    setSelectedTier(tier);
+    setTariffModalOpen(true);
+  };
+
+  // Единый источник про премиум-доступ и лимит бесплатных расчётов.
+  // Контракт стабильный — когда подключим billing, поменяется только hook.
+  const {
+    hasPremium,
+    canCalculate,
+    loaded: entitlementsLoaded,
+    incrementCalcCount,
+  } = useEntitlements();
+
+  // AI PRO «Открыть Premium» — открываем тот же payment flow с тарифом «Безлимит»
+  const openPremium = () => {
+    setSelectedTier("unlimited");
+    setTariffModalOpen(true);
   };
 
   const clearForm = () => {
@@ -517,9 +853,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .api-save{width:100%;padding:13px}
 }
 
-.calc-tabs{display:flex;gap:8px;background:var(--glass);border:1px solid var(--edge);
-  border-radius:14px;padding:6px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  margin-bottom:1.25rem;box-shadow:0 14px 38px rgba(0,0,0,.22)}
+.calc-tabs{display:flex;gap:6px;background:var(--glass);border:1px solid var(--edge);
+  border-radius:12px;padding:5px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  margin-bottom:.7rem;box-shadow:0 10px 28px rgba(0,0,0,.20)}
 .calc-tab{flex:1;font-family:var(--sans);font-size:.88rem;font-weight:600;padding:12px 16px;
   border-radius:10px;cursor:pointer;letter-spacing:.01em;border:1px solid transparent;
   background:transparent;color:var(--txt2);transition:all .22s ease;text-align:center;
@@ -572,6 +908,30 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   color:var(--txt2);font-weight:300;line-height:1.55;display:flex;gap:.7rem;align-items:flex-start}
 .api-pro-hint-ico{color:var(--gold2);flex-shrink:0;margin-top:1px;display:inline-flex}
 .api-pro-hint-ico svg{width:16px;height:16px;display:block}
+.api-pro-actions{display:grid;grid-template-columns:1fr 1fr;gap:.8rem;margin-top:1.6rem}
+.api-pro-actions .api-pro-btn{flex:none;min-width:0;width:100%}
+.api-pro-btn.ghost{background:rgba(255,255,255,.04);color:var(--txt);
+  border:1px solid var(--edge2);box-shadow:none;backdrop-filter:blur(10px)}
+.api-pro-btn.ghost:hover:not(:disabled){border-color:var(--gold);color:var(--gold2);
+  background:var(--gold-bg);box-shadow:0 8px 24px rgba(201,168,76,.18)}
+.api-pro-btn .spin{display:inline-block;width:14px;height:14px;border-radius:50%;
+  border:2px solid rgba(0,0,0,.18);border-top-color:rgba(0,0,0,.55);
+  animation:apiSpin .8s linear infinite;margin-right:2px}
+@keyframes apiSpin{to{transform:rotate(360deg)}}
+
+.api-alert{margin-top:1.1rem;padding:.95rem 1.1rem;border-radius:12px;font-size:.85rem;
+  line-height:1.5;display:flex;gap:.7rem;align-items:flex-start;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  animation:apiAlertIn .25s ease}
+@keyframes apiAlertIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
+.api-alert.ok{background:rgba(46,204,138,.08);border:1px solid rgba(46,204,138,.32);
+  color:#7DEAB2;box-shadow:0 0 30px rgba(46,204,138,.07)}
+.api-alert.err{background:rgba(224,85,102,.08);border:1px solid rgba(224,85,102,.32);
+  color:#FF8A98;box-shadow:0 0 30px rgba(224,85,102,.07)}
+.api-alert-ico{flex-shrink:0;margin-top:1px;display:inline-flex}
+.api-alert-ico svg{width:18px;height:18px;display:block}
+.api-alert-text{flex:1;min-width:0}
+
 .api-input:disabled,
 .api-input:disabled:hover{opacity:.5;cursor:not-allowed;background:rgba(255,255,255,.02);
   border-color:var(--edge);box-shadow:none}
@@ -583,9 +943,112 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .api-pro-grid{grid-template-columns:1fr;gap:.85rem}
   .api-pro-foot{flex-direction:column;align-items:stretch;gap:.8rem}
   .api-pro-btn{width:100%;min-width:0;padding:13px}
+  .api-pro-actions{grid-template-columns:1fr;gap:.7rem}
 }
 
-.tariff-card{margin-top:1.25rem}
+.tariff-card{margin-top:.75rem;scroll-margin-top:1.2rem}
+.tariff-card .card-head{padding:.75rem 1.1rem !important}
+.tariff-card .card-title{font-size:.78rem !important;font-weight:600 !important;
+  color:var(--txt2) !important;letter-spacing:.02em !important}
+
+.tariff-grid-2{
+  grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+  gap:.85rem !important;padding:1rem !important;
+  align-items:stretch
+}
+.tariff-grid-2 .tariff-item{
+  /* одинаковая высота карточек в строке (align-items:stretch на гриде) */
+  height:auto;display:flex;flex-direction:column
+}
+.tariff-grid-2 .tariff-item{padding:.95rem 1rem .9rem !important;gap:.4rem !important}
+.tariff-grid-2 .tariff-name{font-size:.88rem !important}
+.tariff-grid-2 .tariff-price{font-size:1.55rem !important}
+.tariff-grid-2 .tariff-period{font-size:.52rem !important}
+.tariff-grid-2 .tariff-list{margin:.25rem 0 !important;gap:.32rem !important}
+.tariff-grid-2 .tariff-list li{font-size:.72rem !important}
+.tariff-grid-2 .tariff-btn{padding:8px 12px !important;font-size:.76rem !important}
+@media(max-width:600px){
+  .tariff-grid-2{grid-template-columns:1fr !important;padding:.95rem !important}
+  .tariff-grid-2 .tariff-item{padding:1.05rem 1.1rem !important}
+}
+
+/* ====== PREMIUM "Безлимит" tariff ====== */
+.tariff-item.featured{
+  position:relative
+}
+.tariff-item.featured::before{
+  content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg,
+    rgba(201,168,76,.55) 0%,
+    rgba(201,168,76,.18) 25%,
+    rgba(232,201,122,.62) 50%,
+    rgba(201,168,76,.18) 75%,
+    rgba(201,168,76,.55) 100%);
+  background-size:220% 100%;
+  -webkit-mask:linear-gradient(#000,#000) content-box, linear-gradient(#000,#000);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  animation:tariffBorderFlow 5s linear infinite;
+  pointer-events:none;z-index:0
+}
+@keyframes tariffBorderFlow{
+  from{background-position:0% 0}
+  to{background-position:220% 0}
+}
+.tariff-item.featured .tariff-shine{
+  position:absolute;inset:0;border-radius:inherit;
+  overflow:hidden;pointer-events:none;z-index:0
+}
+.tariff-item.featured .tariff-shine::before{
+  content:"";position:absolute;top:-50%;left:0;
+  width:30%;height:200%;
+  background:linear-gradient(115deg,
+    transparent 0%,
+    rgba(255,255,255,.06) 40%,
+    rgba(232,201,122,.22) 50%,
+    rgba(255,255,255,.06) 60%,
+    transparent 100%);
+  transform:translateX(-220%) rotate(20deg);
+  animation:tariffShimmerSweep 6s ease-in-out infinite;
+  filter:blur(2px)
+}
+@keyframes tariffShimmerSweep{
+  0%, 15%{transform:translateX(-220%) rotate(20deg);opacity:0}
+  20%{opacity:1}
+  60%{transform:translateX(440%) rotate(20deg);opacity:1}
+  70%, 100%{transform:translateX(440%) rotate(20deg);opacity:0}
+}
+/* контент карточки — выше шайна, бейдж — поверх всего */
+.tariff-item.featured > .tariff-name,
+.tariff-item.featured > .tariff-price,
+.tariff-item.featured > .tariff-period,
+.tariff-item.featured > .tariff-list,
+.tariff-item.featured > .tariff-btn{position:relative;z-index:2}
+.tariff-item.featured > .tariff-badge{z-index:3}
+
+.tariff-item.featured:hover{
+  transform:translateY(-4px);
+  border-color:rgba(201,168,76,.65);
+  box-shadow:0 30px 78px rgba(0,0,0,.42), 0 0 90px rgba(201,168,76,.24)
+}
+
+.tariff-item.tariff-flash{
+  animation:tariffFlash 1.7s cubic-bezier(.22,1,.36,1)
+}
+@keyframes tariffFlash{
+  0%{box-shadow:0 18px 50px rgba(0,0,0,.3),0 0 50px rgba(201,168,76,.10);
+    border-color:rgba(201,168,76,.45)}
+  25%{box-shadow:0 30px 80px rgba(0,0,0,.4),0 0 110px rgba(201,168,76,.55);
+    border-color:rgba(201,168,76,.95);transform:translateY(-3px)}
+  55%{box-shadow:0 26px 70px rgba(0,0,0,.38),0 0 90px rgba(201,168,76,.4);
+    border-color:rgba(201,168,76,.75);transform:translateY(-2px)}
+  100%{box-shadow:0 18px 50px rgba(0,0,0,.3),0 0 50px rgba(201,168,76,.10);
+    border-color:rgba(201,168,76,.45);transform:translateY(0)}
+}
+@media (prefers-reduced-motion: reduce){
+  .tariff-item.tariff-flash,
+  .tariff-item.featured::before,
+  .tariff-item.featured .tariff-shine::before{animation:none !important}
+}
 .tariff-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;padding:1.5rem}
 .tariff-item{position:relative;background:rgba(255,255,255,.025);border:1px solid var(--edge);
   border-radius:13px;padding:1.4rem 1.3rem;display:flex;flex-direction:column;gap:.7rem;
@@ -626,12 +1089,967 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .tariff-item{padding:1.2rem 1.2rem}
 }
 
-.dash-wrap{max-width:1100px;margin:0 auto;padding:2.5rem 2rem 5rem}
-.dash-h1{font-family:var(--display);font-size:clamp(1.8rem,3vw,2.4rem);font-weight:700;letter-spacing:-.02em;margin:0 0 .4rem}
-.dash-h1 em{font-style:italic;color:var(--gold)}
-.dash-lead{color:var(--txt2);font-size:.92rem;font-weight:300;margin-bottom:2rem}
+/* ====== CALC LOADING ====== */
+.calc-loading{position:relative}
+.calc-loading::after{content:"";position:absolute;inset:0;pointer-events:none;border-radius:inherit;
+  background:linear-gradient(110deg, transparent 25%, rgba(201,168,76,.07) 50%, transparent 75%);
+  background-size:200% 100%;animation:calcShimmer 1.6s linear infinite;z-index:3}
+@keyframes calcShimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+.calc-loading input,
+.calc-loading .mp-tab{opacity:.55;pointer-events:none;cursor:not-allowed}
+/* ====== AUTH LOADING (восстановление сессии) ====== */
+.auth-loading{
+  display:inline-flex;align-items:center;gap:.7rem;
+  padding:.7rem 1rem;border-radius:11px;
+  background:var(--glass);border:1px solid var(--edge);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  font-family:var(--mono);font-size:.68rem;font-weight:500;
+  letter-spacing:.06em;color:var(--txt2);
+  margin-bottom:1.1rem;
+  box-shadow:0 8px 24px rgba(0,0,0,.2);
+  animation:authLoadIn .35s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes authLoadIn{
+  from{opacity:0;transform:translateY(-4px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.auth-loading-ring{
+  width:12px;height:12px;border-radius:50%;flex-shrink:0;
+  border:1.5px solid rgba(201,168,76,.2);
+  border-top-color:var(--gold2);
+  animation:authLoadSpin .8s linear infinite
+}
+@keyframes authLoadSpin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){
+  .auth-loading,
+  .auth-loading-ring{animation:none !important}
+  .auth-loading-ring{border:1.5px solid var(--gold2);border-right-color:transparent}
+}
 
-.dash-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:1.25rem;align-items:start}
+/* ====== UPGRADE HINT (compact, subtle SaaS-style) ====== */
+.upgrade-hint{
+  display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  flex-wrap:wrap;
+  margin-top:1.2rem;padding:.65rem .8rem .65rem 1rem;
+  background:linear-gradient(160deg,rgba(201,168,76,.07),rgba(13,16,32,.65));
+  border:1px solid rgba(201,168,76,.22);
+  border-radius:12px;
+  backdrop-filter:blur(12px) saturate(1.2);
+  -webkit-backdrop-filter:blur(12px) saturate(1.2);
+  box-shadow:0 6px 18px rgba(0,0,0,.22);
+  animation:upgradeHintIn .4s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes upgradeHintIn{
+  from{opacity:0;transform:translateY(4px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.upgrade-hint-left{display:flex;align-items:center;gap:.6rem;min-width:0}
+.upgrade-hint-dot{
+  width:7px;height:7px;border-radius:50%;flex-shrink:0;
+  background:var(--gold);
+  box-shadow:0 0 10px rgba(201,168,76,.55);
+  animation:upgradeHintDot 2.4s ease-in-out infinite
+}
+@keyframes upgradeHintDot{0%,100%{opacity:1}50%{opacity:.5}}
+.upgrade-hint-text{
+  font-family:var(--mono);font-size:.62rem;font-weight:600;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--txt2);
+  white-space:nowrap
+}
+.upgrade-hint-actions{display:flex;gap:.4rem;flex-wrap:wrap}
+.upgrade-hint-btn{
+  font-family:var(--sans);font-size:.74rem;font-weight:500;
+  padding:7px 12px;border-radius:8px;cursor:pointer;
+  background:rgba(255,255,255,.04);color:var(--txt);
+  border:1px solid var(--edge2);
+  transition:transform .22s ease, border-color .22s ease,
+    background .22s ease, color .22s ease, box-shadow .22s ease;
+  display:inline-flex;align-items:center;gap:6px;line-height:1.2;
+  -webkit-appearance:none;appearance:none
+}
+.upgrade-hint-btn em{
+  font-style:normal;color:var(--gold2);font-weight:600;letter-spacing:.01em
+}
+.upgrade-hint-btn:hover{
+  border-color:rgba(201,168,76,.4);
+  background:var(--gold-bg);
+  transform:translateY(-1px);
+  box-shadow:0 4px 12px rgba(201,168,76,.14)
+}
+.upgrade-hint-btn.primary{
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);border-color:transparent;
+  box-shadow:0 6px 16px rgba(201,168,76,.30)
+}
+.upgrade-hint-btn.primary em{color:var(--void);font-weight:700}
+.upgrade-hint-btn.primary:hover{
+  transform:translateY(-1px) scale(1.01);
+  box-shadow:0 10px 22px rgba(201,168,76,.42)
+}
+@media(max-width:560px){
+  .upgrade-hint{flex-direction:column;align-items:stretch;gap:.6rem;padding:.7rem .8rem}
+  .upgrade-hint-left{justify-content:center}
+  .upgrade-hint-actions{display:grid;grid-template-columns:1fr 1fr;gap:.4rem}
+  .upgrade-hint-btn{justify-content:center}
+}
+@media (prefers-reduced-motion: reduce){
+  .upgrade-hint,
+  .upgrade-hint-dot{animation:none !important}
+}
+
+/* ====== PAYWALL CARD (free limit reached) ====== */
+.paywall-card{
+  position:relative;
+  background:linear-gradient(160deg,
+    rgba(201,168,76,.12) 0%,
+    rgba(13,16,32,.96) 70%);
+  border:1px solid rgba(201,168,76,.32);
+  border-radius:14px;
+  padding:1.6rem 1.5rem 1.4rem;
+  margin-top:1.4rem;
+  overflow:hidden;text-align:center;
+  box-shadow:0 18px 50px rgba(0,0,0,.32),
+    0 0 50px rgba(201,168,76,.12);
+  animation:paywallIn .5s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes paywallIn{
+  from{opacity:0;transform:translateY(8px) scale(.985)}
+  to{opacity:1;transform:translateY(0) scale(1)}
+}
+.paywall-card::before{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(420px 220px at 50% -10%,
+    rgba(232,201,122,.18), transparent 65%)
+}
+.paywall-card > *{position:relative}
+
+/* animated gold border light — subtle shimmer flow */
+.paywall-shine{
+  position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(120deg,
+    rgba(201,168,76,.55) 0%,
+    rgba(232,201,122,.15) 25%,
+    rgba(201,168,76,.55) 50%,
+    rgba(232,201,122,.15) 75%,
+    rgba(201,168,76,.55) 100%);
+  background-size:280% 100%;
+  -webkit-mask:linear-gradient(#000,#000) content-box, linear-gradient(#000,#000);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  animation:paywallShineFlow 4s linear infinite;
+  pointer-events:none;z-index:0
+}
+@keyframes paywallShineFlow{
+  from{background-position:0% 0}
+  to{background-position:280% 0}
+}
+
+.paywall-badge{
+  display:inline-flex;align-items:center;gap:5px;
+  font-family:var(--mono);font-size:.56rem;font-weight:700;
+  text-transform:uppercase;letter-spacing:.16em;color:var(--void);
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  padding:4px 10px;border-radius:100px;
+  box-shadow:0 4px 12px rgba(201,168,76,.42);margin-bottom:.85rem
+}
+.paywall-badge svg{width:9px;height:9px;display:block}
+
+.paywall-icon{
+  width:48px;height:48px;border-radius:14px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,rgba(201,168,76,.28),rgba(201,168,76,.08));
+  border:1px solid rgba(201,168,76,.36);color:var(--gold2);
+  margin:0 auto .9rem;
+  box-shadow:0 8px 24px rgba(201,168,76,.22),
+    inset 0 1px 0 rgba(255,255,255,.08);
+  animation:paywallIconPulse 3s ease-in-out infinite
+}
+@keyframes paywallIconPulse{
+  0%,100%{box-shadow:0 8px 24px rgba(201,168,76,.22),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 0 rgba(201,168,76,.18)}
+  50%{box-shadow:0 10px 28px rgba(201,168,76,.30),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 12px rgba(201,168,76,.04)}
+}
+.paywall-icon svg{width:22px;height:22px;display:block}
+
+.paywall-title{
+  font-family:var(--display);font-size:1.15rem;font-weight:700;
+  color:var(--txt);letter-spacing:-.005em;margin:0 0 .4rem;line-height:1.25
+}
+.paywall-sub{
+  font-size:.86rem;color:var(--txt2);font-weight:300;line-height:1.5;
+  margin:0 auto 1.3rem;max-width:320px
+}
+
+.paywall-actions{
+  display:flex;gap:.6rem;flex-wrap:wrap;justify-content:center
+}
+.paywall-btn{
+  font-family:var(--sans);font-size:.84rem;font-weight:600;
+  padding:11px 18px;border-radius:10px;cursor:pointer;
+  transition:transform .22s ease, box-shadow .22s ease,
+    background .22s ease, color .22s ease, border-color .22s ease;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  border:none;letter-spacing:.01em;line-height:1.2;
+  -webkit-appearance:none;appearance:none
+}
+.paywall-btn-ghost{
+  background:rgba(255,255,255,.04);color:var(--txt);
+  border:1px solid var(--edge2)
+}
+.paywall-btn-ghost:hover{
+  border-color:var(--gold);color:var(--gold2);
+  background:var(--gold-bg);transform:translateY(-1px)
+}
+.paywall-btn-gold{
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);box-shadow:0 8px 22px rgba(201,168,76,.32)
+}
+.paywall-btn-gold:hover{
+  transform:translateY(-2px) scale(1.02);
+  box-shadow:0 16px 36px rgba(201,168,76,.46),
+    0 0 24px rgba(201,168,76,.22)
+}
+.paywall-btn-gold .arr{display:inline-block;transition:transform .22s ease}
+.paywall-btn-gold:hover .arr{transform:translateX(3px)}
+
+@media(max-width:520px){
+  .paywall-actions{flex-direction:column}
+  .paywall-btn{width:100%}
+}
+@media (prefers-reduced-motion: reduce){
+  .paywall-card,
+  .paywall-shine,
+  .paywall-icon{animation:none !important}
+}
+
+/* ====== PREMIUM AI PROCESSING OVERLAY ====== */
+.ai-proc-overlay{
+  position:absolute;inset:0;z-index:10;
+  display:flex;align-items:center;justify-content:center;
+  padding:1.5rem;
+  background:rgba(8,10,20,.65);
+  backdrop-filter:blur(10px) saturate(1.2);
+  -webkit-backdrop-filter:blur(10px) saturate(1.2);
+  border-radius:inherit;
+  animation:aiOverlayIn .35s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes aiOverlayIn{from{opacity:0}to{opacity:1}}
+
+.ai-proc-card{
+  position:relative;
+  max-width:380px;width:100%;
+  background:linear-gradient(160deg,
+    rgba(201,168,76,.10) 0%,
+    rgba(13,16,32,.96) 70%);
+  border:1px solid rgba(201,168,76,.25);
+  border-radius:16px;
+  padding:1.5rem 1.4rem 1.3rem;
+  backdrop-filter:blur(18px) saturate(1.3);
+  -webkit-backdrop-filter:blur(18px) saturate(1.3);
+  box-shadow:0 24px 60px rgba(0,0,0,.55),
+    0 0 60px rgba(201,168,76,.14);
+  overflow:hidden;
+  animation:aiCardIn .45s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes aiCardIn{
+  from{opacity:0;transform:translateY(10px) scale(.97)}
+  to{opacity:1;transform:translateY(0) scale(1)}
+}
+.ai-proc-card > *{position:relative;z-index:1}
+
+/* animated border light — золотой gradient «бегает» по периметру */
+.ai-proc-border{
+  position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(120deg,
+    rgba(201,168,76,.7) 0%,
+    rgba(232,201,122,.18) 20%,
+    rgba(201,168,76,.7) 40%,
+    rgba(232,201,122,.12) 70%,
+    rgba(201,168,76,.7) 100%);
+  background-size:300% 100%;
+  -webkit-mask:linear-gradient(#000,#000) content-box, linear-gradient(#000,#000);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  animation:aiBorderFlow 3.2s linear infinite;
+  pointer-events:none;z-index:0
+}
+@keyframes aiBorderFlow{
+  from{background-position:0% 50%}
+  to{background-position:300% 50%}
+}
+
+/* AI icon — золотая капсула с sparkle, пульсирует */
+.ai-proc-ico{
+  width:48px;height:48px;border-radius:14px;
+  display:flex;align-items:center;justify-content:center;
+  margin:0 auto .85rem;
+  background:linear-gradient(135deg,rgba(201,168,76,.26),rgba(201,168,76,.06));
+  border:1px solid rgba(201,168,76,.32);
+  color:#E8C97A;
+  box-shadow:0 8px 24px rgba(201,168,76,.22),
+    inset 0 1px 0 rgba(255,255,255,.08);
+  animation:aiIcoPulse 2.4s ease-in-out infinite
+}
+@keyframes aiIcoPulse{
+  0%,100%{box-shadow:0 8px 24px rgba(201,168,76,.22),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 0 rgba(201,168,76,.16)}
+  50%{box-shadow:0 10px 30px rgba(201,168,76,.32),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 12px rgba(201,168,76,.04)}
+}
+.ai-proc-ico svg{
+  width:24px;height:24px;display:block;
+  animation:aiIcoBreathe 3.6s ease-in-out infinite
+}
+@keyframes aiIcoBreathe{
+  0%,100%{transform:rotate(0deg) scale(1)}
+  50%{transform:rotate(28deg) scale(1.08)}
+}
+
+/* title */
+.ai-proc-title{
+  font-family:var(--display);font-size:1.05rem;font-weight:700;
+  text-align:center;color:var(--txt);margin:0 0 1.1rem;
+  letter-spacing:-.005em;line-height:1.2
+}
+.ai-proc-title em{font-style:italic;color:var(--gold)}
+
+/* stages list */
+.ai-proc-stages{
+  list-style:none;padding:0;margin:0 0 1.1rem;
+  display:flex;flex-direction:column;gap:.5rem
+}
+.ai-proc-stage{
+  display:flex;align-items:center;gap:.7rem;
+  font-family:var(--mono);font-size:.72rem;letter-spacing:.02em;
+  color:rgba(232,238,248,.38);
+  transition:color .35s ease, opacity .35s ease
+}
+.ai-proc-mark{
+  width:14px;height:14px;border-radius:50%;flex-shrink:0;
+  border:1.5px solid rgba(255,255,255,.14);
+  background:transparent;position:relative;
+  transition:all .35s cubic-bezier(.22,1,.36,1)
+}
+.ai-proc-stage.is-active{color:#E8C97A}
+.ai-proc-stage.is-active .ai-proc-mark{
+  border-color:rgba(201,168,76,.65);
+  background:rgba(201,168,76,.18);
+  box-shadow:0 0 0 4px rgba(201,168,76,.10),
+    inset 0 0 8px rgba(201,168,76,.35);
+  animation:aiMarkPulse 1.1s ease-in-out infinite
+}
+@keyframes aiMarkPulse{
+  0%,100%{box-shadow:0 0 0 4px rgba(201,168,76,.10),
+    inset 0 0 8px rgba(201,168,76,.35)}
+  50%{box-shadow:0 0 0 7px rgba(201,168,76,.06),
+    inset 0 0 12px rgba(201,168,76,.55)}
+}
+.ai-proc-stage.is-done{color:rgba(232,238,248,.72)}
+.ai-proc-stage.is-done .ai-proc-mark{
+  border-color:rgba(201,168,76,.6);
+  background:#C9A84C;
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.18)
+}
+.ai-proc-stage.is-done .ai-proc-mark::after{
+  content:"";position:absolute;
+  top:50%;left:50%;
+  width:6px;height:3px;
+  border-left:1.6px solid #05070f;
+  border-bottom:1.6px solid #05070f;
+  transform:translate(-50%,-70%) rotate(-45deg)
+}
+
+/* progress line + shimmer */
+.ai-proc-progress{
+  width:100%;height:3px;border-radius:2px;
+  background:rgba(255,255,255,.06);
+  overflow:hidden;position:relative
+}
+.ai-proc-progress-bar{
+  position:absolute;top:0;left:0;height:100%;width:0;
+  border-radius:inherit;
+  background:linear-gradient(90deg,#C9A84C 0%,#E8C97A 100%);
+  box-shadow:0 0 10px rgba(201,168,76,.42);
+  animation:aiProgressFill 3.6s linear forwards
+}
+@keyframes aiProgressFill{from{width:0}to{width:100%}}
+.ai-proc-progress::after{
+  content:"";position:absolute;top:0;left:-30%;width:30%;height:100%;
+  background:linear-gradient(90deg,
+    transparent 0%,
+    rgba(255,255,255,.5) 50%,
+    transparent 100%);
+  animation:aiProgressShimmer 1.5s ease-in-out infinite;
+  pointer-events:none
+}
+@keyframes aiProgressShimmer{
+  0%{left:-30%;opacity:0}
+  20%{opacity:1}
+  100%{left:100%;opacity:0}
+}
+
+@media(max-width:640px){
+  .ai-proc-overlay{padding:1rem}
+  .ai-proc-card{padding:1.3rem 1.1rem 1.1rem;border-radius:14px}
+  .ai-proc-title{font-size:.95rem}
+  .ai-proc-stage{font-size:.68rem}
+}
+.spin-dark{display:inline-block;width:14px;height:14px;border-radius:50%;
+  border:2px solid rgba(0,0,0,.2);border-top-color:rgba(0,0,0,.6);
+  animation:calcRing .75s linear infinite}
+.btn-gold:disabled,.btn-ghost:disabled{opacity:.6;cursor:not-allowed}
+.btn-gold:disabled:hover,.btn-ghost:disabled:hover{transform:none;box-shadow:none}
+
+/* ====== EMPTY RESULT BARS ====== */
+.empty-bars{display:flex;flex-direction:column;gap:9px;margin:1.6rem auto 0;
+  padding:0 .5rem;max-width:240px}
+.empty-bar{height:9px;border-radius:5px;
+  background:linear-gradient(90deg,
+    rgba(201,168,76,.18) 0%,
+    rgba(201,168,76,.06) 50%,
+    rgba(201,168,76,.18) 100%);
+  background-size:200% 100%;
+  animation:emptyPulse 2.8s ease-in-out infinite;
+  filter:blur(.4px);opacity:.5;align-self:flex-start}
+.empty-bar.bar-1{width:78%}
+.empty-bar.bar-2{width:55%;animation-delay:.3s}
+.empty-bar.bar-3{width:65%;animation-delay:.6s}
+@keyframes emptyPulse{
+  0%,100%{opacity:.35;background-position:0% 0}
+  50%{opacity:.65;background-position:100% 0}
+}
+
+/* ====== DEMO HISTORY ====== */
+.hist-demo{position:relative}
+.hist-demo .hist-item{
+  opacity:.5;filter:saturate(.55);pointer-events:none;cursor:default;
+  animation:demoPulse 4.2s ease-in-out infinite
+}
+.hist-demo .hist-list .hist-item:nth-child(2){animation-delay:.4s}
+.hist-demo .hist-list .hist-item:nth-child(3){animation-delay:.8s}
+@keyframes demoPulse{0%,100%{opacity:.45}50%{opacity:.72}}
+.hist-demo-badge{display:inline-block;margin-left:.7rem;font-family:var(--mono);
+  font-size:.55rem;text-transform:uppercase;letter-spacing:.14em;color:var(--gold2);
+  border:1px solid rgba(201,168,76,.32);background:var(--gold-bg);
+  padding:3px 9px;border-radius:100px;vertical-align:middle;font-weight:600}
+.hist-demo-hint{font-family:var(--mono);font-size:.66rem;letter-spacing:.04em;
+  color:var(--txt3);text-align:center;padding:.95rem 1.5rem;
+  border-top:1px solid var(--edge);background:rgba(255,255,255,.015)}
+
+/* ====== API EMPTY STATE ====== */
+.api-empty{padding:2.2rem 1.7rem 1.9rem;border-bottom:1px solid var(--edge);
+  text-align:center;position:relative;overflow:hidden}
+.api-empty::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(440px 240px at 50% 0%, rgba(201,168,76,.10), transparent 60%)}
+.api-empty > *{position:relative}
+.api-empty-ico{width:64px;height:64px;border-radius:18px;display:inline-flex;
+  align-items:center;justify-content:center;
+  background:linear-gradient(135deg,rgba(201,168,76,.24) 0%,rgba(201,168,76,.06) 100%);
+  border:1px solid rgba(201,168,76,.32);color:var(--gold2);margin-bottom:1.1rem;
+  box-shadow:0 10px 30px rgba(201,168,76,.18);
+  animation:apiEmptyPulse 3.4s ease-in-out infinite}
+@keyframes apiEmptyPulse{
+  0%,100%{box-shadow:0 10px 30px rgba(201,168,76,.18),0 0 0 0 rgba(201,168,76,.18)}
+  50%{box-shadow:0 12px 32px rgba(201,168,76,.22),0 0 0 14px rgba(201,168,76,.04)}
+}
+.api-empty-ico svg{width:28px;height:28px;display:block}
+.api-empty-title{font-family:var(--display);font-size:1.18rem;font-weight:700;color:var(--txt);
+  margin:0 0 .4rem;letter-spacing:-.005em}
+.api-empty-sub{font-size:.88rem;color:var(--txt2);font-weight:300;line-height:1.55;
+  max-width:440px;margin:0 auto 1.3rem}
+.api-empty-list{list-style:none;padding:0;margin:0;display:inline-flex;flex-wrap:wrap;
+  gap:.5rem;justify-content:center}
+.api-empty-list li{font-family:var(--mono);font-size:.62rem;text-transform:uppercase;
+  letter-spacing:.11em;color:var(--gold2);background:var(--gold-bg);
+  border:1px solid rgba(201,168,76,.22);padding:7px 13px;border-radius:100px;
+  display:inline-flex;align-items:center;gap:7px;font-weight:600}
+.api-empty-list li::before{content:"";width:5px;height:5px;border-radius:50%;
+  background:var(--gold);box-shadow:0 0 8px rgba(201,168,76,.6)}
+@media(max-width:640px){
+  .api-empty{padding:1.8rem 1.3rem 1.5rem}
+  .api-empty-title{font-size:1.05rem}
+  .api-empty-sub{font-size:.85rem;margin-bottom:1rem}
+  .api-empty-list{gap:.4rem}
+  .api-empty-list li{font-size:.58rem;padding:6px 10px}
+}
+
+/* ====== ONBOARDING CARD ====== */
+.onboard-card{
+  display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  background:linear-gradient(135deg, rgba(201,168,76,.10) 0%, rgba(255,255,255,.025) 60%);
+  border:1px solid rgba(201,168,76,.28);
+  border-radius:14px;
+  padding:.95rem 1.2rem;margin-bottom:1.1rem;
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  box-shadow:0 12px 32px rgba(0,0,0,.22), 0 0 32px rgba(201,168,76,.07);
+  animation:onboardIn .4s cubic-bezier(.22,1,.36,1) both;
+  position:relative;overflow:hidden
+}
+.onboard-card::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(420px 180px at 50% 0%, rgba(201,168,76,.10), transparent 60%)}
+.onboard-card > *{position:relative}
+@keyframes onboardIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
+.onboard-steps{display:flex;align-items:center;gap:.7rem;flex-wrap:wrap;flex:1}
+.onboard-step{display:inline-flex;align-items:center;gap:.55rem;
+  font-family:var(--mono);font-size:.7rem;color:var(--txt2);letter-spacing:.04em}
+.onboard-num{width:22px;height:22px;border-radius:7px;display:inline-flex;
+  align-items:center;justify-content:center;
+  background:linear-gradient(135deg, var(--gold) 0%, var(--gold2) 100%);
+  color:var(--void);font-family:var(--display);font-weight:700;font-size:.78rem;
+  box-shadow:0 4px 12px rgba(201,168,76,.32)}
+.onboard-text{color:var(--txt)}
+.onboard-arrow{font-family:var(--mono);color:var(--gold);opacity:.55;font-size:.85rem}
+.onboard-close{all:unset;width:28px;height:28px;border-radius:8px;cursor:pointer;
+  border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);
+  color:var(--txt3);font-size:1.15rem;line-height:1;
+  display:inline-flex;align-items:center;justify-content:center;
+  transition:all .18s ease}
+.onboard-close:hover{border-color:var(--gold);color:var(--gold2);background:var(--gold-bg)}
+@media(max-width:640px){
+  .onboard-card{flex-direction:column;align-items:stretch;gap:.7rem}
+  .onboard-arrow{display:none}
+  .onboard-steps{flex-direction:column;gap:.5rem;align-items:flex-start}
+  .onboard-close{align-self:flex-end;margin-top:-2.4rem}
+}
+
+/* ====== PREMIUM INPUTS (focus glow + placeholder fade) ====== */
+.in-wrap input{transition:border .22s ease, background .22s ease, box-shadow .22s ease}
+.in-wrap input::placeholder{transition:opacity .22s ease, transform .22s ease}
+.in-wrap input:focus{
+  border-color:var(--gold);
+  background:rgba(255,255,255,.055);
+  box-shadow:0 0 0 3px rgba(201,168,76,.16), 0 0 24px rgba(201,168,76,.10)
+}
+.in-wrap input:focus::placeholder{opacity:0;transform:translateX(4px)}
+.in-wrap:has(input:focus) .in-cur{color:var(--gold2);transition:color .22s ease}
+
+/* ====== PREMIUM MARKETPLACE TABS ====== */
+.mp-tab{display:inline-flex;align-items:center;justify-content:center;gap:9px;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  transition:all .22s ease;position:relative;overflow:hidden}
+.mp-tab:hover{transform:translateY(-2px);border-color:var(--smoke);color:var(--txt);
+  background:rgba(255,255,255,.04);
+  box-shadow:0 8px 22px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,255,255,.04)}
+.mp-tab.act-ozon{
+  border-color:rgba(61,123,255,.55);color:#9ec6ff;
+  background:linear-gradient(135deg, rgba(61,123,255,.18) 0%, rgba(61,123,255,.05) 100%);
+  box-shadow:0 0 26px rgba(61,123,255,.18), inset 0 1px 0 rgba(255,255,255,.07)
+}
+.mp-tab.act-wb{
+  border-color:rgba(203,17,171,.55);color:#f0a4e6;
+  background:linear-gradient(135deg, rgba(203,17,171,.18) 0%, rgba(203,17,171,.05) 100%);
+  box-shadow:0 0 26px rgba(203,17,171,.18), inset 0 1px 0 rgba(255,255,255,.07)
+}
+.mp-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;
+  background:var(--smoke);transition:all .22s ease}
+.mp-dot-ozon{background:#3d7bff}
+.mp-dot-wb{background:#cb11ab}
+.mp-tab.act-ozon .mp-dot-ozon{box-shadow:0 0 12px #3d7bff, 0 0 24px rgba(61,123,255,.4);
+  animation:mpDotPulse 2.4s ease-in-out infinite}
+.mp-tab.act-wb .mp-dot-wb{box-shadow:0 0 12px #cb11ab, 0 0 24px rgba(203,17,171,.4);
+  animation:mpDotPulse 2.4s ease-in-out infinite}
+@keyframes mpDotPulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
+
+/* ====== STATS CARDS hover + gradient glow ====== */
+.stat-card{position:relative;transition:transform .25s ease, box-shadow .25s ease, border-color .25s ease}
+.stat-card::before{
+  content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;
+  background:linear-gradient(135deg, transparent 0%, rgba(201,168,76,.5) 50%, transparent 100%);
+  -webkit-mask:linear-gradient(#000,#000) content-box, linear-gradient(#000,#000);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  opacity:0;transition:opacity .25s ease;pointer-events:none
+}
+.stat-card:hover{transform:translateY(-3px);
+  border-color:rgba(201,168,76,.3);
+  box-shadow:0 18px 44px rgba(0,0,0,.32), 0 0 36px rgba(201,168,76,.10)}
+.stat-card:hover::before{opacity:1}
+
+/* ====== RESULT CARD premium ====== */
+.res-hero{position:relative;isolation:isolate;overflow:hidden}
+.res-hero-chart{position:absolute;left:0;right:0;bottom:0;width:100%;height:62%;
+  pointer-events:none;opacity:.55;z-index:0}
+.res-hero-glow{position:absolute;left:50%;top:62%;width:280px;height:160px;
+  transform:translate(-50%,-50%);pointer-events:none;z-index:0;
+  background:radial-gradient(closest-side, rgba(201,168,76,.20), transparent 70%);
+  filter:blur(6px);opacity:.7}
+.res-hero > *:not(.res-hero-chart):not(.res-hero-glow){position:relative;z-index:1}
+
+.res-hero-val{transition:transform .35s cubic-bezier(.34,1.56,.64,1), text-shadow .35s ease}
+.result-card.result-pos .res-hero-val.pos{
+  text-shadow:0 0 32px rgba(46,204,138,.32), 0 0 8px rgba(46,204,138,.15)
+}
+.result-card.result-neg .res-hero-val.neg{
+  text-shadow:0 0 32px rgba(224,85,102,.32), 0 0 8px rgba(224,85,102,.15)
+}
+
+.res-margin{position:relative;overflow:hidden}
+.res-margin::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(110deg,
+    transparent 40%, rgba(255,255,255,.18) 50%, transparent 60%);
+  background-size:220% 100%;background-position:200% 0;
+  animation:marginShine 4s ease-in-out infinite}
+@keyframes marginShine{
+  0%, 8%{background-position:200% 0;opacity:0}
+  12%{opacity:1}
+  60%{background-position:-200% 0;opacity:1}
+  72%, 100%{background-position:-200% 0;opacity:0}
+}
+
+.res-row{position:relative;border-bottom:none}
+.res-row::after{content:"";position:absolute;left:0;right:0;bottom:0;height:1px;
+  background:linear-gradient(to right,
+    transparent 0%, rgba(255,255,255,.08) 50%, transparent 100%)}
+.res-row:last-child::after{display:none}
+
+/* ====== SUCCESS PULSE on result-card after calculate ====== */
+.result-card.success-pulse{
+  animation:resultSuccessGlow 2.1s ease-out
+}
+@keyframes resultSuccessGlow{
+  0%{box-shadow:0 24px 60px rgba(0,0,0,.35), 0 0 50px rgba(201,168,76,.06)}
+  18%{box-shadow:0 28px 70px rgba(0,0,0,.4), 0 0 90px rgba(46,204,138,.45)}
+  100%{box-shadow:0 24px 60px rgba(0,0,0,.35), 0 0 50px rgba(201,168,76,.06)}
+}
+.result-card.success-pulse .res-hero-val{
+  animation:profitPop .85s cubic-bezier(.34,1.56,.64,1)
+}
+@keyframes profitPop{
+  0%{transform:scale(.94)}
+  55%{transform:scale(1.06)}
+  100%{transform:scale(1)}
+}
+.result-card.success-pulse .res-margin{
+  animation:marginPop .8s cubic-bezier(.34,1.56,.64,1) .1s both
+}
+@keyframes marginPop{
+  0%{transform:scale(.85);opacity:0}
+  60%{transform:scale(1.05);opacity:1}
+  100%{transform:scale(1);opacity:1}
+}
+/* sparkle */
+.result-card.success-pulse .res-hero::before{
+  content:"✦";position:absolute;top:14px;right:18px;z-index:2;
+  font-size:1rem;color:var(--gold2);
+  text-shadow:0 0 12px rgba(232,201,122,.6);
+  animation:sparkleSpin 1.2s ease-out both;pointer-events:none
+}
+@keyframes sparkleSpin{
+  0%{opacity:0;transform:scale(.3) rotate(0deg)}
+  30%{opacity:1;transform:scale(1.2) rotate(180deg)}
+  100%{opacity:0;transform:scale(1) rotate(360deg)}
+}
+
+/* ====== FILTER BAR (collapsible) ====== */
+.filter-bar{
+  background:var(--glass);border:1px solid var(--edge);border-radius:12px;
+  margin-bottom:.7rem;overflow:hidden;
+  backdrop-filter:blur(14px) saturate(1.2);
+  -webkit-backdrop-filter:blur(14px) saturate(1.2);
+  box-shadow:0 12px 32px rgba(0,0,0,.22);
+  transition:border-color .25s ease, box-shadow .25s ease, background .25s ease
+}
+.filter-bar.filter-open{
+  border-color:rgba(201,168,76,.28);
+  background:rgba(255,255,255,.045);
+  box-shadow:0 16px 42px rgba(0,0,0,.3), 0 0 36px rgba(201,168,76,.08)
+}
+.filter-toggle{
+  all:unset;cursor:pointer;display:flex;align-items:center;
+  gap:.8rem;width:100%;box-sizing:border-box;
+  padding:.85rem 1.1rem;font-family:var(--sans);
+  transition:background .2s ease
+}
+.filter-toggle:hover{background:rgba(255,255,255,.025)}
+.filter-toggle:focus-visible{outline:none;box-shadow:inset 0 0 0 2px rgba(201,168,76,.35)}
+.filter-toggle-ico{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:30px;height:30px;border-radius:9px;flex-shrink:0;
+  background:linear-gradient(135deg,rgba(201,168,76,.2) 0%,rgba(201,168,76,.05) 100%);
+  border:1px solid rgba(201,168,76,.28);color:var(--gold2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+  transition:transform .25s ease, box-shadow .25s ease
+}
+.filter-toggle-ico svg{width:15px;height:15px;display:block}
+.filter-bar.filter-open .filter-toggle-ico{
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 0 18px rgba(201,168,76,.22);
+  transform:rotate(-4deg)
+}
+.filter-toggle-label{font-family:var(--sans);font-size:.88rem;font-weight:600;color:var(--txt);
+  flex-shrink:0;letter-spacing:.005em}
+.filter-toggle-dot{
+  width:6px;height:6px;border-radius:50%;background:var(--gold);
+  box-shadow:0 0 8px var(--gold);flex-shrink:0;
+  animation:filterToggleDot 2s ease-in-out infinite
+}
+@keyframes filterToggleDot{0%,100%{opacity:1}50%{opacity:.5}}
+.filter-toggle-hint{
+  font-family:var(--mono);font-size:.66rem;letter-spacing:.04em;
+  color:var(--txt3);flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+}
+
+.filter-toggle-badges{
+  display:inline-flex;align-items:center;gap:.45rem;flex:1;
+  min-width:0;flex-wrap:wrap
+}
+.filter-bdg{
+  display:inline-flex;align-items:center;gap:.42rem;
+  font-family:var(--mono);font-size:.6rem;font-weight:500;
+  letter-spacing:.04em;
+  padding:5px 11px;border-radius:100px;
+  background:rgba(255,255,255,.035);
+  border:1px solid var(--edge);
+  color:var(--txt2);
+  transition:border-color .22s ease, background .22s ease,
+    color .22s ease, box-shadow .22s ease;
+  white-space:nowrap;flex-shrink:0
+}
+.filter-bdg-dot{
+  width:5px;height:5px;border-radius:50%;
+  background:var(--smoke);flex-shrink:0;
+  transition:background .22s ease, box-shadow .22s ease
+}
+.filter-bdg-l{color:var(--txt3);font-weight:500;letter-spacing:.04em}
+.filter-bdg-v{color:var(--txt);font-weight:600;letter-spacing:.02em}
+
+.filter-bdg.active{
+  background:var(--gold-bg);
+  border-color:rgba(201,168,76,.32);
+  color:var(--gold2);
+  box-shadow:0 4px 14px rgba(201,168,76,.10)
+}
+.filter-bdg.active .filter-bdg-dot{
+  background:var(--gold);
+  box-shadow:0 0 8px rgba(201,168,76,.6)
+}
+.filter-bdg.active .filter-bdg-l{color:var(--gold2);opacity:.78}
+.filter-bdg.active .filter-bdg-v{color:var(--gold3)}
+.filter-toggle-chev{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:26px;height:26px;border-radius:8px;flex-shrink:0;
+  border:1px solid var(--edge2);background:rgba(255,255,255,.03);
+  color:var(--txt2);
+  transition:transform .35s cubic-bezier(.22,1,.36,1),
+    color .2s ease, border-color .2s ease, background .2s ease
+}
+.filter-toggle-chev svg{width:12px;height:12px;display:block}
+.filter-bar.filter-open .filter-toggle-chev{
+  transform:rotate(180deg);color:var(--gold2);
+  border-color:rgba(201,168,76,.32);background:var(--gold-bg);
+  box-shadow:0 0 14px rgba(201,168,76,.18)
+}
+
+.filter-panel-wrap{
+  display:grid;grid-template-rows:0fr;
+  transition:grid-template-rows .35s cubic-bezier(.22,1,.36,1)
+}
+.filter-bar.filter-open .filter-panel-wrap{grid-template-rows:1fr}
+.filter-panel-inner{overflow:hidden;min-height:0}
+.filter-panel{
+  display:flex;align-items:center;gap:1.3rem;flex-wrap:wrap;
+  padding:.5rem 1.1rem 1.05rem;
+  border-top:1px solid rgba(255,255,255,.05)
+}
+
+.filter-group{display:flex;align-items:center;gap:.65rem;min-width:0}
+.filter-label{font-family:var(--mono);font-size:.58rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.14em;color:var(--txt3);flex-shrink:0}
+.filter-pills{display:inline-flex;gap:.32rem;flex-wrap:wrap}
+.filter-pill{
+  font-family:var(--sans);font-size:.78rem;font-weight:500;
+  padding:7px 13px;border-radius:9px;cursor:pointer;
+  background:transparent;border:1px solid var(--edge2);
+  color:var(--txt2);transition:all .2s ease;
+  -webkit-appearance:none;appearance:none
+}
+.filter-pill:hover{
+  border-color:var(--smoke);color:var(--txt);
+  background:rgba(255,255,255,.03);transform:translateY(-1px)
+}
+.filter-pill.active{
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);border-color:transparent;
+  box-shadow:0 8px 22px rgba(201,168,76,.32),
+    inset 0 1px 0 rgba(255,255,255,.22);
+  font-weight:600
+}
+.filter-pill.active:hover{
+  transform:translateY(-2px);
+  box-shadow:0 12px 28px rgba(201,168,76,.42),
+    inset 0 1px 0 rgba(255,255,255,.22)
+}
+.filter-divider{
+  width:1px;height:24px;background:var(--edge);flex-shrink:0
+}
+@media(max-width:980px){
+  .filter-divider{display:none}
+  .filter-group{flex:1 1 auto;min-width:240px;flex-wrap:wrap}
+}
+@media(max-width:760px){
+  .filter-toggle-badges{display:none}
+  .filter-toggle-hint{font-size:.62rem}
+}
+@media(max-width:560px){
+  .filter-toggle{padding:.8rem .95rem;gap:.6rem}
+  .filter-toggle-hint{font-size:.6rem}
+  .filter-toggle-label{font-size:.82rem}
+  .filter-panel{flex-direction:column;align-items:stretch;gap:.9rem;padding:.5rem .95rem 1rem}
+  .filter-group{flex-direction:column;align-items:flex-start;gap:.4rem}
+  .filter-pills{width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(80px,1fr));gap:.35rem}
+  .filter-pill{text-align:center;padding:8px 10px}
+}
+@media (prefers-reduced-motion: reduce){
+  .filter-panel-wrap,
+  .filter-toggle-chev,
+  .filter-toggle-ico,
+  .filter-toggle-dot{transition:none !important;animation:none !important}
+}
+
+.hist-filter-empty{
+  padding:2.4rem 1.5rem;text-align:center;
+  font-family:var(--mono);font-size:.78rem;letter-spacing:.04em;
+  color:var(--txt3);
+  background:rgba(255,255,255,.015);
+  border-top:1px solid var(--edge)
+}
+
+/* ====== HISTORY ITEM REMOVE ANIMATION ====== */
+.hist-item{transition:opacity .28s ease, transform .28s ease, filter .28s ease}
+.hist-item.hist-removing{
+  opacity:0;
+  transform:translateX(28px) scale(.97);
+  filter:blur(1.5px);
+  pointer-events:none
+}
+.hist-del:disabled{cursor:wait;opacity:.7}
+.hist-del:disabled:hover{background:rgba(255,255,255,.04) !important;
+  border-color:rgba(255,255,255,.14) !important;color:#cbd5e1 !important;transform:none !important}
+.hist-del-spin{display:inline-block;width:11px;height:11px;border-radius:50%;
+  border:1.6px solid rgba(224,85,102,.25);border-top-color:#FF8A98;
+  animation:histDelSpin .7s linear infinite}
+@keyframes histDelSpin{to{transform:rotate(360deg)}}
+
+/* ====== TOAST ====== */
+.mp-toast{
+  position:fixed;bottom:24px;right:24px;z-index:300;
+  background:rgba(8,10,20,.85);
+  backdrop-filter:blur(16px) saturate(1.3);
+  -webkit-backdrop-filter:blur(16px) saturate(1.3);
+  border:1px solid var(--edge2);border-radius:12px;
+  padding:.85rem 1.1rem;font-family:var(--sans);font-size:.85rem;font-weight:500;
+  color:var(--txt);box-shadow:0 22px 60px rgba(0,0,0,.5);
+  display:inline-flex;align-items:center;gap:.7rem;max-width:360px;
+  animation:toastIn .3s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes toastIn{
+  from{opacity:0;transform:translate(20px,4px) scale(.96)}
+  to{opacity:1;transform:translate(0,0) scale(1)}
+}
+.mp-toast-ok{
+  border-color:rgba(46,204,138,.42);
+  color:#9bf0c4;
+  box-shadow:0 22px 60px rgba(0,0,0,.5), 0 0 36px rgba(46,204,138,.15)
+}
+.mp-toast-err{
+  border-color:rgba(224,85,102,.42);
+  color:#ff9aa6;
+  box-shadow:0 22px 60px rgba(0,0,0,.5), 0 0 36px rgba(224,85,102,.15)
+}
+.mp-toast-ico{flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+.mp-toast-ico svg{width:18px;height:18px;display:block}
+.mp-toast-text{flex:1;min-width:0;line-height:1.35}
+@media(max-width:640px){
+  .mp-toast{right:16px;left:16px;bottom:16px;max-width:none}
+}
+
+@media (prefers-reduced-motion: reduce){
+  .ai-proc-progress-bar{width:100% !important}
+  .ai-proc-overlay,
+  .ai-proc-card,
+  .ai-proc-border,
+  .ai-proc-ico,
+  .ai-proc-ico svg,
+  .ai-proc-mark,
+  .ai-proc-progress-bar,
+  .ai-proc-progress::after,
+  .calc-loading::after,
+  .empty-bar,
+  .hist-demo .hist-item,
+  .api-empty-ico,
+  .calc-loading-spin,
+  .res-margin::after,
+  .result-card.success-pulse,
+  .result-card.success-pulse .res-hero-val,
+  .result-card.success-pulse .res-margin,
+  .result-card.success-pulse .res-hero::before,
+  .mp-tab.act-ozon .mp-dot-ozon,
+  .mp-tab.act-wb .mp-dot-wb,
+  .onboard-card,
+  .mp-toast,
+  .hist-del-spin{animation:none !important}
+  .hist-item.hist-removing{transition:none}
+}
+
+.dash-wrap{max-width:1100px;margin:0 auto;padding:1.6rem 2rem 4rem}
+.dash-h1{font-family:var(--display);font-size:clamp(1.5rem,2.4vw,1.95rem);font-weight:700;letter-spacing:-.02em;margin:0 0 .3rem}
+.dash-h1 em{font-style:italic;color:var(--gold)}
+.dash-lead{color:var(--txt2);font-size:.86rem;font-weight:300;margin-bottom:1.1rem}
+
+.dash-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:.85rem;align-items:start;margin-top:.5rem}
+.dash-right-col{display:flex;flex-direction:column;gap:.7rem;min-width:0}
+
+/* ====== QUICK SUMMARY (правая колонка под Результатом) ====== */
+.quick-summary{
+  background:rgba(255,255,255,.032);
+  border:1px solid rgba(201,168,76,.25);
+  border-radius:13px;
+  padding:.85rem 1.05rem .7rem;
+  backdrop-filter:blur(10px) saturate(1.2);
+  -webkit-backdrop-filter:blur(10px) saturate(1.2);
+  box-shadow:0 12px 28px rgba(0,0,0,.22), 0 0 26px rgba(201,168,76,.06)
+}
+.quick-summary-head{
+  display:flex;align-items:center;justify-content:space-between;gap:.5rem;
+  margin-bottom:.6rem
+}
+.quick-summary-title{
+  font-family:var(--mono);font-size:.58rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.14em;color:var(--txt3)
+}
+.quick-summary-status{
+  font-family:var(--mono);font-size:.53rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.10em;
+  padding:3px 9px;border-radius:100px;border:1px solid;line-height:1
+}
+.quick-summary-status.ok{
+  color:#7DEAB2;border-color:rgba(46,204,138,.32);background:rgba(46,204,138,.08)
+}
+.quick-summary-status.bad{
+  color:#FF8A98;border-color:rgba(224,85,102,.32);background:rgba(224,85,102,.08)
+}
+.quick-summary-body{display:flex;flex-direction:column}
+.quick-summary-row{
+  display:flex;align-items:baseline;justify-content:space-between;gap:.7rem;
+  padding:.4rem 0;border-bottom:1px solid rgba(255,255,255,.04)
+}
+.quick-summary-row:last-child{border-bottom:none}
+.quick-summary-label{
+  font-family:var(--sans);font-size:.78rem;color:var(--txt2);font-weight:300
+}
+.quick-summary-value{
+  font-family:var(--display);font-size:1.02rem;font-weight:700;
+  color:var(--txt);letter-spacing:-.022em;line-height:1
+}
+.quick-summary-value.pos{color:#2ECC8A}
+.quick-summary-value.neg{color:#E05566}
+.quick-summary-value.muted{color:var(--txt3);font-weight:400}
+.quick-summary-foot{
+  margin-top:.55rem;font-family:var(--mono);font-size:.54rem;
+  letter-spacing:.08em;color:var(--txt3);text-transform:uppercase
+}
 
 .card{background:var(--glass);border:1px solid var(--edge);border-radius:14px;
   backdrop-filter:blur(10px);box-shadow:0 24px 60px rgba(0,0,0,.35);overflow:hidden}
@@ -696,7 +2114,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .empty-title{font-family:var(--display);font-size:1rem;font-weight:700;color:var(--txt2);margin-bottom:.3rem}
 .empty-sub{font-size:.8rem;font-weight:300}
 
-.hist-card{margin-top:1.25rem}
+.hist-card{margin-top:.85rem}
 .hist-list{display:flex;flex-direction:column}
 .hist-item{
   display:flex;
@@ -733,34 +2151,35 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .stats-grid{
   display:grid;
   grid-template-columns:repeat(4,1fr);
-  gap:1rem;
-  margin-bottom:1.4rem;
+  gap:.7rem;
+  margin-bottom:.85rem;
 }
 
 .stat-card{
   background:var(--glass);
   border:1px solid var(--edge);
-  border-radius:14px;
-  padding:1rem 1.1rem;
+  border-radius:12px;
+  padding:.75rem .9rem .8rem;
   backdrop-filter:blur(10px);
-  box-shadow:0 10px 30px rgba(0,0,0,.22);
+  box-shadow:0 8px 22px rgba(0,0,0,.20);
 }
 
 .stat-label{
   font-family:var(--mono);
-  font-size:.62rem;
+  font-size:.58rem;
   text-transform:uppercase;
-  letter-spacing:.08em;
+  letter-spacing:.10em;
   color:var(--txt3);
-  margin-bottom:.55rem;
+  margin-bottom:.4rem;
 }
 
 .stat-value{
   font-family:var(--display);
-  font-size:1.5rem;
+  font-size:1.2rem;
   font-weight:700;
-  letter-spacing:-.03em;
+  letter-spacing:-.025em;
   color:var(--txt);
+  line-height:1;
 }
 
 .stat-value.pos{
@@ -807,7 +2226,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
       </div>
 
       <div className="dash-wrap">
-        {!user && (
+        {authLoading && (
+          <div className="auth-loading" role="status" aria-live="polite">
+            <span className="auth-loading-ring" aria-hidden="true" />
+            <span>Проверяем сессию…</span>
+          </div>
+        )}
+        {!authLoading && !user && (
           <div className="card auth-card">
             <h3 className="auth-title">Вход в аккаунт</h3>
 
@@ -843,7 +2268,162 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           totalRevenue={totalRevenue}
           totalProfit={totalProfit}
           avgMargin={avgMargin}
-          historyCount={history.length}
+          historyCount={filteredHistory.length}
+        />
+
+        <div
+          className={
+            "filter-bar" +
+            (filtersOpen ? " filter-open" : "") +
+            (filtersActive ? " filter-has-active" : "")
+          }
+          role="region"
+          aria-label="Фильтры аналитики"
+        >
+          <button
+            type="button"
+            className="filter-toggle"
+            onClick={() => setFiltersOpen((o) => !o)}
+            aria-expanded={filtersOpen}
+            aria-controls="filter-panel"
+          >
+            <span className="filter-toggle-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="4" y1="6" x2="20" y2="6" />
+                <line x1="4" y1="12" x2="20" y2="12" />
+                <line x1="4" y1="18" x2="20" y2="18" />
+                <circle cx="9" cy="6" r="2.2" fill="#0d1020" />
+                <circle cx="15" cy="12" r="2.2" fill="#0d1020" />
+                <circle cx="7" cy="18" r="2.2" fill="#0d1020" />
+              </svg>
+            </span>
+            <span className="filter-toggle-label">Фильтры</span>
+            {filtersActive && <span className="filter-toggle-dot" aria-hidden="true" />}
+
+            {filtersActive ? (
+              <span className="filter-toggle-badges">
+                <span
+                  className={
+                    "filter-bdg" + (filterPeriod !== "all" ? " active" : "")
+                  }
+                >
+                  <span className="filter-bdg-dot" />
+                  <span className="filter-bdg-l">Период:</span>
+                  <span className="filter-bdg-v">{filterPeriodLabel}</span>
+                </span>
+                <span
+                  className={
+                    "filter-bdg" + (filterMp !== "all" ? " active" : "")
+                  }
+                >
+                  <span className="filter-bdg-dot" />
+                  <span className="filter-bdg-l">Маркетплейсы:</span>
+                  <span className="filter-bdg-v">{filterMpLabel}</span>
+                </span>
+                <span
+                  className={
+                    "filter-bdg" + (filterResult !== "all" ? " active" : "")
+                  }
+                >
+                  <span className="filter-bdg-dot" />
+                  <span className="filter-bdg-l">Результаты:</span>
+                  <span className="filter-bdg-v">{filterResultLabel}</span>
+                </span>
+              </span>
+            ) : (
+              <span className="filter-toggle-hint">
+                Настройте аналитику по периоду, маркетплейсу и результату
+              </span>
+            )}
+
+            <span className="filter-toggle-chev" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </span>
+          </button>
+
+          <div className="filter-panel-wrap">
+            <div className="filter-panel-inner">
+              <div className="filter-panel" id="filter-panel" role="toolbar">
+          <div className="filter-group">
+            <div className="filter-label">Период</div>
+            <div className="filter-pills">
+              {(["7", "14", "30", "all"] as FilterPeriod[]).map((v) => (
+                <button
+                  type="button"
+                  key={v}
+                  className={"filter-pill" + (filterPeriod === v ? " active" : "")}
+                  onClick={() => setFilterPeriod(v)}
+                  aria-pressed={filterPeriod === v}
+                >
+                  {v === "all" ? "Всё время" : v + " дней"}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="filter-divider" aria-hidden="true" />
+
+          <div className="filter-group">
+            <div className="filter-label">Маркетплейс</div>
+            <div className="filter-pills">
+              {(
+                [
+                  ["all", "Все"],
+                  ["ozon", "Ozon"],
+                  ["wb", "Wildberries"],
+                ] as [FilterMp, string][]
+              ).map(([v, label]) => (
+                <button
+                  type="button"
+                  key={v}
+                  className={"filter-pill" + (filterMp === v ? " active" : "")}
+                  onClick={() => setFilterMp(v)}
+                  aria-pressed={filterMp === v}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="filter-divider" aria-hidden="true" />
+
+          <div className="filter-group">
+            <div className="filter-label">Результат</div>
+            <div className="filter-pills">
+              {(
+                [
+                  ["all", "Все"],
+                  ["profit", "Прибыльные"],
+                  ["loss", "Убыточные"],
+                ] as [FilterResult, string][]
+              ).map(([v, label]) => (
+                <button
+                  type="button"
+                  key={v}
+                  className={"filter-pill" + (filterResult === v ? " active" : "")}
+                  onClick={() => setFilterResult(v)}
+                  aria-pressed={filterResult === v}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <AnalyticsBlock
+          realHistory={filteredHistory}
+          hasAnyData={history.length > 0}
+          hasPremium={hasPremium}
+          onOpenPremium={openPremium}
         />
 
         <div className="calc-tabs" role="tablist">
@@ -878,9 +2458,39 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </button>
         </div>
 
+        {calcMode === "manual" && showOnboarding && (
+          <div className="onboard-card" role="note">
+            <div className="onboard-steps">
+              <div className="onboard-step">
+                <span className="onboard-num">1</span>
+                <span className="onboard-text">Введите выручку</span>
+              </div>
+              <div className="onboard-arrow">→</div>
+              <div className="onboard-step">
+                <span className="onboard-num">2</span>
+                <span className="onboard-text">Укажите комиссию</span>
+              </div>
+              <div className="onboard-arrow">→</div>
+              <div className="onboard-step">
+                <span className="onboard-num">3</span>
+                <span className="onboard-text">Нажмите «Рассчитать»</span>
+              </div>
+            </div>
+            <button
+              type="button"
+              className="onboard-close"
+              onClick={dismissOnboarding}
+              aria-label="Скрыть подсказку"
+              title="Скрыть"
+            >
+              ×
+            </button>
+          </div>
+        )}
+
         {calcMode === "manual" ? (
         <div className="dash-grid">
-          <div className="card">
+          <div className={"card" + (isCalculating ? " calc-loading" : "")}>
             <div className="card-head">
               <div className="card-title">Параметры расчёта</div>
             </div>
@@ -888,14 +2498,20 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               <div className="mp-row">
                 <div
                   className={"mp-tab" + (marketplace === "ozon" ? " act-ozon" : "")}
-                  onClick={() => setMarketplace("ozon")}
+                  onClick={() => !isCalculating && setMarketplace("ozon")}
+                  role="button"
+                  aria-pressed={marketplace === "ozon"}
                 >
+                  <span className="mp-dot mp-dot-ozon" aria-hidden="true" />
                   Ozon
                 </div>
                 <div
                   className={"mp-tab" + (marketplace === "wb" ? " act-wb" : "")}
-                  onClick={() => setMarketplace("wb")}
+                  onClick={() => !isCalculating && setMarketplace("wb")}
+                  role="button"
+                  aria-pressed={marketplace === "wb"}
                 >
+                  <span className="mp-dot mp-dot-wb" aria-hidden="true" />
                   Wildberries
                 </div>
               </div>
@@ -914,6 +2530,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         placeholder="0"
                         value={form[f.key]}
                         onChange={(e) => handleField(f.key, e.target.value)}
+                        disabled={isCalculating}
                       />
                       <span className="in-cur">₽</span>
                     </div>
@@ -922,24 +2539,143 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 ))}
               </div>
 
-              <div className="btn-row">
-                <button className="btn-gold" onClick={calculate}>
-                  Рассчитать чистую прибыль
-                </button>
-                <button className="btn-ghost" onClick={clearForm}>
-                  Очистить форму
-                </button>
-              </div>
+              {canCalculate || !entitlementsLoaded ? (
+                <div className="btn-row">
+                  <button
+                    className="btn-gold"
+                    onClick={calculate}
+                    disabled={isCalculating}
+                  >
+                    {isCalculating ? (
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 10 }}>
+                        <span className="spin-dark" />
+                        Считаем…
+                      </span>
+                    ) : (
+                      "Рассчитать чистую прибыль"
+                    )}
+                  </button>
+                  <button
+                    className="btn-ghost"
+                    onClick={clearForm}
+                    disabled={isCalculating}
+                  >
+                    Очистить форму
+                  </button>
+                </div>
+              ) : (
+                <div className="upgrade-hint" role="region" aria-label="Продолжить анализ">
+                  <div className="upgrade-hint-left">
+                    <span className="upgrade-hint-dot" aria-hidden="true" />
+                    <span className="upgrade-hint-text">Продолжить анализ</span>
+                  </div>
+                  <div className="upgrade-hint-actions">
+                    <button
+                      type="button"
+                      className="upgrade-hint-btn"
+                      onClick={() => handleTariff("single")}
+                    >
+                      Разовый расчёт <em>149₽</em>
+                    </button>
+                    <button
+                      type="button"
+                      className="upgrade-hint-btn primary"
+                      onClick={() => handleTariff("unlimited")}
+                    >
+                      Безлимит + AI <em>449₽/мес</em>
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
+
+            {isCalculating && (
+              <div
+                className="ai-proc-overlay"
+                role="status"
+                aria-live="polite"
+                aria-label="Идёт AI-анализ расчёта"
+              >
+                <div className="ai-proc-card">
+                  <span className="ai-proc-border" aria-hidden="true" />
+
+                  <div className="ai-proc-ico" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
+                      <circle cx="19.5" cy="4.5" r="1.1" opacity=".55" />
+                      <circle cx="4.5" cy="18.5" r=".9" opacity=".4" />
+                    </svg>
+                  </div>
+
+                  <div className="ai-proc-title">
+                    AI <em>анализ</em> финансов
+                  </div>
+
+                  <ul className="ai-proc-stages">
+                    {AI_STAGES.map((s, i) => (
+                      <li
+                        key={i}
+                        className={
+                          "ai-proc-stage" +
+                          (i === analysisStage ? " is-active" : "") +
+                          (i < analysisStage ? " is-done" : "")
+                        }
+                      >
+                        <span className="ai-proc-mark" aria-hidden="true" />
+                        <span className="ai-proc-stage-text">{s}</span>
+                      </li>
+                    ))}
+                  </ul>
+
+                  <div className="ai-proc-progress" aria-hidden="true">
+                    <div className="ai-proc-progress-bar" />
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
-          <div className="result-card">
+          <div className="dash-right-col">
+          <div
+            className={
+              "result-card" +
+              (justCalculated ? " success-pulse" : "") +
+              (result && result.profit >= 0 ? " result-pos" : "") +
+              (result && result.profit < 0 ? " result-neg" : "")
+            }
+          >
             <div className="card-head">
               <div className="card-title">Результат</div>
             </div>
             {result ? (
               <>
                 <div className="res-hero">
+                  <svg
+                    className="res-hero-chart"
+                    viewBox="0 0 200 60"
+                    preserveAspectRatio="none"
+                    aria-hidden="true"
+                  >
+                    <defs>
+                      <linearGradient id="resChartFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="rgba(201,168,76,.22)" />
+                        <stop offset="100%" stopColor="rgba(201,168,76,0)" />
+                      </linearGradient>
+                    </defs>
+                    <path
+                      d="M0,46 L20,42 L40,44 L60,32 L80,30 L100,24 L120,26 L140,16 L160,18 L180,10 L200,12 L200,60 L0,60 Z"
+                      fill="url(#resChartFill)"
+                    />
+                    <path
+                      d="M0,46 L20,42 L40,44 L60,32 L80,30 L100,24 L120,26 L140,16 L160,18 L180,10 L200,12"
+                      stroke="rgba(201,168,76,.55)"
+                      strokeWidth="1.4"
+                      fill="none"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                  <div className="res-hero-glow" aria-hidden="true" />
                   <div className="res-hero-lbl">Чистая прибыль</div>
                   <div className={"res-hero-val " + (result.profit >= 0 ? "pos" : "neg")}>
                     {result.profit >= 0 ? "+" : "−"}
@@ -978,8 +2714,68 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 <div className="empty-sub">
                   Заполните поля слева и нажмите «Рассчитать»
                 </div>
+                <div className="empty-bars" aria-hidden="true">
+                  <span className="empty-bar bar-1" />
+                  <span className="empty-bar bar-2" />
+                  <span className="empty-bar bar-3" />
+                </div>
               </div>
             )}
+          </div>
+
+          {(() => {
+            const quick = result ?? history[0] ?? null;
+            const hasData = quick !== null;
+            const isProfit = hasData && quick.profit >= 0;
+            return (
+              <div className="quick-summary" role="region" aria-label="Быстрый итог">
+                <div className="quick-summary-head">
+                  <span className="quick-summary-title">Быстрый итог</span>
+                  {hasData && (
+                    <span
+                      className={
+                        "quick-summary-status " + (isProfit ? "ok" : "bad")
+                      }
+                    >
+                      {isProfit ? "прибыльный" : "убыточный"}
+                    </span>
+                  )}
+                </div>
+
+                <div className="quick-summary-body">
+                  <div className="quick-summary-row">
+                    <span className="quick-summary-label">Чистая прибыль</span>
+                    <span
+                      className={
+                        "quick-summary-value " +
+                        (hasData ? (isProfit ? "pos" : "neg") : "muted")
+                      }
+                    >
+                      {hasData
+                        ? (isProfit ? "+" : "−") +
+                          fmt(Math.abs(quick.profit)) +
+                          " ₽"
+                        : "—"}
+                    </span>
+                  </div>
+                  <div className="quick-summary-row">
+                    <span className="quick-summary-label">Маржинальность</span>
+                    <span
+                      className={
+                        "quick-summary-value " + (hasData ? "" : "muted")
+                      }
+                    >
+                      {hasData ? quick.margin.toFixed(1) + "%" : "—"}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="quick-summary-foot">
+                  Обновляется после каждого расчёта
+                </div>
+              </div>
+            );
+          })()}
           </div>
         </div>
         ) : (
@@ -990,6 +2786,33 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               Подключите API и получайте автоматический расчёт прибыли
             </p>
           </div>
+
+          {user &&
+            !ozonClientId.trim() &&
+            !ozonApiKey.trim() &&
+            !wbApiKey.trim() && (
+              <div className="api-empty">
+                <div className="api-empty-ico" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M9 7V3M15 7V3" />
+                    <rect x="6" y="7" width="12" height="6" rx="1.5" />
+                    <path d="M12 13v4a3 3 0 0 0 3 3h2" />
+                  </svg>
+                </div>
+                <div className="api-empty-title">
+                  Подключите API Ozon или WB
+                </div>
+                <p className="api-empty-sub">
+                  для автоматического анализа прибыли
+                </p>
+                <ul className="api-empty-list">
+                  <li>Автоматическая аналитика</li>
+                  <li>История продаж</li>
+                  <li>Расчёт чистой прибыли</li>
+                </ul>
+              </div>
+          )}
 
           <div className="api-pro-body">
             <div className="api-pro-grid">
@@ -1060,31 +2883,81 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </div>
             </div>
 
-            <div className="api-pro-foot">
+            {apiSaveMessage && (
               <p
                 className={
                   "api-pro-msg" +
                   (apiSaveStatus === "ok" ? " ok" : "") +
                   (apiSaveStatus === "err" ? " err" : "")
                 }
+                style={{ marginTop: "1rem" }}
               >
                 {apiSaveMessage}
               </p>
-              {user ? (
+            )}
+
+            {user ? (
+              <div className="api-pro-actions">
                 <button
                   type="button"
-                  className="api-pro-btn"
+                  className="api-pro-btn ghost"
                   onClick={saveApiKeys}
                   disabled={apiSaveStatus === "saving"}
                 >
-                  {apiSaveStatus === "saving" ? "Подключаем…" : "Подключить маркетплейс"}
+                  {apiSaveStatus === "saving" ? "Сохраняем…" : "Сохранить API"}
                 </button>
-              ) : (
+                <button
+                  type="button"
+                  className="api-pro-btn"
+                  onClick={loadFromOzon}
+                  disabled={ozonLoadStatus === "loading"}
+                >
+                  {ozonLoadStatus === "loading" ? (
+                    <>
+                      <span className="spin" />
+                      Загружаем продажи…
+                    </>
+                  ) : (
+                    "Загрузить данные из Ozon"
+                  )}
+                </button>
+              </div>
+            ) : (
+              <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr" }}>
                 <button type="button" className="api-pro-btn locked" disabled>
                   Войдите в аккаунт для подключения API
                 </button>
-              )}
-            </div>
+              </div>
+            )}
+
+            {ozonLoadStatus === "ok" && (
+              <div className="api-alert ok" role="status">
+                <span className="api-alert-ico">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                  </svg>
+                </span>
+                <span className="api-alert-text">
+                  {ozonLoadMessage || "Продажи успешно загружены"}
+                </span>
+              </div>
+            )}
+
+            {ozonLoadStatus === "err" && (
+              <div className="api-alert err" role="alert">
+                <span className="api-alert-ico">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="M12 8v5" />
+                    <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+                  </svg>
+                </span>
+                <span className="api-alert-text">
+                  {ozonLoadMessage || "Не удалось получить данные Ozon API"}
+                </span>
+              </div>
+            )}
 
             <div className="api-pro-hint">
               <span className="api-pro-hint-ico">
@@ -1100,26 +2973,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         </div>
         )}
 
-        <div className="card tariff-card">
+        <div className="card tariff-card" id="dash-tariffs">
           <div className="card-head">
             <div className="card-title">Тарифы</div>
           </div>
 
-          <div className="tariff-grid">
-            <div className="tariff-item">
-              <div className="tariff-name">Старт</div>
-              <div className="tariff-price">Бесплатно</div>
-              <div className="tariff-period">Первый расчёт</div>
-              <ul className="tariff-list">
-                <li>Один расчёт для оценки сервиса</li>
-                <li>Все функции калькулятора</li>
-                <li>Сохранение результата в историю</li>
-              </ul>
-              <button type="button" className="tariff-btn" disabled>
-                Уже доступно
-              </button>
-            </div>
-
+          <div className="tariff-grid tariff-grid-2">
             <div className="tariff-item">
               <div className="tariff-name">Разовый расчёт</div>
               <div className="tariff-price">
@@ -1127,9 +2986,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </div>
               <div className="tariff-period">Один платёж</div>
               <ul className="tariff-list">
-                <li>Дополнительный расчёт по любому товару</li>
+                <li>Один расчёт за месячный отчёт</li>
+                <li>Сохранение результата в историю</li>
                 <li>Без подписки и автосписаний</li>
-                <li>Подходит, если расчёты нужны редко</li>
               </ul>
               <button
                 type="button"
@@ -1141,6 +3000,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
 
             <div className="tariff-item featured">
+              <span className="tariff-shine" aria-hidden="true" />
               <span className="tariff-badge">Выгодно</span>
               <div className="tariff-name">Безлимит</div>
               <div className="tariff-price">
@@ -1149,6 +3009,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               <div className="tariff-period">Подписка на 30 дней</div>
               <ul className="tariff-list">
                 <li>Неограниченное число расчётов в месяц</li>
+                <li>AI аналитика и рекомендации</li>
                 <li>Приоритетный доступ к новым функциям</li>
                 <li>Полная история без ограничений</li>
               </ul>
@@ -1172,6 +3033,37 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
             <div className="card-body">
               Загрузка истории...
+            </div>
+          </div>
+        )}
+
+        {!isLoadingHistory && history.length === 0 && (
+          <div className="card hist-card hist-demo">
+            <div className="card-head">
+              <div className="card-title">
+                Примеры расчётов
+                <span className="hist-demo-badge">Демо</span>
+              </div>
+            </div>
+            <div className="hist-list">
+              {DEMO_HISTORY.map((d) => (
+                <div className="hist-item" key={d.id}>
+                  <div className={"hist-mp " + d.mp}>
+                    {d.mp === "ozon" ? "Ozon" : "WB"}
+                  </div>
+                  <div className="hist-info">
+                    <div className="hist-rev">Выручка {fmt(d.revenue)} ₽</div>
+                    <div className="hist-date">{d.date}</div>
+                  </div>
+                  <div className="hist-profit pos">
+                    +{fmt(d.profit)} ₽
+                    <span className="hm">маржа {d.margin.toFixed(1)}%</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="hist-demo-hint">
+              Здесь будут ваши расчёты после первого сохранения
             </div>
           </div>
         )}
@@ -1206,141 +3098,85 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </button>
             </div>
 
+            {filteredHistory.length === 0 ? (
+              <div className="hist-filter-empty">
+                Нет расчётов по выбранным фильтрам
+              </div>
+            ) : (
             <div className="hist-list">
-              {history.map((h) => (
-                <div className="hist-item" key={h.id}>
-                  <div className={"hist-mp " + h.marketplace}>
-                    {h.marketplace === "ozon" ? "Ozon" : "WB"}
-                  </div>
-
-                  <div className="hist-info">
-                    <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
-                    <div className="hist-date">{h.date}</div>
-                  </div>
-
-                  <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
-                    {h.profit >= 0 ? "+" : "−"}
-                    {fmt(Math.abs(h.profit))} ₽
-                    <span className="hm">маржа {h.margin.toFixed(1)}%</span>
-                  </div>
-
-                  <button
-                    type="button"
-                    className="hist-del"
-                    onClick={() => deleteHistoryItem(h.id)}
+              {filteredHistory.map((h) => {
+                const removing = removingIds.has(h.id);
+                return (
+                  <div
+                    className={"hist-item" + (removing ? " hist-removing" : "")}
+                    key={h.id}
                   >
-                    ×
-                  </button>
-                </div>
-              ))}
+                    <div className={"hist-mp " + h.marketplace}>
+                      {h.marketplace === "ozon" ? "Ozon" : "WB"}
+                    </div>
+
+                    <div className="hist-info">
+                      <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
+                      <div className="hist-date">{h.date}</div>
+                    </div>
+
+                    <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
+                      {h.profit >= 0 ? "+" : "−"}
+                      {fmt(Math.abs(h.profit))} ₽
+                      <span className="hm">маржа {h.margin.toFixed(1)}%</span>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="hist-del"
+                      onClick={() => deleteHistoryItem(h.id)}
+                      disabled={removing}
+                      aria-label="Удалить расчёт"
+                      title="Удалить"
+                    >
+                      {removing ? <span className="hist-del-spin" /> : "×"}
+                    </button>
+                  </div>
+                );
+              })}
             </div>
+            )}
           </div>
         )}
 
-        <div className="card api-card">
-          <div className="card-head">
-            <div className="card-title">Подключение маркетплейсов</div>
-          </div>
-
-          {user ? (
-            <div className="card-body">
-              <div className="api-grid">
-                <div className="api-fld">
-                  <label>Ozon Client ID</label>
-                  <input
-                    className="api-input"
-                    type="text"
-                    placeholder="Например, 123456"
-                    value={ozonClientId}
-                    onChange={(e) => setOzonClientId(e.target.value)}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                </div>
-
-                <div className="api-fld">
-                  <label>Ozon API Key</label>
-                  <div className="api-secret">
-                    <input
-                      className="api-input"
-                      type={showOzonKey ? "text" : "password"}
-                      placeholder="Вставьте секретный ключ"
-                      value={ozonApiKey}
-                      onChange={(e) => setOzonApiKey(e.target.value)}
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                    <button
-                      type="button"
-                      className="api-eye"
-                      onClick={() => setShowOzonKey((v) => !v)}
-                      aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
-                      title={showOzonKey ? "Скрыть" : "Показать"}
-                    >
-                      {showOzonKey ? eyeOffIcon : eyeIcon}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="api-fld api-fld-full">
-                  <label>Wildberries API Key</label>
-                  <div className="api-secret">
-                    <input
-                      className="api-input"
-                      type={showWbKey ? "text" : "password"}
-                      placeholder="Вставьте токен из личного кабинета WB"
-                      value={wbApiKey}
-                      onChange={(e) => setWbApiKey(e.target.value)}
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                    <button
-                      type="button"
-                      className="api-eye"
-                      onClick={() => setShowWbKey((v) => !v)}
-                      aria-label={showWbKey ? "Скрыть ключ" : "Показать ключ"}
-                      title={showWbKey ? "Скрыть" : "Показать"}
-                    >
-                      {showWbKey ? eyeOffIcon : eyeIcon}
-                    </button>
-                  </div>
-                  <span className="api-hint">
-                    Ключи хранятся только для вашего аккаунта и используются для загрузки данных с маркетплейсов.
-                  </span>
-                </div>
-              </div>
-
-              <div className="api-foot">
-                <p
-                  className={
-                    "api-msg" +
-                    (apiSaveStatus === "ok" ? " ok" : "") +
-                    (apiSaveStatus === "err" ? " err" : "")
-                  }
-                >
-                  {apiSaveMessage}
-                </p>
-                <button
-                  type="button"
-                  className="api-save"
-                  onClick={saveApiKeys}
-                  disabled={apiSaveStatus === "saving"}
-                >
-                  {apiSaveStatus === "saving" ? "Сохраняем…" : "Сохранить API"}
-                </button>
-              </div>
-            </div>
-          ) : (
-            <div className="api-locked">
-              <span className="api-locked-icon">◇</span>
-              <div className="api-locked-title">Войдите в аккаунт</div>
-              <div className="api-locked-sub">
-                API-ключи сохраняются индивидуально для каждого пользователя
-              </div>
-            </div>
-          )}
-        </div>
       </div>
+
+      <TariffModal
+        open={tariffModalOpen}
+        tier={selectedTier}
+        onClose={() => setTariffModalOpen(false)}
+      />
+
+      {toast && (
+        <div
+          key={toast.id}
+          className={"mp-toast mp-toast-" + toast.type}
+          role={toast.type === "err" ? "alert" : "status"}
+        >
+          <span className="mp-toast-ico" aria-hidden="true">
+            {toast.type === "ok" ? (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 8v5" />
+                <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+              </svg>
+            )}
+          </span>
+          <span className="mp-toast-text">{toast.message}</span>
+        </div>
+      )}
     </>
   );
 }

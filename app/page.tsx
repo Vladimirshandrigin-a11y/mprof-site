@@ -1,8 +1,109 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
+import { TariffModal, type TariffTier } from "./components/TariffModal";
+
+const FAQS: { q: string; a: string }[] = [
+  {
+    q: "Нужно ли подключать API сразу?",
+    a: "Нет, первый расчёт можно сделать вручную без подключения API.",
+  },
+  {
+    q: "Работает ли сервис с Ozon и Wildberries?",
+    a: "Да, M‑Prof рассчитан для продавцов Ozon и Wildberries.",
+  },
+  {
+    q: "Чем отличается разовый расчёт от безлимита?",
+    a: "Разовый расчёт подходит для единичной проверки товара, безлимит — для регулярной аналитики в течение месяца.",
+  },
+  {
+    q: "Безопасно ли хранить API-ключи?",
+    a: "Ключи привязываются к аккаунту пользователя и используются только для загрузки данных маркетплейса.",
+  },
+  {
+    q: "Когда появится оплата?",
+    a: "Оплата скоро будет доступна. Сейчас сервис можно тестировать бесплатно.",
+  },
+];
+
+function HeroCount({
+  to,
+  suffix = "",
+  duration = 1500,
+}: {
+  to: number;
+  suffix?: string;
+  duration?: number;
+}) {
+  const [v, setV] = useState(0);
+
+  useEffect(() => {
+    if (to === 0) {
+      setV(0);
+      return;
+    }
+    const reduced =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduced) {
+      setV(to);
+      return;
+    }
+    let raf = 0;
+    const start = performance.now();
+    const tick = (now: number) => {
+      const p = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - p, 3);
+      setV(Math.round(to * eased));
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [to, duration]);
+
+  return (
+    <>
+      {v.toLocaleString("ru-RU")}
+      {suffix}
+    </>
+  );
+}
 
 export default function HomePage() {
+  const [tariffModalOpen, setTariffModalOpen] = useState(false);
+  const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
+  const [openFaq, setOpenFaq] = useState<number | null>(0);
+
+  const openTariff = (t: TariffTier) => {
+    setSelectedTier(t);
+    setTariffModalOpen(true);
+  };
+
+  useEffect(() => {
+    const els = document.querySelectorAll<HTMLElement>(".reveal");
+
+    if (typeof IntersectionObserver === "undefined") {
+      els.forEach((el) => el.classList.add("in-view"));
+      return;
+    }
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((e) => {
+          if (e.isIntersecting) {
+            e.target.classList.add("in-view");
+            io.unobserve(e.target);
+          }
+        });
+      },
+      { threshold: 0.12, rootMargin: "0px 0px -60px 0px" }
+    );
+
+    els.forEach((el) => io.observe(el));
+    return () => io.disconnect();
+  }, []);
+
   return (
     <>
       <style jsx global>{`
@@ -166,13 +267,52 @@ a{color:inherit;text-decoration:none}
   border-radius:50%;background:var(--gold);box-shadow:0 0 7px rgba(201,168,76,.6)}
 .ln-tariff-btn{font-family:var(--sans);font-size:.88rem;font-weight:600;background:transparent;
   border:1px solid var(--edge2);color:var(--txt);padding:12px 16px;border-radius:10px;cursor:pointer;
-  transition:all .22s ease;margin-top:auto;text-align:center;text-decoration:none;display:inline-block}
+  transition:all .22s ease;margin-top:auto;text-align:center;text-decoration:none;display:inline-block;
+  -webkit-appearance:none;appearance:none;line-height:1.3}
 .ln-tariff-btn:hover{border-color:var(--gold);color:var(--gold2);background:var(--gold-bg);
   transform:translateY(-1px)}
 .ln-tariff-btn.primary{background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
   color:var(--void);border:none;box-shadow:0 8px 28px rgba(201,168,76,.28)}
 .ln-tariff-btn.primary:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(201,168,76,.42);
   color:var(--void)}
+
+/* ====== FAQ ====== */
+.ln-faq-grid{max-width:780px;margin:0 auto;display:flex;flex-direction:column;gap:.7rem}
+.ln-faq-item{background:var(--glass);border:1px solid var(--edge);border-radius:14px;
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  transition:border-color .25s ease,background .25s ease,box-shadow .25s ease,transform .25s ease;
+  overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.22);position:relative}
+.ln-faq-item:hover{border-color:var(--smoke);background:var(--glass2);transform:translateY(-1px)}
+.ln-faq-item.open{
+  border-color:rgba(201,168,76,.38);
+  background:linear-gradient(160deg,rgba(201,168,76,.07) 0%,rgba(255,255,255,.025) 60%);
+  box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 42px rgba(201,168,76,.09)
+}
+.ln-faq-q{all:unset;display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  padding:1.15rem 1.4rem;cursor:pointer;width:100%;box-sizing:border-box;
+  font-family:var(--display);font-size:1.02rem;font-weight:600;color:var(--txt);
+  transition:color .22s ease;line-height:1.35}
+.ln-faq-q:focus-visible{outline:none;box-shadow:inset 0 0 0 2px rgba(201,168,76,.38)}
+.ln-faq-item.open .ln-faq-q{color:var(--gold2)}
+.ln-faq-q-text{flex:1}
+.ln-faq-chev{flex-shrink:0;width:30px;height:30px;border-radius:9px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:rgba(255,255,255,.04);border:1px solid var(--edge2);color:var(--txt2);
+  transition:all .3s ease}
+.ln-faq-chev svg{width:14px;height:14px;display:block;transition:transform .3s ease}
+.ln-faq-item.open .ln-faq-chev{background:var(--gold-bg);border-color:rgba(201,168,76,.4);color:var(--gold2);
+  box-shadow:0 0 18px rgba(201,168,76,.18)}
+.ln-faq-item.open .ln-faq-chev svg{transform:rotate(180deg)}
+.ln-faq-a-wrap{display:grid;grid-template-rows:0fr;transition:grid-template-rows .35s ease}
+.ln-faq-item.open .ln-faq-a-wrap{grid-template-rows:1fr}
+.ln-faq-a-inner{overflow:hidden;min-height:0}
+.ln-faq-a{margin:0;padding:0 1.4rem 1.2rem;font-size:.92rem;color:var(--txt2);font-weight:300;
+  line-height:1.6}
+@media(max-width:640px){
+  .ln-faq-q{padding:1rem 1.1rem;font-size:.95rem}
+  .ln-faq-a{padding:0 1.1rem 1.05rem;font-size:.88rem}
+  .ln-faq-chev{width:28px;height:28px}
+}
 
 /* ====== FINAL CTA ====== */
 .ln-final{padding:5rem 0 6rem;text-align:center}
@@ -218,6 +358,195 @@ a{color:inherit;text-decoration:none}
   .ln-foot-links{justify-content:center;flex-wrap:wrap}
   .ln-tariff{padding:1.7rem 1.4rem 1.4rem}
 }
+
+/* ====== ANIMATED BACKGROUND BLOBS ====== */
+.ln-bg-blobs{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+.ln-bg-blob{position:absolute;border-radius:50%;filter:blur(110px);opacity:.55;
+  will-change:transform;mix-blend-mode:screen}
+.bg-blob-gold{width:760px;height:760px;top:-220px;right:-180px;
+  background:radial-gradient(circle, rgba(201,168,76,.42) 0%, rgba(201,168,76,.16) 35%, transparent 70%);
+  animation:blobFloatA 34s ease-in-out infinite alternate}
+.bg-blob-blue{width:820px;height:820px;bottom:-260px;left:-200px;
+  background:radial-gradient(circle, rgba(70,110,200,.32) 0%, rgba(70,110,200,.12) 35%, transparent 70%);
+  animation:blobFloatB 42s ease-in-out infinite alternate}
+.bg-blob-purple{width:660px;height:660px;top:42%;left:38%;
+  background:radial-gradient(circle, rgba(120,90,200,.24) 0%, rgba(120,90,200,.08) 35%, transparent 70%);
+  animation:blobFloatC 50s ease-in-out infinite alternate}
+@keyframes blobFloatA{
+  0%{transform:translate(0,0) scale(1)}
+  50%{transform:translate(80px,140px) scale(1.08)}
+  100%{transform:translate(-50px,90px) scale(.95)}
+}
+@keyframes blobFloatB{
+  0%{transform:translate(0,0) scale(1)}
+  50%{transform:translate(120px,-90px) scale(1.05)}
+  100%{transform:translate(60px,-180px) scale(1.1)}
+}
+@keyframes blobFloatC{
+  0%{transform:translate(0,0) scale(1)}
+  50%{transform:translate(-120px,80px) scale(.92)}
+  100%{transform:translate(90px,-60px) scale(1.04)}
+}
+
+/* ====== HERO STAGGER ON LOAD ====== */
+.ln-hero.reveal{opacity:1;transform:none}
+.ln-hero-inner > *{animation:heroIn .85s cubic-bezier(.22,1,.36,1) both}
+.ln-hero-inner > *:nth-child(1){animation-delay:0ms}
+.ln-hero-inner > *:nth-child(2){animation-delay:90ms}
+.ln-hero-inner > *:nth-child(3){animation-delay:170ms}
+.ln-hero-inner > *:nth-child(4){animation-delay:250ms}
+.ln-hero-inner > *:nth-child(5){animation-delay:330ms}
+@keyframes heroIn{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
+
+/* ====== SCROLL REVEAL ====== */
+.reveal{opacity:0;transform:translateY(30px);
+  transition:opacity .85s cubic-bezier(.22,1,.36,1), transform .85s cubic-bezier(.22,1,.36,1)}
+.reveal.in-view{opacity:1;transform:translateY(0)}
+
+.reveal .ln-feat,
+.reveal .ln-step,
+.reveal .ln-tariff,
+.reveal .ln-faq-item{opacity:0}
+.reveal.in-view .ln-feat,
+.reveal.in-view .ln-step,
+.reveal.in-view .ln-tariff,
+.reveal.in-view .ln-faq-item{
+  animation:cardRevealUp .7s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes cardRevealUp{
+  from{opacity:0;transform:translateY(20px)}
+  to{opacity:1;transform:translateY(0)}
+}
+
+.reveal.in-view .ln-feat:nth-child(1),
+.reveal.in-view .ln-tariff:nth-child(1),
+.reveal.in-view .ln-step:nth-child(1),
+.reveal.in-view .ln-faq-item:nth-child(1){animation-delay:120ms}
+.reveal.in-view .ln-feat:nth-child(2),
+.reveal.in-view .ln-tariff:nth-child(2),
+.reveal.in-view .ln-step:nth-child(2),
+.reveal.in-view .ln-faq-item:nth-child(2){animation-delay:200ms}
+.reveal.in-view .ln-feat:nth-child(3),
+.reveal.in-view .ln-tariff:nth-child(3),
+.reveal.in-view .ln-step:nth-child(3),
+.reveal.in-view .ln-faq-item:nth-child(3){animation-delay:280ms}
+.reveal.in-view .ln-feat:nth-child(4),
+.reveal.in-view .ln-faq-item:nth-child(4){animation-delay:360ms}
+.reveal.in-view .ln-feat:nth-child(5),
+.reveal.in-view .ln-faq-item:nth-child(5){animation-delay:440ms}
+.reveal.in-view .ln-feat:nth-child(6){animation-delay:520ms}
+
+/* ====== ENHANCED HOVER GLOW ====== */
+.ln-feat:hover{
+  transform:translateY(-4px);
+  border-color:rgba(201,168,76,.4);
+  background:var(--glass2);
+  box-shadow:0 24px 70px rgba(0,0,0,.36), 0 0 50px rgba(201,168,76,.14),
+    inset 0 1px 0 rgba(255,255,255,.05)
+}
+.ln-stat:hover{
+  transform:translateY(-4px);
+  border-color:rgba(201,168,76,.4);
+  background:var(--glass2);
+  box-shadow:0 22px 58px rgba(0,0,0,.32), 0 0 44px rgba(201,168,76,.14)
+}
+.ln-tariff:hover{
+  transform:translateY(-4px);
+  border-color:rgba(201,168,76,.36);
+  background:rgba(255,255,255,.05);
+  box-shadow:0 22px 58px rgba(0,0,0,.32), 0 0 44px rgba(201,168,76,.12)
+}
+.ln-tariff.featured:hover{
+  transform:translateY(-4px);
+  border-color:rgba(201,168,76,.7);
+  box-shadow:0 28px 70px rgba(0,0,0,.4), 0 0 72px rgba(201,168,76,.24)
+}
+.ln-faq-item:hover{
+  transform:translateY(-3px);
+  border-color:rgba(201,168,76,.34);
+  background:var(--glass2);
+  box-shadow:0 18px 46px rgba(0,0,0,.28), 0 0 40px rgba(201,168,76,.10)
+}
+.ln-step:hover{
+  transform:translateY(-4px);
+  border-color:rgba(201,168,76,.36);
+  background:var(--glass2);
+  box-shadow:0 24px 60px rgba(0,0,0,.34), 0 0 46px rgba(201,168,76,.12)
+}
+
+/* ====== PREMIUM BUTTONS (scale + glow) ====== */
+.ln-btn-gold:hover{
+  transform:translateY(-3px) scale(1.02);
+  box-shadow:0 22px 52px rgba(201,168,76,.46), 0 0 30px rgba(201,168,76,.22)
+}
+.ln-btn-gold:active{
+  transform:translateY(-1px) scale(.98);
+  box-shadow:0 8px 18px rgba(201,168,76,.34);
+  transition:transform .08s ease, box-shadow .08s ease
+}
+.ln-btn-ghost:hover{
+  transform:translateY(-3px) scale(1.01);
+  box-shadow:0 14px 38px rgba(201,168,76,.18)
+}
+.ln-btn-ghost:active{transform:translateY(-1px) scale(.99)}
+
+.ln-tariff-btn:active{transform:translateY(0) scale(.98)}
+.ln-tariff-btn.primary:hover{
+  transform:translateY(-2px) scale(1.02);
+  box-shadow:0 18px 42px rgba(201,168,76,.46), 0 0 28px rgba(201,168,76,.2);
+  color:var(--void)
+}
+.ln-tariff-btn.primary:active{
+  transform:translateY(0) scale(.98);
+  box-shadow:0 6px 16px rgba(201,168,76,.32)
+}
+
+.ln-nav-cta:hover{transform:translateY(-1px) scale(1.02)}
+.ln-nav-cta:active{transform:translateY(0) scale(.98)}
+
+/* ====== SHIMMER ON FEATURED TARIFF ====== */
+.ln-tariff.featured .ln-tariff-shine{
+  position:absolute;inset:0;border-radius:inherit;
+  overflow:hidden;pointer-events:none;z-index:0
+}
+.ln-tariff.featured .ln-tariff-shine::before{
+  content:"";position:absolute;top:-60%;left:0;width:32%;height:220%;
+  background:linear-gradient(115deg,
+    transparent 0%,
+    rgba(255,255,255,.06) 40%,
+    rgba(232,201,122,.20) 50%,
+    rgba(255,255,255,.06) 60%,
+    transparent 100%);
+  transform:translateX(-220%) rotate(20deg);
+  animation:tariffShimmer 6s ease-in-out infinite;
+  filter:blur(2px)
+}
+@keyframes tariffShimmer{
+  0%, 15%{transform:translateX(-220%) rotate(20deg);opacity:0}
+  20%{opacity:1}
+  60%{transform:translateX(440%) rotate(20deg);opacity:1}
+  70%, 100%{transform:translateX(440%) rotate(20deg);opacity:0}
+}
+.ln-tariff-name,
+.ln-tariff-price,
+.ln-tariff-period,
+.ln-tariff-list,
+.ln-tariff-btn{position:relative;z-index:1}
+.ln-tariff-badge{z-index:3}
+
+/* ====== REDUCED MOTION ====== */
+@media (prefers-reduced-motion: reduce){
+  .ln-bg-blob,
+  .ln-hero-inner > *,
+  .ln-tariff.featured .ln-tariff-shine::before{animation:none !important}
+  .ln-hero-inner > *{opacity:1;transform:none}
+  .reveal,
+  .reveal .ln-feat,
+  .reveal .ln-step,
+  .reveal .ln-tariff,
+  .reveal .ln-faq-item{opacity:1;transform:none;transition:none;animation:none !important}
+}
+
       `}</style>
 
       {/* ====== NAV ====== */}
@@ -234,8 +563,15 @@ a{color:inherit;text-decoration:none}
         </div>
       </nav>
 
+      {/* ====== ANIMATED BACKGROUND BLOBS ====== */}
+      <div className="ln-bg-blobs" aria-hidden="true">
+        <span className="ln-bg-blob bg-blob-gold" />
+        <span className="ln-bg-blob bg-blob-blue" />
+        <span className="ln-bg-blob bg-blob-purple" />
+      </div>
+
       {/* ====== HERO ====== */}
-      <section className="ln-hero">
+      <section className="ln-hero reveal">
         <div className="ln-wrap">
           <div className="ln-hero-inner">
             <div className="ln-eyebrow">
@@ -264,16 +600,16 @@ a{color:inherit;text-decoration:none}
 
             <div className="ln-hero-stats">
               <div className="ln-stat">
-                <div className="ln-stat-v">30 сек</div>
+                <div className="ln-stat-v"><HeroCount to={30} suffix=" сек" /></div>
                 <div className="ln-stat-l">Один расчёт</div>
               </div>
               <div className="ln-stat">
-                <div className="ln-stat-v">2 МП</div>
-                <div className="ln-stat-l">Ozon · Wildberries</div>
+                <div className="ln-stat-v"><HeroCount to={2} suffix=" млн ₽" /></div>
+                <div className="ln-stat-l">Средние обороты</div>
               </div>
               <div className="ln-stat">
-                <div className="ln-stat-v">0 ₽</div>
-                <div className="ln-stat-l">Первый расчёт</div>
+                <div className="ln-stat-v"><HeroCount to={0} suffix=" ₽" /></div>
+                <div className="ln-stat-l">Старт</div>
               </div>
             </div>
           </div>
@@ -281,7 +617,7 @@ a{color:inherit;text-decoration:none}
       </section>
 
       {/* ====== FEATURES ====== */}
-      <section className="ln-section" id="features">
+      <section className="ln-section reveal" id="features">
         <div className="ln-wrap">
           <div className="ln-section-h">
             <div className="ln-section-eyebrow">Возможности</div>
@@ -380,7 +716,7 @@ a{color:inherit;text-decoration:none}
       </section>
 
       {/* ====== HOW IT WORKS ====== */}
-      <section className="ln-section" id="how">
+      <section className="ln-section reveal" id="how">
         <div className="ln-wrap">
           <div className="ln-section-h">
             <div className="ln-section-eyebrow">Как это работает</div>
@@ -421,7 +757,7 @@ a{color:inherit;text-decoration:none}
       </section>
 
       {/* ====== PRICING ====== */}
-      <section className="ln-section" id="pricing">
+      <section className="ln-section reveal" id="pricing">
         <div className="ln-wrap">
           <div className="ln-section-h">
             <div className="ln-section-eyebrow">Тарифы</div>
@@ -455,16 +791,21 @@ a{color:inherit;text-decoration:none}
               </div>
               <div className="ln-tariff-period">Один платёж</div>
               <ul className="ln-tariff-list">
-                <li>Дополнительный расчёт по любому товару</li>
+                <li>Один расчёт за месячный отчёт</li>
+                <li>Сохранение результата в историю</li>
                 <li>Без подписки и автосписаний</li>
-                <li>Подходит, если расчёты нужны редко</li>
               </ul>
-              <Link href="/app" className="ln-tariff-btn">
+              <button
+                type="button"
+                className="ln-tariff-btn"
+                onClick={() => openTariff("single")}
+              >
                 Купить расчёт 149₽
-              </Link>
+              </button>
             </div>
 
             <div className="ln-tariff featured">
+              <span className="ln-tariff-shine" aria-hidden="true" />
               <span className="ln-tariff-badge">Выгодно</span>
               <div className="ln-tariff-name">Безлимит</div>
               <div className="ln-tariff-price">
@@ -476,16 +817,72 @@ a{color:inherit;text-decoration:none}
                 <li>Приоритетный доступ к новым функциям</li>
                 <li>Полная история без ограничений</li>
               </ul>
-              <Link href="/app" className="ln-tariff-btn primary">
+              <button
+                type="button"
+                className="ln-tariff-btn primary"
+                onClick={() => openTariff("unlimited")}
+              >
                 Оформить безлимит 449₽
-              </Link>
+              </button>
             </div>
           </div>
         </div>
       </section>
 
+      {/* ====== FAQ ====== */}
+      <section className="ln-section reveal" id="faq">
+        <div className="ln-wrap">
+          <div className="ln-section-h">
+            <div className="ln-section-eyebrow">FAQ</div>
+            <h2 className="ln-h2">
+              Частые <em>вопросы</em>
+            </h2>
+            <p className="ln-section-sub">
+              Коротко о том, что чаще всего спрашивают перед стартом.
+            </p>
+          </div>
+
+          <div className="ln-faq-grid">
+            {FAQS.map((f, i) => {
+              const isOpen = openFaq === i;
+              return (
+                <div
+                  key={i}
+                  className={"ln-faq-item" + (isOpen ? " open" : "")}
+                >
+                  <button
+                    type="button"
+                    className="ln-faq-q"
+                    aria-expanded={isOpen}
+                    aria-controls={`ln-faq-a-${i}`}
+                    onClick={() => setOpenFaq(isOpen ? null : i)}
+                  >
+                    <span className="ln-faq-q-text">{f.q}</span>
+                    <span className="ln-faq-chev" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="m6 9 6 6 6-6" />
+                      </svg>
+                    </span>
+                  </button>
+                  <div
+                    className="ln-faq-a-wrap"
+                    id={`ln-faq-a-${i}`}
+                    role="region"
+                  >
+                    <div className="ln-faq-a-inner">
+                      <p className="ln-faq-a">{f.a}</p>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </section>
+
       {/* ====== FINAL CTA ====== */}
-      <section className="ln-final">
+      <section className="ln-final reveal">
         <div className="ln-wrap">
           <div className="ln-final-card">
             <h2 className="ln-h2">
@@ -516,6 +913,12 @@ a{color:inherit;text-decoration:none}
           </div>
         </div>
       </footer>
+
+      <TariffModal
+        open={tariffModalOpen}
+        tier={selectedTier}
+        onClose={() => setTariffModalOpen(false)}
+      />
     </>
   );
 }
