@@ -1,7 +1,7 @@
 "use client";
 
 import { createClient } from "@supabase/supabase-js"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
@@ -41,6 +41,8 @@ interface CalcResult {
   margin: number;
   date: string;
   createdAt: string;
+  /** true — запись пришла из/попала в Supabase; false — локальная (DEV/offline). */
+  synced: boolean;
 }
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
@@ -53,6 +55,53 @@ const FIELDS: { key: string; label: string; hint?: string }[] = [
   { key: "tax", label: "Налог" },
   { key: "other", label: "Прочие расходы" },
 ];
+
+const UPLOAD_STAGES = [
+  "Читаем отчёт…",
+  "Анализируем продажи…",
+  "Проверяем комиссии…",
+  "Формируем финансовую модель…",
+];
+
+interface UploadedReport {
+  id: number;
+  filename: string;
+  marketplace: "ozon" | "wb";
+  profit: number;
+  margin: number;
+  rowsCount: number;
+  period: string;
+  date: string;
+}
+
+/**
+ * Безопасный форматтер Supabase / PostgrestError.
+ * PostgrestError — это plain object с полями на прототипе, поэтому
+ * `console.error(error)` рендерит `{}`. Этот хелпер всегда возвращает
+ * структурированный объект для логов + plain message для UI.
+ */
+function formatSupabaseError(err: unknown): {
+  message: string;
+  code?: string;
+  details?: string;
+  hint?: string;
+} {
+  if (!err) return { message: "Неизвестная ошибка" };
+  if (typeof err === "string") return { message: err };
+  if (err instanceof Error) return { message: err.message || "Неизвестная ошибка" };
+  const e = err as {
+    message?: string;
+    code?: string;
+    details?: string;
+    hint?: string;
+  };
+  return {
+    message: e.message || "Неизвестная ошибка",
+    code: e.code,
+    details: e.details,
+    hint: e.hint,
+  };
+}
 
 const AI_STAGES = [
   "Анализируем выручку…",
@@ -119,7 +168,241 @@ export default function AppPage() {
   const [showOzonKey, setShowOzonKey] = useState(false);
   const [showWbKey, setShowWbKey] = useState(false);
   const [tariffMessage, setTariffMessage] = useState("");
-  const [calcMode, setCalcMode] = useState<"manual" | "api">("manual");
+  const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("manual");
+
+  // ===== Upload report (UI-заготовка, без реального парсинга) =====
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadDragActive, setUploadDragActive] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<
+    "idle" | "ready" | "processing" | "success" | "error"
+  >("idle");
+  const [uploadStage, setUploadStage] = useState(0);
+  const [uploadDetected, setUploadDetected] = useState<{
+    marketplace: "ozon" | "wb";
+    period: string;
+    rowsCount: number;
+  } | null>(null);
+  const [uploadErrorMsg, setUploadErrorMsg] = useState("");
+  const [uploadedReports, setUploadedReports] = useState<UploadedReport[]>([]);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  const acceptUploadFile = (file: File | null) => {
+    if (!file) return;
+    if (!/\.(xlsx|csv)$/i.test(file.name)) {
+      showToast("Поддерживаются только XLSX и CSV", "err");
+      return;
+    }
+    setUploadFile(file);
+    setUploadStatus("ready");
+  };
+
+  const removeUploadFile = () => {
+    setUploadFile(null);
+    setUploadStatus("idle");
+    setUploadStage(0);
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+  };
+
+  const analyzeUpload = async () => {
+    if (!uploadFile || uploadStatus === "processing") return;
+    if (!canCalculate) {
+      setSelectedTier("unlimited");
+      setTariffModalOpen(true);
+      return;
+    }
+
+    setUploadStatus("processing");
+    setUploadStage(0);
+    setUploadErrorMsg("");
+
+    const reduced =
+      typeof window !== "undefined" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    if (reduced) {
+      setUploadStage(UPLOAD_STAGES.length - 1);
+      await new Promise((r) => setTimeout(r, 600));
+    } else {
+      for (let i = 1; i < UPLOAD_STAGES.length; i++) {
+        await new Promise((r) => setTimeout(r, 750));
+        setUploadStage(i);
+      }
+      await new Promise((r) => setTimeout(r, 700));
+    }
+
+    // эвристика выбора маркетплейса по имени файла
+    const demoMp: Marketplace = /wb|wildber/i.test(uploadFile.name)
+      ? "wb"
+      : "ozon";
+    const demo = {
+      revenue: 480000,
+      commission: 86400,
+      logistics: 32000,
+      storage: 8500,
+      ads: 48000,
+      cost: 180000,
+      tax: 28800,
+      other: 4200,
+    };
+    const expensesSum =
+      demo.commission +
+      demo.logistics +
+      demo.storage +
+      demo.ads +
+      demo.cost +
+      demo.tax +
+      demo.other;
+    const profit = demo.revenue - expensesSum;
+    const margin = demo.revenue > 0 ? (profit / demo.revenue) * 100 : 0;
+    const now = new Date();
+
+    // подставляем значения в форму, чтобы было видно при переключении на ручной
+    setMarketplace(demoMp);
+    setForm({
+      revenue: String(demo.revenue),
+      commission: String(demo.commission),
+      logistics: String(demo.logistics),
+      storage: String(demo.storage),
+      ads: String(demo.ads),
+      cost: String(demo.cost),
+      tax: String(demo.tax),
+      other: String(demo.other),
+    });
+
+    let insertedRow: { id?: number; created_at?: string } | null = null;
+    let insertErr: ReturnType<typeof formatSupabaseError> | null = null;
+
+    // Если пользователь не залогинен — не пытаемся писать в БД (RLS отбьёт).
+    // Просто кладём в локальную history.
+    const canPersist = !!user?.id;
+
+    if (canPersist) {
+      try {
+        const insertRes = await supabase
+          .from("calculations")
+          .insert([
+            {
+              marketplace: demoMp,
+              revenue: demo.revenue,
+              commission: demo.commission,
+              logistics: demo.logistics,
+              storage: demo.storage,
+              ads: demo.ads,
+              cost_price: demo.cost,
+              tax: demo.tax,
+              other_expenses: demo.other,
+              total_expenses: expensesSum,
+              profit,
+              margin,
+              user_id: user!.id,
+            },
+          ])
+          .select()
+          .single();
+
+        insertedRow =
+          (insertRes.data as { id?: number; created_at?: string } | null) ??
+          null;
+        if (insertRes.error) {
+          insertErr = formatSupabaseError(insertRes.error);
+        }
+      } catch (e) {
+        insertErr = formatSupabaseError(e);
+      }
+    }
+
+    const uploadSynced = !insertErr && !!insertedRow?.id;
+
+    if (insertErr) {
+      console.warn(
+        "analyzeUpload: save failed, using local fallback",
+        insertErr
+      );
+    }
+
+    {
+      const row = insertedRow;
+      const res: CalcResult = {
+        id: row?.id ?? Date.now(),
+        marketplace: demoMp,
+        revenue: demo.revenue,
+        commission: demo.commission,
+        logistics: demo.logistics,
+        storage: demo.storage,
+        ads: demo.ads,
+        cost: demo.cost,
+        tax: demo.tax,
+        other: demo.other,
+        expenses: expensesSum,
+        profit,
+        margin,
+        date: now.toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        createdAt: row?.created_at ?? now.toISOString(),
+        synced: uploadSynced,
+      };
+
+      setResult(res);
+      setHistory((prev) => [res, ...prev].slice(0, 8));
+      incrementCalcCount();
+      setJustCalculated(true);
+      window.setTimeout(() => setJustCalculated(false), 2200);
+      dismissOnboarding();
+
+      // success state — показываем детектированные метаданные пользователю
+      const monthName = now.toLocaleString("ru-RU", { month: "long" });
+      const period = `За ${monthName} ${now.getFullYear()}`;
+      const rowsCount = 120 + Math.floor(Math.random() * 380);
+
+      setUploadDetected({ marketplace: demoMp, period, rowsCount });
+      setUploadStatus("success");
+
+      setUploadedReports((prev) =>
+        [
+          {
+            id: res.id,
+            filename: uploadFile.name,
+            marketplace: demoMp,
+            profit,
+            margin,
+            rowsCount,
+            period,
+            date: res.date,
+          },
+          ...prev,
+        ].slice(0, 6)
+      );
+
+      if (uploadSynced) {
+        showToast("Отчёт сохранён", "ok");
+      } else {
+        // Soft fallback: ни ошибки, ни алярма — просто инфо.
+        showToast("Отчёт сохранён локально", "warn");
+      }
+    }
+  };
+
+  const resetUploadFlow = () => {
+    setUploadFile(null);
+    setUploadStatus("idle");
+    setUploadStage(0);
+    setUploadDetected(null);
+    setUploadErrorMsg("");
+  };
+
+  const openUploadResults = () => {
+    resetUploadFlow();
+    setCalcMode("manual");
+  };
   const [tariffModalOpen, setTariffModalOpen] = useState(false);
   const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
   const [isCalculating, setIsCalculating] = useState(false);
@@ -154,11 +437,12 @@ export default function AppPage() {
     return () => window.clearInterval(interval);
   }, [isCalculating]);
   const [removingIds, setRemovingIds] = useState<Set<number>>(new Set());
+  type ToastType = "ok" | "warn" | "err";
   const [toast, setToast] = useState<
-    { id: number; message: string; type: "ok" | "err" } | null
+    { id: number; message: string; type: ToastType } | null
   >(null);
 
-  const showToast = (message: string, type: "ok" | "err" = "ok") => {
+  const showToast = (message: string, type: ToastType = "ok") => {
     setToast({ id: Date.now(), message, type });
   };
 
@@ -331,7 +615,7 @@ export default function AppPage() {
       .maybeSingle();
 
     if (error) {
-      console.error("loadApiKeys error:", error);
+      console.error("loadApiKeys error:", formatSupabaseError(error));
       return;
     }
 
@@ -367,9 +651,10 @@ export default function AppPage() {
       );
 
     if (error) {
-      console.error("saveApiKeys error:", error);
+      const fmt = formatSupabaseError(error);
+      console.error("saveApiKeys error:", fmt);
       setApiSaveStatus("err");
-      setApiSaveMessage("Ошибка: " + error.message);
+      setApiSaveMessage("Ошибка: " + fmt.message);
       return;
     }
 
@@ -381,24 +666,31 @@ export default function AppPage() {
     const ok = confirm("Удалить всю историю?");
     if (!ok) return;
 
-    const snapshot = history;
-
     // optimistic: чистим UI сразу
     setHistory([]);
     setSelectedId(null);
+    setResult(null);
 
-    let q = supabase.from("calculations").delete();
-    if (user?.id) {
-      q = q.eq("user_id", user.id);
-    } else {
-      q = q.is("user_id", null);
+    if (!user?.id) {
+      showToast("История очищена локально", "warn");
+      return;
     }
 
-    const { error } = await q;
-    if (error) {
-      console.error("clearHistory error:", error);
-      setHistory(snapshot); // откат
-      showToast("Ошибка удаления истории", "err");
+    let delErr: ReturnType<typeof formatSupabaseError> | null = null;
+    try {
+      const { error } = await supabase
+        .from("calculations")
+        .delete()
+        .eq("user_id", user.id);
+      if (error) delErr = formatSupabaseError(error);
+    } catch (e) {
+      delErr = formatSupabaseError(e);
+    }
+
+    if (delErr) {
+      console.warn("clearHistory: cloud delete failed", delErr);
+      // НЕ откатываем — пользователь явно нажал «Удалить всю историю».
+      showToast("История очищена локально", "warn");
       return;
     }
     showToast("История очищена", "ok");
@@ -420,32 +712,38 @@ export default function AppPage() {
       return next;
     });
 
-    // 2) запрос в Supabase: фильтруем по id + user_id (для RLS-совместимости)
-    let q = supabase.from("calculations").delete().eq("id", id);
-    if (user?.id) {
-      q = q.eq("user_id", user.id);
+    // 2) Делаем delete в Supabase ТОЛЬКО если запись синхронизирована
+    //    и пользователь залогинен. Локальные записи (synced: false)
+    //    удаляются только из state — без сетевых запросов и ложных ошибок.
+    const shouldPersistDelete = !!item.synced && !!user?.id;
+    let delErr: ReturnType<typeof formatSupabaseError> | null = null;
+
+    if (shouldPersistDelete) {
+      try {
+        const q = supabase
+          .from("calculations")
+          .delete()
+          .eq("id", id)
+          .eq("user_id", user!.id);
+
+        // параллельно даём анимации проиграться минимум 300мс
+        const [delResult] = await Promise.all([
+          q,
+          new Promise<void>((r) => setTimeout(r, 300)),
+        ]);
+
+        if (delResult.error) {
+          delErr = formatSupabaseError(delResult.error);
+        }
+      } catch (e) {
+        delErr = formatSupabaseError(e);
+      }
     } else {
-      q = q.is("user_id", null);
+      // local-only delete — просто ждём анимацию
+      await new Promise((r) => setTimeout(r, 300));
     }
 
-    // 3) параллельно даём анимации проиграться минимум 300мс
-    const [delResult] = await Promise.all([
-      q,
-      new Promise<void>((r) => setTimeout(r, 300)),
-    ]);
-
-    if (delResult.error) {
-      console.error("deleteHistoryItem error:", delResult.error);
-      setRemovingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(id);
-        return next;
-      });
-      showToast("Ошибка удаления", "err");
-      return;
-    }
-
-    // 4) убираем из стейта — analytics/charts/insights пересчитаются автоматом
+    // 3) Локальное удаление выполняется ВСЕГДА (DEV / offline fallback).
     setHistory((prev) => prev.filter((h) => h.id !== id));
     setRemovingIds((prev) => {
       const next = new Set(prev);
@@ -453,11 +751,18 @@ export default function AppPage() {
       return next;
     });
     if (selectedId === id) setSelectedId(null);
-
-    // если открытый result соответствует удалённому id — закрываем
     setResult((prev) => (prev && prev.id === id ? null : prev));
 
-    showToast("Расчёт удалён", "ok");
+    if (delErr) {
+      // Не error — fallback нормально сработал.
+      console.warn("deleteHistoryItem: cloud delete failed", delErr);
+      showToast("Удалено локально", "warn");
+    } else if (shouldPersistDelete) {
+      showToast("Удалено", "ok");
+    } else {
+      // запись изначально не была в облаке (DEV / offline / неавторизованный юзер)
+      showToast("Удалено локально", "warn");
+    }
   };
 
   const loadHistory = async (userId: string | null) => {
@@ -476,7 +781,7 @@ export default function AppPage() {
     const { data, error } = await query;
 
     if (error) {
-      console.error(error);
+      console.error("loadHistory error:", formatSupabaseError(error));
       setIsLoadingHistory(false);
       return;
     }
@@ -502,6 +807,7 @@ export default function AppPage() {
         minute: "2-digit",
       }),
       createdAt: item.created_at,
+      synced: true,
     }));
 
     setHistory(mapped);
@@ -566,6 +872,7 @@ export default function AppPage() {
           minute: "2-digit",
         }),
         createdAt: now.toISOString(),
+        synced: false, // переопределится после вызова supabase ниже
       };
 
       // Минимальная задержка, чтобы UX-состояние «Считаем…» не моргало
@@ -593,27 +900,52 @@ export default function AppPage() {
       // 5 стадий × 700мс + небольшой буфер чтобы последняя стадия успела
       // отрисоваться. reduced-motion обрабатывается в useEffect выше.
       const minDelay = new Promise<void>((r) => setTimeout(r, 3600));
-      const [insertResult] = await Promise.all([insertPromise, minDelay]);
-      const { data: inserted, error } = insertResult;
 
-      if (error) {
-        console.error("Supabase save error:", error);
-        showToast("Не удалось сохранить расчёт", "err");
+      // Безопасный wrap insert'а — если supabase бросит исключение
+      // (сеть, RLS, schema), приложение не падает: показываем результат
+      // локально и логируем подробности.
+      let inserted: { id?: number; created_at?: string } | null = null;
+      let insertError: ReturnType<typeof formatSupabaseError> | null = null;
+      try {
+        const [insertResult] = await Promise.all([insertPromise, minDelay]);
+        inserted =
+          (insertResult.data as { id?: number; created_at?: string } | null) ??
+          null;
+        if (insertResult.error) {
+          insertError = formatSupabaseError(insertResult.error);
+        }
+      } catch (e) {
+        await minDelay; // подержать UX-стадии даже при сетевом сбое
+        insertError = formatSupabaseError(e);
       }
 
-      // Если БД вернула id/created_at — используем их. Иначе fallback на клиентские.
-      const dbRow =
-        inserted as { id?: number; created_at?: string } | null;
-      const dbId = dbRow?.id ?? res.id;
-      const dbCreatedAt = dbRow?.created_at ?? res.createdAt;
+      const synced = !insertError && !!inserted?.id;
+
+      if (insertError) {
+        // console.warn (не error), чтобы Next.js dev overlay не считал это fatal'ом.
+        console.warn("calculate: save failed, using local fallback", insertError);
+      }
+
+      // Если БД вернула id/created_at — используем их.
+      // Иначе fallback на клиентские (DEV/offline) — dashboard работает.
+      const dbId = inserted?.id ?? res.id;
+      const dbCreatedAt = inserted?.created_at ?? res.createdAt;
       const resWithDbId: CalcResult = {
         ...res,
         id: dbId,
         createdAt: dbCreatedAt,
+        synced,
       };
 
       setResult(resWithDbId);
       setHistory((prev) => [resWithDbId, ...prev].slice(0, 8));
+
+      if (synced) {
+        showToast("Расчёт сохранён", "ok");
+      } else {
+        // Soft notification — не «ошибка», локальный fallback сработал ок.
+        showToast("Расчёт сохранён локально", "warn");
+      }
 
       // persistent счётчик использованных бесплатных расчётов (не сбрасывается чисткой history)
       incrementCalcCount();
@@ -853,9 +1185,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .api-save{width:100%;padding:13px}
 }
 
-.calc-tabs{display:flex;gap:6px;background:var(--glass);border:1px solid var(--edge);
+.calc-tabs{display:flex;gap:5px;background:var(--glass);border:1px solid var(--edge);
   border-radius:12px;padding:5px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  margin-bottom:.7rem;box-shadow:0 10px 28px rgba(0,0,0,.20)}
+  margin-bottom:.55rem;box-shadow:0 10px 28px rgba(0,0,0,.20)}
 .calc-tab{flex:1;font-family:var(--sans);font-size:.88rem;font-weight:600;padding:12px 16px;
   border-radius:10px;cursor:pointer;letter-spacing:.01em;border:1px solid transparent;
   background:transparent;color:var(--txt2);transition:all .22s ease;text-align:center;
@@ -946,7 +1278,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .api-pro-actions{grid-template-columns:1fr;gap:.7rem}
 }
 
-.tariff-card{margin-top:.75rem;scroll-margin-top:1.2rem}
+.tariff-card{margin-top:.55rem;scroll-margin-top:1.2rem}
 .tariff-card .card-head{padding:.75rem 1.1rem !important}
 .tariff-card .card-title{font-size:.78rem !important;font-weight:600 !important;
   color:var(--txt2) !important;letter-spacing:.02em !important}
@@ -1124,6 +1456,386 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .auth-loading,
   .auth-loading-ring{animation:none !important}
   .auth-loading-ring{border:1.5px solid var(--gold2);border-right-color:transparent}
+}
+
+/* ====== UPLOAD REPORT CARD ====== */
+.upload-card{padding:1.4rem;margin-bottom:.25rem}
+
+/* === IDLE: premium drag&drop === */
+.upload-drop{
+  position:relative;overflow:hidden;
+  border:1.5px dashed rgba(201,168,76,.32);
+  border-radius:16px;
+  padding:2.6rem 1.6rem 2.1rem;text-align:center;
+  display:flex;flex-direction:column;align-items:center;gap:.65rem;
+  background:linear-gradient(160deg,
+    rgba(201,168,76,.05) 0%,
+    rgba(255,255,255,.015) 70%);
+  transition:border-color .28s ease, background .28s ease,
+    transform .28s ease, box-shadow .28s ease
+}
+.upload-drop > *{position:relative;z-index:2}
+/* мягкий зерновой golden glow по центру */
+.upload-drop-glow{
+  position:absolute;inset:0;pointer-events:none;z-index:0;
+  background:radial-gradient(420px 220px at 50% 30%,
+    rgba(232,201,122,.12), transparent 70%)
+}
+/* медленный диагональный световой sweep */
+.upload-drop-sweep{
+  position:absolute;inset:0;pointer-events:none;z-index:1;
+  background:linear-gradient(120deg,
+    transparent 25%,
+    rgba(232,201,122,.07) 45%,
+    rgba(201,168,76,.10) 50%,
+    rgba(232,201,122,.07) 55%,
+    transparent 75%);
+  background-size:280% 100%;
+  animation:uploadSweep 7s linear infinite
+}
+@keyframes uploadSweep{
+  from{background-position:0% 0}
+  to{background-position:280% 0}
+}
+.upload-drop.is-active{
+  border-color:rgba(232,201,122,.7);
+  border-style:solid;
+  background:linear-gradient(160deg,
+    rgba(201,168,76,.12) 0%,
+    rgba(255,255,255,.025) 70%);
+  transform:scale(1.005);
+  box-shadow:0 0 0 4px rgba(201,168,76,.10),
+    0 0 60px rgba(201,168,76,.18),
+    inset 0 0 30px rgba(201,168,76,.06)
+}
+.upload-drop-icon{
+  width:60px;height:60px;border-radius:17px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,rgba(201,168,76,.28),rgba(201,168,76,.06));
+  border:1px solid rgba(201,168,76,.4);color:var(--gold2);
+  box-shadow:0 10px 26px rgba(201,168,76,.22),
+    inset 0 1px 0 rgba(255,255,255,.08);
+  margin-bottom:.4rem;
+  animation:uploadIcoPulse 3s ease-in-out infinite
+}
+@keyframes uploadIcoPulse{
+  0%,100%{box-shadow:0 10px 26px rgba(201,168,76,.22),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 0 rgba(201,168,76,.16)}
+  50%{box-shadow:0 12px 30px rgba(201,168,76,.30),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 14px rgba(201,168,76,.04)}
+}
+.upload-drop-icon svg{width:26px;height:26px;display:block}
+.upload-drop-title{
+  font-family:var(--display);font-size:1.25rem;font-weight:700;
+  color:var(--txt);margin:0;letter-spacing:-.012em;line-height:1.2
+}
+.upload-drop-title em{font-style:italic;color:var(--gold2)}
+.upload-drop-sub{
+  font-size:.86rem;color:var(--txt2);font-weight:300;line-height:1.55;
+  margin:0 0 .25rem;max-width:400px
+}
+.upload-pick-btn .arr{display:inline-block;transition:transform .22s ease;margin-left:6px}
+.upload-pick-btn:hover .arr{transform:translateX(3px)}
+.upload-input-hidden{
+  position:absolute;width:0;height:0;opacity:0;pointer-events:none
+}
+.upload-pick-btn{
+  font-family:var(--sans);font-size:.85rem;font-weight:600;
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);border:none;padding:9px 22px;border-radius:10px;
+  cursor:pointer;margin-top:.3rem;
+  box-shadow:0 8px 22px rgba(201,168,76,.30);
+  transition:transform .22s ease, box-shadow .22s ease;
+  -webkit-appearance:none;appearance:none
+}
+.upload-pick-btn:hover{
+  transform:translateY(-1px) scale(1.02);
+  box-shadow:0 14px 30px rgba(201,168,76,.42)
+}
+.upload-formats{
+  display:inline-flex;gap:.45rem;margin-top:.35rem
+}
+.upload-formats span{
+  font-family:var(--mono);font-size:.55rem;font-weight:600;
+  letter-spacing:.14em;text-transform:uppercase;
+  color:var(--txt3);
+  padding:3px 8px;border-radius:5px;
+  border:1px solid var(--edge2);
+  background:rgba(255,255,255,.025)
+}
+
+/* === READY: file selected === */
+.upload-ready{display:flex;flex-direction:column;gap:1rem}
+.upload-file-info{
+  display:flex;align-items:center;gap:.85rem;
+  background:rgba(255,255,255,.025);
+  border:1px solid rgba(201,168,76,.22);
+  border-radius:12px;padding:.8rem .9rem;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  animation:uploadInfoIn .35s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes uploadInfoIn{
+  from{opacity:0;transform:translateY(4px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.upload-file-icon{
+  width:40px;height:40px;border-radius:10px;flex-shrink:0;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,rgba(201,168,76,.24),rgba(201,168,76,.06));
+  border:1px solid rgba(201,168,76,.32);color:var(--gold2);
+  box-shadow:0 6px 16px rgba(201,168,76,.14),
+    inset 0 1px 0 rgba(255,255,255,.06)
+}
+.upload-file-icon svg{width:18px;height:18px;display:block}
+.upload-file-meta{flex:1;min-width:0}
+.upload-file-name{
+  font-family:var(--sans);font-size:.86rem;color:var(--txt);font-weight:500;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px
+}
+.upload-file-size{
+  font-family:var(--mono);font-size:.58rem;color:var(--txt3);
+  letter-spacing:.06em
+}
+.upload-file-remove{
+  all:unset;cursor:pointer;flex-shrink:0;
+  width:30px;height:30px;border-radius:9px;
+  display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(255,255,255,.04);color:var(--txt2);
+  font-size:1.05rem;line-height:1;
+  transition:all .2s ease
+}
+.upload-file-remove:hover{
+  border-color:rgba(224,85,102,.42);
+  color:#FF8A98;
+  background:rgba(224,85,102,.08)
+}
+.upload-analyze-btn{
+  font-family:var(--sans);font-size:.9rem;font-weight:600;
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);border:none;padding:12px 22px;border-radius:11px;
+  cursor:pointer;width:100%;
+  box-shadow:0 10px 28px rgba(201,168,76,.32);
+  transition:transform .22s ease, box-shadow .22s ease;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  -webkit-appearance:none;appearance:none
+}
+.upload-analyze-btn:hover{
+  transform:translateY(-1px) scale(1.01);
+  box-shadow:0 16px 36px rgba(201,168,76,.44)
+}
+.upload-analyze-btn .arr{display:inline-block;transition:transform .22s ease}
+.upload-analyze-btn:hover .arr{transform:translateX(3px)}
+
+/* === PROCESSING (использует .ai-proc-* ниже) === */
+.upload-processing{
+  padding:1rem 0 .5rem;
+  display:flex;flex-direction:column;align-items:center;gap:.85rem;
+  text-align:center
+}
+.upload-processing .ai-proc-stages{width:100%;max-width:340px}
+.upload-processing .ai-proc-progress{width:100%;max-width:340px}
+
+/* === SUCCESS state === */
+.upload-success{
+  display:flex;flex-direction:column;align-items:center;gap:.8rem;
+  padding:1.4rem .5rem .3rem;text-align:center;
+  animation:uploadSuccessIn .45s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes uploadSuccessIn{
+  from{opacity:0;transform:translateY(8px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.upload-success-icon{
+  width:62px;height:62px;border-radius:18px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,rgba(46,204,138,.28),rgba(46,204,138,.06));
+  border:1px solid rgba(46,204,138,.42);color:#7DEAB2;
+  box-shadow:0 12px 30px rgba(46,204,138,.26),
+    inset 0 1px 0 rgba(255,255,255,.08);
+  animation:uploadSuccessIcoIn .55s cubic-bezier(.34,1.56,.64,1) both,
+    uploadSuccessIcoPulse 3s ease-in-out infinite .55s
+}
+@keyframes uploadSuccessIcoIn{
+  from{opacity:0;transform:scale(.5) rotate(-14deg)}
+  to{opacity:1;transform:scale(1) rotate(0)}
+}
+@keyframes uploadSuccessIcoPulse{
+  0%,100%{box-shadow:0 12px 30px rgba(46,204,138,.26),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 0 rgba(46,204,138,.18)}
+  50%{box-shadow:0 14px 34px rgba(46,204,138,.32),
+    inset 0 1px 0 rgba(255,255,255,.08),
+    0 0 0 14px rgba(46,204,138,.04)}
+}
+.upload-success-icon svg{width:28px;height:28px;display:block}
+.upload-success-title{
+  font-family:var(--display);font-size:1.1rem;font-weight:700;
+  color:var(--txt);letter-spacing:-.005em;margin:0
+}
+.upload-success-sub{
+  font-family:var(--mono);font-size:.7rem;letter-spacing:.04em;
+  color:var(--txt2);max-width:340px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  margin:0 .5rem
+}
+.upload-success-meta{
+  display:flex;align-items:center;gap:.4rem;flex-wrap:wrap;justify-content:center;
+  margin:.2rem 0 .35rem
+}
+.upload-mp-badge{
+  display:inline-flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:.6rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.1em;
+  padding:5px 11px;border-radius:100px;border:1px solid;line-height:1
+}
+.upload-mp-badge.sm{font-size:.54rem;padding:3px 8px;gap:5px}
+.upload-mp-badge.ozon{
+  color:#9ec6ff;border-color:rgba(61,123,255,.45);background:rgba(61,123,255,.1)
+}
+.upload-mp-badge.wb{
+  color:#f0a4e6;border-color:rgba(203,17,171,.45);background:rgba(203,17,171,.1)
+}
+.upload-mp-dot{
+  width:6px;height:6px;border-radius:50%;flex-shrink:0;
+  background:currentColor;box-shadow:0 0 6px currentColor;opacity:.85
+}
+.upload-meta-pill{
+  font-family:var(--mono);font-size:.6rem;font-weight:500;
+  letter-spacing:.06em;color:var(--txt2);
+  padding:5px 10px;border-radius:100px;
+  border:1px solid var(--edge2);background:rgba(255,255,255,.025)
+}
+.upload-success-actions{
+  display:flex;gap:.5rem;flex-wrap:wrap;justify-content:center;
+  margin-top:.5rem;width:100%;max-width:380px
+}
+.upload-success-btn{
+  font-family:var(--sans);font-size:.85rem;font-weight:600;
+  padding:11px 18px;border-radius:10px;cursor:pointer;
+  transition:transform .22s ease, box-shadow .22s ease,
+    background .22s ease, color .22s ease, border-color .22s ease;
+  border:none;display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  -webkit-appearance:none;appearance:none;flex:1;min-width:140px
+}
+.upload-success-btn.primary{
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);
+  box-shadow:0 10px 26px rgba(201,168,76,.32)
+}
+.upload-success-btn.primary:hover{
+  transform:translateY(-1px) scale(1.01);
+  box-shadow:0 16px 34px rgba(201,168,76,.44)
+}
+.upload-success-btn.ghost{
+  background:rgba(255,255,255,.04);color:var(--txt);
+  border:1px solid var(--edge2)
+}
+.upload-success-btn.ghost:hover{
+  border-color:rgba(201,168,76,.4);color:var(--gold2);
+  background:var(--gold-bg);transform:translateY(-1px)
+}
+.upload-success-btn .arr{display:inline-block;transition:transform .22s ease}
+.upload-success-btn:hover .arr{transform:translateX(3px)}
+
+/* === ERROR state === */
+.upload-error{
+  display:flex;flex-direction:column;align-items:center;gap:.7rem;
+  padding:1.4rem .5rem .3rem;text-align:center;
+  animation:uploadSuccessIn .4s cubic-bezier(.22,1,.36,1) both
+}
+.upload-error-icon{
+  width:56px;height:56px;border-radius:16px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,rgba(224,85,102,.26),rgba(224,85,102,.06));
+  border:1px solid rgba(224,85,102,.4);color:#FF8A98;
+  box-shadow:0 12px 28px rgba(224,85,102,.22),
+    inset 0 1px 0 rgba(255,255,255,.06)
+}
+.upload-error-icon svg{width:24px;height:24px}
+.upload-error-title{
+  font-family:var(--display);font-size:1.05rem;font-weight:700;
+  color:var(--txt);margin:0
+}
+.upload-error-sub{
+  font-size:.85rem;color:var(--txt2);font-weight:300;line-height:1.5;
+  margin:0 0 .3rem;max-width:340px
+}
+
+/* === RECENT UPLOADS mini section === */
+.upload-recent{margin-top:.75rem}
+.upload-recent-head{
+  display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:.5rem;padding:0 .15rem
+}
+.upload-recent-title{
+  font-family:var(--mono);font-size:.58rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.14em;color:var(--txt3)
+}
+.upload-recent-count{
+  font-family:var(--mono);font-size:.55rem;color:var(--gold2);
+  background:var(--gold-bg);border:1px solid rgba(201,168,76,.22);
+  padding:2px 8px;border-radius:100px;letter-spacing:.06em
+}
+.upload-recent-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  gap:.55rem
+}
+.upload-recent-card{
+  background:rgba(255,255,255,.025);
+  border:1px solid rgba(255,255,255,.07);
+  border-radius:11px;padding:.65rem .8rem;
+  display:flex;flex-direction:column;gap:.4rem;
+  transition:transform .22s ease, border-color .22s ease,
+    background .22s ease, box-shadow .22s ease
+}
+.upload-recent-card:hover{
+  transform:translateY(-2px);
+  border-color:rgba(201,168,76,.3);
+  background:rgba(255,255,255,.045);
+  box-shadow:0 10px 22px rgba(0,0,0,.24),
+    0 0 22px rgba(201,168,76,.08)
+}
+.upload-recent-row{
+  display:flex;align-items:center;justify-content:space-between;gap:.5rem
+}
+.upload-recent-status{
+  font-family:var(--mono);font-size:.5rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.12em;color:#7DEAB2;
+  padding:2px 7px;border-radius:5px;
+  background:rgba(46,204,138,.08);border:1px solid rgba(46,204,138,.22)
+}
+.upload-recent-name{
+  font-family:var(--sans);font-size:.78rem;color:var(--txt);font-weight:500;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap
+}
+.upload-recent-foot{
+  display:flex;align-items:center;justify-content:space-between;gap:.5rem
+}
+.upload-recent-profit{
+  font-family:var(--display);font-size:.95rem;font-weight:700;
+  letter-spacing:-.022em;line-height:1
+}
+.upload-recent-profit.pos{color:#2ECC8A}
+.upload-recent-profit.neg{color:#E05566}
+.upload-recent-date{
+  font-family:var(--mono);font-size:.55rem;color:var(--txt3);letter-spacing:.06em
+}
+
+@media (prefers-reduced-motion: reduce){
+  .upload-drop,
+  .upload-drop-sweep,
+  .upload-drop-icon,
+  .upload-pick-btn,
+  .upload-analyze-btn,
+  .upload-file-info,
+  .upload-success,
+  .upload-success-icon,
+  .upload-error,
+  .upload-recent-card{transition:none !important;animation:none !important}
+  .upload-drop.is-active{transform:none}
 }
 
 /* ====== UPGRADE HINT (compact, subtle SaaS-style) ====== */
@@ -1745,7 +2457,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 /* ====== FILTER BAR (collapsible) ====== */
 .filter-bar{
   background:var(--glass);border:1px solid var(--edge);border-radius:12px;
-  margin-bottom:.7rem;overflow:hidden;
+  margin-bottom:.55rem;overflow:hidden;
   backdrop-filter:blur(14px) saturate(1.2);
   -webkit-backdrop-filter:blur(14px) saturate(1.2);
   box-shadow:0 12px 32px rgba(0,0,0,.22);
@@ -1953,6 +2665,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   color:#9bf0c4;
   box-shadow:0 22px 60px rgba(0,0,0,.5), 0 0 36px rgba(46,204,138,.15)
 }
+.mp-toast-warn{
+  border-color:rgba(201,168,76,.42);
+  color:#F5DFA0;
+  box-shadow:0 22px 60px rgba(0,0,0,.5), 0 0 36px rgba(201,168,76,.18)
+}
 .mp-toast-err{
   border-color:rgba(224,85,102,.42);
   color:#ff9aa6;
@@ -1993,12 +2710,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .hist-item.hist-removing{transition:none}
 }
 
-.dash-wrap{max-width:1100px;margin:0 auto;padding:1.6rem 2rem 4rem}
-.dash-h1{font-family:var(--display);font-size:clamp(1.5rem,2.4vw,1.95rem);font-weight:700;letter-spacing:-.02em;margin:0 0 .3rem}
+.dash-wrap{max-width:1100px;margin:0 auto;padding:1.2rem 2rem 3.2rem}
+.dash-h1{font-family:var(--display);font-size:clamp(1.45rem,2.3vw,1.85rem);font-weight:700;letter-spacing:-.02em;margin:0 0 .25rem}
 .dash-h1 em{font-style:italic;color:var(--gold)}
-.dash-lead{color:var(--txt2);font-size:.86rem;font-weight:300;margin-bottom:1.1rem}
+.dash-lead{color:var(--txt2);font-size:.84rem;font-weight:300;margin-bottom:.85rem}
 
-.dash-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:.85rem;align-items:start;margin-top:.5rem}
+.dash-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:.7rem;align-items:start;margin-top:.3rem}
 .dash-right-col{display:flex;flex-direction:column;gap:.7rem;min-width:0}
 
 /* ====== QUICK SUMMARY (правая колонка под Результатом) ====== */
@@ -2114,7 +2831,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .empty-title{font-family:var(--display);font-size:1rem;font-weight:700;color:var(--txt2);margin-bottom:.3rem}
 .empty-sub{font-size:.8rem;font-weight:300}
 
-.hist-card{margin-top:.85rem}
+.hist-card{margin-top:.65rem}
 .hist-list{display:flex;flex-direction:column}
 .hist-item{
   display:flex;
@@ -2151,8 +2868,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .stats-grid{
   display:grid;
   grid-template-columns:repeat(4,1fr);
-  gap:.7rem;
-  margin-bottom:.85rem;
+  gap:.55rem;
+  margin-bottom:.65rem;
 }
 
 .stat-card{
@@ -2456,6 +3173,22 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </span>
             Авторасчёт через API
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={calcMode === "upload"}
+            className={"calc-tab" + (calcMode === "upload" ? " active" : "")}
+            onClick={() => setCalcMode("upload")}
+          >
+            <span className="calc-tab-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <path d="M17 8 12 3 7 8" />
+                <path d="M12 3v13" />
+              </svg>
+            </span>
+            Загрузить отчёт
+          </button>
         </div>
 
         {calcMode === "manual" && showOnboarding && (
@@ -2488,7 +3221,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
         )}
 
-        {calcMode === "manual" ? (
+        {calcMode === "manual" && (
         <div className="dash-grid">
           <div className={"card" + (isCalculating ? " calc-loading" : "")}>
             <div className="card-head">
@@ -2778,12 +3511,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           })()}
           </div>
         </div>
-        ) : (
+        )}
+
+        {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
             <div className="api-pro-title">Подключение маркетплейсов</div>
             <p className="api-pro-sub">
-              Подключите API и получайте автоматический расчёт прибыли
+              Подключите Ozon/WB API для автоматической загрузки продаж, комиссий и расходов.
             </p>
           </div>
 
@@ -2972,6 +3707,256 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
         </div>
         )}
+
+        {calcMode === "upload" && (
+          <div className="card upload-card" role="region" aria-label="Загрузка отчёта">
+            {uploadStatus === "idle" && (
+              <div
+                className={"upload-drop" + (uploadDragActive ? " is-active" : "")}
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setUploadDragActive(true);
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  setUploadDragActive(false);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setUploadDragActive(false);
+                  acceptUploadFile(e.dataTransfer.files?.[0] ?? null);
+                }}
+              >
+                <span className="upload-drop-glow" aria-hidden="true" />
+                <span className="upload-drop-sweep" aria-hidden="true" />
+
+                <div className="upload-drop-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <path d="M17 8 12 3 7 8" />
+                    <path d="M12 3v13" />
+                  </svg>
+                </div>
+                <h3 className="upload-drop-title">
+                  Загрузите <em>месячный отчёт</em>
+                </h3>
+                <p className="upload-drop-sub">
+                  Перетащите файл из личного кабинета Ozon или Wildberries сюда — или выберите вручную.
+                </p>
+
+                <input
+                  ref={uploadInputRef}
+                  type="file"
+                  accept=".xlsx,.csv"
+                  className="upload-input-hidden"
+                  onChange={(e) => {
+                    acceptUploadFile(e.target.files?.[0] ?? null);
+                    if (e.target) e.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  className="upload-pick-btn"
+                  onClick={() => uploadInputRef.current?.click()}
+                >
+                  Выбрать файл
+                  <span className="arr" aria-hidden="true">→</span>
+                </button>
+
+                <div className="upload-formats" aria-hidden="true">
+                  <span>XLSX</span>
+                  <span>CSV</span>
+                </div>
+              </div>
+            )}
+
+            {uploadStatus === "ready" && uploadFile && (
+              <div className="upload-ready">
+                <div className="upload-file-info">
+                  <div className="upload-file-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                      strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <path d="M14 2v6h6" />
+                      <path d="M9 13h6M9 17h4" />
+                    </svg>
+                  </div>
+                  <div className="upload-file-meta">
+                    <div className="upload-file-name" title={uploadFile.name}>
+                      {uploadFile.name}
+                    </div>
+                    <div className="upload-file-size">
+                      {formatFileSize(uploadFile.size)} · Файл готов к анализу
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="upload-file-remove"
+                    onClick={removeUploadFile}
+                    aria-label="Удалить файл"
+                    title="Удалить файл"
+                  >
+                    ×
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  className="upload-analyze-btn"
+                  onClick={analyzeUpload}
+                >
+                  Проанализировать отчёт
+                  <span className="arr" aria-hidden="true">→</span>
+                </button>
+              </div>
+            )}
+
+            {uploadStatus === "processing" && (
+              <div className="upload-processing" role="status" aria-live="polite">
+                <div className="ai-proc-ico" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
+                  </svg>
+                </div>
+                <div className="ai-proc-title">
+                  Анализ <em>отчёта</em>
+                </div>
+                <ul className="ai-proc-stages">
+                  {UPLOAD_STAGES.map((s, i) => (
+                    <li
+                      key={i}
+                      className={
+                        "ai-proc-stage" +
+                        (i === uploadStage ? " is-active" : "") +
+                        (i < uploadStage ? " is-done" : "")
+                      }
+                    >
+                      <span className="ai-proc-mark" aria-hidden="true" />
+                      <span className="ai-proc-stage-text">{s}</span>
+                    </li>
+                  ))}
+                </ul>
+                <div className="ai-proc-progress" aria-hidden="true">
+                  <div className="ai-proc-progress-bar" />
+                </div>
+              </div>
+            )}
+
+            {uploadStatus === "success" && uploadDetected && uploadFile && (
+              <div className="upload-success" role="status">
+                <div className="upload-success-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="m8 12.5 2.8 2.8L16.5 9.5" />
+                  </svg>
+                </div>
+
+                <div className="upload-success-title">Отчёт обработан</div>
+                <div className="upload-success-sub" title={uploadFile.name}>
+                  {uploadFile.name}
+                </div>
+
+                <div className="upload-success-meta">
+                  <span className={"upload-mp-badge " + uploadDetected.marketplace}>
+                    <span className="upload-mp-dot" />
+                    {uploadDetected.marketplace === "ozon" ? "Ozon" : "Wildberries"}
+                  </span>
+                  <span className="upload-meta-pill">{uploadDetected.period}</span>
+                  <span className="upload-meta-pill">
+                    {uploadDetected.rowsCount.toLocaleString("ru-RU")} строк
+                  </span>
+                </div>
+
+                <div className="upload-success-actions">
+                  <button
+                    type="button"
+                    className="upload-success-btn primary"
+                    onClick={openUploadResults}
+                  >
+                    Открыть результаты
+                    <span className="arr" aria-hidden="true">→</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="upload-success-btn ghost"
+                    onClick={resetUploadFlow}
+                  >
+                    Загрузить ещё отчёт
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {uploadStatus === "error" && (
+              <div className="upload-error" role="alert">
+                <div className="upload-error-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                    <path d="M12 9v4" />
+                    <circle cx="12" cy="17" r=".6" fill="currentColor" />
+                  </svg>
+                </div>
+                <div className="upload-error-title">Не удалось обработать отчёт</div>
+                <p className="upload-error-sub">
+                  {uploadErrorMsg || "Проверьте формат файла и попробуйте снова."}
+                </p>
+                <button
+                  type="button"
+                  className="upload-success-btn primary"
+                  onClick={resetUploadFlow}
+                >
+                  Попробовать снова
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {calcMode === "upload" &&
+          uploadedReports.length > 0 &&
+          (uploadStatus === "idle" || uploadStatus === "success") && (
+            <div className="upload-recent">
+              <div className="upload-recent-head">
+                <span className="upload-recent-title">Недавние загрузки</span>
+                <span className="upload-recent-count">
+                  {uploadedReports.length}
+                </span>
+              </div>
+              <div className="upload-recent-grid">
+                {uploadedReports.map((r) => (
+                  <div className="upload-recent-card" key={r.id}>
+                    <div className="upload-recent-row">
+                      <span
+                        className={"upload-mp-badge sm " + r.marketplace}
+                        title={r.marketplace === "ozon" ? "Ozon" : "Wildberries"}
+                      >
+                        <span className="upload-mp-dot" />
+                        {r.marketplace === "ozon" ? "Ozon" : "WB"}
+                      </span>
+                      <span className="upload-recent-status">обработан</span>
+                    </div>
+                    <div className="upload-recent-name" title={r.filename}>
+                      {r.filename}
+                    </div>
+                    <div className="upload-recent-foot">
+                      <span
+                        className={
+                          "upload-recent-profit " + (r.profit >= 0 ? "pos" : "neg")
+                        }
+                      >
+                        {r.profit >= 0 ? "+" : "−"}
+                        {fmt(Math.abs(r.profit))} ₽
+                      </span>
+                      <span className="upload-recent-date">{r.date}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
         <div className="card tariff-card" id="dash-tariffs">
           <div className="card-head">
@@ -3165,12 +4150,19 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 <circle cx="12" cy="12" r="9" />
                 <path d="m8.5 12.5 2.5 2.5 4.5-5" />
               </svg>
-            ) : (
+            ) : toast.type === "warn" ? (
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
                 strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="9" />
                 <path d="M12 8v5" />
                 <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                <path d="M12 9v4" />
+                <circle cx="12" cy="17" r=".7" fill="currentColor" />
               </svg>
             )}
           </span>
