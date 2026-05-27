@@ -9,19 +9,43 @@ import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
-  {
-    auth: {
-      // Сохраняем сессию между перезагрузками + автообновление токенов +
-      // подбор session из URL после magic-link.
-      persistSession: true,
-      autoRefreshToken: true,
-      detectSessionInUrl: true,
-    },
-  }
-)
+/**
+ * Supabase client с safe-fallback на placeholder URL/key.
+ *
+ * Зачем не `process.env.X!`:
+ *   - На Railway / CI без env-переменных `createClient(undefined, undefined, …)`
+ *     валится во время module-eval (prerender), и весь build падает.
+ *   - Fallback-строка — валидный URL → `createClient` не бросит исключение.
+ *   - При наличии env (production / dev с .env.local) клиент использует
+ *     настоящие значения.
+ *
+ * В браузере без env — однократный `console.warn`, чтобы это сразу заметить.
+ */
+const SUPABASE_URL =
+  process.env.NEXT_PUBLIC_SUPABASE_URL || "https://placeholder.supabase.co";
+const SUPABASE_KEY =
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || "placeholder-anon-key";
+
+if (
+  typeof window !== "undefined" &&
+  (!process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    !process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)
+) {
+  // eslint-disable-next-line no-console
+  console.warn(
+    "[Supabase] NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY не заданы — сетевые вызовы будут падать."
+  );
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: {
+    // Сохраняем сессию между перезагрузками + автообновление токенов +
+    // подбор session из URL после magic-link.
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
+  },
+});
 
 type Marketplace = "ozon" | "wb";
 
