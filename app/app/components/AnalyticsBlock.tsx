@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 interface AnalyticsCalc {
-  id: number;
+  id: string;
   marketplace: "ozon" | "wb";
   revenue: number;
   profit: number;

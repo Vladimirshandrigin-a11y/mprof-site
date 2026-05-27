@@ -1,6 +1,5 @@
 "use client";
 
-import { createClient } from "@supabase/supabase-js"
 import { useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
@@ -8,49 +7,61 @@ import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
+import {
+  supabase,
+  saveCalculationToCloud,
+  loadCalculationsFromCloud,
+  deleteCalculationFromCloud,
+  clearCalculationsFromCloud,
+  saveUploadedReportToCloud,
+  loadUploadedReportsFromCloud,
+  type CloudCalculation,
+  type CalcMode as CloudCalcMode,
+} from "./lib/supabase-cloud"
 
-/**
- * Supabase client с safe-fallback на placeholder URL/key.
- *
- * Зачем не `process.env.X!`:
- *   - На Railway / CI без env-переменных `createClient(undefined, undefined, …)`
- *     валится во время module-eval (prerender), и весь build падает.
- *   - Fallback-строка — валидный URL → `createClient` не бросит исключение.
- *   - При наличии env (production / dev с .env.local) клиент использует
- *     настоящие значения.
- *
- * В браузере без env — однократный `console.warn`, чтобы это сразу заметить.
- */
-const SUPABASE_URL =
-  process.env.NEXT_PUBLIC_SUPABASE_URL || "https://placeholder.supabase.co";
-const SUPABASE_KEY =
-  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || "placeholder-anon-key";
+// Supabase client импортируется из lib/supabase-cloud (единый instance,
+// fallback на placeholder URL/key, browser-only warning при отсутствии env).
 
-if (
-  typeof window !== "undefined" &&
-  (!process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    !process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)
-) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    "[Supabase] NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY не заданы — сетевые вызовы будут падать."
-  );
+/** Локальный id для расчётов, которые не попали в облако (offline/DEV). */
+function makeLocalId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return "local-" + crypto.randomUUID();
+  }
+  return "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: {
-    // Сохраняем сессию между перезагрузками + автообновление токенов +
-    // подбор session из URL после magic-link.
-    persistSession: true,
-    autoRefreshToken: true,
-    detectSessionInUrl: true,
-  },
-});
+/** Mapping облачной строки в локальный CalcResult shape (используется в UI). */
+function cloudToLocal(c: CloudCalculation): CalcResult {
+  const created = new Date(c.created_at);
+  return {
+    id: c.id,
+    marketplace: c.marketplace,
+    revenue: Number(c.revenue) || 0,
+    commission: Number(c.commission) || 0,
+    logistics: Number(c.logistics) || 0,
+    storage: Number(c.storage) || 0,
+    ads: Number(c.ads) || 0,
+    cost: Number(c.cost) || 0,
+    tax: Number(c.tax) || 0,
+    other: Number(c.other_expenses) || 0,
+    expenses: Number(c.total_expenses) || 0,
+    profit: Number(c.profit) || 0,
+    margin: Number(c.margin) || 0,
+    date: created.toLocaleString("ru-RU", {
+      day: "2-digit",
+      month: "short",
+      hour: "2-digit",
+      minute: "2-digit",
+    }),
+    createdAt: c.created_at,
+    synced: true,
+  };
+}
 
 type Marketplace = "ozon" | "wb";
 
 interface CalcResult {
-  id: number;
+  id: string;
   marketplace: Marketplace;
   revenue: number;
   commission: number;
@@ -88,7 +99,7 @@ const UPLOAD_STAGES = [
 ];
 
 interface UploadedReport {
-  id: number;
+  id: string;
   filename: string;
   marketplace: "ozon" | "wb";
   profit: number;
@@ -136,16 +147,16 @@ const AI_STAGES = [
 ];
 
 const DEMO_HISTORY: {
-  id: number;
+  id: string;
   mp: "ozon" | "wb";
   revenue: number;
   profit: number;
   margin: number;
   date: string;
 }[] = [
-  { id: -101, mp: "ozon", revenue: 180000, profit: 32450, margin: 18.0, date: "пример" },
-  { id: -102, mp: "wb",   revenue:  95000, profit: 18200, margin: 19.2, date: "пример" },
-  { id: -103, mp: "ozon", revenue: 240000, profit: 54900, margin: 22.9, date: "пример" },
+  { id: "demo-1", mp: "ozon", revenue: 180000, profit: 32450, margin: 18.0, date: "пример" },
+  { id: "demo-2", mp: "wb",   revenue:  95000, profit: 18200, margin: 19.2, date: "пример" },
+  { id: "demo-3", mp: "ozon", revenue: 240000, profit: 54900, margin: 22.9, date: "пример" },
 ];
 
 const EMPTY: Record<string, string> = {
@@ -178,7 +189,7 @@ export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
   const [result, setResult] = useState<CalcResult | null>(null);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [history, setHistory] = useState<CalcResult[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   const [user, setUser] = useState<User | null>(null);
@@ -298,61 +309,48 @@ export default function AppPage() {
       other: String(demo.other),
     });
 
-    let insertedRow: { id?: number; created_at?: string } | null = null;
-    let insertErr: ReturnType<typeof formatSupabaseError> | null = null;
-
-    // Если пользователь не залогинен — не пытаемся писать в БД (RLS отбьёт).
-    // Просто кладём в локальную history.
+    // Если пользователь не залогинен — пишем только локально.
     const canPersist = !!user?.id;
 
-    if (canPersist) {
-      try {
-        const insertRes = await supabase
-          .from("calculations")
-          .insert([
-            {
-              marketplace: demoMp,
-              revenue: demo.revenue,
-              commission: demo.commission,
-              logistics: demo.logistics,
-              storage: demo.storage,
-              ads: demo.ads,
-              cost_price: demo.cost,
-              tax: demo.tax,
-              other_expenses: demo.other,
-              total_expenses: expensesSum,
-              profit,
-              margin,
-              user_id: user!.id,
-            },
-          ])
-          .select()
-          .single();
+    let cloudCalcId: string | null = null;
+    let cloudCreatedAt: string | null = null;
+    let uploadSynced = false;
 
-        insertedRow =
-          (insertRes.data as { id?: number; created_at?: string } | null) ??
-          null;
-        if (insertRes.error) {
-          insertErr = formatSupabaseError(insertRes.error);
-        }
-      } catch (e) {
-        insertErr = formatSupabaseError(e);
+    if (canPersist) {
+      const saveRes = await saveCalculationToCloud(
+        {
+          marketplace: demoMp,
+          mode: "upload" as CloudCalcMode,
+          revenue: demo.revenue,
+          commission: demo.commission,
+          logistics: demo.logistics,
+          ads: demo.ads,
+          storage: demo.storage,
+          tax: demo.tax,
+          cost: demo.cost,
+          other_expenses: demo.other,
+          total_expenses: expensesSum,
+          profit,
+          margin,
+        },
+        user!.id
+      );
+
+      if (saveRes.error) {
+        console.warn(
+          "analyzeUpload: cloud save failed, fallback local",
+          saveRes.error
+        );
+      } else if (saveRes.data) {
+        cloudCalcId = saveRes.data.id;
+        cloudCreatedAt = saveRes.data.created_at;
+        uploadSynced = true;
       }
     }
 
-    const uploadSynced = !insertErr && !!insertedRow?.id;
-
-    if (insertErr) {
-      console.warn(
-        "analyzeUpload: save failed, using local fallback",
-        insertErr
-      );
-    }
-
     {
-      const row = insertedRow;
       const res: CalcResult = {
-        id: row?.id ?? Date.now(),
+        id: cloudCalcId ?? makeLocalId(),
         marketplace: demoMp,
         revenue: demo.revenue,
         commission: demo.commission,
@@ -371,12 +369,12 @@ export default function AppPage() {
           hour: "2-digit",
           minute: "2-digit",
         }),
-        createdAt: row?.created_at ?? now.toISOString(),
+        createdAt: cloudCreatedAt ?? now.toISOString(),
         synced: uploadSynced,
       };
 
       setResult(res);
-      setHistory((prev) => [res, ...prev].slice(0, 8));
+      setHistory((prev) => [res, ...prev].slice(0, 50));
       incrementCalcCount();
       setJustCalculated(true);
       window.setTimeout(() => setJustCalculated(false), 2200);
@@ -390,10 +388,35 @@ export default function AppPage() {
       setUploadDetected({ marketplace: demoMp, period, rowsCount });
       setUploadStatus("success");
 
+      // Сохраняем uploaded_report в облако (если есть user и cloud calc id);
+      // ID отчёта — либо из облака, либо локальный.
+      let reportId: string = makeLocalId();
+      if (canPersist) {
+        const repRes = await saveUploadedReportToCloud(
+          {
+            file_name: uploadFile.name,
+            file_size: formatFileSize(uploadFile.size),
+            marketplace: demoMp,
+            period,
+            rows_count: rowsCount,
+            calculation_id: cloudCalcId, // может быть null если cloud calc упал
+          },
+          user!.id
+        );
+        if (repRes.data?.id) {
+          reportId = repRes.data.id;
+        } else if (repRes.error) {
+          console.warn(
+            "analyzeUpload: uploaded_report save failed",
+            repRes.error
+          );
+        }
+      }
+
       setUploadedReports((prev) =>
         [
           {
-            id: res.id,
+            id: reportId,
             filename: uploadFile.name,
             marketplace: demoMp,
             profit,
@@ -460,7 +483,7 @@ export default function AppPage() {
 
     return () => window.clearInterval(interval);
   }, [isCalculating]);
-  const [removingIds, setRemovingIds] = useState<Set<number>>(new Set());
+  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   type ToastType = "ok" | "warn" | "err";
   const [toast, setToast] = useState<
     { id: number; message: string; type: ToastType } | null
@@ -566,23 +589,29 @@ export default function AppPage() {
   useEffect(() => {
     let mounted = true;
 
-    supabase.auth.getSession().then(({ data }) => {
+    supabase.auth.getSession().then(async ({ data }) => {
       if (!mounted) return;
       const u = data.session?.user ?? null;
       setUser(u);
       setAuthLoading(false);
-      loadHistory(u?.id ?? null);
-      if (u?.id) loadApiKeys(u.id);
+      if (u?.id) {
+        const calcs = await loadHistory(u.id);
+        loadApiKeys(u.id);
+        loadUploadedReportsCloud(u.id, calcs);
+      } else {
+        loadHistory(null);
+      }
     });
 
-    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
+    const { data: sub } = supabase.auth.onAuthStateChange(async (event, session) => {
       if (!mounted) return;
       const u = session?.user ?? null;
       setUser(u);
 
       if (event === "SIGNED_IN" && u?.id) {
-        loadHistory(u.id);
+        const calcs = await loadHistory(u.id);
         loadApiKeys(u.id);
+        loadUploadedReportsCloud(u.id, calcs);
       }
       if (event === "SIGNED_OUT") {
         setHistory([]);
@@ -590,6 +619,7 @@ export default function AppPage() {
         setOzonClientId("");
         setOzonApiKey("");
         setWbApiKey("");
+        setUploadedReports([]);
       }
     });
 
@@ -700,27 +730,18 @@ export default function AppPage() {
       return;
     }
 
-    let delErr: ReturnType<typeof formatSupabaseError> | null = null;
-    try {
-      const { error } = await supabase
-        .from("calculations")
-        .delete()
-        .eq("user_id", user.id);
-      if (error) delErr = formatSupabaseError(error);
-    } catch (e) {
-      delErr = formatSupabaseError(e);
-    }
-
-    if (delErr) {
-      console.warn("clearHistory: cloud delete failed", delErr);
-      // НЕ откатываем — пользователь явно нажал «Удалить всю историю».
+    const res = await clearCalculationsFromCloud(user.id);
+    if (res.error) {
+      console.warn("clearHistory: cloud delete failed", res.error);
+      // НЕ откатываем локальную чистку — пользователь явно нажал «Удалить всю историю».
       showToast("История очищена локально", "warn");
       return;
     }
+    setUploadedReports([]); // cascade: uploaded_reports.calculation_id → null уже в DB
     showToast("История очищена", "ok");
   };
 
-  const deleteHistoryItem = async (id: number) => {
+  const deleteHistoryItem = async (id: string) => {
     if (removingIds.has(id)) return;
 
     const item = history.find((h) => h.id === id);
@@ -736,32 +757,18 @@ export default function AppPage() {
       return next;
     });
 
-    // 2) Делаем delete в Supabase ТОЛЬКО если запись синхронизирована
+    // 2) Делаем delete через cloud helper ТОЛЬКО если запись синхронизирована
     //    и пользователь залогинен. Локальные записи (synced: false)
     //    удаляются только из state — без сетевых запросов и ложных ошибок.
     const shouldPersistDelete = !!item.synced && !!user?.id;
     let delErr: ReturnType<typeof formatSupabaseError> | null = null;
 
     if (shouldPersistDelete) {
-      try {
-        const q = supabase
-          .from("calculations")
-          .delete()
-          .eq("id", id)
-          .eq("user_id", user!.id);
-
-        // параллельно даём анимации проиграться минимум 300мс
-        const [delResult] = await Promise.all([
-          q,
-          new Promise<void>((r) => setTimeout(r, 300)),
-        ]);
-
-        if (delResult.error) {
-          delErr = formatSupabaseError(delResult.error);
-        }
-      } catch (e) {
-        delErr = formatSupabaseError(e);
-      }
+      const [delRes] = await Promise.all([
+        deleteCalculationFromCloud(id, user!.id),
+        new Promise<void>((r) => setTimeout(r, 300)),
+      ]);
+      if (delRes.error) delErr = delRes.error;
     } else {
       // local-only delete — просто ждём анимацию
       await new Promise((r) => setTimeout(r, 300));
@@ -789,53 +796,61 @@ export default function AppPage() {
     }
   };
 
-  const loadHistory = async (userId: string | null) => {
-    let query = supabase
-      .from("calculations")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(8);
-
-    if (userId) {
-      query = query.eq("user_id", userId);
-    } else {
-      query = query.is("user_id", null);
-    }
-
-    const { data, error } = await query;
-
-    if (error) {
-      console.error("loadHistory error:", formatSupabaseError(error));
+  /** Загрузка истории через cloud helper. Возвращает мапнутый массив для
+   *  опционального join'а с uploaded_reports. UI обновляется внутри. */
+  const loadHistory = async (
+    userId: string | null
+  ): Promise<CalcResult[]> => {
+    if (!userId) {
+      // Не залогинен → история работает только локально, ничего не подгружаем.
+      setHistory([]);
       setIsLoadingHistory(false);
-      return;
+      return [];
     }
 
-    const mapped: CalcResult[] = data.map((item: any) => ({
-      id: item.id,
-      marketplace: item.marketplace,
-      revenue: item.revenue,
-      commission: item.commission,
-      logistics: item.logistics,
-      storage: item.storage,
-      ads: item.ads,
-      cost: item.cost_price,
-      tax: item.tax,
-      other: item.other_expenses,
-      expenses: item.total_expenses,
-      profit: item.profit,
-      margin: item.margin,
-      date: new Date(item.created_at).toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-      createdAt: item.created_at,
-      synced: true,
-    }));
-
-    setHistory(mapped);
+    const res = await loadCalculationsFromCloud(userId, 50);
     setIsLoadingHistory(false);
+
+    if (res.error) {
+      console.warn("loadHistory: cloud unavailable", res.error);
+      // Graceful fallback: оставляем текущий локальный state нетронутым.
+      return [];
+    }
+
+    const mapped = (res.data ?? []).map(cloudToLocal);
+    setHistory(mapped);
+    return mapped;
+  };
+
+  /** Загрузка uploaded_reports после логина. Join'ит profit/margin
+   *  из переданных calculations (если есть связь по calculation_id). */
+  const loadUploadedReportsCloud = async (
+    userId: string,
+    linkedCalcs: CalcResult[]
+  ) => {
+    const res = await loadUploadedReportsFromCloud(userId, 20);
+    if (res.error || !res.data) return;
+
+    const calcMap = new Map(linkedCalcs.map((c) => [c.id, c]));
+    const enriched: UploadedReport[] = res.data.map((r) => {
+      const linked = r.calculation_id ? calcMap.get(r.calculation_id) : null;
+      return {
+        id: r.id,
+        filename: r.file_name || "—",
+        marketplace: r.marketplace ?? "ozon",
+        profit: linked?.profit ?? 0,
+        margin: linked?.margin ?? 0,
+        rowsCount: r.rows_count ?? 0,
+        period: r.period || "",
+        date: new Date(r.created_at).toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+      };
+    });
+    setUploadedReports(enriched);
   };
 
   const num = (v: string) => {
@@ -875,8 +890,8 @@ export default function AppPage() {
       const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
 
       const now = new Date();
-      const res: CalcResult = {
-        id: Date.now(),
+      const localResult: CalcResult = {
+        id: makeLocalId(),
         marketplace,
         revenue,
         commission: num(form.commission),
@@ -896,73 +911,68 @@ export default function AppPage() {
           minute: "2-digit",
         }),
         createdAt: now.toISOString(),
-        synced: false, // переопределится после вызова supabase ниже
+        synced: false,
       };
 
-      // Минимальная задержка, чтобы UX-состояние «Считаем…» не моргало
-      const insertPromise = supabase
-        .from("calculations")
-        .insert([
-          {
-            marketplace,
-            revenue,
-            commission: num(form.commission),
-            logistics: num(form.logistics),
-            storage: num(form.storage),
-            ads: num(form.ads),
-            cost_price: num(form.cost),
-            tax: num(form.tax),
-            other_expenses: num(form.other),
-            total_expenses: expenses,
-            profit,
-            margin,
-            user_id: user?.id ?? null,
-          },
-        ])
-        .select()
-        .single();
-      // 5 стадий × 700мс + небольшой буфер чтобы последняя стадия успела
-      // отрисоваться. reduced-motion обрабатывается в useEffect выше.
+      // 5 стадий × 700мс — минимальная задержка для AI processing overlay.
       const minDelay = new Promise<void>((r) => setTimeout(r, 3600));
 
-      // Безопасный wrap insert'а — если supabase бросит исключение
-      // (сеть, RLS, schema), приложение не падает: показываем результат
-      // локально и логируем подробности.
-      let inserted: { id?: number; created_at?: string } | null = null;
-      let insertError: ReturnType<typeof formatSupabaseError> | null = null;
-      try {
-        const [insertResult] = await Promise.all([insertPromise, minDelay]);
-        inserted =
-          (insertResult.data as { id?: number; created_at?: string } | null) ??
-          null;
-        if (insertResult.error) {
-          insertError = formatSupabaseError(insertResult.error);
-        }
-      } catch (e) {
-        await minDelay; // подержать UX-стадии даже при сетевом сбое
-        insertError = formatSupabaseError(e);
-      }
+      // Параллельно: cloud save (через helper, который сам обрабатывает ошибки)
+      // и таймер для UX. Если юзер не залогинен — save пропускаем сразу.
+      const savePromise: Promise<{
+        synced: boolean;
+        cloudId: string | null;
+        cloudCreatedAt: string | null;
+      }> = user?.id
+        ? saveCalculationToCloud(
+            {
+              marketplace,
+              mode: "manual" as CloudCalcMode,
+              revenue,
+              commission: num(form.commission),
+              logistics: num(form.logistics),
+              ads: num(form.ads),
+              storage: num(form.storage),
+              tax: num(form.tax),
+              cost: num(form.cost),
+              other_expenses: num(form.other),
+              total_expenses: expenses,
+              profit,
+              margin,
+            },
+            user.id
+          ).then((res) => {
+            if (res.error) {
+              console.warn(
+                "calculate: cloud save failed, fallback local",
+                res.error
+              );
+              return { synced: false, cloudId: null, cloudCreatedAt: null };
+            }
+            return {
+              synced: true,
+              cloudId: res.data?.id ?? null,
+              cloudCreatedAt: res.data?.created_at ?? null,
+            };
+          })
+        : Promise.resolve({
+            synced: false,
+            cloudId: null,
+            cloudCreatedAt: null,
+          });
 
-      const synced = !insertError && !!inserted?.id;
+      const [saveResult] = await Promise.all([savePromise, minDelay]);
 
-      if (insertError) {
-        // console.warn (не error), чтобы Next.js dev overlay не считал это fatal'ом.
-        console.warn("calculate: save failed, using local fallback", insertError);
-      }
-
-      // Если БД вернула id/created_at — используем их.
-      // Иначе fallback на клиентские (DEV/offline) — dashboard работает.
-      const dbId = inserted?.id ?? res.id;
-      const dbCreatedAt = inserted?.created_at ?? res.createdAt;
-      const resWithDbId: CalcResult = {
-        ...res,
-        id: dbId,
-        createdAt: dbCreatedAt,
-        synced,
+      const finalResult: CalcResult = {
+        ...localResult,
+        id: saveResult.cloudId ?? localResult.id,
+        createdAt: saveResult.cloudCreatedAt ?? localResult.createdAt,
+        synced: saveResult.synced,
       };
 
-      setResult(resWithDbId);
-      setHistory((prev) => [resWithDbId, ...prev].slice(0, 8));
+      setResult(finalResult);
+      setHistory((prev) => [finalResult, ...prev].slice(0, 50));
+      const synced = saveResult.synced;
 
       if (synced) {
         showToast("Расчёт сохранён", "ok");
