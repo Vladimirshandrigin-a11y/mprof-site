@@ -102,15 +102,22 @@ async function handleSucceeded(
     }
   }
 
-  // Профиль — источник правды для entitlements. Переустанавливаем теми же
-  // значениями (идемпотентно): при повторе webhook чинит и частичный сбой.
+  // Профиль — источник правды для entitlements (его читает useEntitlements).
+  // UPSERT, а не UPDATE: если строки профиля ещё нет (триггер on_auth_user_created
+  // не отработал или пользователь старше триггера), прежний UPDATE молча затрагивал
+  // 0 строк — и премиум НЕ выдавался. upsert создаёт строку при отсутствии и
+  // обновляет при наличии: идемпотентно, и чинит частичный сбой при повторе webhook.
+  // Передаём только id/plan/premium_until — email и created_at у существующей
+  // строки сохраняются (upsert трогает лишь переданные колонки).
   const { error: profErr } = await admin
     .from("profiles")
-    .update({ plan: sub.plan, premium_until: expiresAt })
-    .eq("id", sub.user_id);
+    .upsert(
+      { id: sub.user_id, plan: sub.plan, premium_until: expiresAt },
+      { onConflict: "id" }
+    );
   if (profErr) {
     // eslint-disable-next-line no-console
-    console.error("[payment/webhook] profile update error", profErr);
+    console.error("[payment/webhook] profile upsert error", profErr);
     return { http: 500, body: { ok: false, error: "profile_update_failed" } };
   }
 

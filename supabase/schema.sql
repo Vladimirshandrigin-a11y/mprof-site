@@ -47,6 +47,14 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
+-- BACKFILL: создать profile для уже существующих пользователей, у которых его нет
+-- (зарегистрировались до установки триггера). Без этого их entitlements читают
+-- пустой профиль → hasPremium=false даже после оплаты. Идемпотентно.
+insert into public.profiles (id, email)
+select u.id, u.email
+from auth.users u
+on conflict (id) do nothing;
+
 -- ============================================================================
 -- calculations
 -- ============================================================================
