@@ -77,6 +77,51 @@ create index if not exists idx_calculations_user_created
   on public.calculations(user_id, created_at desc);
 
 -- ============================================================================
+-- MIGRATION: если у вас уже есть calculations table из старого кода (где
+-- использовались колонки cost_price), эти ALTER'ы добавят недостающие.
+-- CREATE TABLE IF NOT EXISTS выше для уже существующей таблицы — no-op,
+-- поэтому новые колонки добавляются отдельно.
+-- ============================================================================
+alter table public.calculations
+  add column if not exists mode text default 'manual';
+alter table public.calculations
+  add column if not exists ai_score int;
+alter table public.calculations
+  add column if not exists ai_insights jsonb;
+alter table public.calculations
+  add column if not exists cost numeric default 0;
+
+-- Перенос legacy cost_price → cost, если старая колонка ещё существует
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public'
+      and table_name = 'calculations'
+      and column_name = 'cost_price'
+  ) then
+    update public.calculations
+       set cost = coalesce(cost, cost_price)
+     where cost is null or cost = 0;
+    -- cost_price оставляем — на случай rollback. Дроп — отдельным шагом:
+    --   alter table public.calculations drop column cost_price;
+  end if;
+end $$;
+
+-- Заодно гарантируем check-constraint для mode (если был добавлен без него)
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'calculations_mode_check'
+  ) then
+    alter table public.calculations
+      add constraint calculations_mode_check
+      check (mode in ('manual', 'upload', 'api'));
+  end if;
+end $$;
+
+-- ============================================================================
 -- uploaded_reports
 -- ============================================================================
 create table if not exists public.uploaded_reports (

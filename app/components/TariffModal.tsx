@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { supabase } from "../app/lib/supabase-cloud";
 
 export type TariffTier = "single" | "unlimited";
 
@@ -48,12 +49,26 @@ const TIER_DATA: Record<
 
 const PROCESSING_DELAY_MS = 2400;
 
+// === RELEASE v1.0 ===
+// Premium РАЗБЛОКИРОВАН — модалка показывает рабочий интерфейс тарифа (шаги 1–3).
+// Реальная онлайн-оплата (ЮKassa) ещё подключается: шаг 3 честно сообщает, что
+// оплата завершается, все функции пока бесплатны. «🔒 Скоро»-состояние модалки
+// сохранено в коде ниже (поставь флаг → true), ничего не удалено.
+const PAYMENT_COMING_SOON: boolean = false;
+
 export function TariffModal({ open, tier, onClose }: Props) {
   const [step, setStep] = useState<1 | 2 | 3>(1);
+  // Этап 1.5: реальная оплата через POST /api/payment/create.
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Сбрасываем шаг при каждом открытии модалки
+  // Сбрасываем шаг и платёжное состояние при каждом открытии модалки
   useEffect(() => {
-    if (open) setStep(1);
+    if (open) {
+      setStep(1);
+      setLoading(false);
+      setError(null);
+    }
   }, [open, tier]);
 
   // Auto-advance step 2 → 3
@@ -81,6 +96,52 @@ export function TariffModal({ open, tier, onClose }: Props) {
   if (!open) return null;
 
   const data = TIER_DATA[tier ?? "unlimited"];
+  const plan: TariffTier = tier ?? "unlimited";
+
+  // Создаёт платёж на бэкенде и редиректит в ЮKassa. Сумма и провайдер —
+  // на сервере (PLAN_PRICING); сюда приходит только confirmationUrl.
+  const handlePay = async () => {
+    setError(null);
+    setLoading(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const token = session?.access_token;
+      if (!token) {
+        setError("Войдите в аккаунт, чтобы оформить тариф.");
+        setLoading(false);
+        return;
+      }
+
+      const res = await fetch("/api/payment/create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ plan }),
+      });
+      const result = (await res.json().catch(() => null)) as {
+        ok?: boolean;
+        confirmationUrl?: string;
+        error?: string;
+      } | null;
+
+      if (result?.ok && result.confirmationUrl) {
+        // Уходим на страницу оплаты ЮKassa — loading не снимаем.
+        window.location.href = result.confirmationUrl;
+        return;
+      }
+
+      // ЮKassa не настроена / любая иная ошибка — честное сообщение в модалке.
+      setError("Оплата пока не настроена. Попробуйте позже.");
+      setLoading(false);
+    } catch {
+      setError("Оплата пока не настроена. Попробуйте позже.");
+      setLoading(false);
+    }
+  };
 
   return (
     <>
@@ -385,6 +446,29 @@ export function TariffModal({ open, tier, onClose }: Props) {
         .tm-btn-gold .arr{display:inline-block;transition:transform .22s ease}
         .tm-btn-gold:hover .arr{transform:translateX(3px)}
 
+        /* === Этап 1.5 — состояние «создаём платёж» / ошибка === */
+        .tm-btn:disabled{opacity:.65;cursor:default}
+        .tm-btn-gold:disabled,
+        .tm-btn-gold:disabled:hover{
+          transform:none;
+          box-shadow:0 10px 28px rgba(201,168,76,.22)
+        }
+        .tm-error{
+          font-size:.85rem;color:#FFB4B4;font-weight:400;line-height:1.5;
+          margin:0 0 .95rem;
+          background:rgba(255,90,90,.08);
+          border:1px solid rgba(255,90,90,.24);
+          border-radius:10px;padding:.7rem .85rem
+        }
+
+        /* === RELEASE v1.0 — «Скоро» (disabled) button === */
+        .tm-btn.tm-btn-soon{
+          background:linear-gradient(135deg,rgba(201,168,76,.22),rgba(201,168,76,.10));
+          color:#E8C97A;border:1px solid rgba(201,168,76,.4);
+          box-shadow:none;cursor:default;letter-spacing:.04em
+        }
+        .tm-btn.tm-btn-soon:hover{transform:none;box-shadow:none}
+
         @media(max-width:640px){
           .tm-card{padding:2.1rem 1.45rem 1.6rem;border-radius:18px;min-height:340px}
           .tm-title{font-size:1.3rem}
@@ -421,6 +505,56 @@ export function TariffModal({ open, tier, onClose }: Props) {
             </svg>
           </button>
 
+          {PAYMENT_COMING_SOON ? (
+            <div className="tm-step" key="soon">
+              <span className="tm-pro-badge">🔒 Скоро</span>
+              <h3 id="tm-title" className="tm-title">
+                {data.name}
+              </h3>
+
+              <div className="tm-price-row">
+                <div className="tm-price">
+                  <em>{data.priceNumber}</em> ₽
+                </div>
+                {data.isSub && <span className="tm-mo">/мес</span>}
+              </div>
+              <p className="tm-period">{data.period}</p>
+
+              <ul className="tm-perks">
+                {data.perks.map((p, i) => (
+                  <li key={i}>
+                    <span className="tm-check" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="m5 12 5 5L20 7" />
+                      </svg>
+                    </span>
+                    {p}
+                  </li>
+                ))}
+              </ul>
+
+              <p
+                className="tm-sub"
+                style={{ textAlign: "left", maxWidth: "none", margin: "0 0 1.4rem" }}
+              >
+                Онлайн-оплата скоро заработает. Пока все функции расчёта
+                доступны бесплатно — без подписки и платежей.
+              </p>
+
+              <div className="tm-actions">
+                <button
+                  type="button"
+                  className="tm-btn tm-btn-soon"
+                  disabled
+                  aria-disabled="true"
+                >
+                  Скоро
+                </button>
+              </div>
+            </div>
+          ) : (
+            <>
           {/* Progress dots */}
           <div className="tm-steps" aria-hidden="true">
             <span className={"tm-step-dot " + (step === 1 ? "active" : "done")} />
@@ -463,14 +597,28 @@ export function TariffModal({ open, tier, onClose }: Props) {
                   ))}
                 </ul>
 
+                {error && (
+                  <p className="tm-error" role="alert">
+                    {error}
+                  </p>
+                )}
+
                 <div className="tm-actions">
                   <button
                     type="button"
                     className="tm-btn tm-btn-gold"
-                    onClick={() => setStep(2)}
+                    onClick={handlePay}
+                    disabled={loading}
+                    aria-busy={loading}
                   >
-                    Продолжить
-                    <span className="arr" aria-hidden="true">→</span>
+                    {loading ? (
+                      "Создаём платёж…"
+                    ) : (
+                      <>
+                        Продолжить
+                        <span className="arr" aria-hidden="true">→</span>
+                      </>
+                    )}
                   </button>
                 </div>
               </>
@@ -530,6 +678,8 @@ export function TariffModal({ open, tier, onClose }: Props) {
               </>
             )}
           </div>
+            </>
+          )}
         </div>
       </div>
     </>

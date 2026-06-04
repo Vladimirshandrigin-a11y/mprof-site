@@ -5,11 +5,13 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
+import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
 import {
   supabase,
   saveCalculationToCloud,
+  updateCalculationInCloud,
   loadCalculationsFromCloud,
   deleteCalculationFromCloud,
   clearCalculationsFromCloud,
@@ -18,6 +20,14 @@ import {
   type CloudCalculation,
   type CalcMode as CloudCalcMode,
 } from "./lib/supabase-cloud"
+import {
+  parseOzonReport,
+  type OzonDebugInfo,
+} from "./lib/report-parsers/ozon-parser"
+import {
+  parseUpdPdf,
+  type UpdDebugInfo,
+} from "./lib/report-parsers/upd-pdf-parser"
 
 // Supabase client импортируется из lib/supabase-cloud (единый instance,
 // fallback на placeholder URL/key, browser-only warning при отсутствии env).
@@ -55,6 +65,7 @@ function cloudToLocal(c: CloudCalculation): CalcResult {
     }),
     createdAt: c.created_at,
     synced: true,
+    aiInsights: c.ai_insights ?? null,
   };
 }
 
@@ -78,6 +89,54 @@ interface CalcResult {
   createdAt: string;
   /** true — запись пришла из/попала в Supabase; false — локальная (DEV/offline). */
   synced: boolean;
+  /** Разбор net-profit 3-file расчёта (из calculations.ai_insights) — чтобы
+   *  клик по истории мог восстановить combinedResult + profitInputs. */
+  aiInsights?: unknown;
+}
+
+/** Структура, которую пишем в calculations.ai_insights для 3-file расчётов. */
+type NetProfitBreakdown = {
+  kind: "net-profit-3file";
+  roi: number;
+  taxPercent: number;
+  costPrice: number;
+  tax: number;
+  ads: number;
+  packaging: number;
+  deliveryToWarehouse: number;
+  salary: number;
+  other: number;
+  updServicesTotal: number;
+  updCommissionTotal: number;
+  revenueOzon: number;
+  loyaltyPayouts: number;
+  profitBeforeCost: number;
+};
+
+/** Безопасно достаёт NetProfitBreakdown из ai_insights (jsonb → unknown). */
+function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  if (o.kind !== "net-profit-3file") return null;
+  const n = (x: unknown) =>
+    typeof x === "number" && Number.isFinite(x) ? x : 0;
+  return {
+    kind: "net-profit-3file",
+    roi: n(o.roi),
+    taxPercent: n(o.taxPercent),
+    costPrice: n(o.costPrice),
+    tax: n(o.tax),
+    ads: n(o.ads),
+    packaging: n(o.packaging),
+    deliveryToWarehouse: n(o.deliveryToWarehouse),
+    salary: n(o.salary),
+    other: n(o.other),
+    updServicesTotal: n(o.updServicesTotal),
+    updCommissionTotal: n(o.updCommissionTotal),
+    revenueOzon: n(o.revenueOzon),
+    loyaltyPayouts: n(o.loyaltyPayouts),
+    profitBeforeCost: n(o.profitBeforeCost),
+  };
 }
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
@@ -96,6 +155,42 @@ const UPLOAD_STAGES = [
   "Анализируем продажи…",
   "Проверяем комиссии…",
   "Формируем финансовую модель…",
+];
+
+// ===== Финальный калькулятор чистой прибыли (после расчёта 3 файлов) =====
+// Поля доп. расходов, которые продавец вносит вручную поверх данных из отчётов.
+// Налог — единственное поле в процентах (база: выручка Ozon), остальные в ₽.
+type ProfitInputs = {
+  costPrice: string;
+  taxPercent: string;
+  ads: string;
+  packaging: string;
+  deliveryToWarehouse: string;
+  salary: string;
+  other: string;
+};
+const EMPTY_PROFIT: ProfitInputs = {
+  costPrice: "",
+  taxPercent: "",
+  ads: "",
+  packaging: "",
+  deliveryToWarehouse: "",
+  salary: "",
+  other: "",
+};
+const PROFIT_EXPENSE_FIELDS: {
+  key: keyof ProfitInputs;
+  label: string;
+  unit: "₽" | "%";
+  hint?: string;
+}[] = [
+  { key: "costPrice", label: "Себестоимость товара", unit: "₽" },
+  { key: "taxPercent", label: "Налог", unit: "%", hint: "% от выручки Ozon" },
+  { key: "ads", label: "Реклама", unit: "₽" },
+  { key: "packaging", label: "Упаковка", unit: "₽" },
+  { key: "deliveryToWarehouse", label: "Доставка до склада", unit: "₽" },
+  { key: "salary", label: "Зарплата / подрядчики", unit: "₽" },
+  { key: "other", label: "Прочие расходы", unit: "₽" },
 ];
 
 interface UploadedReport {
@@ -185,6 +280,16 @@ const eyeOffIcon = (
   </svg>
 );
 
+// === RELEASE v1.0 ===
+// «🔒 Скоро» остаётся ТОЛЬКО у незавершённых для v1 функций (AI, API-автозагрузка).
+// Тарифы и Premium РАЗБЛОКИРОВАНЫ (payment=false): карточки 149 ₽ / 449 ₽ видны
+// пользователю, чтобы проверить интерес; онлайн-оплата (ЮKassa) — в подготовке.
+// Реальный код всех блоков ПОЛНОСТЬЮ сохранён — ничего не удалено.
+const COMING_SOON = {
+  apiAutoload: true, // Автозагрузка через API (Ozon / WB) — пока «Скоро»
+  payment: false, // Тарифы + Premium РАЗБЛОКИРОВАНЫ — карточки видны
+};
+
 export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
@@ -206,6 +311,7 @@ export default function AppPage() {
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("manual");
 
   // ===== Upload report (UI-заготовка, без реального парсинга) =====
+  // ===== Legacy single-file state (для обратной совместимости и demo) =====
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadDragActive, setUploadDragActive] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<
@@ -218,8 +324,495 @@ export default function AppPage() {
     rowsCount: number;
   } | null>(null);
   const [uploadErrorMsg, setUploadErrorMsg] = useState("");
+  const [uploadDebugInfo, setUploadDebugInfo] = useState<OzonDebugInfo | null>(
+    null
+  );
   const [uploadedReports, setUploadedReports] = useState<UploadedReport[]>([]);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  // ===== 3-file architecture: XLSX (реализация) + 2× PDF (УПД) =====
+  // Слот 1: Отчёт о реализации товара (XLSX) → revenue + loyaltyPayouts
+  // Слот 2: УПД доп. услуги (PDF)          → updServicesTotal (расход)
+  // Слот 3: УПД агентское вознаграждение   → updCommissionTotal (расход)
+  // Формула: profitBeforeCost = revenue + loyaltyPayouts - updServices - updCommission
+  const [slotXlsx, setSlotXlsx] = useState<File | null>(null);
+  const [slotUpdServices, setSlotUpdServices] = useState<File | null>(null);
+  const [slotUpdCommission, setSlotUpdCommission] = useState<File | null>(null);
+  const [combinedStatus, setCombinedStatus] = useState<
+    "idle" | "processing" | "success" | "error"
+  >("idle");
+  const [combinedError, setCombinedError] = useState("");
+  const [combinedResult, setCombinedResult] = useState<{
+    revenue: number;
+    loyaltyPayouts: number;
+    updServicesTotal: number;
+    updCommissionTotal: number;
+    profitBeforeCost: number;
+  } | null>(null);
+  const [combinedDebug, setCombinedDebug] = useState<{
+    xlsx: OzonDebugInfo | null;
+    updServices: UpdDebugInfo | null;
+    updCommission: UpdDebugInfo | null;
+  } | null>(null);
+  const xlsxInputRef = useRef<HTMLInputElement | null>(null);
+  const updServicesInputRef = useRef<HTMLInputElement | null>(null);
+  const updCommissionInputRef = useRef<HTMLInputElement | null>(null);
+  /** Какой слот сейчас под перетаскиванием — для подсветки. */
+  const [dragOverSlot, setDragOverSlot] = useState<
+    "xlsx" | "updServices" | "updCommission" | null
+  >(null);
+
+  // ===== Финальный калькулятор чистой прибыли =====
+  const [showProfitForm, setShowProfitForm] = useState(false);
+  const [profitInputs, setProfitInputs] = useState<ProfitInputs>({
+    ...EMPTY_PROFIT,
+  });
+  const [profitSaving, setProfitSaving] = useState(false);
+  const [profitSaved, setProfitSaved] = useState(false);
+  // Хэндл авто-сохранённой записи 3-файлового анализа, чтобы «Сохранить
+  // результат» ОБНОВЛЯЛ её (один анализ = одна строка), а не плодил вторую.
+  // synced=false → облачной строки нет, правим только локальную в истории.
+  const [lastUploadCalc, setLastUploadCalc] = useState<{
+    id: string;
+    synced: boolean;
+  } | null>(null);
+  const handleProfitInput = (key: keyof ProfitInputs, value: string) => {
+    setProfitInputs((prev) => ({ ...prev, [key]: value }));
+    // Любая правка расходов → разрешаем повторное сохранение нового результата.
+    setProfitSaved(false);
+  };
+  /** Итоговый расчёт чистой прибыли поверх данных из 3 отчётов. */
+  const profitCalc = useMemo(() => {
+    if (!combinedResult) return null;
+    const num = (s: string) => {
+      const n = parseFloat(s.replace(/\s/g, "").replace(",", "."));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+    const { revenue, loyaltyPayouts, profitBeforeCost } = combinedResult;
+    const costPrice = num(profitInputs.costPrice);
+    const taxPercent = num(profitInputs.taxPercent);
+    const ads = num(profitInputs.ads);
+    const packaging = num(profitInputs.packaging);
+    const deliveryToWarehouse = num(profitInputs.deliveryToWarehouse);
+    const salary = num(profitInputs.salary);
+    const other = num(profitInputs.other);
+
+    // База налога — выручка Ozon (УСН «Доходы» по выбору пользователя).
+    const tax = revenue * (taxPercent / 100);
+    // В итоговом блоке costPrice и tax вынесены отдельными строками,
+    // остальные ручные расходы сворачиваются в «Прочие расходы».
+    const otherExpensesGroup =
+      ads + packaging + deliveryToWarehouse + salary + other;
+    const totalExtraExpenses = costPrice + tax + otherExpensesGroup;
+    const netProfit = profitBeforeCost - totalExtraExpenses;
+    const incomeBase = revenue + loyaltyPayouts;
+    const margin = incomeBase > 0 ? (netProfit / incomeBase) * 100 : 0;
+    const roi = costPrice > 0 ? (netProfit / costPrice) * 100 : 0;
+
+    return {
+      costPrice,
+      taxPercent,
+      tax,
+      ads,
+      packaging,
+      deliveryToWarehouse,
+      salary,
+      other,
+      otherExpensesGroup,
+      totalExtraExpenses,
+      netProfit,
+      margin,
+      roi,
+    };
+  }, [combinedResult, profitInputs]);
+
+  /**
+   * Сохранение ИТОГОВОЙ чистой прибыли (после себестоимости/налога/прочих
+   * расходов) в историю + Supabase как отдельную запись calculation.
+   * Гранулярные поля без своих колонок (ROI, упаковка, доставка, зарплата)
+   * пишем в jsonb `ai_insights`, чтобы ничего не терялось при перезагрузке.
+   * incrementCalcCount НЕ зовём — квота уже списана авто-сейвом в analyzeAllThree.
+   */
+  const saveProfitResult = async () => {
+    if (!combinedResult || !profitCalc) return;
+    if (profitSaving) return;
+    setProfitSaving(true);
+
+    const now = new Date();
+    const incomeRevenue =
+      combinedResult.revenue + combinedResult.loyaltyPayouts;
+    // ads выносим в свою колонку, остальные ручные — в other_expenses.
+    const otherGroup =
+      profitCalc.packaging +
+      profitCalc.deliveryToWarehouse +
+      profitCalc.salary +
+      profitCalc.other;
+    // total_expenses включает Ozon-комиссии + все доп. расходы, поэтому
+    // identity profit = revenue − total_expenses = netProfit сохраняется.
+    const totalExpenses =
+      combinedResult.updServicesTotal +
+      combinedResult.updCommissionTotal +
+      profitCalc.costPrice +
+      profitCalc.tax +
+      profitCalc.ads +
+      otherGroup;
+
+    const breakdown: NetProfitBreakdown = {
+      kind: "net-profit-3file",
+      roi: profitCalc.roi,
+      taxPercent: profitCalc.taxPercent,
+      costPrice: profitCalc.costPrice,
+      tax: profitCalc.tax,
+      ads: profitCalc.ads,
+      packaging: profitCalc.packaging,
+      deliveryToWarehouse: profitCalc.deliveryToWarehouse,
+      salary: profitCalc.salary,
+      other: profitCalc.other,
+      updServicesTotal: combinedResult.updServicesTotal,
+      updCommissionTotal: combinedResult.updCommissionTotal,
+      revenueOzon: combinedResult.revenue,
+      loyaltyPayouts: combinedResult.loyaltyPayouts,
+      profitBeforeCost: combinedResult.profitBeforeCost,
+    };
+
+    // Поля записи — идентичны для update и insert.
+    const payload = {
+      marketplace: "ozon" as const,
+      mode: "upload" as CloudCalcMode,
+      revenue: incomeRevenue,
+      commission: combinedResult.updServicesTotal,
+      logistics: combinedResult.updCommissionTotal,
+      ads: profitCalc.ads,
+      storage: 0,
+      tax: profitCalc.tax,
+      cost: profitCalc.costPrice,
+      other_expenses: otherGroup,
+      total_expenses: totalExpenses,
+      profit: profitCalc.netProfit,
+      margin: profitCalc.margin,
+      ai_insights: breakdown,
+    };
+
+    const canPersist = !!user?.id;
+    let cloudCalcId: string | null = null;
+    let cloudCreatedAt: string | null = null;
+    let synced = false;
+    let calcErrMsg: string | null = null;
+
+    if (canPersist) {
+      // Есть облачная запись этого анализа → ОБНОВЛЯЕМ её (один анализ = одна
+      // строка). Если её нет / update не нашёл строку — вставляем (fallback).
+      if (lastUploadCalc?.synced) {
+        const upRes = await updateCalculationInCloud(
+          lastUploadCalc.id,
+          payload,
+          user!.id
+        );
+        if (upRes.data?.id) {
+          cloudCalcId = upRes.data.id;
+          cloudCreatedAt = upRes.data.created_at;
+          synced = true;
+        } else {
+          calcErrMsg = upRes.error?.message ?? null;
+        }
+      }
+      if (!synced) {
+        const saveRes = await saveCalculationToCloud(payload, user!.id);
+        if (saveRes.error) {
+          calcErrMsg = saveRes.error.message;
+        } else if (saveRes.data?.id) {
+          cloudCalcId = saveRes.data.id;
+          cloudCreatedAt = saveRes.data.created_at;
+          synced = true;
+          calcErrMsg = null;
+        }
+      }
+    }
+
+    // id строки в истории: облачный (после update/insert) → иначе id авто-записи
+    // (правим её на месте) → иначе новый локальный.
+    const targetId = lastUploadCalc?.id ?? null;
+    const res: CalcResult = {
+      id: cloudCalcId ?? targetId ?? makeLocalId(),
+      marketplace: "ozon",
+      revenue: incomeRevenue,
+      commission: combinedResult.updServicesTotal,
+      logistics: combinedResult.updCommissionTotal,
+      storage: 0,
+      ads: profitCalc.ads,
+      cost: profitCalc.costPrice,
+      tax: profitCalc.tax,
+      other: otherGroup,
+      expenses: totalExpenses,
+      profit: profitCalc.netProfit,
+      margin: profitCalc.margin,
+      aiInsights: breakdown,
+      date: now.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      createdAt: cloudCreatedAt ?? now.toISOString(),
+      synced,
+    };
+
+    // Обновляем СУЩЕСТВУЮЩУЮ строку на её месте (позицию и время анализа не
+    // меняем). Если строки нет (edge: её удалили) — добавляем как новую.
+    setHistory((prev) => {
+      const idx = targetId ? prev.findIndex((h) => h.id === targetId) : -1;
+      if (idx === -1) return [res, ...prev].slice(0, 50);
+      const next = [...prev];
+      next[idx] = { ...res, date: prev[idx].date, createdAt: prev[idx].createdAt };
+      return next;
+    });
+    setLastUploadCalc({ id: res.id, synced });
+    setProfitSaving(false);
+    setProfitSaved(true);
+
+    if (synced) {
+      showToast("Чистая прибыль сохранена", "ok");
+    } else if (canPersist && calcErrMsg) {
+      showToast("Облако: " + calcErrMsg, "warn");
+    } else {
+      showToast("Сохранено локально", "warn");
+    }
+  };
+
+  /**
+   * Скачать PDF-отчёт о чистой прибыли (3-file расчёт). Доступно только когда
+   * combinedStatus === "success" и есть profitCalc (кнопка отрендерена внутри
+   * формы чистой прибыли). Кириллица: jsPDF стандартными шрифтами кириллицу не
+   * рендерит, поэтому отчёт рисуется на canvas (системный шрифт корректно
+   * отображает русский), затем вставляется картинкой в A4-страницу jsPDF.
+   * Без ручного подключения шрифтов и без сторонних зависимостей кроме jspdf.
+   */
+  const downloadProfitPdf = async () => {
+    if (!combinedResult || !profitCalc) return;
+    try {
+      const { jsPDF } = await import("jspdf");
+
+      const cr = combinedResult;
+      const pc = profitCalc;
+      const now = new Date();
+      const dateStr = now.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      const money = (n: number) =>
+        n.toLocaleString("ru-RU", {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        }) + " ₽";
+      const pctv = (n: number) =>
+        n.toLocaleString("ru-RU", {
+          minimumFractionDigits: 1,
+          maximumFractionDigits: 1,
+        }) + " %";
+      const netPositive = pc.netProfit >= 0;
+
+      // Строки таблицы основных показателей (порядок — как в форме на экране).
+      const taxLabel =
+        pc.taxPercent > 0
+          ? `Налог (${pc.taxPercent.toLocaleString("ru-RU", {
+              maximumFractionDigits: 2,
+            })}%)`
+          : "Налог";
+      const rows: { label: string; value: string; bold?: boolean }[] = [
+        { label: "Выручка Ozon", value: "+" + money(cr.revenue) },
+        { label: "Выплаты от партнёров", value: "+" + money(cr.loyaltyPayouts) },
+        { label: "Расходы Ozon по УПД", value: "−" + money(cr.updServicesTotal) },
+        {
+          label: "Агентское вознаграждение",
+          value: "−" + money(cr.updCommissionTotal),
+        },
+        {
+          label: "Прибыль до себестоимости",
+          value: money(cr.profitBeforeCost),
+          bold: true,
+        },
+        { label: "Себестоимость", value: "−" + money(pc.costPrice) },
+        { label: taxLabel, value: "−" + money(pc.tax) },
+        { label: "Реклама", value: "−" + money(pc.ads) },
+        { label: "Упаковка", value: "−" + money(pc.packaging) },
+        { label: "Доставка до склада", value: "−" + money(pc.deliveryToWarehouse) },
+        { label: "Зарплата / подрядчики", value: "−" + money(pc.salary) },
+        { label: "Прочие расходы", value: "−" + money(pc.other) },
+      ];
+
+      // ── Canvas (A4 @96dpi = 794×1123), scale ×2 для чёткости ──
+      const scale = 2;
+      const W = 794;
+      const H = 1123;
+      const canvas = document.createElement("canvas");
+      canvas.width = W * scale;
+      canvas.height = H * scale;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("canvas 2d context недоступен");
+      ctx.scale(scale, scale);
+
+      const SANS = "'Helvetica Neue', Arial, sans-serif";
+      const ML = 64;
+      const MR = W - 64;
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#0e1525";
+      ctx.fillRect(0, 0, W, 8);
+
+      ctx.textBaseline = "alphabetic";
+      let y = 90;
+      ctx.fillStyle = "#0e1525";
+      ctx.font = `700 25px ${SANS}`;
+      ctx.fillText("M-Prof — отчёт о чистой прибыли", ML, y);
+
+      y += 30;
+      ctx.font = `400 13px ${SANS}`;
+      ctx.fillStyle = "#5b6677";
+      ctx.fillText(`Дата формирования: ${dateStr}`, ML, y);
+      y += 20;
+      ctx.fillText("Marketplace: Ozon", ML, y);
+
+      y += 22;
+      ctx.strokeStyle = "#e3e7ee";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(ML, y);
+      ctx.lineTo(MR, y);
+      ctx.stroke();
+
+      y += 32;
+      ctx.font = `700 15px ${SANS}`;
+      ctx.fillStyle = "#0e1525";
+      ctx.fillText("Основные показатели", ML, y);
+
+      const rowH = 30;
+      const drawRow = (
+        label: string,
+        value: string,
+        opts?: { bold?: boolean; size?: number; color?: string }
+      ) => {
+        const size = opts?.size ?? 13;
+        ctx.font = `${opts?.bold ? "700" : "400"} ${size}px ${SANS}`;
+        ctx.fillStyle = "#384150";
+        ctx.textAlign = "left";
+        ctx.fillText(label, ML, y + 20);
+        ctx.font = `${opts?.bold ? "700" : "600"} ${size}px ${SANS}`;
+        ctx.fillStyle = opts?.color ?? "#0e1525";
+        ctx.textAlign = "right";
+        ctx.fillText(value, MR, y + 20);
+        ctx.textAlign = "left";
+        ctx.strokeStyle = "#f0f2f6";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(ML, y + rowH);
+        ctx.lineTo(MR, y + rowH);
+        ctx.stroke();
+        y += rowH;
+      };
+
+      y += 12;
+      rows.forEach((r) => drawRow(r.label, r.value, { bold: r.bold }));
+
+      // Разделитель перед итоговым результатом.
+      y += 10;
+      ctx.strokeStyle = "#cfd5df";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(ML, y);
+      ctx.lineTo(MR, y);
+      ctx.stroke();
+      y += 6;
+
+      drawRow("Чистая прибыль", money(pc.netProfit), {
+        bold: true,
+        size: 18,
+        color: netPositive ? "#1d8a4f" : "#c0392b",
+      });
+      drawRow("Маржинальность", pctv(pc.margin), {
+        bold: true,
+        color: pc.margin < 0 ? "#c0392b" : "#0e1525",
+      });
+      drawRow("ROI", pctv(pc.roi), {
+        bold: true,
+        color: pc.roi < 0 ? "#c0392b" : "#0e1525",
+      });
+
+      // Короткий вывод.
+      y += 26;
+      const conclusion = netPositive
+        ? "Бизнес-модель прибыльная по загруженным данным."
+        : "Расчёт показывает убыток. Проверьте себестоимость и расходы.";
+      const boxH = 44;
+      ctx.fillStyle = netPositive ? "#eaf7ef" : "#fdecea";
+      ctx.fillRect(ML, y, MR - ML, boxH);
+      ctx.font = `600 13px ${SANS}`;
+      ctx.fillStyle = netPositive ? "#1d8a4f" : "#c0392b";
+      ctx.textAlign = "left";
+      ctx.fillText(conclusion, ML + 16, y + 27);
+
+      // Подпись внизу страницы.
+      ctx.font = `400 12px ${SANS}`;
+      ctx.fillStyle = "#8a93a3";
+      ctx.textAlign = "center";
+      ctx.fillText("Отчёт сформирован сервисом M-Prof", W / 2, H - 46);
+      ctx.textAlign = "left";
+
+      // ── Canvas → картинка → A4 PDF ──
+      const imgData = canvas.toDataURL("image/png");
+      const doc = new jsPDF({ orientation: "portrait", unit: "px", format: "a4" });
+      const pw = doc.internal.pageSize.getWidth();
+      const ph = doc.internal.pageSize.getHeight();
+      doc.addImage(imgData, "PNG", 0, 0, pw, ph);
+      doc.save(`mprof-profit-report-${now.toISOString().slice(0, 10)}.pdf`);
+      showToast("PDF-отчёт сформирован", "ok");
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[pdf] downloadProfitPdf", e);
+      showToast("Не удалось сформировать PDF", "err");
+    }
+  };
+
+  /**
+   * Клик по строке истории, относящейся к 3-file расчёту: восстанавливаем
+   * редактируемое состояние (combinedResult + форма чистой прибыли) из
+   * ai_insights, чтобы пользователь мог поменять себестоимость/налог/расходы и
+   * нажать «Сохранить результат» — обновится ТА ЖЕ строка (lastUploadCalc),
+   * а не создастся новая. Записи без net-profit разбора (ручной/API расчёт)
+   * не восстанавливаются — guard возвращает null и handler выходит.
+   */
+  const restoreUploadCalc = (item: CalcResult) => {
+    const b = asNetProfitBreakdown(item.aiInsights);
+    if (!b) return;
+    const s = (n: number) => (n ? String(n) : "");
+    setCalcMode("upload");
+    setCombinedError("");
+    setCombinedStatus("success");
+    setCombinedResult({
+      revenue: b.revenueOzon,
+      loyaltyPayouts: b.loyaltyPayouts,
+      updServicesTotal: b.updServicesTotal,
+      updCommissionTotal: b.updCommissionTotal,
+      profitBeforeCost: b.profitBeforeCost,
+    });
+    setProfitInputs({
+      costPrice: s(b.costPrice),
+      taxPercent: s(b.taxPercent),
+      ads: s(b.ads),
+      packaging: s(b.packaging),
+      deliveryToWarehouse: s(b.deliveryToWarehouse),
+      salary: s(b.salary),
+      other: s(b.other),
+    });
+    setShowProfitForm(true);
+    setLastUploadCalc({ id: item.id, synced: item.synced });
+    setSelectedId(item.id);
+    setProfitSaved(false);
+    setProfitSaving(false);
+  };
 
   const acceptUploadFile = (file: File | null) => {
     if (!file) return;
@@ -244,8 +837,19 @@ export default function AppPage() {
   };
 
   const analyzeUpload = async () => {
-    if (!uploadFile || uploadStatus === "processing") return;
+    if (!uploadFile || uploadStatus === "processing") {
+      // eslint-disable-next-line no-console
+      console.warn("[upload] analyzeUpload guard exit", {
+        hasFile: !!uploadFile,
+        uploadStatus,
+      });
+      return;
+    }
     if (!canCalculate) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[upload] analyzeUpload blocked by paywall (canCalculate=false)"
+      );
       setSelectedTier("unlimited");
       setTariffModalOpen(true);
       return;
@@ -254,6 +858,12 @@ export default function AppPage() {
     setUploadStatus("processing");
     setUploadStage(0);
     setUploadErrorMsg("");
+    setUploadDebugInfo(null);
+
+    // Запускаем парсинг параллельно со стадиями анимации — пока крутятся
+    // фейковые «стадии AI», файл уже реально читается. К концу анимации
+    // у нас обычно уже есть результат.
+    const parsePromise = parseOzonReport(uploadFile);
 
     const reduced =
       typeof window !== "undefined" &&
@@ -270,65 +880,105 @@ export default function AppPage() {
       await new Promise((r) => setTimeout(r, 700));
     }
 
-    // эвристика выбора маркетплейса по имени файла
-    const demoMp: Marketplace = /wb|wildber/i.test(uploadFile.name)
-      ? "wb"
-      : "ozon";
-    const demo = {
-      revenue: 480000,
-      commission: 86400,
-      logistics: 32000,
-      storage: 8500,
-      ads: 48000,
-      cost: 180000,
-      tax: 28800,
-      other: 4200,
-    };
-    const expensesSum =
-      demo.commission +
-      demo.logistics +
-      demo.storage +
-      demo.ads +
-      demo.cost +
-      demo.tax +
-      demo.other;
-    const profit = demo.revenue - expensesSum;
-    const margin = demo.revenue > 0 ? (profit / demo.revenue) * 100 : 0;
-    const now = new Date();
+    const parseResult = await parsePromise;
+    // Сохраняем debugInfo всегда — в DEV MODE он отрисуется на ошибочном
+    // экране для диагностики реальных файлов Ozon.
+    setUploadDebugInfo(parseResult.debugInfo);
 
-    // подставляем значения в форму, чтобы было видно при переключении на ручной
-    setMarketplace(demoMp);
-    setForm({
-      revenue: String(demo.revenue),
-      commission: String(demo.commission),
-      logistics: String(demo.logistics),
-      storage: String(demo.storage),
-      ads: String(demo.ads),
-      cost: String(demo.cost),
-      tax: String(demo.tax),
-      other: String(demo.other),
+    // eslint-disable-next-line no-console
+    console.log("[upload] parseResult shape:", {
+      ok: parseResult.ok,
+      error: parseResult.error,
+      hasReport: !!parseResult.report,
+      reportEstimate: parseResult.report?.estimate ?? null,
+      reportRowsCount: parseResult.report?.rowsCount ?? null,
+      debugRowsParsed: parseResult.debugInfo.rowsParsed,
+      debugFailedAt: parseResult.debugInfo.failedAt,
+      debugWarnings: parseResult.debugInfo.aggregationWarnings.length,
     });
 
-    // Если пользователь не залогинен — пишем только локально.
+    if (!parseResult.ok || !parseResult.report) {
+      // eslint-disable-next-line no-console
+      console.warn("[upload] → setUploadStatus('error') (parser returned !ok)", {
+        ok: parseResult.ok,
+        error: parseResult.error,
+        hasReport: !!parseResult.report,
+        failedAt: parseResult.debugInfo.failedAt,
+        rowsParsed: parseResult.debugInfo.rowsParsed,
+      });
+      setUploadStatus("error");
+      setUploadErrorMsg(
+        parseResult.error ||
+          "Не удалось распознать отчёт Ozon. Проверьте, что это XLSX-файл из личного кабинета Ozon."
+      );
+      return;
+    }
+
+    // eslint-disable-next-line no-console
+    console.log("[upload] SUCCESS FLOW START", {
+      mp: parseResult.report.marketplace,
+      estimate: parseResult.report.estimate,
+      rowsCount: parseResult.report.rowsCount,
+      period: parseResult.report.period,
+    });
+
+    const report = parseResult.report;
+    const mp: Marketplace = report.marketplace;
+    const est = report.estimate;
+
+    // Финансовая модель из реального отчёта (cost обычно 0 — Ozon не отдаёт
+    // себестоимость, юзер может дозаполнить в ручном расчёте).
+    const revenue = est.revenue;
+    const commission = est.commission;
+    const logistics = est.logistics;
+    const storage = est.storage;
+    const ads = est.ads;
+    const cost = est.cost;
+    const tax = est.tax;
+    const other = est.other;
+    const expensesSum =
+      commission + logistics + storage + ads + cost + tax + other;
+    const profit = revenue - expensesSum;
+    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
+    const now = new Date();
+
+    // Подставляем значения в форму — юзер сможет переключиться на ручной
+    // режим и увидеть распарсенные числа.
+    setMarketplace(mp);
+    setForm({
+      revenue: String(Math.round(revenue)),
+      commission: String(Math.round(commission)),
+      logistics: String(Math.round(logistics)),
+      storage: String(Math.round(storage)),
+      ads: String(Math.round(ads)),
+      cost: String(Math.round(cost)),
+      tax: String(Math.round(tax)),
+      other: String(Math.round(other)),
+    });
+
+    // eslint-disable-next-line no-console
+    console.log("[debug] analyzeUpload user.id =", user?.id ?? "(anonymous)");
+
     const canPersist = !!user?.id;
 
     let cloudCalcId: string | null = null;
     let cloudCreatedAt: string | null = null;
     let uploadSynced = false;
+    let calcErrMsg: string | null = null;
 
     if (canPersist) {
       const saveRes = await saveCalculationToCloud(
         {
-          marketplace: demoMp,
+          marketplace: mp,
           mode: "upload" as CloudCalcMode,
-          revenue: demo.revenue,
-          commission: demo.commission,
-          logistics: demo.logistics,
-          ads: demo.ads,
-          storage: demo.storage,
-          tax: demo.tax,
-          cost: demo.cost,
-          other_expenses: demo.other,
+          revenue,
+          commission,
+          logistics,
+          ads,
+          storage,
+          tax,
+          cost,
+          other_expenses: other,
           total_expenses: expensesSum,
           profit,
           margin,
@@ -337,11 +987,8 @@ export default function AppPage() {
       );
 
       if (saveRes.error) {
-        console.warn(
-          "analyzeUpload: cloud save failed, fallback local",
-          saveRes.error
-        );
-      } else if (saveRes.data) {
+        calcErrMsg = saveRes.error.message;
+      } else if (saveRes.data?.id) {
         cloudCalcId = saveRes.data.id;
         cloudCreatedAt = saveRes.data.created_at;
         uploadSynced = true;
@@ -351,15 +998,15 @@ export default function AppPage() {
     {
       const res: CalcResult = {
         id: cloudCalcId ?? makeLocalId(),
-        marketplace: demoMp,
-        revenue: demo.revenue,
-        commission: demo.commission,
-        logistics: demo.logistics,
-        storage: demo.storage,
-        ads: demo.ads,
-        cost: demo.cost,
-        tax: demo.tax,
-        other: demo.other,
+        marketplace: mp,
+        revenue,
+        commission,
+        logistics,
+        storage,
+        ads,
+        cost,
+        tax,
+        other,
         expenses: expensesSum,
         profit,
         margin,
@@ -380,12 +1027,22 @@ export default function AppPage() {
       window.setTimeout(() => setJustCalculated(false), 2200);
       dismissOnboarding();
 
-      // success state — показываем детектированные метаданные пользователю
+      // Период — из парсера, иначе fallback на месяц текущей даты загрузки
       const monthName = now.toLocaleString("ru-RU", { month: "long" });
-      const period = `За ${monthName} ${now.getFullYear()}`;
-      const rowsCount = 120 + Math.floor(Math.random() * 380);
+      const period =
+        report.period ?? `За ${monthName} ${now.getFullYear()}`;
+      const rowsCount = report.rowsCount;
 
-      setUploadDetected({ marketplace: demoMp, period, rowsCount });
+      // eslint-disable-next-line no-console
+      console.log("[upload] → setUploadStatus('success')", {
+        mp,
+        period,
+        rowsCount,
+        profit,
+        margin,
+        synced: uploadSynced,
+      });
+      setUploadDetected({ marketplace: mp, period, rowsCount });
       setUploadStatus("success");
 
       // Сохраняем uploaded_report в облако (если есть user и cloud calc id);
@@ -396,7 +1053,7 @@ export default function AppPage() {
           {
             file_name: uploadFile.name,
             file_size: formatFileSize(uploadFile.size),
-            marketplace: demoMp,
+            marketplace: mp,
             period,
             rows_count: rowsCount,
             calculation_id: cloudCalcId, // может быть null если cloud calc упал
@@ -418,7 +1075,7 @@ export default function AppPage() {
           {
             id: reportId,
             filename: uploadFile.name,
-            marketplace: demoMp,
+            marketplace: mp,
             profit,
             margin,
             rowsCount,
@@ -431,8 +1088,10 @@ export default function AppPage() {
 
       if (uploadSynced) {
         showToast("Отчёт сохранён", "ok");
+      } else if (canPersist && calcErrMsg) {
+        showToast("Облако: " + calcErrMsg, "warn");
       } else {
-        // Soft fallback: ни ошибки, ни алярма — просто инфо.
+        // Soft fallback (anon / DEV)
         showToast("Отчёт сохранён локально", "warn");
       }
     }
@@ -444,11 +1103,335 @@ export default function AppPage() {
     setUploadStage(0);
     setUploadDetected(null);
     setUploadErrorMsg("");
+    setUploadDebugInfo(null);
   };
 
   const openUploadResults = () => {
     resetUploadFlow();
     setCalcMode("manual");
+  };
+
+  // ===== 3-file flow helpers =====
+  /** Положить файл в КОНКРЕТНЫЙ слот (через input[type=file] click). */
+  const acceptSlot = (
+    slot: "xlsx" | "updServices" | "updCommission",
+    file: File | null
+  ) => {
+    if (!file) return;
+    const isXlsx = /\.(xlsx|csv)$/i.test(file.name);
+    const isPdf = /\.pdf$/i.test(file.name);
+    if (slot === "xlsx" && !isXlsx) {
+      showToast("Слот 1: только XLSX или CSV", "err");
+      return;
+    }
+    if (slot !== "xlsx" && !isPdf) {
+      showToast("Слот УПД: только PDF", "err");
+      return;
+    }
+    if (slot === "xlsx") setSlotXlsx(file);
+    if (slot === "updServices") setSlotUpdServices(file);
+    if (slot === "updCommission") setSlotUpdCommission(file);
+  };
+
+  /**
+   * Маршрутизация файлов из drag&drop — мы можем не знать на какой
+   * именно слот перетащил пользователь (он мог промахнуться). По типу:
+   *  - XLSX/CSV → slot 1 (realization)
+   *  - PDF → первый пустой PDF-слот (services → commission)
+   * `preferredSlot` подсказывает желаемый слот (если drop попал на конкретный).
+   */
+  const acceptDroppedFile = (
+    file: File | null,
+    preferredSlot: "xlsx" | "updServices" | "updCommission" | null
+  ) => {
+    if (!file) return;
+    const isXlsx = /\.(xlsx|csv)$/i.test(file.name);
+    const isPdf = /\.pdf$/i.test(file.name);
+
+    if (isXlsx) {
+      // XLSX всегда идёт в slot 1, независимо от того, куда дропнули
+      if (preferredSlot && preferredSlot !== "xlsx") {
+        showToast(`XLSX отправлен в слот 1 (реализация)`, "warn");
+      }
+      setSlotXlsx(file);
+      return;
+    }
+    if (isPdf) {
+      // Если drop попал точно на PDF-слот — кладём туда (даже перезаписав)
+      if (preferredSlot === "updServices") {
+        setSlotUpdServices(file);
+        return;
+      }
+      if (preferredSlot === "updCommission") {
+        setSlotUpdCommission(file);
+        return;
+      }
+      // Иначе — в первый пустой PDF-слот
+      if (!slotUpdServices) {
+        setSlotUpdServices(file);
+      } else if (!slotUpdCommission) {
+        setSlotUpdCommission(file);
+      } else {
+        // Оба заняты — заменяем второй (более вероятный «refresh»)
+        setSlotUpdCommission(file);
+        showToast("Заменили УПД агентское вознаграждение", "warn");
+      }
+      return;
+    }
+    showToast("Только XLSX/CSV (слот 1) или PDF (слоты 2/3)", "err");
+  };
+
+  const resetCombinedFlow = () => {
+    setSlotXlsx(null);
+    setSlotUpdServices(null);
+    setSlotUpdCommission(null);
+    setCombinedStatus("idle");
+    setCombinedError("");
+    setCombinedResult(null);
+    setCombinedDebug(null);
+    setShowProfitForm(false);
+    setProfitInputs({ ...EMPTY_PROFIT });
+    setProfitSaving(false);
+    setProfitSaved(false);
+    setLastUploadCalc(null);
+  };
+
+  const analyzeAllThree = async () => {
+    if (!slotXlsx || !slotUpdServices || !slotUpdCommission) {
+      showToast("Загрузите все 3 файла", "warn");
+      return;
+    }
+    if (combinedStatus === "processing") return;
+    if (!canCalculate) {
+      // eslint-disable-next-line no-console
+      console.warn("[upload-3] blocked by paywall");
+      setSelectedTier("unlimited");
+      setTariffModalOpen(true);
+      return;
+    }
+
+    setCombinedStatus("processing");
+    setCombinedError("");
+    setCombinedResult(null);
+    setCombinedDebug(null);
+
+    // eslint-disable-next-line no-console
+    console.log("[upload-3] starting parallel parse of 3 files", {
+      xlsx: slotXlsx.name,
+      updServices: slotUpdServices.name,
+      updCommission: slotUpdCommission.name,
+    });
+
+    // Параллельный парсинг всех трёх
+    const [xlsxRes, updSrvRes, updComRes] = await Promise.all([
+      parseOzonReport(slotXlsx),
+      parseUpdPdf(slotUpdServices),
+      parseUpdPdf(slotUpdCommission),
+    ]);
+
+    setCombinedDebug({
+      xlsx: xlsxRes.debugInfo,
+      updServices: updSrvRes.debugInfo,
+      updCommission: updComRes.debugInfo,
+    });
+
+    // eslint-disable-next-line no-console
+    console.log("[upload-3] parse results:", {
+      xlsxOk: xlsxRes.ok,
+      xlsxRevenueFromTotals:
+        xlsxRes.report?.totals.revenueFromTotalsRow ?? null,
+      xlsxLoyaltyFromTotals:
+        xlsxRes.report?.totals.loyaltyPayoutsFromTotalsRow ?? null,
+      updServicesOk: updSrvRes.ok,
+      updServicesTotal: updSrvRes.report?.totalAmount ?? null,
+      updCommissionOk: updComRes.ok,
+      updCommissionTotal: updComRes.report?.totalAmount ?? null,
+    });
+
+    if (!xlsxRes.ok || !xlsxRes.report) {
+      setCombinedStatus("error");
+      setCombinedError(
+        `XLSX: ${xlsxRes.error ?? "не удалось обработать"}`
+      );
+      return;
+    }
+    if (!updSrvRes.ok || !updSrvRes.report) {
+      setCombinedStatus("error");
+      setCombinedError(
+        `УПД доп. услуги: ${updSrvRes.error ?? "не удалось обработать"}`
+      );
+      return;
+    }
+    if (!updComRes.ok || !updComRes.report) {
+      setCombinedStatus("error");
+      setCombinedError(
+        `УПД агентское: ${updComRes.error ?? "не удалось обработать"}`
+      );
+      return;
+    }
+
+    // STRICT POLICY: revenue из XLSX берётся ТОЛЬКО через text-match строки
+    // «Итого реализовано (за вычетом возвратов)». Если text-match не нашёл —
+    // парсер возвращает null (никакого numeric fallback'а нет). В этом случае
+    // мы НЕ заполняем форму и НЕ показываем результат — это ошибка анализа.
+    const revenueFromTotals = xlsxRes.report.totals.revenueFromTotalsRow;
+    const loyaltyPayouts =
+      xlsxRes.report.totals.loyaltyPayoutsFromTotalsRow ?? 0;
+    const updServicesTotal = updSrvRes.report.totalAmount;
+    const updCommissionTotal = updComRes.report.totalAmount;
+
+    if (revenueFromTotals === null || revenueFromTotals <= 0) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[upload-3] revenue text-match failed — strict policy, no fallback",
+        {
+          matchedRevenueTotalDetails:
+            xlsxRes.debugInfo.matchedRevenueTotalDetails,
+        }
+      );
+      setCombinedStatus("error");
+      setCombinedError(
+        'Не найдена строка «Итого реализовано (за вычетом возвратов)» в XLSX. revenue не заполнять. Проверьте, что файл — оригинальный «Отчёт о реализации товара» из Ozon, без обрезок. Откройте DEV debug для деталей.'
+      );
+      return;
+    }
+
+    const revenue = revenueFromTotals;
+
+    const profitBeforeCost =
+      revenue + loyaltyPayouts - updServicesTotal - updCommissionTotal;
+
+    // eslint-disable-next-line no-console
+    console.log("[upload-3] FORMULA:", {
+      revenue,
+      loyaltyPayouts,
+      updServicesTotal,
+      updCommissionTotal,
+      profitBeforeCost,
+    });
+
+    setCombinedResult({
+      revenue,
+      loyaltyPayouts,
+      updServicesTotal,
+      updCommissionTotal,
+      profitBeforeCost,
+    });
+
+    // Автозаполнение формы в manual mode (для last-mile проверки/правок).
+    // Объединяем доход (revenue + loyaltyPayouts) и расходы (Ozon-комиссии).
+    setForm({
+      ...EMPTY,
+      revenue: String((revenue + loyaltyPayouts).toFixed(2)),
+      commission: String(updServicesTotal.toFixed(2)),
+      logistics: String(updCommissionTotal.toFixed(2)),
+    });
+
+    // Сохраняем результат 3-file flow в историю + Supabase как calculation (mode='upload').
+    // Все доп. расходы = 0, поэтому identity profit = revenue − total_expenses (= profitBeforeCost).
+    {
+      const now = new Date();
+      const incomeRevenue = revenue + loyaltyPayouts;
+      const upExpenses = updServicesTotal + updCommissionTotal;
+      const upMargin =
+        incomeRevenue > 0 ? (profitBeforeCost / incomeRevenue) * 100 : 0;
+
+      // Разбор для ai_insights — чтобы клик по истории мог восстановить
+      // combinedResult и (после ввода себестоимости) форму чистой прибыли.
+      // На этом этапе все доп. расходы = 0 (черновик до ввода себестоимости).
+      const breakdown: NetProfitBreakdown = {
+        kind: "net-profit-3file",
+        roi: 0,
+        taxPercent: 0,
+        costPrice: 0,
+        tax: 0,
+        ads: 0,
+        packaging: 0,
+        deliveryToWarehouse: 0,
+        salary: 0,
+        other: 0,
+        updServicesTotal,
+        updCommissionTotal,
+        revenueOzon: revenue,
+        loyaltyPayouts,
+        profitBeforeCost,
+      };
+
+      const canPersist = !!user?.id;
+      let cloudCalcId: string | null = null;
+      let cloudCreatedAt: string | null = null;
+      let synced = false;
+      let calcErrMsg: string | null = null;
+
+      if (canPersist) {
+        const saveRes = await saveCalculationToCloud(
+          {
+            marketplace: "ozon",
+            mode: "upload" as CloudCalcMode,
+            revenue: incomeRevenue,
+            commission: updServicesTotal,
+            logistics: updCommissionTotal,
+            ads: 0,
+            storage: 0,
+            tax: 0,
+            cost: 0,
+            other_expenses: 0,
+            total_expenses: upExpenses,
+            profit: profitBeforeCost,
+            margin: upMargin,
+            ai_insights: breakdown,
+          },
+          user!.id
+        );
+        if (saveRes.error) {
+          calcErrMsg = saveRes.error.message;
+        } else if (saveRes.data?.id) {
+          cloudCalcId = saveRes.data.id;
+          cloudCreatedAt = saveRes.data.created_at;
+          synced = true;
+        }
+      }
+
+      const res: CalcResult = {
+        id: cloudCalcId ?? makeLocalId(),
+        marketplace: "ozon",
+        revenue: incomeRevenue,
+        commission: updServicesTotal,
+        logistics: updCommissionTotal,
+        storage: 0,
+        ads: 0,
+        cost: 0,
+        tax: 0,
+        other: 0,
+        expenses: upExpenses,
+        profit: profitBeforeCost,
+        margin: upMargin,
+        aiInsights: breakdown,
+        date: now.toLocaleString("ru-RU", {
+          day: "2-digit",
+          month: "short",
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+        createdAt: cloudCreatedAt ?? now.toISOString(),
+        synced,
+      };
+
+      setHistory((prev) => [res, ...prev].slice(0, 50));
+      incrementCalcCount();
+      // Запоминаем эту строку — «Сохранить результат» обновит ИМЕННО её.
+      setLastUploadCalc({ id: res.id, synced });
+
+      if (synced) {
+        showToast("Расчёт сохранён", "ok");
+      } else if (canPersist && calcErrMsg) {
+        showToast("Облако: " + calcErrMsg, "warn");
+      } else {
+        showToast("Расчёт сохранён локально", "warn");
+      }
+    }
+
+    setCombinedStatus("success");
   };
   const [tariffModalOpen, setTariffModalOpen] = useState(false);
   const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
@@ -592,6 +1575,8 @@ export default function AppPage() {
     supabase.auth.getSession().then(async ({ data }) => {
       if (!mounted) return;
       const u = data.session?.user ?? null;
+      // eslint-disable-next-line no-console
+      console.log("[debug] getSession user.id =", u?.id ?? "(no session)");
       setUser(u);
       setAuthLoading(false);
       if (u?.id) {
@@ -635,10 +1620,15 @@ export default function AppPage() {
       return;
     }
 
+    // Куда вернуть пользователя по ссылке из письма. На проде — NEXT_PUBLIC_SITE_URL
+    // (Railway-домен), в dev (переменная не задана) — origin текущего окна.
+    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "");
+    const emailRedirectTo = `${siteUrl || window.location.origin}/app`;
+
     const { error } = await supabase.auth.signInWithOtp({
       email: email.trim(),
       options: {
-        emailRedirectTo: "http://localhost:3000/app",
+        emailRedirectTo,
       },
     });
 
@@ -783,6 +1773,9 @@ export default function AppPage() {
     });
     if (selectedId === id) setSelectedId(null);
     setResult((prev) => (prev && prev.id === id ? null : prev));
+    // Если удалили авто-запись анализа — сбрасываем хэндл, чтобы следующее
+    // «Сохранить результат» вставило новую строку, а не апдейтило удалённую.
+    if (lastUploadCalc?.id === id) setLastUploadCalc(null);
 
     if (delErr) {
       // Не error — fallback нормально сработал.
@@ -919,10 +1912,14 @@ export default function AppPage() {
 
       // Параллельно: cloud save (через helper, который сам обрабатывает ошибки)
       // и таймер для UX. Если юзер не залогинен — save пропускаем сразу.
+      // eslint-disable-next-line no-console
+      console.log("[debug] calculate user.id =", user?.id ?? "(anonymous)");
+
       const savePromise: Promise<{
         synced: boolean;
         cloudId: string | null;
         cloudCreatedAt: string | null;
+        errMsg: string | null;
       }> = user?.id
         ? saveCalculationToCloud(
             {
@@ -942,23 +1939,20 @@ export default function AppPage() {
             },
             user.id
           ).then((res) => {
-            if (res.error) {
-              console.warn(
-                "calculate: cloud save failed, fallback local",
-                res.error
-              );
-              return { synced: false, cloudId: null, cloudCreatedAt: null };
-            }
+            // Strict synced: ТОЛЬКО если нет ошибки И вернулся id из БД.
+            const ok = !res.error && !!res.data?.id;
             return {
-              synced: true,
+              synced: ok,
               cloudId: res.data?.id ?? null,
               cloudCreatedAt: res.data?.created_at ?? null,
+              errMsg: res.error?.message ?? null,
             };
           })
         : Promise.resolve({
             synced: false,
             cloudId: null,
             cloudCreatedAt: null,
+            errMsg: null,
           });
 
       const [saveResult] = await Promise.all([savePromise, minDelay]);
@@ -976,8 +1970,11 @@ export default function AppPage() {
 
       if (synced) {
         showToast("Расчёт сохранён", "ok");
+      } else if (user?.id && saveResult.errMsg) {
+        // Был логин — но cloud упал. Показываем причину одной строкой.
+        showToast("Облако: " + saveResult.errMsg, "warn");
       } else {
-        // Soft notification — не «ошибка», локальный fallback сработал ок.
+        // Не залогинен / DEV — обычный soft-fallback.
         showToast("Расчёт сохранён локально", "warn");
       }
 
@@ -1493,7 +2490,213 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 }
 
 /* ====== UPLOAD REPORT CARD ====== */
-.upload-card{padding:1.4rem;margin-bottom:.25rem}
+.upload-card{padding:1.4rem;margin-bottom:.25rem;min-width:0;overflow:hidden}
+
+/* ===== 3-file upload (новая архитектура) ===== */
+.upload-3-head{margin-bottom:1.2rem}
+.upload-3-title{
+  font-family:var(--display);font-style:italic;font-size:1.45rem;
+  color:var(--txt);margin:0 0 .35rem;letter-spacing:.005em
+}
+.upload-3-sub{
+  font-size:.85rem;color:var(--txt2);line-height:1.5;margin:0;max-width:680px
+}
+.upload-3-sub b{color:var(--gold2);font-weight:500}
+.upload-3-slots{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:12px;margin-bottom:1.2rem;
+  width:100%;min-width:0
+}
+/* Laptop / tablet → 2 columns (третий уезжает вниз, без переполнения) */
+@media (max-width:1100px){
+  .upload-3-slots{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+/* Mobile → 1 column */
+@media (max-width:680px){
+  .upload-3-slots{grid-template-columns:1fr}
+}
+.upload-slot{
+  position:relative;display:flex;gap:12px;align-items:flex-start;
+  background:rgba(255,255,255,.028);
+  border:1px solid var(--edge);
+  border-radius:14px;padding:14px;
+  min-width:0;            /* критично — иначе grid не позволит ужаться */
+  transition:border-color .25s,background .25s,transform .2s
+}
+.upload-slot.is-drag{
+  border-color:var(--gold);
+  background:rgba(201,168,76,.08);
+  box-shadow:0 0 0 1px rgba(201,168,76,.25),0 8px 22px rgba(201,168,76,.08)
+}
+.upload-slot:hover{border-color:rgba(201,168,76,.22);background:rgba(255,255,255,.04)}
+.upload-slot.is-ready{
+  border-color:rgba(46,204,138,.32);background:rgba(46,204,138,.05);
+  box-shadow:0 0 0 1px rgba(46,204,138,.10),0 8px 22px rgba(46,204,138,.06)
+}
+.upload-slot-num{
+  flex:0 0 28px;width:28px;height:28px;display:grid;place-items:center;
+  border-radius:50%;font-family:var(--mono);font-size:.72rem;
+  background:rgba(201,168,76,.13);color:var(--gold2);
+  border:1px solid rgba(201,168,76,.28)
+}
+.upload-slot.is-ready .upload-slot-num{
+  background:rgba(46,204,138,.16);color:#7be8b2;border-color:rgba(46,204,138,.34)
+}
+.upload-slot-body{flex:1;min-width:0}
+.upload-slot-label{
+  font-size:.88rem;color:var(--txt);font-weight:500;margin-bottom:2px;line-height:1.3
+}
+.upload-slot-meta{
+  font-family:var(--mono);font-size:.6rem;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px
+}
+.upload-slot-pick{
+  width:100%;padding:8px 12px;border-radius:9px;font-size:.78rem;
+  background:rgba(201,168,76,.10);color:var(--gold2);
+  border:1px solid rgba(201,168,76,.28);cursor:pointer;
+  transition:all .2s
+}
+.upload-slot-pick:hover{background:rgba(201,168,76,.16);border-color:var(--gold)}
+.upload-slot-file{
+  display:flex;align-items:center;gap:8px;
+  background:rgba(46,204,138,.08);
+  border:1px solid rgba(46,204,138,.20);
+  border-radius:9px;padding:7px 10px;
+  font-size:.74rem
+}
+.upload-slot-file-name{
+  flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  color:var(--txt)
+}
+.upload-slot-remove{
+  width:20px;height:20px;display:grid;place-items:center;
+  background:transparent;color:var(--txt2);border:1px solid var(--edge);
+  border-radius:50%;cursor:pointer;font-size:.95rem;line-height:1;
+  transition:all .15s
+}
+.upload-slot-remove:hover{color:var(--red);border-color:rgba(224,85,102,.35)}
+
+.upload-3-actions{
+  display:flex;gap:12px;flex-wrap:wrap;align-items:center
+}
+.upload-3-btn{
+  padding:10px 18px;border-radius:10px;font-size:.85rem;font-weight:500;
+  cursor:pointer;transition:all .2s;border:1px solid transparent
+}
+.upload-3-btn.primary{
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:#0d1020;border-color:var(--gold);
+  box-shadow:0 6px 16px rgba(201,168,76,.22)
+}
+.upload-3-btn.primary:hover:not(:disabled){
+  transform:translateY(-1px);box-shadow:0 10px 24px rgba(201,168,76,.32)
+}
+.upload-3-btn.primary:disabled{
+  opacity:.4;cursor:not-allowed;background:rgba(201,168,76,.18);color:var(--txt2);
+  box-shadow:none
+}
+.upload-3-btn.ghost{
+  background:transparent;color:var(--txt2);border-color:var(--edge)
+}
+.upload-3-btn.ghost:hover:not(:disabled){
+  color:var(--txt);border-color:rgba(255,255,255,.18)
+}
+
+.upload-3-result{
+  margin-top:1.3rem;padding:1.3rem 1.4rem;border-radius:14px;
+  background:linear-gradient(135deg,rgba(46,204,138,.06) 0%,rgba(46,204,138,.02) 100%);
+  border:1px solid rgba(46,204,138,.22);position:relative
+}
+.upload-3-result-title{
+  font-family:var(--mono);font-size:.62rem;color:#7be8b2;
+  text-transform:uppercase;letter-spacing:.1em;margin-bottom:.5rem
+}
+.upload-3-result-big{
+  font-family:var(--display);font-style:italic;font-size:2.4rem;
+  color:var(--txt);margin-bottom:1rem;letter-spacing:-.01em;line-height:1.1
+}
+.upload-3-result-breakdown{
+  display:grid;grid-template-columns:1fr;gap:6px;padding:.7rem 0 .3rem;
+  border-top:1px solid rgba(255,255,255,.06)
+}
+.upload-3-row{
+  display:flex;justify-content:space-between;align-items:baseline;
+  font-size:.82rem;color:var(--txt2);padding:3px 0
+}
+.upload-3-row .num{
+  font-family:var(--mono);font-size:.82rem;color:#7be8b2;font-variant-numeric:tabular-nums
+}
+.upload-3-row.negative .num{color:#e89a99}
+.upload-3-row.subtotal{
+  border-top:1px dashed rgba(255,255,255,.1);margin-top:4px;padding-top:7px;
+  color:var(--txt);font-weight:500
+}
+.upload-3-row.subtotal .num{color:var(--txt)}
+
+/* ===== Финальный калькулятор чистой прибыли ===== */
+.profit-calc{
+  margin-top:1.2rem;padding-top:1.2rem;border-top:1px solid rgba(255,255,255,.08)
+}
+.profit-calc-head{
+  font-family:var(--mono);font-size:.6rem;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem
+}
+.profit-grid{margin-bottom:.4rem}
+.profit-summary{
+  margin-top:1.3rem;padding:1.2rem 1.3rem;border-radius:12px;
+  background:rgba(255,255,255,.025);border:1px solid var(--edge)
+}
+.profit-summary-title{
+  font-family:var(--mono);font-size:.6rem;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.1em;margin-bottom:.4rem
+}
+.profit-summary-big{
+  font-family:var(--display);font-style:italic;font-size:2.2rem;
+  color:#7be8b2;letter-spacing:-.01em;line-height:1.1
+}
+.profit-summary-big.neg{color:#e89a99}
+.profit-stats{
+  display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:1rem
+}
+.profit-stat{
+  display:flex;flex-direction:column;gap:3px;padding:.7rem .9rem;
+  background:rgba(255,255,255,.025);border:1px solid var(--edge);border-radius:10px
+}
+.profit-stat-label{
+  font-family:var(--mono);font-size:.58rem;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.08em
+}
+.profit-stat-val{
+  font-family:var(--mono);font-size:1.15rem;color:var(--txt);
+  font-variant-numeric:tabular-nums
+}
+.profit-stat-val.neg{color:#e89a99}
+.profit-breakdown{
+  display:grid;grid-template-columns:1fr;gap:6px;margin-top:1.1rem;
+  padding-top:.9rem;border-top:1px solid rgba(255,255,255,.06)
+}
+
+.upload-3-error{
+  margin-top:1.2rem;padding:1.1rem 1.3rem;border-radius:12px;
+  background:rgba(224,85,102,.07);border:1px solid rgba(224,85,102,.24)
+}
+.upload-3-error-title{
+  font-size:1rem;color:#f0a4a4;font-weight:500;margin-bottom:.3rem
+}
+.upload-3-error-sub{
+  font-size:.82rem;color:var(--txt2);margin:0;line-height:1.5
+}
+
+.upload-3-debug{
+  margin-top:1.2rem;padding:.7rem 1rem;border-radius:10px;
+  background:rgba(255,255,255,.025);border:1px solid var(--edge);
+  font-size:.7rem;color:var(--txt2)
+}
+.upload-3-debug summary{
+  cursor:pointer;font-family:var(--mono);text-transform:uppercase;
+  letter-spacing:.08em;color:var(--gold2);font-size:.6rem
+}
 
 /* === IDLE: premium drag&drop === */
 .upload-drop{
@@ -3547,7 +4750,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         </div>
         )}
 
-        {calcMode === "api" && (
+        {calcMode === "api" && COMING_SOON.apiAutoload && (
+          <ComingSoon
+            title="Автозагрузка через API"
+            description="Подключение Ozon и Wildberries по API: продажи, комиссии и расходы будут подтягиваться автоматически — без ручной выгрузки файлов."
+          />
+        )}
+
+        {calcMode === "api" && !COMING_SOON.apiAutoload && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
             <div className="api-pro-title">Подключение маркетплейсов</div>
@@ -3743,207 +4953,543 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         )}
 
         {calcMode === "upload" && (
-          <div className="card upload-card" role="region" aria-label="Загрузка отчёта">
-            {uploadStatus === "idle" && (
+          <div className="card upload-card" role="region" aria-label="Загрузка отчёта (3 файла)">
+            <div className="upload-3-head">
+              <div className="upload-3-title">
+                Точный расчёт Ozon — 3 файла
+              </div>
+              <p className="upload-3-sub">
+                Загрузите XLSX-отчёт о реализации и оба УПД (доп. услуги +
+                агентское вознаграждение). Прибыль до себестоимости считается
+                по формуле: <b>revenue + loyaltyPayouts − updServices − updCommission</b>.
+              </p>
+            </div>
+
+            <div className="upload-3-slots">
+              {/* Slot 1: XLSX */}
               <div
-                className={"upload-drop" + (uploadDragActive ? " is-active" : "")}
+                className={
+                  "upload-slot " +
+                  (slotXlsx ? "is-ready " : "") +
+                  (dragOverSlot === "xlsx" ? "is-drag" : "")
+                }
                 onDragOver={(e) => {
                   e.preventDefault();
-                  setUploadDragActive(true);
+                  e.stopPropagation();
+                  setDragOverSlot("xlsx");
                 }}
                 onDragLeave={(e) => {
                   e.preventDefault();
-                  setUploadDragActive(false);
+                  setDragOverSlot(null);
                 }}
                 onDrop={(e) => {
                   e.preventDefault();
-                  setUploadDragActive(false);
-                  acceptUploadFile(e.dataTransfer.files?.[0] ?? null);
+                  e.stopPropagation();
+                  setDragOverSlot(null);
+                  acceptDroppedFile(
+                    e.dataTransfer.files?.[0] ?? null,
+                    "xlsx"
+                  );
                 }}
               >
-                <span className="upload-drop-glow" aria-hidden="true" />
-                <span className="upload-drop-sweep" aria-hidden="true" />
-
-                <div className="upload-drop-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                    <path d="M17 8 12 3 7 8" />
-                    <path d="M12 3v13" />
-                  </svg>
-                </div>
-                <h3 className="upload-drop-title">
-                  Загрузите <em>месячный отчёт</em>
-                </h3>
-                <p className="upload-drop-sub">
-                  Перетащите файл из личного кабинета Ozon или Wildberries сюда — или выберите вручную.
-                </p>
-
-                <input
-                  ref={uploadInputRef}
-                  type="file"
-                  accept=".xlsx,.csv"
-                  className="upload-input-hidden"
-                  onChange={(e) => {
-                    acceptUploadFile(e.target.files?.[0] ?? null);
-                    if (e.target) e.target.value = "";
-                  }}
-                />
-                <button
-                  type="button"
-                  className="upload-pick-btn"
-                  onClick={() => uploadInputRef.current?.click()}
-                >
-                  Выбрать файл
-                  <span className="arr" aria-hidden="true">→</span>
-                </button>
-
-                <div className="upload-formats" aria-hidden="true">
-                  <span>XLSX</span>
-                  <span>CSV</span>
-                </div>
-              </div>
-            )}
-
-            {uploadStatus === "ready" && uploadFile && (
-              <div className="upload-ready">
-                <div className="upload-file-info">
-                  <div className="upload-file-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                      strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                      <path d="M14 2v6h6" />
-                      <path d="M9 13h6M9 17h4" />
-                    </svg>
+                <div className="upload-slot-num" aria-hidden="true">1</div>
+                <div className="upload-slot-body">
+                  <div className="upload-slot-label">
+                    Отчёт о реализации товара
                   </div>
-                  <div className="upload-file-meta">
-                    <div className="upload-file-name" title={uploadFile.name}>
-                      {uploadFile.name}
+                  <div className="upload-slot-meta">XLSX или CSV</div>
+                  {slotXlsx ? (
+                    <div className="upload-slot-file" title={slotXlsx.name}>
+                      <span className="upload-slot-file-name">{slotXlsx.name}</span>
+                      <button
+                        type="button"
+                        className="upload-slot-remove"
+                        onClick={() => setSlotXlsx(null)}
+                        aria-label="Удалить файл"
+                      >
+                        ×
+                      </button>
                     </div>
-                    <div className="upload-file-size">
-                      {formatFileSize(uploadFile.size)} · Файл готов к анализу
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="upload-file-remove"
-                    onClick={removeUploadFile}
-                    aria-label="Удалить файл"
-                    title="Удалить файл"
-                  >
-                    ×
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  className="upload-analyze-btn"
-                  onClick={analyzeUpload}
-                >
-                  Проанализировать отчёт
-                  <span className="arr" aria-hidden="true">→</span>
-                </button>
-              </div>
-            )}
-
-            {uploadStatus === "processing" && (
-              <div className="upload-processing" role="status" aria-live="polite">
-                <div className="ai-proc-ico" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
-                  </svg>
-                </div>
-                <div className="ai-proc-title">
-                  Анализ <em>отчёта</em>
-                </div>
-                <ul className="ai-proc-stages">
-                  {UPLOAD_STAGES.map((s, i) => (
-                    <li
-                      key={i}
-                      className={
-                        "ai-proc-stage" +
-                        (i === uploadStage ? " is-active" : "") +
-                        (i < uploadStage ? " is-done" : "")
-                      }
+                  ) : (
+                    <button
+                      type="button"
+                      className="upload-slot-pick"
+                      onClick={() => xlsxInputRef.current?.click()}
                     >
-                      <span className="ai-proc-mark" aria-hidden="true" />
-                      <span className="ai-proc-stage-text">{s}</span>
-                    </li>
-                  ))}
-                </ul>
-                <div className="ai-proc-progress" aria-hidden="true">
-                  <div className="ai-proc-progress-bar" />
+                      Выбрать файл
+                    </button>
+                  )}
+                  <input
+                    ref={xlsxInputRef}
+                    type="file"
+                    accept=".xlsx,.csv"
+                    style={{ display: "none" }}
+                    onChange={(e) =>
+                      acceptSlot("xlsx", e.target.files?.[0] ?? null)
+                    }
+                  />
                 </div>
               </div>
-            )}
 
-            {uploadStatus === "success" && uploadDetected && uploadFile && (
-              <div className="upload-success" role="status">
-                <div className="upload-success-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m8 12.5 2.8 2.8L16.5 9.5" />
-                  </svg>
-                </div>
-
-                <div className="upload-success-title">Отчёт обработан</div>
-                <div className="upload-success-sub" title={uploadFile.name}>
-                  {uploadFile.name}
-                </div>
-
-                <div className="upload-success-meta">
-                  <span className={"upload-mp-badge " + uploadDetected.marketplace}>
-                    <span className="upload-mp-dot" />
-                    {uploadDetected.marketplace === "ozon" ? "Ozon" : "Wildberries"}
-                  </span>
-                  <span className="upload-meta-pill">{uploadDetected.period}</span>
-                  <span className="upload-meta-pill">
-                    {uploadDetected.rowsCount.toLocaleString("ru-RU")} строк
-                  </span>
-                </div>
-
-                <div className="upload-success-actions">
-                  <button
-                    type="button"
-                    className="upload-success-btn primary"
-                    onClick={openUploadResults}
-                  >
-                    Открыть результаты
-                    <span className="arr" aria-hidden="true">→</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="upload-success-btn ghost"
-                    onClick={resetUploadFlow}
-                  >
-                    Загрузить ещё отчёт
-                  </button>
+              {/* Slot 2: UPD services */}
+              <div
+                className={
+                  "upload-slot " +
+                  (slotUpdServices ? "is-ready " : "") +
+                  (dragOverSlot === "updServices" ? "is-drag" : "")
+                }
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDragOverSlot("updServices");
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  setDragOverSlot(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDragOverSlot(null);
+                  acceptDroppedFile(
+                    e.dataTransfer.files?.[0] ?? null,
+                    "updServices"
+                  );
+                }}
+              >
+                <div className="upload-slot-num" aria-hidden="true">2</div>
+                <div className="upload-slot-body">
+                  <div className="upload-slot-label">УПД доп. услуги</div>
+                  <div className="upload-slot-meta">PDF</div>
+                  {slotUpdServices ? (
+                    <div className="upload-slot-file" title={slotUpdServices.name}>
+                      <span className="upload-slot-file-name">
+                        {slotUpdServices.name}
+                      </span>
+                      <button
+                        type="button"
+                        className="upload-slot-remove"
+                        onClick={() => setSlotUpdServices(null)}
+                        aria-label="Удалить файл"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="upload-slot-pick"
+                      onClick={() => updServicesInputRef.current?.click()}
+                    >
+                      Выбрать файл
+                    </button>
+                  )}
+                  <input
+                    ref={updServicesInputRef}
+                    type="file"
+                    accept=".pdf"
+                    style={{ display: "none" }}
+                    onChange={(e) =>
+                      acceptSlot("updServices", e.target.files?.[0] ?? null)
+                    }
+                  />
                 </div>
               </div>
-            )}
 
-            {uploadStatus === "error" && (
-              <div className="upload-error" role="alert">
-                <div className="upload-error-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                    <path d="M12 9v4" />
-                    <circle cx="12" cy="17" r=".6" fill="currentColor" />
-                  </svg>
+              {/* Slot 3: UPD commission */}
+              <div
+                className={
+                  "upload-slot " +
+                  (slotUpdCommission ? "is-ready " : "") +
+                  (dragOverSlot === "updCommission" ? "is-drag" : "")
+                }
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDragOverSlot("updCommission");
+                }}
+                onDragLeave={(e) => {
+                  e.preventDefault();
+                  setDragOverSlot(null);
+                }}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDragOverSlot(null);
+                  acceptDroppedFile(
+                    e.dataTransfer.files?.[0] ?? null,
+                    "updCommission"
+                  );
+                }}
+              >
+                <div className="upload-slot-num" aria-hidden="true">3</div>
+                <div className="upload-slot-body">
+                  <div className="upload-slot-label">
+                    УПД агентское вознаграждение
+                  </div>
+                  <div className="upload-slot-meta">PDF</div>
+                  {slotUpdCommission ? (
+                    <div className="upload-slot-file" title={slotUpdCommission.name}>
+                      <span className="upload-slot-file-name">
+                        {slotUpdCommission.name}
+                      </span>
+                      <button
+                        type="button"
+                        className="upload-slot-remove"
+                        onClick={() => setSlotUpdCommission(null)}
+                        aria-label="Удалить файл"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      className="upload-slot-pick"
+                      onClick={() => updCommissionInputRef.current?.click()}
+                    >
+                      Выбрать файл
+                    </button>
+                  )}
+                  <input
+                    ref={updCommissionInputRef}
+                    type="file"
+                    accept=".pdf"
+                    style={{ display: "none" }}
+                    onChange={(e) =>
+                      acceptSlot("updCommission", e.target.files?.[0] ?? null)
+                    }
+                  />
                 </div>
-                <div className="upload-error-title">Не удалось обработать отчёт</div>
-                <p className="upload-error-sub">
-                  {uploadErrorMsg || "Проверьте формат файла и попробуйте снова."}
-                </p>
+              </div>
+            </div>
+
+            <div className="upload-3-actions">
+              <button
+                type="button"
+                className="upload-3-btn primary"
+                onClick={analyzeAllThree}
+                disabled={
+                  combinedStatus === "processing" ||
+                  !slotXlsx ||
+                  !slotUpdServices ||
+                  !slotUpdCommission
+                }
+              >
+                {combinedStatus === "processing"
+                  ? "Анализируем 3 файла…"
+                  : "Проанализировать все 3 файла"}
+              </button>
+              {(slotXlsx || slotUpdServices || slotUpdCommission ||
+                combinedStatus !== "idle") && (
                 <button
                   type="button"
-                  className="upload-success-btn primary"
-                  onClick={resetUploadFlow}
+                  className="upload-3-btn ghost"
+                  onClick={resetCombinedFlow}
+                  disabled={combinedStatus === "processing"}
                 >
-                  Попробовать снова
+                  Сбросить
                 </button>
+              )}
+            </div>
+
+            {combinedStatus === "success" && combinedResult && (
+              <div className="upload-3-result" role="status">
+                <div className="upload-3-result-title">
+                  ✓ Прибыль до себестоимости
+                </div>
+                <div className="upload-3-result-big">
+                  {combinedResult.profitBeforeCost.toLocaleString("ru-RU", {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                  })}{" "}
+                  ₽
+                </div>
+                <div className="upload-3-result-breakdown">
+                  <div className="upload-3-row">
+                    <span>Revenue (Итого реализовано)</span>
+                    <span className="num">
+                      +
+                      {combinedResult.revenue.toLocaleString("ru-RU", {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      })}{" "}
+                      ₽
+                    </span>
+                  </div>
+                  <div className="upload-3-row">
+                    <span>Выплаты от партнёров</span>
+                    <span className="num">
+                      +
+                      {combinedResult.loyaltyPayouts.toLocaleString("ru-RU", {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      })}{" "}
+                      ₽
+                    </span>
+                  </div>
+                  <div className="upload-3-row negative">
+                    <span>УПД доп. услуги</span>
+                    <span className="num">
+                      −
+                      {combinedResult.updServicesTotal.toLocaleString("ru-RU", {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      })}{" "}
+                      ₽
+                    </span>
+                  </div>
+                  <div className="upload-3-row negative">
+                    <span>УПД агентское вознаграждение</span>
+                    <span className="num">
+                      −
+                      {combinedResult.updCommissionTotal.toLocaleString("ru-RU", {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 2,
+                      })}{" "}
+                      ₽
+                    </span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="upload-3-btn primary"
+                  onClick={() => setShowProfitForm((v) => !v)}
+                  style={{ marginTop: 14 }}
+                >
+                  {showProfitForm
+                    ? "Свернуть форму ↑"
+                    : "Открыть форму (себестоимость, налог) →"}
+                </button>
+
+                {showProfitForm && profitCalc && (
+                  <div className="profit-calc">
+                    <div className="profit-calc-head">
+                      Дополнительные расходы
+                    </div>
+                    <div className="form-grid profit-grid">
+                      {PROFIT_EXPENSE_FIELDS.map((f) => (
+                        <div className="fld" key={f.key}>
+                          <label>{f.label}</label>
+                          <div className="in-wrap">
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              placeholder="0"
+                              value={profitInputs[f.key]}
+                              onChange={(e) =>
+                                handleProfitInput(f.key, e.target.value)
+                              }
+                            />
+                            <span className="in-cur">{f.unit}</span>
+                          </div>
+                          {f.hint && (
+                            <span className="fld-hint">{f.hint}</span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+
+                    <div className="profit-summary">
+                      <div className="profit-summary-title">
+                        Чистая прибыль
+                      </div>
+                      <div
+                        className={
+                          "profit-summary-big" +
+                          (profitCalc.netProfit < 0 ? " neg" : "")
+                        }
+                      >
+                        {profitCalc.netProfit.toLocaleString("ru-RU", {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}{" "}
+                        ₽
+                      </div>
+
+                      <div className="profit-stats">
+                        <div className="profit-stat">
+                          <span className="profit-stat-label">
+                            Маржинальность
+                          </span>
+                          <span
+                            className={
+                              "profit-stat-val" +
+                              (profitCalc.margin < 0 ? " neg" : "")
+                            }
+                          >
+                            {profitCalc.margin.toLocaleString("ru-RU", {
+                              minimumFractionDigits: 1,
+                              maximumFractionDigits: 1,
+                            })}
+                            %
+                          </span>
+                        </div>
+                        <div className="profit-stat">
+                          <span className="profit-stat-label">ROI</span>
+                          <span
+                            className={
+                              "profit-stat-val" +
+                              (profitCalc.roi < 0 ? " neg" : "")
+                            }
+                          >
+                            {profitCalc.roi.toLocaleString("ru-RU", {
+                              minimumFractionDigits: 1,
+                              maximumFractionDigits: 1,
+                            })}
+                            %
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="profit-breakdown">
+                        <div className="upload-3-row">
+                          <span>Выручка Ozon</span>
+                          <span className="num">
+                            +
+                            {combinedResult.revenue.toLocaleString("ru-RU", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row">
+                          <span>Выплаты от партнёров</span>
+                          <span className="num">
+                            +
+                            {combinedResult.loyaltyPayouts.toLocaleString(
+                              "ru-RU",
+                              {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }
+                            )}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row negative">
+                          <span>Расходы Ozon по УПД</span>
+                          <span className="num">
+                            −
+                            {combinedResult.updServicesTotal.toLocaleString(
+                              "ru-RU",
+                              {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }
+                            )}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row negative">
+                          <span>Агентское вознаграждение</span>
+                          <span className="num">
+                            −
+                            {combinedResult.updCommissionTotal.toLocaleString(
+                              "ru-RU",
+                              {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }
+                            )}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row subtotal">
+                          <span>Прибыль до себестоимости</span>
+                          <span className="num">
+                            {combinedResult.profitBeforeCost.toLocaleString(
+                              "ru-RU",
+                              {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }
+                            )}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row negative">
+                          <span>Себестоимость</span>
+                          <span className="num">
+                            −
+                            {profitCalc.costPrice.toLocaleString("ru-RU", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row negative">
+                          <span>
+                            Налог
+                            {profitCalc.taxPercent > 0
+                              ? ` (${profitCalc.taxPercent.toLocaleString(
+                                  "ru-RU",
+                                  { maximumFractionDigits: 2 }
+                                )}%)`
+                              : ""}
+                          </span>
+                          <span className="num">
+                            −
+                            {profitCalc.tax.toLocaleString("ru-RU", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div className="upload-3-row negative">
+                          <span>Прочие расходы</span>
+                          <span className="num">
+                            −
+                            {profitCalc.otherExpensesGroup.toLocaleString(
+                              "ru-RU",
+                              {
+                                minimumFractionDigits: 2,
+                                maximumFractionDigits: 2,
+                              }
+                            )}{" "}
+                            ₽
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="upload-3-btn primary"
+                      onClick={saveProfitResult}
+                      disabled={profitSaving}
+                      style={{ marginTop: 14, width: "100%" }}
+                    >
+                      {profitSaving
+                        ? "Сохранение…"
+                        : profitSaved
+                        ? "Сохранено ✓"
+                        : "Сохранить результат"}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="upload-3-btn ghost"
+                      onClick={downloadProfitPdf}
+                      style={{ marginTop: 10, width: "100%" }}
+                    >
+                      Скачать PDF-отчёт
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {combinedStatus === "error" && (
+              <div className="upload-3-error" role="alert">
+                <div className="upload-3-error-title">Ошибка анализа</div>
+                <p className="upload-3-error-sub">
+                  {combinedError ||
+                    "Не удалось разобрать один из файлов. Проверьте формат."}
+                </p>
               </div>
             )}
           </div>
@@ -3992,6 +5538,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
           )}
 
+        {COMING_SOON.payment && (
+          <ComingSoon
+            title="Premium и оплата"
+            description="Тариф «Безлимит + AI», разовые расчёты и онлайн-оплата. Сейчас все функции расчёта доступны бесплатно — платные планы подключим совсем скоро."
+          />
+        )}
+
+        {!COMING_SOON.payment && (
         <div className="card tariff-card" id="dash-tariffs">
           <div className="card-head">
             <div className="card-title">Тарифы</div>
@@ -4044,6 +5598,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
           {tariffMessage && <p className="tariff-msg">{tariffMessage}</p>}
         </div>
+        )}
 
         {isLoadingHistory && (
           <div className="card hist-card">
@@ -4127,8 +5682,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 const removing = removingIds.has(h.id);
                 return (
                   <div
-                    className={"hist-item" + (removing ? " hist-removing" : "")}
+                    className={
+                      "hist-item" +
+                      (removing ? " hist-removing" : "") +
+                      (selectedId === h.id ? " active" : "")
+                    }
                     key={h.id}
+                    onClick={() => restoreUploadCalc(h)}
                   >
                     <div className={"hist-mp " + h.marketplace}>
                       {h.marketplace === "ozon" ? "Ozon" : "WB"}
@@ -4148,7 +5708,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     <button
                       type="button"
                       className="hist-del"
-                      onClick={() => deleteHistoryItem(h.id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteHistoryItem(h.id);
+                      }}
                       disabled={removing}
                       aria-label="Удалить расчёт"
                       title="Удалить"

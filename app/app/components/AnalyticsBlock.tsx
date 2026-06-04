@@ -651,6 +651,44 @@ function buildQuickActions(
   return out.slice(0, 4);
 }
 
+/* ===== Реальная AI-аналитика (ответ серверного /api/ai/analyze) ===== */
+type AiAnalysis = {
+  aiScore: number;
+  healthLabel: string;
+  summary: string;
+  risks: string[];
+  recommendations: string[];
+  quickActions: string[];
+};
+
+/** quickActions от AI — строки вида «Действие — эффект». Разбиваем на 2 части
+ *  под существующий дизайн карточки (action + impact). Нет разделителя —
+ *  всё уходит в action, impact пустой. Дизайн не меняется. */
+function aiQuickFromStrings(items: string[]): QuickAction[] {
+  return items.slice(0, 4).map((raw) => {
+    const s = String(raw).trim();
+    const parts = s.split(/\s*[—–:→]\s*/);
+    const impact = parts.slice(1).join(" ").trim();
+    if (parts.length >= 2 && parts[0].trim() && impact) {
+      return { action: parts[0].trim(), impact };
+    }
+    return { action: s, impact: "" };
+  });
+}
+
+/** risks/recommendations от AI → слоты инсайтов под существующий дизайн
+ *  (цветной бордер + иконка): риск → warning, рекомендация → optimization. */
+function aiSlotsFromAnalysis(a: AiAnalysis): Insight[] {
+  const out: Insight[] = [];
+  if (a.risks[0]) out.push({ kind: "warning", ico: ICONS.alert, text: a.risks[0] });
+  if (a.recommendations[0])
+    out.push({ kind: "optimization", ico: ICONS.zap, text: a.recommendations[0] });
+  if (a.risks[1]) out.push({ kind: "warning", ico: ICONS.target, text: a.risks[1] });
+  if (out.length === 0 && a.summary)
+    out.push({ kind: "positive", ico: ICONS.trendUp, text: a.summary });
+  return out.slice(0, 4);
+}
+
 /* Score ring — анимированное кольцо вокруг числа */
 function ScoreRing({
   score,
@@ -869,6 +907,13 @@ function DonutChart({
 
 /* ---------- MAIN ---------- */
 
+// === RELEASE v1.0 ===
+// AI Аналитика временно показывается в состоянии «🔒 Скоро».
+// Вся реальная логика ниже (запрос /api/ai/analyze, rule-based fallback,
+// отрисовка score/инсайтов/рекомендаций) ПОЛНОСТЬЮ сохранена — чтобы
+// включить функцию, достаточно поставить флаг в false. Ничего не удалено.
+const AI_COMING_SOON: boolean = true;
+
 export function AnalyticsBlock({
   realHistory,
   hasAnyData = false,
@@ -882,6 +927,109 @@ export function AnalyticsBlock({
   //   real            — есть данные для отрисовки
   const isFilteredEmpty = history.length === 0 && hasAnyData;
   const isDemo = history.length === 0 && !hasAnyData;
+
+  // ===== Реальная AI-аналитика через серверный /api/ai/analyze =====
+  //   aiData   — успешный ответ AI (показываем вместо rule-based);
+  //   aiLoading — идёт запрос («AI анализирует расчёт…»);
+  //   aiFailed  — ошибка/недоступно → тихий fallback на rule-based.
+  const [aiData, setAiData] = useState<AiAnalysis | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiFailed, setAiFailed] = useState(false);
+
+  // Числовые агрегаты по истории — ЕДИНСТВЕННОЕ, что уходит в AI.
+  // Никаких файлов/сырых отчётов: только суммы и проценты. Строка-подпись
+  // служит и телом запроса, и стабильным ключом зависимости эффекта.
+  const aiPayloadSig = (() => {
+    if (history.length === 0) return "";
+    const sum = (sel: (h: AnalyticsCalc) => number) =>
+      history.reduce((a, h) => a + (Number(sel(h)) || 0), 0);
+    const revenue = sum((h) => h.revenue);
+    const profit = sum((h) => h.profit);
+    const margin =
+      revenue > 0
+        ? (profit / revenue) * 100
+        : history.reduce((a, h) => a + h.margin, 0) / history.length;
+    return JSON.stringify({
+      revenue: Math.round(revenue),
+      profit: Math.round(profit),
+      margin: Number(margin.toFixed(2)),
+      commission: Math.round(sum((h) => h.commission)),
+      logistics: Math.round(sum((h) => h.logistics)),
+      ads: Math.round(sum((h) => h.ads)),
+      storage: Math.round(sum((h) => h.storage)),
+      cost: Math.round(sum((h) => h.cost)),
+      tax: Math.round(sum((h) => h.tax)),
+      other_expenses: Math.round(sum((h) => h.other)),
+      marketplace: history[0].marketplace,
+      mode: "history",
+    });
+  })();
+
+  // Запрос только когда есть premium И реальные данные (нет данных → нет вызова).
+  // Любой сбой → aiFailed=true: остаёмся на rule-based, сайт не падает.
+  useEffect(() => {
+    if (AI_COMING_SOON || !hasPremium || !aiPayloadSig) {
+      setAiData(null);
+      setAiFailed(false);
+      setAiLoading(false);
+      return;
+    }
+    let active = true;
+    const controller = new AbortController();
+    setAiLoading(true);
+    setAiFailed(false);
+    (async () => {
+      try {
+        const res = await fetch("/api/ai/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: aiPayloadSig,
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error("status " + res.status);
+        const json = (await res.json()) as Partial<AiAnalysis> & {
+          ok?: boolean;
+        };
+        if (!active) return;
+        if (
+          json &&
+          typeof json.aiScore === "number" &&
+          (Array.isArray(json.risks) || typeof json.summary === "string")
+        ) {
+          setAiData({
+            aiScore: json.aiScore,
+            healthLabel:
+              typeof json.healthLabel === "string" ? json.healthLabel : "",
+            summary: typeof json.summary === "string" ? json.summary : "",
+            risks: Array.isArray(json.risks)
+              ? json.risks.filter((x): x is string => typeof x === "string")
+              : [],
+            recommendations: Array.isArray(json.recommendations)
+              ? json.recommendations.filter(
+                  (x): x is string => typeof x === "string"
+                )
+              : [],
+            quickActions: Array.isArray(json.quickActions)
+              ? json.quickActions.filter(
+                  (x): x is string => typeof x === "string"
+                )
+              : [],
+          });
+          setAiFailed(false);
+        } else {
+          setAiFailed(true);
+        }
+      } catch {
+        if (active) setAiFailed(true);
+      } finally {
+        if (active) setAiLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [hasPremium, aiPayloadSig]);
 
   /* charts series */
   const realSlice = history.slice(0, 14).reverse(); // oldest → newest
@@ -909,29 +1057,55 @@ export function AnalyticsBlock({
   const expenses = expensesAreDemo ? DEMO_EXPENSES : computedExpenses;
   const totalExp = expenses.reduce((s, e) => s + e.value, 0);
 
-  /* AI cockpit data */
+  /* AI cockpit data — rule-based база (fallback), поверх неё AI-override */
   const insights = computeInsights(history);
   const insightsAreDemo = history.length === 0;
-  const aiScore = computeScore(history);
-  const aiTier = getTier(aiScore);
   const aiConfidence = getConfidence(history.length);
   const aiConfidencePct = getConfidencePct(history.length);
   const aiTrend = getTrend(history);
   const aiIndicators = computeIndicators(history);
-  const aiRecs = buildRecommendations(aiIndicators, history);
-  const aiSummary = buildSummary(history, aiScore, aiIndicators);
   const aiHealth = buildHealth(history, aiIndicators);
-  const aiQuick = buildQuickActions(history, aiIndicators);
 
-  // slot первого инсайта каждого нужного типа
+  // --- rule-based значения: используются, когда AI недоступен/ошибка ---
+  const rbScore = computeScore(history);
+  const rbRecs = buildRecommendations(aiIndicators, history);
+  const rbSummary = buildSummary(history, rbScore, aiIndicators);
+  const rbQuick = buildQuickActions(history, aiIndicators);
   const slotPositive = insights.find((i) => i.kind === "positive");
   const slotWarning = insights.find(
     (i) => i.kind === "warning" || i.kind === "danger"
   );
   const slotOptim = insights.find((i) => i.kind === "optimization");
-  const aiSlots: Insight[] = [slotPositive, slotWarning, slotOptim].filter(
+  const rbSlots: Insight[] = [slotPositive, slotWarning, slotOptim].filter(
     Boolean
   ) as Insight[];
+
+  // --- AI-override: при успешном ответе /api/ai/analyze показываем его,
+  //     иначе остаёмся на rule-based. Разметка/дизайн ниже не меняются. ---
+  const useAi = !!aiData && !aiFailed;
+  const aiScore = useAi ? clamp(0, 100, Math.round(aiData!.aiScore)) : rbScore;
+  const aiTier: Tier = useAi
+    ? {
+        kind: getTier(aiScore).kind,
+        label: aiData!.healthLabel || getTier(aiScore).label,
+      }
+    : getTier(rbScore);
+  const aiSummary = useAi ? aiData!.summary || rbSummary : rbSummary;
+  const aiRecs =
+    useAi && aiData!.recommendations.length
+      ? aiData!.recommendations.slice(0, 4)
+      : rbRecs;
+  const aiQuick =
+    useAi && aiData!.quickActions.length
+      ? aiQuickFromStrings(aiData!.quickActions)
+      : rbQuick;
+  const aiSlots: Insight[] =
+    useAi &&
+    (aiData!.risks.length ||
+      aiData!.recommendations.length ||
+      aiData!.summary)
+      ? aiSlotsFromAnalysis(aiData!)
+      : rbSlots;
 
   /* recent */
   const recent: DemoRecent[] =
@@ -1546,6 +1720,57 @@ export function AnalyticsBlock({
         .ai-lock-btn:active{transform:translateY(0) scale(.98)}
         .ai-lock-btn .arr{display:inline-block;transition:transform .22s ease}
         .ai-lock-btn:hover .arr{transform:translateX(3px)}
+        .ai-lock-btn.is-soon{
+          background:linear-gradient(135deg,rgba(201,168,76,.22),rgba(201,168,76,.10));
+          color:#E8C97A;border:1px solid rgba(201,168,76,.4);
+          box-shadow:none;cursor:default;letter-spacing:.04em
+        }
+        .ai-lock-btn.is-soon:hover{transform:none;box-shadow:none}
+
+        /* === RELEASE v1.0 — компактная карточка «AI Аналитика — Скоро» ===
+           Не рендерит тяжёлый ai-body, поэтому не растягивает страницу.
+           Контент по центру; карточка занимает свою колонку без лишней высоты. */
+        .an-ai-soon{
+          align-items:center;justify-content:center;text-align:center;
+          gap:.55rem;padding:1.7rem 1.4rem
+        }
+        .an-ai-soon .ai-card-shine{opacity:.5}
+        .ai-soon-badge{
+          display:inline-flex;align-items:center;gap:6px;
+          font-family:'DM Mono',monospace;font-size:.58rem;font-weight:700;
+          text-transform:uppercase;letter-spacing:.16em;color:#05070f;
+          background:linear-gradient(135deg,#C9A84C 0%,#E8C97A 100%);
+          padding:5px 11px;border-radius:100px;
+          box-shadow:0 6px 16px rgba(201,168,76,.42)
+        }
+        .ai-soon-icon{
+          width:48px;height:48px;border-radius:14px;
+          display:inline-flex;align-items:center;justify-content:center;
+          background:linear-gradient(135deg,rgba(201,168,76,.28) 0%,rgba(201,168,76,.08) 100%);
+          border:1px solid rgba(201,168,76,.4);color:#E8C97A;
+          box-shadow:0 12px 30px rgba(201,168,76,.2),inset 0 1px 0 rgba(255,255,255,.08);
+          animation:lockGlow 3s ease-in-out infinite
+        }
+        .ai-soon-icon svg{width:22px;height:22px;display:block}
+        .ai-soon-title{
+          font-family:'Playfair Display',Georgia,serif;
+          font-size:1.1rem;font-weight:700;color:#E8EEF8;
+          letter-spacing:-.005em;margin:.1rem 0 0
+        }
+        .ai-soon-sub{
+          font-size:.82rem;color:#8A9FBB;font-weight:300;line-height:1.5;
+          max-width:300px;margin:0
+        }
+        .ai-soon-btn{
+          margin-top:.35rem;font-family:'Outfit',sans-serif;
+          font-size:.82rem;font-weight:600;letter-spacing:.04em;
+          background:linear-gradient(135deg,rgba(201,168,76,.22),rgba(201,168,76,.10));
+          color:#E8C97A;border:1px solid rgba(201,168,76,.4);
+          padding:9px 24px;border-radius:11px;cursor:default
+        }
+        @media (prefers-reduced-motion: reduce){
+          .ai-soon-icon{animation:none}
+        }
 
         /* === RECENT === */
         .rc-wide{margin-top:.55rem}
@@ -1743,10 +1968,39 @@ export function AnalyticsBlock({
           </div>
 
           {/* AI — full right column (spans both rows) */}
+          {/* RELEASE v1.0: при AI_COMING_SOON показываем компактную карточку
+              «Скоро» вместо полного AI-кокпита. Весь функционал AI (ScoreRing,
+              health-бары, инсайты, рекомендации) сохранён в ветке else ниже —
+              ничего не удалено, вернётся при AI_COMING_SOON=false. */}
+          {AI_COMING_SOON ? (
+            <div
+              className="an-card an-ai-card an-area-ai an-ai-soon"
+              role="region"
+              aria-label="AI Аналитика — скоро"
+            >
+              <span className="ai-card-shine" aria-hidden="true" />
+              <span className="ai-soon-badge">🔒 Скоро</span>
+              <div className="ai-soon-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
+                </svg>
+              </div>
+              <h3 className="ai-soon-title">AI Аналитика</h3>
+              <p className="ai-soon-sub">
+                Автоматический AI-разбор прибыли, рисков и рекомендаций.
+              </p>
+              <button
+                type="button"
+                className="ai-soon-btn"
+                disabled
+                aria-disabled="true"
+              >
+                Скоро
+              </button>
+            </div>
+          ) : (
           <div
-            className={
-              "an-card an-ai-card an-area-ai" + (hasPremium ? "" : " ai-locked")
-            }
+            className={"an-card an-ai-card an-area-ai" + (hasPremium ? "" : " ai-locked")}
           >
             <span className="ai-card-shine" aria-hidden="true" />
 
@@ -1761,7 +2015,13 @@ export function AnalyticsBlock({
               </div>
               {hasPremium && (
                 <div className="ai-sub">
-                  {insightsAreDemo ? "Пример аналитики" : "Rule-based"}
+                  {insightsAreDemo
+                    ? "Пример аналитики"
+                    : aiLoading
+                    ? "AI анализирует расчёт…"
+                    : useAi
+                    ? "AI-анализ"
+                    : "Rule-based"}
                 </div>
               )}
             </div>
@@ -1902,7 +2162,10 @@ export function AnalyticsBlock({
               </div>
             </div>
 
-            {!hasPremium && (
+            {/* RELEASE v1.0: AI_COMING_SOON-оверлей убран — это теперь отдельная
+                компактная карточка выше. Здесь остаётся только Premium-замок
+                (показывается, когда hasPremium=false). Ничего не удалено. */}
+            {!hasPremium ? (
               <div className="ai-lock-overlay" role="region" aria-label="AI Аналитика — Premium">
                 <div className="ai-lock-icon" aria-hidden="true">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1924,8 +2187,9 @@ export function AnalyticsBlock({
                   <span className="arr" aria-hidden="true">→</span>
                 </button>
               </div>
-            )}
+            ) : null}
           </div>
+          )}
 
           {/* Recent — bottom-left under donut */}
           <div className="an-card rc-wide an-area-recent">

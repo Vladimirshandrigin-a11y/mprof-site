@@ -275,6 +275,14 @@ a{color:inherit;text-decoration:none}
   color:var(--void);border:none;box-shadow:0 8px 28px rgba(201,168,76,.28)}
 .ln-tariff-btn.primary:hover{transform:translateY(-2px);box-shadow:0 16px 40px rgba(201,168,76,.42);
   color:var(--void)}
+.ln-pay-note{display:flex;align-items:center;gap:.9rem;max-width:760px;margin:1.8rem auto 0;
+  padding:1rem 1.4rem;background:var(--gold-bg);border:1px solid rgba(201,168,76,.22);
+  border-radius:13px;backdrop-filter:blur(10px)}
+.ln-pay-note-ic{flex-shrink:0;width:30px;height:30px;border-radius:9px;display:inline-flex;
+  align-items:center;justify-content:center;background:rgba(201,168,76,.14);
+  border:1px solid rgba(201,168,76,.3);color:var(--gold2)}
+.ln-pay-note-ic svg{width:16px;height:16px}
+.ln-pay-note-txt{font-size:.85rem;color:var(--txt2);font-weight:300;line-height:1.55}
 
 /* ====== FAQ ====== */
 .ln-faq-grid{max-width:780px;margin:0 auto;display:flex;flex-direction:column;gap:.7rem}
@@ -331,7 +339,7 @@ a{color:inherit;text-decoration:none}
 .ln-foot-brand{font-family:var(--display);font-size:.95rem;font-weight:700;color:var(--txt2)}
 .ln-foot-brand em{font-style:italic;color:var(--gold)}
 .ln-foot-c{font-family:var(--mono);font-size:.7rem;color:var(--txt3);letter-spacing:.06em}
-.ln-foot-links{display:flex;gap:1.4rem}
+.ln-foot-links{display:flex;gap:1.4rem;flex-wrap:wrap;justify-content:flex-end}
 .ln-foot-link{font-size:.8rem;color:var(--txt2);transition:color .18s ease}
 .ln-foot-link:hover{color:var(--gold2)}
 
@@ -826,6 +834,20 @@ a{color:inherit;text-decoration:none}
               </button>
             </div>
           </div>
+
+          <div className="ln-pay-note">
+            <span className="ln-pay-note-ic" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            </span>
+            <div className="ln-pay-note-txt">
+              После оплаты доступ активируется автоматически. Разовый тариф
+              предоставляет один расчёт. Тариф «Безлимитный» предоставляет доступ
+              на 30 дней.
+            </div>
+          </div>
         </div>
       </section>
 
@@ -910,6 +932,9 @@ a{color:inherit;text-decoration:none}
             <Link href="/app" className="ln-foot-link">Dashboard</Link>
             <a href="#features" className="ln-foot-link">Возможности</a>
             <a href="#pricing" className="ln-foot-link">Тарифы</a>
+            <Link href="/contacts" className="ln-foot-link">Контакты</Link>
+            <Link href="/privacy" className="ln-foot-link">Политика конфиденциальности</Link>
+            <Link href="/offer" className="ln-foot-link">Публичная оферта</Link>
           </div>
         </div>
       </footer>

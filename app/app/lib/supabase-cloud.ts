@@ -175,14 +175,62 @@ export async function saveCalculationToCloud(
 ): Promise<CloudResult<CloudCalculation>> {
   try {
     const payload = { ...input, user_id: userId };
+    // eslint-disable-next-line no-console
+    console.log("[cloud] saveCalculationToCloud payload", payload);
     const { data, error } = await supabase
       .from("calculations")
       .insert([payload])
       .select()
       .single();
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error("[cloud] saveCalculationToCloud error", fmtError(error));
+      return { data: null, error: fmtError(error) };
+    }
+    // eslint-disable-next-line no-console
+    console.log("[cloud] saveCalculationToCloud ok", { id: (data as { id?: string } | null)?.id });
     return { data: (data as CloudCalculation | null) ?? null, error: null };
   } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[cloud] saveCalculationToCloud throw", fmtError(e));
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+/**
+ * Точечный UPDATE существующего calculation. Используется, чтобы «черновик»
+ * 3-файлового анализа превратить в финальную чистую прибыль, не создавая
+ * вторую строку. RLS-политика `calculations_update_own` разрешает апдейт
+ * только своих строк (auth.uid() = user_id). Никогда не бросает.
+ * Если строка не найдена (например, была удалена) — `.single()` вернёт error,
+ * вызывающий код делает fallback на insert.
+ */
+export async function updateCalculationInCloud(
+  calculationId: string,
+  fields: Partial<CalculationInsertInput>,
+  userId: string
+): Promise<CloudResult<CloudCalculation>> {
+  try {
+    // eslint-disable-next-line no-console
+    console.log("[cloud] updateCalculationInCloud", { calculationId });
+    const { data, error } = await supabase
+      .from("calculations")
+      .update(fields)
+      .eq("id", calculationId)
+      .eq("user_id", userId)
+      .select()
+      .single();
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error("[cloud] updateCalculationInCloud error", fmtError(error));
+      return { data: null, error: fmtError(error) };
+    }
+    // eslint-disable-next-line no-console
+    console.log("[cloud] updateCalculationInCloud ok", { id: (data as { id?: string } | null)?.id });
+    return { data: (data as CloudCalculation | null) ?? null, error: null };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[cloud] updateCalculationInCloud throw", fmtError(e));
     return { data: null, error: fmtError(e) };
   }
 }
@@ -192,15 +240,25 @@ export async function loadCalculationsFromCloud(
   limit = 50
 ): Promise<CloudResult<CloudCalculation[]>> {
   try {
+    // eslint-disable-next-line no-console
+    console.log("[cloud] loadCalculationsFromCloud", { userId, limit });
     const { data, error } = await supabase
       .from("calculations")
       .select("*")
       .eq("user_id", userId)
       .order("created_at", { ascending: false })
       .limit(limit);
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error("[cloud] loadCalculationsFromCloud error", fmtError(error));
+      return { data: null, error: fmtError(error) };
+    }
+    // eslint-disable-next-line no-console
+    console.log("[cloud] loadCalculationsFromCloud ok", { count: data?.length ?? 0 });
     return { data: ((data as CloudCalculation[]) ?? []), error: null };
   } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[cloud] loadCalculationsFromCloud throw", fmtError(e));
     return { data: null, error: fmtError(e) };
   }
 }
@@ -247,14 +305,24 @@ export async function saveUploadedReportToCloud(
 ): Promise<CloudResult<CloudUploadedReport>> {
   try {
     const payload = { ...input, user_id: userId };
+    // eslint-disable-next-line no-console
+    console.log("[cloud] saveUploadedReportToCloud payload", payload);
     const { data, error } = await supabase
       .from("uploaded_reports")
       .insert([payload])
       .select()
       .single();
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error("[cloud] saveUploadedReportToCloud error", fmtError(error));
+      return { data: null, error: fmtError(error) };
+    }
+    // eslint-disable-next-line no-console
+    console.log("[cloud] saveUploadedReportToCloud ok", { id: (data as { id?: string } | null)?.id });
     return { data: (data as CloudUploadedReport | null) ?? null, error: null };
   } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[cloud] saveUploadedReportToCloud throw", fmtError(e));
     return { data: null, error: fmtError(e) };
   }
 }
