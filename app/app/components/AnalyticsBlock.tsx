@@ -1053,7 +1053,10 @@ export function AnalyticsBlock({
 
   /* expense breakdown */
   const computedExpenses = computeExpenseBreakdown(history);
-  const expensesAreDemo = computedExpenses.length === 0;
+  // Демо-разбивку показываем ТОЛЬКО в полном demo-режиме (0 расчётов). Если у
+  // пользователя есть расчёты, но в них нет разбивки расходов, — рисуем реальную
+  // (возможно пустую) структуру, а НЕ подмешиваем пример поверх реальных данных.
+  const expensesAreDemo = isDemo;
   const expenses = expensesAreDemo ? DEMO_EXPENSES : computedExpenses;
   const totalExp = expenses.reduce((s, e) => s + e.value, 0);
 
@@ -1848,7 +1851,7 @@ export function AnalyticsBlock({
             {isFilteredEmpty
               ? "Фильтр активен"
               : isDemo
-              ? "Демо-данные"
+              ? "Нет данных"
               : "Ваши данные"}
           </div>
         </div>
@@ -1870,6 +1873,26 @@ export function AnalyticsBlock({
               Попробуйте изменить период, маркетплейс или тип результата, чтобы увидеть аналитику.
             </p>
           </div>
+        ) : isDemo ? (
+          <div className="filter-empty" role="status">
+            <div className="filter-empty-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 3v18h18" />
+                <rect x="7" y="11" width="3" height="6" rx="1" />
+                <rect x="12" y="7" width="3" height="10" rx="1" />
+                <rect x="17" y="13" width="3" height="4" rx="1" />
+              </svg>
+            </div>
+            <h3 className="filter-empty-title">
+              Аналитика появится после первого расчёта
+            </h3>
+            <p className="filter-empty-sub">
+              Здесь будут ваши графики выручки и прибыли, структура расходов и
+              последние расчёты — на основе реальных данных. Сделайте первый
+              расчёт в калькуляторе выше.
+            </p>
+          </div>
         ) : (
         <>
         <div className="an-grid an-grid-row-1">
@@ -1881,7 +1904,15 @@ export function AnalyticsBlock({
                   {isDemo ? "Выручка за 14 дней" : "Выручка по расчётам"}
                 </div>
                 <div className={"an-card-sub" + (isDemo ? " demo" : "")}>
-                  {isDemo ? "Пример данных" : `${revenueSeries.length} расчётов`}
+                  {isDemo
+                    ? "Пример данных"
+                    : `${revenueSeries.length} ${
+                        revenueSeries.length === 1
+                          ? "расчёт"
+                          : revenueSeries.length < 5
+                          ? "расчёта"
+                          : "расчётов"
+                      }`}
                 </div>
               </div>
               <div className="an-card-val">{fmt(sumRev)} ₽</div>
@@ -1909,7 +1940,15 @@ export function AnalyticsBlock({
                   {isDemo ? "Чистая прибыль за 14 дней" : "Прибыль по расчётам"}
                 </div>
                 <div className={"an-card-sub" + (isDemo ? " demo" : "")}>
-                  {isDemo ? "Пример данных" : `${profitSeries.length} расчётов`}
+                  {isDemo
+                    ? "Пример данных"
+                    : `${profitSeries.length} ${
+                        profitSeries.length === 1
+                          ? "расчёт"
+                          : profitSeries.length < 5
+                          ? "расчёта"
+                          : "расчётов"
+                      }`}
                 </div>
               </div>
               <div className={"an-card-val " + (sumProf >= 0 ? "pos" : "neg")}>

@@ -825,6 +825,43 @@ export default function AppPage() {
     setProfitSaving(false);
   };
 
+  /**
+   * Клик по строке «Последние расчёты» → загрузить этот расчёт в калькулятор.
+   * Универсальный загрузчик поверх restoreUploadCalc:
+   *   • 3-file (upload) расчёт → восстанавливаем combinedResult + форму чистой
+   *     прибыли через restoreUploadCalc, режим «upload»;
+   *   • ручной (manual) расчёт → заполняем форму параметров сохранёнными числами
+   *     и показываем результат, режим «manual».
+   * В обоих случаях плавно скроллим наверх (там калькулятор), чтобы пользователь
+   * увидел подставленный расчёт.
+   */
+  const loadCalcIntoCalculator = (item: CalcResult) => {
+    const breakdown = asNetProfitBreakdown(item.aiInsights);
+    if (breakdown) {
+      // Upload-расчёт: вся логика восстановления уже в restoreUploadCalc.
+      restoreUploadCalc(item);
+    } else {
+      // Ручной расчёт: восстанавливаем форму параметров и итоговый результат.
+      const s = (n: number) => String(Math.round(n));
+      setCalcMode("manual");
+      setMarketplace(item.marketplace);
+      setForm({
+        revenue: s(item.revenue),
+        commission: s(item.commission),
+        logistics: s(item.logistics),
+        storage: s(item.storage),
+        ads: s(item.ads),
+        cost: s(item.cost),
+        tax: s(item.tax),
+        other: s(item.other),
+      });
+      setResult(item);
+      setShowProfitForm(false);
+      setSelectedId(item.id);
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   const acceptUploadFile = (file: File | null) => {
     if (!file) return;
     if (!/\.(xlsx|csv)$/i.test(file.name)) {
@@ -5851,7 +5888,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       (selectedId === h.id ? " active" : "")
                     }
                     key={h.id}
-                    onClick={() => restoreUploadCalc(h)}
+                    onClick={() => loadCalcIntoCalculator(h)}
                   >
                     <div className={"hist-mp " + h.marketplace}>
                       {h.marketplace === "ozon" ? "Ozon" : "WB"}
