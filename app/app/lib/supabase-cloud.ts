@@ -166,6 +166,70 @@ export async function getUserProfile(
   }
 }
 
+/**
+ * Сколько ОПЛАЧЕННЫХ разовых расчётов (тариф single) есть у пользователя.
+ * Каждая активная single-подписка = +1 расчёт сверх бесплатного лимита.
+ * Это «реестр кредитов»: webhook ЮKassa переводит подписку в active, а сам
+ * факт использования считается через profiles.calculations_used. Не зависит
+ * от записи в profiles — поэтому single работает, даже если premium_until/plan
+ * в профиле по какой-то причине не обновились.
+ * RLS subscriptions_select_own отдаёт только свои строки. Сбой → 0 (fail-closed).
+ */
+export async function countActiveSingleCredits(userId: string): Promise<number> {
+  try {
+    const { count, error } = await supabase
+      .from("subscriptions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId)
+      .eq("plan", "single")
+      .eq("status", "active");
+    if (error) return 0;
+    return count ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Ответ RPC consume_calculation() (см. supabase/schema.sql). */
+export interface ConsumeResult {
+  ok: boolean;
+  /** При ok=false: 'limit_reached' | 'not_authenticated' | текст ошибки RPC. */
+  reason?: string;
+  /** Новое значение profiles.calculations_used после списания. */
+  used?: number;
+  /** Текущий лимит = 1 бесплатный + число активных single-кредитов. */
+  allowance?: number;
+  /** true, если списания не было — активный unlimited. */
+  unlimited?: boolean;
+}
+
+/**
+ * Server-authoritative списание одного расчёта через RPC consume_calculation().
+ * Единственный путь расхода квоты для залогиненного пользователя: клиент больше
+ * НЕ пишет profiles.calculations_used напрямую (UPDATE на profiles ему отозван
+ * в schema.sql). Сервер атомарно под row-lock проверяет право и инкрементит
+ * счётчик; для unlimited со свежим premium_until — не списывает.
+ *
+ * Fail-closed: любая ошибка RPC → ok=false (не выдаём бесплатный расчёт при сбое).
+ * Вызывать РОВНО один раз на расчёт, ПЕРЕД сохранением/выдачей результата.
+ */
+export async function consumeCalculation(): Promise<ConsumeResult> {
+  try {
+    const { data, error } = await supabase.rpc("consume_calculation");
+    if (error) return { ok: false, reason: error.message };
+    const r = (data ?? {}) as Partial<ConsumeResult>;
+    return {
+      ok: r.ok === true,
+      reason: r.reason,
+      used: typeof r.used === "number" ? r.used : undefined,
+      allowance: typeof r.allowance === "number" ? r.allowance : undefined,
+      unlimited: r.unlimited === true,
+    };
+  } catch (e) {
+    return { ok: false, reason: fmtError(e).message };
+  }
+}
+
 // ============================================================================
 // Calculations
 // ============================================================================

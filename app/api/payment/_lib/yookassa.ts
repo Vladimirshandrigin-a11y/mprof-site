@@ -123,3 +123,82 @@ export async function createYooKassaPayment(
     clearTimeout(timeout);
   }
 }
+
+// ============================================================================
+// getYooKassaPayment — АВТОРИТЕТНОЕ состояние платежа.
+//
+// Webhook НЕ доверяет телу уведомления (его может подделать кто угодно). Он берёт
+// из тела только payment.id и перепроверяет факт оплаты здесь — прямым GET к API
+// ЮKassa под Basic-auth. Возвращает нормализованный объект (status / paid / amount
+// / metadata), по которому webhook решает, активировать ли подписку.
+// ============================================================================
+export interface YooKassaPayment {
+  id: string;
+  /** "pending" | "waiting_for_capture" | "succeeded" | "canceled". */
+  status: string;
+  /** true только когда деньги реально захвачены. */
+  paid: boolean;
+  amount: { value: string; currency: string };
+  metadata: Record<string, string>;
+}
+
+export interface FetchPaymentResult {
+  ok: boolean;
+  payment?: YooKassaPayment;
+  error?: string;
+}
+
+export async function getYooKassaPayment(
+  paymentId: string
+): Promise<FetchPaymentResult> {
+  const cfg = getConfig();
+  if (!cfg) return { ok: false, error: "ЮKassa не настроена" };
+
+  const auth = Buffer.from(`${cfg.shopId}:${cfg.secretKey}`).toString("base64");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${YOOKASSA_API}/${encodeURIComponent(paymentId)}`, {
+      method: "GET",
+      headers: { Authorization: `Basic ${auth}` },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    const raw = await res.text();
+    if (!res.ok) {
+      // eslint-disable-next-line no-console
+      console.error("[yookassa] get payment error", res.status, raw.slice(0, 300));
+      return { ok: false, error: `ЮKassa ответила статусом ${res.status}` };
+    }
+
+    const data = JSON.parse(raw) as {
+      id?: string;
+      status?: string;
+      paid?: boolean;
+      amount?: { value?: string; currency?: string };
+      metadata?: Record<string, string>;
+    };
+    if (!data.id || typeof data.status !== "string" || !data.amount) {
+      return { ok: false, error: "ЮKassa вернула неполный ответ" };
+    }
+    return {
+      ok: true,
+      payment: {
+        id: data.id,
+        status: data.status,
+        paid: data.paid === true,
+        amount: {
+          value: String(data.amount.value ?? ""),
+          currency: String(data.amount.currency ?? ""),
+        },
+        metadata: data.metadata ?? {},
+      },
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "сеть недоступна";
+    return { ok: false, error: `ЮKassa недоступна: ${msg}` };
+  } finally {
+    clearTimeout(timeout);
+  }
+}

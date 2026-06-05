@@ -431,7 +431,7 @@ export default function AppPage() {
    * расходов) в историю + Supabase как отдельную запись calculation.
    * Гранулярные поля без своих колонок (ROI, упаковка, доставка, зарплата)
    * пишем в jsonb `ai_insights`, чтобы ничего не терялось при перезагрузке.
-   * incrementCalcCount НЕ зовём — квота уже списана авто-сейвом в analyzeAllThree.
+   * consumeCalculation НЕ зовём — квота уже списана авто-сейвом в analyzeAllThree.
    */
   const saveProfitResult = async () => {
     if (!combinedResult || !profitCalc) return;
@@ -914,6 +914,18 @@ export default function AppPage() {
       return;
     }
 
+    // Парс прошёл. Списываем расчёт server-authoritative ДО сохранения/выдачи —
+    // кредит не сгорает на ошибке парсинга (consume только после успешного парса).
+    const consumed = await consumeCalculation();
+    if (!consumed.ok) {
+      // eslint-disable-next-line no-console
+      console.warn("[upload] consume blocked → paywall", consumed.reason);
+      setUploadStatus("ready");
+      setSelectedTier("unlimited");
+      setTariffModalOpen(true);
+      return;
+    }
+
     // eslint-disable-next-line no-console
     console.log("[upload] SUCCESS FLOW START", {
       mp: parseResult.report.marketplace,
@@ -1022,7 +1034,6 @@ export default function AppPage() {
 
       setResult(res);
       setHistory((prev) => [res, ...prev].slice(0, 50));
-      incrementCalcCount();
       setJustCalculated(true);
       window.setTimeout(() => setJustCalculated(false), 2200);
       dismissOnboarding();
@@ -1296,6 +1307,18 @@ export default function AppPage() {
       return;
     }
 
+    // Все парсы прошли. Списываем расчёт server-authoritative ДО построения и
+    // сохранения результата — кредит не сгорает на ошибке парсинга файлов.
+    const consumed = await consumeCalculation();
+    if (!consumed.ok) {
+      // eslint-disable-next-line no-console
+      console.warn("[upload-3] consume blocked → paywall", consumed.reason);
+      setCombinedStatus("idle");
+      setSelectedTier("unlimited");
+      setTariffModalOpen(true);
+      return;
+    }
+
     const revenue = revenueFromTotals;
 
     const profitBeforeCost =
@@ -1418,7 +1441,6 @@ export default function AppPage() {
       };
 
       setHistory((prev) => [res, ...prev].slice(0, 50));
-      incrementCalcCount();
       // Запоминаем эту строку — «Сохранить результат» обновит ИМЕННО её.
       setLastUploadCalc({ id: res.id, synced });
 
@@ -1870,6 +1892,17 @@ export default function AppPage() {
     setIsCalculating(true);
 
     try {
+      // Ручной расчёт не парсит файлы (арифметика не падает) — списываем сразу,
+      // server-authoritative, ДО выдачи результата. !ok → paywall, результата нет.
+      const consumed = await consumeCalculation();
+      if (!consumed.ok) {
+        // eslint-disable-next-line no-console
+        console.warn("[calc] consume blocked → paywall", consumed.reason);
+        setSelectedTier("unlimited");
+        setTariffModalOpen(true);
+        return;
+      }
+
       const revenue = num(form.revenue);
       const expenses =
         num(form.commission) +
@@ -1978,9 +2011,6 @@ export default function AppPage() {
         showToast("Расчёт сохранён локально", "warn");
       }
 
-      // persistent счётчик использованных бесплатных расчётов (не сбрасывается чисткой history)
-      incrementCalcCount();
-
       // success state — короткий glow + бейдж-shine
       setJustCalculated(true);
       window.setTimeout(() => setJustCalculated(false), 2200);
@@ -2048,7 +2078,7 @@ export default function AppPage() {
     hasPremium,
     canCalculate,
     loaded: entitlementsLoaded,
-    incrementCalcCount,
+    consumeCalculation,
   } = useEntitlements();
 
   // AI PRO «Открыть Premium» — открываем тот же payment flow с тарифом «Безлимит»

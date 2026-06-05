@@ -182,13 +182,25 @@ create policy "profiles_select_own"
   on public.profiles for select
   using (auth.uid() = id);
 
+-- profiles UPDATE: клиенту НЕ открываем. Раньше здесь была политика
+-- profiles_update_own (auth.uid() = id) — но она позволяла пользователю менять
+-- собственные plan / premium_until / calculations_used обычным anon-клиентом и
+-- так обойти paywall (выдать себе unlimited / обнулить счётчик). Теперь эти поля
+-- меняют ТОЛЬКО:
+--   • RPC public.consume_calculation() — SECURITY DEFINER, выполняется как owner;
+--   • webhook ЮKassa — service_role, обходит RLS.
+-- Снимаем саму политику и (ниже) отзываем привилегию UPDATE у клиентских ролей.
 drop policy if exists "profiles_update_own" on public.profiles;
-create policy "profiles_update_own"
-  on public.profiles for update
-  using (auth.uid() = id)
-  with check (auth.uid() = id);
 
--- insert idёт через trigger (security definer), отдельный policy не нужен
+-- LOCKDOWN. Column-level REVOKE здесь НЕ сработал бы: Supabase по умолчанию
+-- грантит table-level ALL ролям anon/authenticated, а table-level UPDATE
+-- перекрывает column-level revoke. Поэтому забираем UPDATE на profiles целиком —
+-- клиент в profiles не пишет вообще (см. supabase-cloud.ts: setCalculationsUsed
+-- удалён, расход списывает RPC). Идемпотентно. SECURITY DEFINER-функция и
+-- service_role на это не влияют — они работают мимо клиентских грантов.
+revoke update on public.profiles from anon, authenticated;
+
+-- insert идёт через trigger (security definer), отдельный policy не нужен
 
 -- calculations
 alter table public.calculations enable row level security;
@@ -247,3 +259,84 @@ drop policy if exists "subscriptions_select_own" on public.subscriptions;
 create policy "subscriptions_select_own"
   on public.subscriptions for select
   using (auth.uid() = user_id);
+
+-- ============================================================================
+-- consume_calculation() — server-authoritative списание одного расчёта.
+--
+-- Единственный путь, которым расходуется квота. Клиент НЕ инкрементит счётчик
+-- сам (UPDATE на profiles ему отозван). Функция атомарно под row-lock:
+--   • unlimited со свежим premium_until > now()  → ok, лимит НЕ трогаем;
+--   • иначе allowance = 1 бесплатный + число active single-подписок (кредиты),
+--     и если calculations_used < allowance → инкремент + ok, иначе → limit_reached.
+--
+-- Почему SECURITY DEFINER: authenticated-роли отозван UPDATE на profiles, а
+-- функция выполняется как owner и потому может писать счётчик. auth.uid() внутри
+-- DEFINER по-прежнему возвращает uid вызывающего (читается из JWT-claims GUC).
+--
+-- Почему FOR UPDATE: сериализует параллельные расчёты одного пользователя
+-- (две вкладки/быстрые клики) — без блокировки оба прочли бы старый счётчик и
+-- списали бы один кредит дважды. Лок на строку profiles исключает double-spend.
+--
+-- Идемпотентности тут НЕТ намеренно: каждый успешный вызов = один расход. Вызывать
+-- РОВНО один раз на расчёт, ПЕРЕД сохранением/выдачей результата.
+-- ============================================================================
+create or replace function public.consume_calculation()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid            uuid := auth.uid();
+  prof           public.profiles%rowtype;
+  single_credits int;
+  allowance      int;
+  used           int;
+  free_limit     constant int := 1;
+begin
+  if uid is null then
+    return jsonb_build_object('ok', false, 'reason', 'not_authenticated');
+  end if;
+
+  -- Блокируем строку профиля до конца транзакции (анти-double-spend).
+  select * into prof from public.profiles where id = uid for update;
+  if not found then
+    -- Профиль обычно создаётся триггером на signup; это страховка.
+    insert into public.profiles (id) values (uid) on conflict (id) do nothing;
+    select * into prof from public.profiles where id = uid for update;
+  end if;
+
+  -- Безлимит: тариф unlimited со свежим сроком. Счётчик не расходуем.
+  if prof.plan = 'unlimited'
+     and prof.premium_until is not null
+     and prof.premium_until > now() then
+    return jsonb_build_object('ok', true, 'unlimited', true);
+  end if;
+
+  -- Квота = 1 бесплатный + по +1 за каждую активную single-подписку (реестр кредитов).
+  select count(*) into single_credits
+  from public.subscriptions
+  where user_id = uid and plan = 'single' and status = 'active';
+
+  used      := coalesce(prof.calculations_used, 0);
+  allowance := free_limit + single_credits;
+
+  if used >= allowance then
+    return jsonb_build_object(
+      'ok', false, 'reason', 'limit_reached',
+      'used', used, 'allowance', allowance
+    );
+  end if;
+
+  update public.profiles
+     set calculations_used = used + 1
+   where id = uid;
+
+  return jsonb_build_object('ok', true, 'used', used + 1, 'allowance', allowance);
+end;
+$$;
+
+-- Доступ к функции: только залогиненным. anon (аноним) считает лимит в
+-- localStorage и RPC не зовёт; revoke from public убирает неявный широкий грант.
+revoke all on function public.consume_calculation() from public;
+grant execute on function public.consume_calculation() to authenticated;
