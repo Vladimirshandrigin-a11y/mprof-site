@@ -16,6 +16,10 @@ export const FREE_CALCULATIONS_LIMIT = 1;
 export interface Entitlements {
   /** Активный безлимит (тариф unlimited). single «премиумом» НЕ считается. */
   hasPremium: boolean;
+  /** Число активных оплаченных разовых расчётов (single-кредитов). Для анонима 0. */
+  singleCredits: number;
+  /** ISO-срок окончания безлимита (profiles.premium_until) либо null. Только для показа статуса. */
+  premiumUntil: string | null;
   freeCalculationsLimit: number;
   /** Сколько расчётов уже израсходовано (profiles.calculations_used; для анонима — localStorage). */
   calcCount: number;
@@ -68,11 +72,19 @@ export function useEntitlements(): Entitlements {
   const [calcCount, setCalcCount] = useState(0);
   const [hasPremium, setHasPremium] = useState(false);
   const [singleCredits, setSingleCredits] = useState(0);
+  const [premiumUntil, setPremiumUntil] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+    // Страховка от вечного !loaded: getCurrentUser()/getSession в supabase-js
+    // может зависнуть (navigator-lock / refresh токена). Пока loaded=false,
+    // тарифный блок и paywall не отрисуются — поэтому гарантированно снимаем флаг
+    // максимум через 8с. Премиум/кредиты подтянутся, когда запрос всё же ответит.
+    const safety = setTimeout(() => {
+      if (!cancelled) setLoaded(true);
+    }, 8000);
     (async () => {
       try {
         const { user } = await getCurrentUser();
@@ -92,6 +104,7 @@ export function useEntitlements(): Entitlements {
             setCalcCount(n);
             setHasPremium(false);
             setSingleCredits(0);
+            setPremiumUntil(null);
           }
           return;
         }
@@ -106,19 +119,25 @@ export function useEntitlements(): Entitlements {
           setCalcCount(profile?.calculations_used ?? 0);
           setHasPremium(isUnlimitedActive(profile));
           setSingleCredits(credits);
+          setPremiumUntil(profile?.premium_until ?? null);
         }
       } catch {
         // Любой сбой Supabase — нет премиума/кредитов, но UI не падает.
         if (!cancelled) {
           setHasPremium(false);
           setSingleCredits(0);
+          setPremiumUntil(null);
         }
       } finally {
-        if (!cancelled) setLoaded(true);
+        if (!cancelled) {
+          clearTimeout(safety);
+          setLoaded(true);
+        }
       }
     })();
     return () => {
       cancelled = true;
+      clearTimeout(safety);
     };
   }, []);
 
@@ -156,6 +175,8 @@ export function useEntitlements(): Entitlements {
 
   return {
     hasPremium,
+    singleCredits,
+    premiumUntil,
     freeCalculationsLimit: FREE_CALCULATIONS_LIMIT,
     calcCount,
     canCalculate,

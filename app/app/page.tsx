@@ -290,6 +290,18 @@ const COMING_SOON = {
   payment: false, // Тарифы + Premium РАЗБЛОКИРОВАНЫ — карточки видны
 };
 
+// ISO-дата (например, profiles.premium_until) → "DD.MM.YYYY". Пустая строка,
+// если строку не удалось распарсить — вызывающий код тогда дату не показывает.
+function formatRuDate(iso: string | null): string {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  const d = new Date(t);
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${dd}.${mm}.${d.getFullYear()}`;
+}
+
 export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
@@ -1592,32 +1604,76 @@ export default function AppPage() {
   //    + слушаем все последующие изменения auth (SIGNED_IN / SIGNED_OUT / TOKEN_REFRESHED)
   useEffect(() => {
     let mounted = true;
+    let loadingCleared = false;
 
-    supabase.auth.getSession().then(async ({ data }) => {
-      if (!mounted) return;
-      const u = data.session?.user ?? null;
-      // eslint-disable-next-line no-console
-      console.log("[debug] getSession user.id =", u?.id ?? "(no session)");
-      setUser(u);
-      setAuthLoading(false);
-      if (u?.id) {
-        const calcs = await loadHistory(u.id);
-        loadApiKeys(u.id);
-        loadUploadedReportsCloud(u.id, calcs);
-      } else {
-        loadHistory(null);
+    // "Проверяем сессию…" ОБЯЗАНО сняться при любом исходе. Раньше
+    // setAuthLoading(false) вызывался ТОЛЬКО внутри getSession().then(...), без
+    // catch/finally/timeout — поэтому reject или зависание getSession (известная
+    // проблема navigator-lock / refresh в supabase-js) держали экран в вечном
+    // "Проверяем сессию…". Теперь снимаем loading гарантированно (3 страховки:
+    // finally, событие INITIAL_SESSION и таймаут).
+    const clearAuthLoading = () => {
+      if (mounted && !loadingCleared) {
+        loadingCleared = true;
+        setAuthLoading(false);
       }
-    });
+    };
 
-    const { data: sub } = supabase.auth.onAuthStateChange(async (event, session) => {
+    // Подгрузка данных пользователя НЕ должна блокировать снятие loading.
+    const loadUserData = (uid: string) => {
+      loadHistory(uid).then((calcs) => {
+        loadApiKeys(uid);
+        loadUploadedReportsCloud(uid, calcs);
+      });
+    };
+
+    // Последний рубеж: если getSession не ответит — не держим экран бесконечно.
+    const safety = setTimeout(() => {
+      if (mounted && !loadingCleared) {
+        // eslint-disable-next-line no-console
+        console.warn("[auth] getSession не ответил за 8с — снимаем loading");
+        clearAuthLoading();
+      }
+    }, 8000);
+
+    supabase.auth
+      .getSession()
+      .then(({ data }) => {
+        if (!mounted) return;
+        const u = data.session?.user ?? null;
+        // eslint-disable-next-line no-console
+        console.log("[debug] getSession user.id =", u?.id ?? "(no session)");
+        setUser(u);
+        if (u?.id) loadUserData(u.id);
+        else loadHistory(null);
+      })
+      .catch((e) => {
+        // eslint-disable-next-line no-console
+        console.error("[auth] getSession error", e);
+        if (mounted) {
+          setUser(null);
+          loadHistory(null);
+        }
+      })
+      .finally(() => {
+        clearTimeout(safety);
+        clearAuthLoading();
+      });
+
+    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
       if (!mounted) return;
       const u = session?.user ?? null;
       setUser(u);
+      // Резерв: INITIAL_SESSION snimaet loading, даже если getSession завис.
+      clearAuthLoading();
 
+      // ВАЖНО: не await-им supabase-вызовы прямо в колбэке onAuthStateChange —
+      // это дедлок внутреннего lock auth-token (после него getSession() висит).
+      // Откладываем загрузку данных в макро-таск, чтобы колбэк отдал lock.
       if (event === "SIGNED_IN" && u?.id) {
-        const calcs = await loadHistory(u.id);
-        loadApiKeys(u.id);
-        loadUploadedReportsCloud(u.id, calcs);
+        setTimeout(() => {
+          if (mounted) loadUserData(u.id);
+        }, 0);
       }
       if (event === "SIGNED_OUT") {
         setHistory([]);
@@ -1631,6 +1687,7 @@ export default function AppPage() {
 
     return () => {
       mounted = false;
+      clearTimeout(safety);
       sub.subscription.unsubscribe();
     };
   }, []);
@@ -2075,10 +2132,34 @@ export default function AppPage() {
   // Контракт стабильный — когда подключим billing, поменяется только hook.
   const {
     hasPremium,
+    singleCredits,
+    premiumUntil,
     canCalculate,
     loaded: entitlementsLoaded,
     consumeCalculation,
   } = useEntitlements();
+
+  // Баннер статуса «Безлимит» можно скрыть крестиком; выбор запоминаем в
+  // localStorage. Скрытие касается ТОЛЬКО unlimited-баннера и не влияет на показ
+  // тарифов/paywall для остальных пользователей (см. секцию ниже).
+  const [unlimitedBannerHidden, setUnlimitedBannerHidden] = useState(false);
+  useEffect(() => {
+    try {
+      setUnlimitedBannerHidden(
+        window.localStorage.getItem("mprof_unlimited_banner_hidden") === "1"
+      );
+    } catch {
+      /* localStorage недоступен — оставляем баннер видимым */
+    }
+  }, []);
+  const hideUnlimitedBanner = () => {
+    setUnlimitedBannerHidden(true);
+    try {
+      window.localStorage.setItem("mprof_unlimited_banner_hidden", "1");
+    } catch {
+      /* ignore */
+    }
+  };
 
   // AI PRO «Открыть Premium» — открываем тот же payment flow с тарифом «Безлимит»
   const openPremium = () => {
@@ -2480,6 +2561,32 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .tariff-grid{grid-template-columns:1fr;gap:.85rem;padding:1.2rem}
   .tariff-item{padding:1.2rem 1.2rem}
 }
+
+/* ====== Tariff STATUS (активный безлимит) ====== */
+.tariff-status{position:relative;padding:1.25rem 1.4rem 1.35rem}
+.tariff-status-x{
+  position:absolute;top:.7rem;right:.7rem;width:30px;height:30px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:1.3rem;line-height:1;color:var(--txt3);
+  background:transparent;border:1px solid transparent;border-radius:8px;
+  cursor:pointer;transition:all .18s
+}
+.tariff-status-x:hover{color:var(--txt);border-color:var(--edge2);background:rgba(255,255,255,.04)}
+.tariff-status-head{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;padding-right:2.4rem}
+.tariff-status-badge{
+  font-family:var(--mono);font-size:.55rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:.14em;color:var(--void);
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  padding:4px 12px;border-radius:100px;box-shadow:0 4px 14px rgba(201,168,76,.35)
+}
+.tariff-status-title{font-family:var(--display);font-size:1.1rem;font-weight:700;
+  color:var(--txt);letter-spacing:-.01em}
+.tariff-status-text{font-size:.85rem;color:var(--txt2);line-height:1.5;font-weight:300;
+  margin:.75rem 0 .25rem}
+.tariff-status-list{margin:.5rem 0 !important}
+.tariff-status-until{font-family:var(--mono);font-size:.72rem;color:var(--gold2);
+  letter-spacing:.03em;margin:.7rem 0 0}
+.tariff-status-until strong{color:var(--txt);font-weight:600}
 
 /* ====== CALC LOADING ====== */
 .calc-loading{position:relative}
@@ -4563,26 +4670,15 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   </button>
                 </div>
               ) : (
-                <div className="upgrade-hint" role="region" aria-label="Продолжить анализ">
+                <div className="upgrade-hint" role="region" aria-label="Лимит расчётов исчерпан">
+                  {/* Возле кнопки расчёта НЕ дублируем продажу тарифов: только
+                      нейтральная подсказка. Карточки 149/449 — в одном месте, в
+                      нижнем тарифном блоке dashboard (#dash-tariffs). */}
                   <div className="upgrade-hint-left">
                     <span className="upgrade-hint-dot" aria-hidden="true" />
-                    <span className="upgrade-hint-text">Продолжить анализ</span>
-                  </div>
-                  <div className="upgrade-hint-actions">
-                    <button
-                      type="button"
-                      className="upgrade-hint-btn"
-                      onClick={() => handleTariff("single")}
-                    >
-                      Разовый расчёт <em>149₽</em>
-                    </button>
-                    <button
-                      type="button"
-                      className="upgrade-hint-btn primary"
-                      onClick={() => handleTariff("unlimited")}
-                    >
-                      Безлимит + AI <em>449₽/мес</em>
-                    </button>
+                    <span className="upgrade-hint-text">
+                      Лимит расчётов исчерпан — выберите тариф в блоке ниже
+                    </span>
                   </div>
                 </div>
               )}
@@ -5567,9 +5663,105 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
           )}
 
-        {/* Тарифы на основном экране калькулятора НЕ показываем. Они доступны
-            только: (1) в inline-блоке upgrade-hint — когда доступа нет
-            (canCalculate === false); (2) в paywall-модалке TariffModal. */}
+        {/* Тарифный блок dashboard. Показ зависит от прав (entitlements):
+            • unlimited активен → блок СТАТУСА тарифа (без карточек покупки),
+              скрывается крестиком (localStorage mprof_unlimited_banner_hidden);
+            • не unlimited И (есть single-кредит ИЛИ нет доступа) → карточки покупки;
+            • иначе (free с остатком бесплатного расчёта) → ничего.
+            entitlementsLoaded-гейт убирает мерцание до ответа Supabase. */}
+        {entitlementsLoaded && hasPremium && !unlimitedBannerHidden && (
+          <div className="card tariff-card tariff-status" id="dash-tariff-status">
+            <button
+              type="button"
+              className="tariff-status-x"
+              onClick={hideUnlimitedBanner}
+              aria-label="Скрыть блок тарифа"
+              title="Скрыть"
+            >
+              ×
+            </button>
+            <div className="tariff-status-head">
+              <span className="tariff-status-badge">Активно</span>
+              <div className="tariff-status-title">Ваш тариф: Безлимит</div>
+            </div>
+            <p className="tariff-status-text">
+              Вы можете выполнять неограниченное количество расчётов до окончания
+              подписки.
+            </p>
+            <ul className="tariff-list tariff-status-list">
+              <li>Неограниченное количество расчётов</li>
+              <li>AI-аналитика и рекомендации</li>
+              <li>Полная история без ограничений</li>
+              <li>Приоритетный доступ к новым функциям</li>
+            </ul>
+            {formatRuDate(premiumUntil) && (
+              <p className="tariff-status-until">
+                Активен до: <strong>{formatRuDate(premiumUntil)}</strong>
+              </p>
+            )}
+          </div>
+        )}
+
+        {entitlementsLoaded &&
+          !hasPremium &&
+          (singleCredits > 0 || !canCalculate) && (
+            <div className="card tariff-card" id="dash-tariffs">
+              <div className="card-head">
+                <div className="card-title">
+                  {singleCredits > 0 ? "Расширить доступ" : "Тарифы"}
+                </div>
+              </div>
+
+              <div className="tariff-grid tariff-grid-2">
+                <div className="tariff-item">
+                  <div className="tariff-name">Разовый расчёт</div>
+                  <div className="tariff-price">
+                    <em>149</em> ₽
+                  </div>
+                  <div className="tariff-period">Один платёж</div>
+                  <ul className="tariff-list">
+                    <li>Один расчёт за месячный отчёт</li>
+                    <li>Сохранение результата в историю</li>
+                    <li>Без подписки и автосписаний</li>
+                  </ul>
+                  <button
+                    type="button"
+                    className="tariff-btn"
+                    onClick={() => handleTariff("single")}
+                  >
+                    {singleCredits > 0
+                      ? "Купить ещё разовый расчёт 149₽"
+                      : "Разовый расчёт 149₽"}
+                  </button>
+                </div>
+
+                <div className="tariff-item featured">
+                  <span className="tariff-shine" aria-hidden="true" />
+                  <span className="tariff-badge">Выгодно</span>
+                  <div className="tariff-name">Безлимит</div>
+                  <div className="tariff-price">
+                    <em>449</em> ₽<span className="tariff-month">/мес</span>
+                  </div>
+                  <div className="tariff-period">Подписка на 30 дней</div>
+                  <ul className="tariff-list">
+                    <li>Неограниченное число расчётов в месяц</li>
+                    <li>AI аналитика и рекомендации</li>
+                    <li>Приоритетный доступ к новым функциям</li>
+                    <li>Полная история без ограничений</li>
+                  </ul>
+                  <button
+                    type="button"
+                    className="tariff-btn primary"
+                    onClick={() => handleTariff("unlimited")}
+                  >
+                    {singleCredits > 0
+                      ? "Оформить безлимит 449₽"
+                      : "Безлимит 449₽"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
         {isLoadingHistory && (
           <div className="card hist-card">
