@@ -307,7 +307,6 @@ export default function AppPage() {
   const [apiSaveMessage, setApiSaveMessage] = useState("");
   const [showOzonKey, setShowOzonKey] = useState(false);
   const [showWbKey, setShowWbKey] = useState(false);
-  const [tariffMessage, setTariffMessage] = useState("");
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("manual");
 
   // ===== Upload report (UI-заготовка, без реального парсинга) =====
@@ -5568,67 +5567,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
           )}
 
-        {COMING_SOON.payment && (
-          <ComingSoon
-            title="Premium и оплата"
-            description="Тариф «Безлимит + AI», разовые расчёты и онлайн-оплата. Сейчас все функции расчёта доступны бесплатно — платные планы подключим совсем скоро."
-          />
-        )}
-
-        {!COMING_SOON.payment && (
-        <div className="card tariff-card" id="dash-tariffs">
-          <div className="card-head">
-            <div className="card-title">Тарифы</div>
-          </div>
-
-          <div className="tariff-grid tariff-grid-2">
-            <div className="tariff-item">
-              <div className="tariff-name">Разовый расчёт</div>
-              <div className="tariff-price">
-                <em>149</em> ₽
-              </div>
-              <div className="tariff-period">Один платёж</div>
-              <ul className="tariff-list">
-                <li>Один расчёт за месячный отчёт</li>
-                <li>Сохранение результата в историю</li>
-                <li>Без подписки и автосписаний</li>
-              </ul>
-              <button
-                type="button"
-                className="tariff-btn"
-                onClick={() => handleTariff("single")}
-              >
-                Купить расчёт 149₽
-              </button>
-            </div>
-
-            <div className="tariff-item featured">
-              <span className="tariff-shine" aria-hidden="true" />
-              <span className="tariff-badge">Выгодно</span>
-              <div className="tariff-name">Безлимит</div>
-              <div className="tariff-price">
-                <em>449</em> ₽<span className="tariff-month">/мес</span>
-              </div>
-              <div className="tariff-period">Подписка на 30 дней</div>
-              <ul className="tariff-list">
-                <li>Неограниченное число расчётов в месяц</li>
-                <li>AI аналитика и рекомендации</li>
-                <li>Приоритетный доступ к новым функциям</li>
-                <li>Полная история без ограничений</li>
-              </ul>
-              <button
-                type="button"
-                className="tariff-btn primary"
-                onClick={() => handleTariff("unlimited")}
-              >
-                Оформить безлимит 449₽
-              </button>
-            </div>
-          </div>
-
-          {tariffMessage && <p className="tariff-msg">{tariffMessage}</p>}
-        </div>
-        )}
+        {/* Тарифы на основном экране калькулятора НЕ показываем. Они доступны
+            только: (1) в inline-блоке upgrade-hint — когда доступа нет
+            (canCalculate === false); (2) в paywall-модалке TariffModal. */}
 
         {isLoadingHistory && (
           <div className="card hist-card">
