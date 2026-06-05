@@ -320,6 +320,10 @@ export default function AppPage() {
   const [showOzonKey, setShowOzonKey] = useState(false);
   const [showWbKey, setShowWbKey] = useState(false);
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("manual");
+  // Якорь для скролла «Последние расчёты» → калькулятор. Ведём scrollIntoView
+  // сюда (табы режимов прямо над «Параметры расчёта»), а не на самый верх к
+  // логотипу. scroll-margin-top в .calc-tabs компенсирует sticky-шапку .dash-top.
+  const calcSectionRef = useRef<HTMLDivElement | null>(null);
 
   // ===== Upload report (UI-заготовка, без реального парсинга) =====
   // ===== Legacy single-file state (для обратной совместимости и demo) =====
@@ -859,7 +863,10 @@ export default function AppPage() {
       setShowProfitForm(false);
       setSelectedId(item.id);
     }
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    // Плавно подводим к блоку расчёта (табы + «Параметры расчёта»), а не к самому
+    // верху страницы. block:"start" + scroll-margin-top в .calc-tabs учитывают
+    // sticky-шапку, поэтому скролл останавливается на калькуляторе, не на логотипе.
+    calcSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   };
 
   const acceptUploadFile = (file: File | null) => {
@@ -2365,7 +2372,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
 .calc-tabs{display:flex;gap:5px;background:var(--glass);border:1px solid var(--edge);
   border-radius:12px;padding:5px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  margin-bottom:.55rem;box-shadow:0 10px 28px rgba(0,0,0,.20)}
+  margin-bottom:.55rem;box-shadow:0 10px 28px rgba(0,0,0,.20);scroll-margin-top:84px}
 .calc-tab{flex:1;font-family:var(--sans);font-size:.88rem;font-weight:600;padding:12px 16px;
   border-radius:10px;cursor:pointer;letter-spacing:.01em;border:1px solid transparent;
   background:transparent;color:var(--txt2);transition:all .22s ease;text-align:center;
@@ -4553,7 +4560,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           onOpenPremium={openPremium}
         />
 
-        <div className="calc-tabs" role="tablist">
+        <div className="calc-tabs" role="tablist" ref={calcSectionRef}>
           <button
             type="button"
             role="tab"
