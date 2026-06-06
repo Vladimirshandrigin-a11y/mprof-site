@@ -241,19 +241,6 @@ const AI_STAGES = [
   "Формируем рекомендации…",
 ];
 
-const DEMO_HISTORY: {
-  id: string;
-  mp: "ozon" | "wb";
-  revenue: number;
-  profit: number;
-  margin: number;
-  date: string;
-}[] = [
-  { id: "demo-1", mp: "ozon", revenue: 180000, profit: 32450, margin: 18.0, date: "пример" },
-  { id: "demo-2", mp: "wb",   revenue:  95000, profit: 18200, margin: 19.2, date: "пример" },
-  { id: "demo-3", mp: "ozon", revenue: 240000, profit: 54900, margin: 22.9, date: "пример" },
-];
-
 const EMPTY: Record<string, string> = {
   revenue: "",
   commission: "",
@@ -3651,23 +3638,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   50%{opacity:.65;background-position:100% 0}
 }
 
-/* ====== DEMO HISTORY ====== */
-.hist-demo{position:relative}
-.hist-demo .hist-item{
-  opacity:.5;filter:saturate(.55);pointer-events:none;cursor:default;
-  animation:demoPulse 4.2s ease-in-out infinite
-}
-.hist-demo .hist-list .hist-item:nth-child(2){animation-delay:.4s}
-.hist-demo .hist-list .hist-item:nth-child(3){animation-delay:.8s}
-@keyframes demoPulse{0%,100%{opacity:.45}50%{opacity:.72}}
-.hist-demo-badge{display:inline-block;margin-left:.7rem;font-family:var(--mono);
-  font-size:.55rem;text-transform:uppercase;letter-spacing:.14em;color:var(--gold2);
-  border:1px solid rgba(201,168,76,.32);background:var(--gold-bg);
-  padding:3px 9px;border-radius:100px;vertical-align:middle;font-weight:600}
-.hist-demo-hint{font-family:var(--mono);font-size:.66rem;letter-spacing:.04em;
-  color:var(--txt3);text-align:center;padding:.95rem 1.5rem;
-  border-top:1px solid var(--edge);background:rgba(255,255,255,.015)}
-
 /* ====== API EMPTY STATE ====== */
 .api-empty{padding:2.2rem 1.7rem 1.9rem;border-bottom:1px solid var(--edge);
   text-align:center;position:relative;overflow:hidden}
@@ -4111,7 +4081,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .ai-proc-progress::after,
   .calc-loading::after,
   .empty-bar,
-  .hist-demo .hist-item,
   .api-empty-ico,
   .calc-loading-spin,
   .res-margin::after,
@@ -5819,32 +5788,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         )}
 
         {!isLoadingHistory && history.length === 0 && (
-          <div className="card hist-card hist-demo">
+          <div className="card hist-card">
             <div className="card-head">
-              <div className="card-title">
-                Примеры расчётов
-                <span className="hist-demo-badge">Демо</span>
-              </div>
+              <div className="card-title">Последние расчёты</div>
             </div>
-            <div className="hist-list">
-              {DEMO_HISTORY.map((d) => (
-                <div className="hist-item" key={d.id}>
-                  <div className={"hist-mp " + d.mp}>
-                    {d.mp === "ozon" ? "Ozon" : "WB"}
-                  </div>
-                  <div className="hist-info">
-                    <div className="hist-rev">Выручка {fmt(d.revenue)} ₽</div>
-                    <div className="hist-date">{d.date}</div>
-                  </div>
-                  <div className="hist-profit pos">
-                    +{fmt(d.profit)} ₽
-                    <span className="hm">маржа {d.margin.toFixed(1)}%</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="hist-demo-hint">
-              Здесь будут ваши расчёты после первого сохранения
+            <div className="hist-filter-empty">
+              Здесь появятся ваши расчёты после первого сохранения
             </div>
           </div>
         )}
