@@ -24,7 +24,9 @@ export const dynamic = "force-dynamic";
 //   • status === "succeeded";
 //   • paid === true (деньги реально захвачены);
 //   • amount.value === цена тарифа на сервере (PLAN_PRICING) и currency === RUB;
-//   • metadata.plan === plan нашей подписки в БД (платёж за тот тариф, что ждём).
+//   • metadata.plan (ЕСЛИ присутствует) совпадает с sub.plan из БД — это лишь
+//     мягкая доп. сверка; источник правды о тарифе — сама запись subscriptions,
+//     найденная по provider_payment_id / metadata.subscription_id.
 //
 // Что делает подтверждённый succeeded — РАЗНОЕ для двух тарифов:
 //   • unlimited → подписку в active со сроком +30 дней (expires_at) И профиль:
@@ -118,8 +120,11 @@ async function handleVerifiedSucceeded(
   if (!sub)
     return { http: 200, body: { ok: false, reason: "subscription_not_found" } };
 
-  // metadata.plan платежа должен совпасть с планом нашей подписки.
-  if (metaPlan !== sub.plan) {
+  // Источник правды о тарифе — sub.plan из БД. metadata.plan платежа проверяем
+  // ТОЛЬКО как мягкую сверку и ТОЛЬКО если он реально пришёл. Если metadata
+  // пустая (старый платёж/деплой, где plan не ушёл) — не блокируем: ниже сумма
+  // сверяется против sub.plan, и этого достаточно для активации.
+  if (metaPlan && metaPlan !== sub.plan) {
     // eslint-disable-next-line no-console
     console.error("[payment/webhook] plan mismatch", {
       paymentId: payment.id,
