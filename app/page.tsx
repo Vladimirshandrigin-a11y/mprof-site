@@ -74,6 +74,8 @@ export default function HomePage() {
   const [tariffModalOpen, setTariffModalOpen] = useState(false);
   const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
   const [openFaq, setOpenFaq] = useState<number | null>(0);
+  // Мобильное меню-гамбургер (видно только на ширине ≤640px).
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const openTariff = (t: TariffTier) => {
     setSelectedTier(t);
@@ -146,9 +148,26 @@ a{color:inherit;text-decoration:none}
 .ln-nav-link{font-size:.82rem;color:var(--txt2);font-weight:400;transition:color .18s ease}
 .ln-nav-link:hover{color:var(--gold2)}
 .ln-nav-cta{font-family:var(--sans);font-size:.82rem;font-weight:500;color:var(--txt);
-  padding:8px 18px;border:1px solid var(--edge2);border-radius:10px;background:rgba(255,255,255,.03);
+  min-height:44px;padding:0 18px;display:inline-flex;align-items:center;justify-content:center;
+  border:1px solid var(--edge2);border-radius:10px;background:rgba(255,255,255,.03);
   transition:all .2s ease;cursor:pointer;backdrop-filter:blur(8px)}
 .ln-nav-cta:hover{border-color:var(--gold);color:var(--gold2);background:var(--gold-bg);transform:translateY(-1px)}
+
+/* ====== MOBILE BURGER + MENU (≤640px) ====== */
+.ln-burger{display:none;width:44px;height:44px;align-items:center;justify-content:center;
+  padding:0;background:rgba(255,255,255,.04);border:1px solid var(--edge2);border-radius:10px;
+  color:var(--txt);cursor:pointer;-webkit-appearance:none;appearance:none;
+  -webkit-tap-highlight-color:transparent;transition:border-color .2s ease,background .2s ease}
+.ln-burger:hover{border-color:var(--gold);background:var(--gold-bg)}
+.ln-burger-bars{position:relative;display:flex;flex-direction:column;justify-content:center;
+  gap:5px;width:20px;height:16px}
+.ln-burger-bars span{display:block;height:2px;width:100%;border-radius:2px;background:currentColor;
+  transition:transform .28s ease,opacity .2s ease}
+.ln-burger[aria-expanded="true"] .ln-burger-bars span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+.ln-burger[aria-expanded="true"] .ln-burger-bars span:nth-child(2){opacity:0}
+.ln-burger[aria-expanded="true"] .ln-burger-bars span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+.ln-mobile-menu{display:none}
+@keyframes lnMenuDrop{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
 
 /* ====== LAYOUT ====== */
 .ln-wrap{max-width:1180px;margin:0 auto;padding:0 2rem}
@@ -355,8 +374,19 @@ a{color:inherit;text-decoration:none}
   .ln-nav{padding:.9rem 1.2rem}
   .ln-wrap{padding:0 1.2rem}
   .ln-brand-sub{display:none}
-  .ln-nav-links{gap:.8rem}
-  .ln-nav-link{display:none}
+  .ln-nav-links{display:none}
+  .ln-burger{display:inline-flex}
+  .ln-mobile-menu{display:flex;flex-direction:column;position:absolute;top:100%;left:0;right:0;
+    padding:.4rem 1.2rem 1rem;background:rgba(6,9,20,.97);
+    backdrop-filter:blur(20px) saturate(1.35);-webkit-backdrop-filter:blur(20px) saturate(1.35);
+    border-bottom:1px solid var(--edge);box-shadow:0 20px 50px rgba(0,0,0,.4);
+    animation:lnMenuDrop .25s ease both}
+  .ln-mobile-link{display:flex;align-items:center;min-height:48px;font-size:1rem;font-weight:500;
+    color:var(--txt2);border-bottom:1px solid var(--edge);transition:color .18s ease}
+  .ln-mobile-link:active{color:var(--gold2)}
+  .ln-mobile-cta{display:flex;align-items:center;justify-content:center;min-height:50px;margin-top:.7rem;
+    font-weight:600;color:var(--void);background:linear-gradient(135deg,var(--gold),var(--gold2));
+    border-radius:11px}
   .ln-feat-grid{grid-template-columns:1fr}
   .ln-hero-stats{grid-template-columns:1fr;gap:.7rem;max-width:340px}
   .ln-cta-row{flex-direction:column;align-items:stretch}
@@ -569,6 +599,52 @@ a{color:inherit;text-decoration:none}
           <a href="#pricing" className="ln-nav-link">Тарифы</a>
           <Link href="/app" className="ln-nav-cta">Открыть Dashboard</Link>
         </div>
+        <button
+          type="button"
+          className="ln-burger"
+          aria-label="Меню"
+          aria-expanded={menuOpen}
+          aria-controls="ln-mobile-menu"
+          onClick={() => setMenuOpen((v) => !v)}
+        >
+          <span className="ln-burger-bars" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
+        </button>
+        {menuOpen && (
+          <div className="ln-mobile-menu" id="ln-mobile-menu">
+            <a
+              href="#features"
+              className="ln-mobile-link"
+              onClick={() => setMenuOpen(false)}
+            >
+              Возможности
+            </a>
+            <a
+              href="#how"
+              className="ln-mobile-link"
+              onClick={() => setMenuOpen(false)}
+            >
+              Как работает
+            </a>
+            <a
+              href="#pricing"
+              className="ln-mobile-link"
+              onClick={() => setMenuOpen(false)}
+            >
+              Тарифы
+            </a>
+            <Link
+              href="/app"
+              className="ln-mobile-cta"
+              onClick={() => setMenuOpen(false)}
+            >
+              Открыть Dashboard →
+            </Link>
+          </div>
+        )}
       </nav>
 
       {/* ====== ANIMATED BACKGROUND BLOBS ====== */}

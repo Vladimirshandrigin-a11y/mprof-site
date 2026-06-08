@@ -475,6 +475,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
           .tm-price{font-size:2.5rem}
           .tm-actions{flex-direction:column}
           .tm-btn{width:100%;min-width:0}
+          .tm-close{width:44px;height:44px}
         }
 
         @media (prefers-reduced-motion: reduce){

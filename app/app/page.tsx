@@ -4333,6 +4333,16 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .btn-row{flex-direction:column}
   .res-hero-val{font-size:2.1rem}
 }
+/* MOBILE A11Y (≤640px): 16px-инпуты против iOS-зума + зоны нажатия ≥44×44px. */
+@media(max-width:640px){
+  .auth-input,.api-input,.in-wrap input{font-size:16px}
+  .dash-signout{min-height:44px;display:inline-flex;align-items:center;justify-content:center;padding:0 16px}
+  .api-eye{width:44px;height:44px}
+  .api-secret .api-input{padding-right:56px}
+  .tariff-status-x{width:44px;height:44px}
+  .upload-slot-remove{width:44px;height:44px}
+  .onboard-close{width:44px;height:44px}
+}
       `}</style>
 
       <div className="dash-top">
