@@ -340,3 +340,73 @@ $$;
 -- localStorage и RPC не зовёт; revoke from public убирает неявный широкий грант.
 revoke all on function public.consume_calculation() from public;
 grant execute on function public.consume_calculation() to authenticated;
+
+-- ============================================================================
+-- products — каталог товаров пользователя (Артикул / Название / Себестоимость)
+--
+-- Таблица создаётся идемпотентно. Если она уже была заведена вручную в Supabase
+-- (возможно, с другим набором колонок) — ALTER ... ADD COLUMN IF NOT EXISTS ниже
+-- гарантирует наличие именно тех колонок, которые читает клиент:
+--   sku (text) / name (text) / cost_price (numeric).
+-- RLS — по тому же паттерну, что calculations / uploaded_reports: пользователь
+-- видит и правит ТОЛЬКО свои товары (auth.uid() = user_id).
+-- ============================================================================
+create table if not exists public.products (
+  id          uuid        primary key default gen_random_uuid(),
+  user_id     uuid        not null references auth.users(id) on delete cascade,
+  sku         text,
+  name        text        not null default '',
+  cost_price  numeric     not null default 0,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- Гарантируем нужные колонки, даже если таблица уже существовала ранее.
+alter table public.products add column if not exists sku        text;
+alter table public.products add column if not exists name       text        not null default '';
+alter table public.products add column if not exists cost_price numeric     not null default 0;
+alter table public.products add column if not exists created_at timestamptz not null default now();
+alter table public.products add column if not exists updated_at timestamptz not null default now();
+
+create index if not exists idx_products_user_created
+  on public.products(user_id, created_at desc);
+
+-- updated_at автообновляется на каждый UPDATE строки.
+create or replace function public.touch_products_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_products_touch on public.products;
+create trigger trg_products_touch
+  before update on public.products
+  for each row execute function public.touch_products_updated_at();
+
+-- ROW LEVEL SECURITY — только свои товары
+alter table public.products enable row level security;
+
+drop policy if exists "products_select_own" on public.products;
+create policy "products_select_own"
+  on public.products for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "products_insert_own" on public.products;
+create policy "products_insert_own"
+  on public.products for insert
+  with check (auth.uid() = user_id);
+
+drop policy if exists "products_update_own" on public.products;
+create policy "products_update_own"
+  on public.products for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+drop policy if exists "products_delete_own" on public.products;
+create policy "products_delete_own"
+  on public.products for delete
+  using (auth.uid() = user_id);

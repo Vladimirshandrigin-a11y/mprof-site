@@ -410,6 +410,105 @@ export async function loadUploadedReportsFromCloud(
 }
 
 // ============================================================================
+// Products — каталог товаров пользователя.
+//
+// RLS (см. supabase/schema.sql): пользователь видит/правит ТОЛЬКО свои строки
+// (auth.uid() = user_id). Все функции возвращают CloudResult и не бросают.
+// ============================================================================
+export interface Product {
+  id: string;
+  user_id: string;
+  /** Артикул. Может быть пустым. */
+  sku: string | null;
+  /** Название (обязательно на уровне UI). */
+  name: string;
+  /** Себестоимость, ₽. */
+  cost_price: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Поля для insert. user_id заполняется helper'ом из текущей сессии. */
+export type ProductInsertInput = {
+  sku: string | null;
+  name: string;
+  cost_price: number;
+};
+
+export type ProductUpdateInput = Partial<ProductInsertInput>;
+
+export async function loadProductsFromCloud(
+  userId: string
+): Promise<CloudResult<Product[]>> {
+  try {
+    const { data, error } = await supabase
+      .from("products")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
+    if (error) return { data: null, error: fmtError(error) };
+    return { data: (data as Product[]) ?? [], error: null };
+  } catch (e) {
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+export async function addProductToCloud(
+  input: ProductInsertInput,
+  userId: string
+): Promise<CloudResult<Product>> {
+  try {
+    const payload = { ...input, user_id: userId };
+    const { data, error } = await supabase
+      .from("products")
+      .insert([payload])
+      .select()
+      .single();
+    if (error) return { data: null, error: fmtError(error) };
+    return { data: (data as Product | null) ?? null, error: null };
+  } catch (e) {
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+export async function updateProductInCloud(
+  productId: string,
+  fields: ProductUpdateInput,
+  userId: string
+): Promise<CloudResult<Product>> {
+  try {
+    const { data, error } = await supabase
+      .from("products")
+      .update(fields)
+      .eq("id", productId)
+      .eq("user_id", userId)
+      .select()
+      .single();
+    if (error) return { data: null, error: fmtError(error) };
+    return { data: (data as Product | null) ?? null, error: null };
+  } catch (e) {
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+export async function deleteProductFromCloud(
+  productId: string,
+  userId: string
+): Promise<CloudResult<{ ok: true }>> {
+  try {
+    const { error } = await supabase
+      .from("products")
+      .delete()
+      .eq("id", productId)
+      .eq("user_id", userId);
+    if (error) return { data: null, error: fmtError(error) };
+    return { data: { ok: true }, error: null };
+  } catch (e) {
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+// ============================================================================
 // Convenience: проверить доступен ли cloud-режим
 // (есть env и есть залогиненный пользователь). При false — UI остаётся в
 // localStorage fallback'е.

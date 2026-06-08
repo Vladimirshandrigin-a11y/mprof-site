@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
+import { ProductCatalog } from "./components/ProductCatalog"
 import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
@@ -307,6 +308,10 @@ export default function AppPage() {
   const [showOzonKey, setShowOzonKey] = useState(false);
   const [showWbKey, setShowWbKey] = useState(false);
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("manual");
+  // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
+  // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
+  // когда user отсутствует, и тогда всегда показываем калькулятор.
+  const [mainTab, setMainTab] = useState<"calc" | "catalog">("calc");
   // Якорь для скролла «Последние расчёты» → калькулятор. Ведём scrollIntoView
   // сюда (табы режимов прямо над «Параметры расчёта»), а не на самый верх к
   // логотипу. scroll-margin-top в .calc-tabs компенсирует sticky-шапку .dash-top.
@@ -2404,6 +2409,21 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .calc-tabs{flex-direction:column;gap:6px}
   .calc-tab{padding:11px}
 }
+/* === MAIN TABS (Калькулятор / Каталог товаров) === */
+.main-tabs{display:flex;gap:6px;background:var(--glass);border:1px solid var(--edge);
+  border-radius:14px;padding:6px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  margin:.2rem 0 1.1rem;box-shadow:0 10px 28px rgba(0,0,0,.20);max-width:520px}
+.main-tab{flex:1;font-family:var(--sans);font-size:.9rem;font-weight:600;padding:12px 18px;
+  border-radius:10px;cursor:pointer;border:1px solid transparent;background:transparent;
+  color:var(--txt2);transition:all .22s ease;display:inline-flex;align-items:center;
+  justify-content:center;gap:9px;min-height:44px}
+.main-tab:hover{color:var(--txt);background:rgba(255,255,255,.03)}
+.main-tab.active{color:var(--void);
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  box-shadow:0 8px 26px rgba(201,168,76,.3),inset 0 1px 0 rgba(255,255,255,.22)}
+.main-tab-ico{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px}
+.main-tab-ico svg{width:17px;height:17px;display:block}
+@media(max-width:640px){.main-tabs{max-width:none}}
 
 .api-pro-card{margin-bottom:.25rem;position:relative;overflow:hidden;
   box-shadow:0 24px 60px rgba(0,0,0,.35),0 0 50px rgba(201,168,76,.06)}
@@ -4398,6 +4418,44 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
         )}
 
+        {user && (
+          <div className="main-tabs" role="tablist" aria-label="Разделы">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "calc"}
+              className={"main-tab" + (mainTab === "calc" ? " active" : "")}
+              onClick={() => setMainTab("calc")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="4" y="3" width="16" height="18" rx="2.5" />
+                  <path d="M8 7h8M8 11h8M8 15h5" />
+                </svg>
+              </span>
+              Калькулятор
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "catalog"}
+              className={"main-tab" + (mainTab === "catalog" ? " active" : "")}
+              onClick={() => setMainTab("catalog")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 7l9-4 9 4-9 4-9-4z" />
+                  <path d="M3 7v10l9 4 9-4V7" />
+                  <path d="M12 11v10" />
+                </svg>
+              </span>
+              Каталог товаров
+            </button>
+          </div>
+        )}
+
+        {(mainTab === "calc" || !user) && (
+          <>
         <h1 className="dash-h1">
           Новый <em>расчёт</em>
         </h1>
@@ -5919,7 +5977,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             )}
           </div>
         )}
+          </>
+        )}
 
+        {user && mainTab === "catalog" && (
+          <ProductCatalog user={user} showToast={showToast} />
+        )}
       </div>
 
       <TariffModal
