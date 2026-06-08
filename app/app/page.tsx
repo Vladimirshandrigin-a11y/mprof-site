@@ -6,6 +6,7 @@ import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { ProductCatalog } from "./components/ProductCatalog"
+import { OzonProductBreakdown } from "./components/OzonProductBreakdown"
 import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
@@ -24,6 +25,7 @@ import {
 import {
   parseOzonReport,
   type OzonDebugInfo,
+  type OzonProductRow,
 } from "./lib/report-parsers/ozon-parser"
 import {
   parseUpdPdf,
@@ -361,6 +363,10 @@ export default function AppPage() {
     updServices: UpdDebugInfo | null;
     updCommission: UpdDebugInfo | null;
   } | null>(null);
+  /** Per-SKU строки из последнего распарсенного отчёта Ozon — для подстановки
+   *  себестоимости из каталога и блока «Прибыль по товарам». Заполняется в
+   *  обоих flow (одиночный upload и 3-file). Пусто → блок не показывается. */
+  const [reportProducts, setReportProducts] = useState<OzonProductRow[]>([]);
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const updServicesInputRef = useRef<HTMLInputElement | null>(null);
   const updCommissionInputRef = useRef<HTMLInputElement | null>(null);
@@ -805,6 +811,9 @@ export default function AppPage() {
       updCommissionTotal: b.updCommissionTotal,
       profitBeforeCost: b.profitBeforeCost,
     });
+    // История не хранит per-SKU строки — очищаем, чтобы не показать блок
+    // «Прибыль по товарам» от другого, ранее загруженного отчёта.
+    setReportProducts([]);
     setProfitInputs({
       costPrice: s(b.costPrice),
       taxPercent: s(b.taxPercent),
@@ -906,6 +915,7 @@ export default function AppPage() {
     setUploadStage(0);
     setUploadErrorMsg("");
     setUploadDebugInfo(null);
+    setReportProducts([]);
 
     // Запускаем парсинг параллельно со стадиями анимации — пока крутятся
     // фейковые «стадии AI», файл уже реально читается. К концу анимации
@@ -984,6 +994,10 @@ export default function AppPage() {
     const report = parseResult.report;
     const mp: Marketplace = report.marketplace;
     const est = report.estimate;
+
+    // Per-SKU слой для блока «Прибыль по товарам» (best-effort: пусто, если
+    // колонки артикула в отчёте не распознаны — тогда блок не показывается).
+    setReportProducts(report.products);
 
     // Финансовая модель из реального отчёта (cost обычно 0 — Ozon не отдаёт
     // себестоимость, юзер может дозаполнить в ручном расчёте).
@@ -1247,6 +1261,7 @@ export default function AppPage() {
     setCombinedError("");
     setCombinedResult(null);
     setCombinedDebug(null);
+    setReportProducts([]);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
     setProfitSaving(false);
@@ -1272,6 +1287,7 @@ export default function AppPage() {
     setCombinedError("");
     setCombinedResult(null);
     setCombinedDebug(null);
+    setReportProducts([]);
 
     // eslint-disable-next-line no-console
     console.log("[upload-3] starting parallel parse of 3 files", {
@@ -1387,6 +1403,9 @@ export default function AppPage() {
       updCommissionTotal,
       profitBeforeCost,
     });
+
+    // Per-SKU слой из XLSX-отчёта — для блока «Прибыль по товарам».
+    setReportProducts(xlsxRes.report.products);
 
     // Автозаполнение формы в manual mode (для last-mile проверки/правок).
     // Объединяем доход (revenue + loyaltyPayouts) и расходы (Ozon-комиссии).
@@ -5727,6 +5746,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </div>
             )}
           </div>
+        )}
+
+        {/* Прибыль по товарам — подстановка себестоимости из каталога по sku.
+            Показывается, когда в распарсенном отчёте есть per-SKU строки. */}
+        {reportProducts.length > 0 && (
+          <OzonProductBreakdown products={reportProducts} user={user} />
         )}
 
         {calcMode === "upload" &&

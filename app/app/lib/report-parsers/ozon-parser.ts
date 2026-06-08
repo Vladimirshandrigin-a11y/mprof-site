@@ -69,6 +69,17 @@ export interface OzonEstimate {
   other: number;
 }
 
+/**
+ * Per-SKU строка из тела отчёта — для матчинга с каталогом товаров.
+ * article — артикул продавца (offer_id), ключ для поиска по products.sku.
+ */
+export interface OzonProductRow {
+  article: string;
+  name: string;
+  revenue: number;
+  quantity: number;
+}
+
 export interface OzonParsedReport {
   marketplace: "ozon";
   detected: true;
@@ -76,6 +87,15 @@ export interface OzonParsedReport {
   rowsCount: number;
   totals: OzonParsedTotals;
   estimate: OzonEstimate;
+  /**
+   * Per-SKU строки (артикул / наименование / выручка / кол-во) для подстановки
+   * себестоимости из каталога. Best-effort: заполняется ТОЛЬКО когда колонки
+   * артикула/наименования удалось распознать в шапке отчёта (clean-header
+   * формат). Для PUA-mangled realization-формата с нечитаемыми заголовками
+   * остаётся пустым — UI в этом случае показывает только агрегаты, не подставляя
+   * сомнительные данные. НЕ влияет на totals/estimate — это отдельный слой.
+   */
+  products: OzonProductRow[];
 }
 
 export type HeaderConfidence = "low" | "medium" | "high";
@@ -232,6 +252,12 @@ const HEADER_PATTERNS: Record<FieldKey, RegExp[]> = {
     /\bprice\b/i,
   ],
   revenue: [
+    // «Реализовано на сумму, руб.» — ИТОГ по строке (выручка). Это ОТДЕЛЬНАЯ
+    // колонка от «Цена реализации» (unit price → price). Стоит левее в шапке
+    // Ozon realization, поэтому забирает revenue-слот (matcher берёт левейшую
+    // подходящую колонку). Без неё /реализаци/ ошибочно ловил «Цена реализации»
+    // и выручка считалась по цене за единицу (занижение для qty>1).
+    /реализован.{0,12}сумм/i,
     /сумма\s*реализ/i,
     /стоимость\s*реализ/i,
     /сумма\s*продаж/i,
@@ -276,6 +302,95 @@ const HEADER_PATTERNS: Record<FieldKey, RegExp[]> = {
 };
 
 const TOTAL_ROW_PATTERNS = [/^итог/i, /^total$/i, /^всего/i];
+
+/**
+ * Паттерны для колонок per-SKU слоя (артикул / наименование). НЕ входят в
+ * HEADER_PATTERNS / FieldKey — это отдельный, изолированный матчинг,
+ * чтобы не возмущать настроенный scorer выбора header-row. Используется
+ * только для подстановки себестоимости из каталога.
+ */
+const ARTICLE_HEADER_PATTERNS: RegExp[] = [
+  /артикул/i,
+  /\bsku\b/i,
+  /offer[\s._-]*id/i,
+  /\barticle\b/i,
+];
+const NAME_HEADER_PATTERNS: RegExp[] = [
+  /наименован/i,
+  /название\s*товар/i,
+  /^название$/i,
+  /^товар$/i,
+  /^наименование$/i,
+  /product\s*name/i,
+];
+
+/**
+ * Найти индексы колонок «Артикул» и «Наименование».
+ *
+ * Ozon realization-отчёт имеет ДВУХ-СТРОЧНУЮ шапку: текстовые ярлыки
+ * («Артикул», «Название товара», «SKU», «Штрих-код») лежат на 1–3 строки ВЫШЕ
+ * числовой под-шапки («Кол-во», «Цена реализации»), которую scorer выбирает как
+ * header-row. Поэтому ярлыки ищем в ОКНЕ строк [headerRowIdx-3 .. headerRowIdx],
+ * выравнивая по индексу колонки. Скан изолирован от scorer'а header-row и на
+ * агрегаты/итоги НЕ влияет.
+ *
+ * Возвращает null для колонки, если ярлык не найден (например, PUA-mangled
+ * realization-fallback) — тогда per-SKU слой пуст и UI показывает только агрегаты.
+ */
+function detectArticleNameCols(
+  rows: unknown[][],
+  headerRowIdx: number
+): { articleCol: number | null; nameCol: number | null } {
+  let articleCol: number | null = null;
+  let nameCol: number | null = null;
+  if (!Array.isArray(rows) || headerRowIdx < 0) {
+    return { articleCol, nameCol };
+  }
+  const startIdx = Math.max(0, headerRowIdx - 3);
+  let width = 0;
+  for (let r = startIdx; r <= headerRowIdx && r < rows.length; r++) {
+    const row = rows[r];
+    if (Array.isArray(row) && row.length > width) width = row.length;
+  }
+  // Слева-направо по колонкам: при двух кандидатах («Артикул» в col2 и «SKU» в
+  // col3) выигрывает левый — это и есть колонка «Артикул», как в UI-таблице.
+  for (let col = 0; col < width; col++) {
+    for (let r = headerRowIdx; r >= startIdx; r--) {
+      const row = rows[r];
+      if (!Array.isArray(row)) continue;
+      const text = asCellString(row[col]).toLowerCase().trim();
+      if (!text) continue;
+      if (articleCol === null && ARTICLE_HEADER_PATTERNS.some((p) => p.test(text))) {
+        articleCol = col;
+      }
+      if (nameCol === null && NAME_HEADER_PATTERNS.some((p) => p.test(text))) {
+        nameCol = col;
+      }
+    }
+  }
+  return { articleCol, nameCol };
+}
+
+/**
+ * Строка-легенда нумерации колонок Ozon («1 2 3 4 …»), которую Ozon вставляет
+ * между двух-строчной шапкой и данными. Это не товар — исключаем из per-SKU слоя.
+ * На агрегаты/итоги НЕ влияет (та логика нетронута, строку считает как и раньше).
+ */
+function isColumnNumberLegendRow(row: unknown[]): boolean {
+  if (!Array.isArray(row)) return false;
+  const nums: number[] = [];
+  for (const cell of row) {
+    const t = asCellString(cell).trim();
+    if (t === "") continue;
+    if (!/^\d{1,3}$/.test(t)) return false;
+    nums.push(Number(t));
+  }
+  if (nums.length < 3) return false;
+  for (let k = 1; k < nums.length; k++) {
+    if (nums[k] <= nums[k - 1]) return false;
+  }
+  return true;
+}
 
 /**
  * Boost-слова — почти гарантированно встречаются в шапке таблицы Ozon.
@@ -1637,6 +1752,18 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
     let productRowCount = 0;
     let qtyPriceFallbackCount = 0; // сколько раз использовали qty*price вместо revenue колонки
 
+    // ===== Per-SKU слой (для каталога) =====
+    // Колонки артикул/наименование ищем в ОКНЕ строк над под-шапкой (Ozon
+    // realization имеет двух-строчную шапку — ярлыки на строку выше числовой).
+    // В realization-fallback заголовки — PUA-мусор, поэтому per-SKU слой
+    // намеренно пуст: лучше показать только агрегаты, чем подставить garbage.
+    const { articleCol, nameCol } = usedRealizationFallback
+      ? { articleCol: null, nameCol: null }
+      : detectArticleNameCols(dataRows, headerRowIdx);
+    const products: OzonProductRow[] = [];
+    // eslint-disable-next-line no-console
+    console.log(LOG, "per-SKU columns:", { articleCol, nameCol });
+
     const rowsAfterHeader = Math.max(0, dataRows.length - headerRowIdx - 1);
     debugInfo.rowsAfterHeader = rowsAfterHeader;
 
@@ -1677,6 +1804,27 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
         if (skipReasons.total <= 3) {
           // eslint-disable-next-line no-console
           console.log(LOG, `skip row ${i} (total row):`, row.slice(0, 8));
+        }
+        continue;
+      }
+      // Сводная строка-итог БЕЗ текстовой метки в первых ячейках (напр. строка
+      // с Σ «Реализовано на сумму» в col5, но пустыми артикулом/названием) и
+      // строка-легенда «1 2 3 …» — это НЕ товары. После исправления revenue→col5
+      // их деньги задваивали бы totalRevenue (итог Ozon попадал бы в сумму ещё
+      // раз). Скипаем из агрегата И из per-SKU слоя одинаково, чтобы выполнялось
+      // totals.revenue == Σ(per-SKU) == Ozon «Итого реализовано».
+      if (
+        isColumnNumberLegendRow(row) ||
+        (articleCol !== null && asCellString(row[articleCol]).trim() === "")
+      ) {
+        skipReasons.total++;
+        if (skipReasons.total <= 6) {
+          // eslint-disable-next-line no-console
+          console.log(
+            LOG,
+            `skip row ${i} (non-product summary/legend):`,
+            row.slice(0, 8)
+          );
         }
         continue;
       }
@@ -1756,6 +1904,20 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
       }
 
       productRowCount++;
+
+      // Per-SKU захват: артикул обязателен (это ключ матчинга с каталогом).
+      // Используем уже посчитанные rev/qty этой строки — никаких новых сумм.
+      if (articleCol !== null && !isColumnNumberLegendRow(row)) {
+        const article = asCellString(row[articleCol]).trim();
+        if (article) {
+          products.push({
+            article,
+            name: nameCol !== null ? asCellString(row[nameCol]).trim() : "",
+            revenue: rev,
+            quantity: qty,
+          });
+        }
+      }
 
       // Лог + сэмпл первых 5 распознанных строк (с raw-значениями для DEV)
       if (firstParsedRows.length < 5) {
@@ -2038,7 +2200,11 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
       rowsCount: productRowCount,
       totals: finalTotals,
       estimate: finalEstimate,
+      products,
     };
+
+    // eslint-disable-next-line no-console
+    console.log(LOG, `per-SKU products captured: ${products.length}`);
 
     // eslint-disable-next-line no-console
     console.log(LOG, "FINAL ESTIMATE:", finalEstimate);
