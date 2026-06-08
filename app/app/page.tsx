@@ -1749,15 +1749,43 @@ export default function AppPage() {
   };
 
   const signOut = async () => {
-    await supabase.auth.signOut();
-    setUser(null);
-    setHistory([]);
-    setResult(null);
-    setOzonClientId("");
-    setOzonApiKey("");
-    setWbApiKey("");
-    setApiSaveMessage("");
-    setApiSaveStatus("idle");
+    // Выход обязан срабатывать при ЛЮБОМ исходе. Раньше был голый
+    // `await supabase.auth.signOut()` без try/catch: дефолтный global-scope делает
+    // сетевой revoke токена, который может зависнуть/упасть (navigator-lock /
+    // refresh в supabase-js — та же проблема, что у getSession). Тогда промис не
+    // резолвится → строки после await не выполняются → пользователь остаётся
+    // «залогинен». Лечим: scope:'local' (без сети, сразу чистит локальную сессию
+    // из localStorage) + try/finally, чтобы выход завершился всегда.
+    try {
+      await supabase.auth.signOut({ scope: "local" });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[auth] signOut error", e);
+    } finally {
+      // Сброс in-memory state.
+      setUser(null);
+      setHistory([]);
+      setResult(null);
+      setUploadedReports([]);
+      setOzonClientId("");
+      setOzonApiKey("");
+      setWbApiKey("");
+      setApiSaveMessage("");
+      setApiSaveStatus("idle");
+      // Премиум-баннер — device-pref, привязанный к показу premium: сбрасываем,
+      // чтобы состояние одного аккаунта не «утекло» следующему. mprof_calc_count
+      // (анти-абуз анонимного лимита) и mprof_onboarded НЕ трогаем.
+      try {
+        window.localStorage.removeItem("mprof_unlimited_banner_hidden");
+      } catch {
+        /* localStorage недоступен — игнор */
+      }
+      // useEntitlements не слушает onAuthStateChange и грузится только на mount —
+      // hasPremium/singleCredits/profile НЕ сбросятся без перезагрузки документа
+      // (router.refresh() не пересоздаёт client-компоненты). Поэтому жёсткий
+      // переход на "/" — гарантированный полный сброс user/session/profile/прав.
+      window.location.href = "/";
+    }
   };
 
   const loadApiKeys = async (userId: string) => {
