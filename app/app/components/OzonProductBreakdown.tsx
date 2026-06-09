@@ -82,6 +82,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [exportingAnalytics, setExportingAnalytics] = useState(false);
 
   // Загружаем каталог при появлении товаров в отчёте / смене пользователя.
   useEffect(() => {
@@ -183,20 +184,42 @@ export function OzonProductBreakdown({ products, user }: Props) {
     return out;
   }, [products, catalog]);
 
-  // ===== Аналитика =====
-  const topProfit = useMemo(
+  // ===== Аналитика товаров =====
+  // Используем уже рассчитанные значения (revenue/profit/margin/unitCost) —
+  // ничего не пересчитываем. Берём только товары с найденной себестоимостью,
+  // т.е. для которых прибыль реально посчитана (matched && profit !== null).
+  const scored = useMemo(
+    () => rows.filter((r) => r.matched && r.profit !== null),
+    [rows]
+  );
+  // ТОП-10 прибыльных — по прибыли по убыванию.
+  const topProfitable = useMemo(
+    () => [...scored].sort((a, b) => (b.profit ?? 0) - (a.profit ?? 0)).slice(0, 10),
+    [scored]
+  );
+  // ТОП-10 убыточных — только отрицательная прибыль, по возрастанию.
+  const topLosses = useMemo(
     () =>
-      rows
-        .filter((r) => r.hasCost && r.profit !== null)
-        .sort((a, b) => (b.profit ?? 0) - (a.profit ?? 0))
+      scored
+        .filter((r) => (r.profit ?? 0) < 0)
+        .sort((a, b) => (a.profit ?? 0) - (b.profit ?? 0))
         .slice(0, 10),
-    [rows]
+    [scored]
   );
-  const topRevenue = useMemo(
-    () => [...rows].sort((a, b) => b.revenue - a.revenue).slice(0, 10),
-    [rows]
+  // Лучший товар месяца — максимум прибыли.
+  const bestProduct = useMemo(
+    () =>
+      scored.length
+        ? scored.reduce((best, r) => ((r.profit ?? 0) > (best.profit ?? 0) ? r : best))
+        : null,
+    [scored]
   );
-  const noCost = useMemo(() => rows.filter((r) => !r.hasCost), [rows]);
+  // Самый убыточный товар — минимум прибыли, но только если он отрицательный.
+  const worstProduct = useMemo(() => {
+    if (!scored.length) return null;
+    const min = scored.reduce((w, r) => ((r.profit ?? 0) < (w.profit ?? 0) ? r : w));
+    return (min.profit ?? 0) < 0 ? min : null;
+  }, [scored]);
 
   // Блок «Товары без себестоимости» (по ТЗ): unitCost === null ИЛИ matched === false.
   // Не меняет существующий расчёт — это отдельная производная выборка из rows.
@@ -250,6 +273,42 @@ export function OzonProductBreakdown({ products, user }: Props) {
       // Выгрузка не критична: при сбое файл просто не скачается.
     } finally {
       setExporting(false);
+    }
+  }
+
+  // Выгрузка аналитики: два листа — Top Profitable и Top Losses.
+  // Колонки: sku | name | revenue | profit | margin (уже рассчитанные значения).
+  async function handleAnalyticsExport() {
+    if (exportingAnalytics) return;
+    if (topProfitable.length === 0 && topLosses.length === 0) return;
+    setExportingAnalytics(true);
+    try {
+      const XLSX = await import("xlsx");
+      const header = ["sku", "name", "revenue", "profit", "margin"];
+      const toRows = (list: BreakdownRow[]) =>
+        list.map((r) => ({
+          sku: r.article,
+          name: r.name,
+          revenue: r.revenue,
+          profit: r.profit ?? 0,
+          margin: r.margin !== null ? Number(r.margin.toFixed(2)) : 0,
+        }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(
+        wb,
+        XLSX.utils.json_to_sheet(toRows(topProfitable), { header }),
+        "Top Profitable"
+      );
+      XLSX.utils.book_append_sheet(
+        wb,
+        XLSX.utils.json_to_sheet(toRows(topLosses), { header }),
+        "Top Losses"
+      );
+      XLSX.writeFile(wb, "analitika-tovarov.xlsx");
+    } catch {
+      // Выгрузка не критична: при сбое файл просто не скачается.
+    } finally {
+      setExportingAnalytics(false);
     }
   }
 
@@ -391,122 +450,289 @@ export function OzonProductBreakdown({ products, user }: Props) {
               </div>
             ))}
           </div>
-
-          {/* Аналитика */}
-          <div className="pb-analytics">
-            <div className="pb-an">
-              <div className="pb-an-h">
-                <span className="pb-an-ic pb-ic-gold" aria-hidden="true">
-                  <svg viewBox="0 0 24 24">
-                    <path d="M12 2v20M5 9l7-7 7 7" />
-                  </svg>
-                </span>
-                ТОП-10 по прибыли
-              </div>
-              {topProfit.length === 0 ? (
-                <div className="pb-an-empty">
-                  Нет товаров с указанной себестоимостью
-                </div>
-              ) : (
-                <ol className="pb-an-list">
-                  {topProfit.map((r, i) => (
-                    <li className="pb-an-item" key={r.article + i}>
-                      <span className="pb-an-rank">{i + 1}</span>
-                      <span className="pb-an-name" title={r.name}>
-                        <b>{r.article}</b>
-                        <i>{r.name}</i>
-                      </span>
-                      <span className="pb-an-val pos">
-                        {formatSignedRub(r.profit ?? 0)}
-                      </span>
-                    </li>
-                  ))}
-                </ol>
-              )}
-            </div>
-
-            <div className="pb-an">
-              <div className="pb-an-h">
-                <span className="pb-an-ic pb-ic-blue" aria-hidden="true">
-                  <svg viewBox="0 0 24 24">
-                    <path d="M3 3v18h18" />
-                    <path d="M7 14l4-4 3 3 5-6" />
-                  </svg>
-                </span>
-                ТОП-10 по выручке
-              </div>
-              {topRevenue.length === 0 ? (
-                <div className="pb-an-empty">Нет данных</div>
-              ) : (
-                <ol className="pb-an-list">
-                  {topRevenue.map((r, i) => (
-                    <li className="pb-an-item" key={r.article + i}>
-                      <span className="pb-an-rank">{i + 1}</span>
-                      <span className="pb-an-name" title={r.name}>
-                        <b>{r.article}</b>
-                        <i>{r.name}</i>
-                      </span>
-                      <span className="pb-an-val">{formatRub(r.revenue)}</span>
-                    </li>
-                  ))}
-                </ol>
-              )}
-            </div>
-
-            <div className="pb-an">
-              <div className="pb-an-h">
-                <span className="pb-an-ic pb-ic-warn" aria-hidden="true">
-                  <svg viewBox="0 0 24 24">
-                    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
-                    <path d="M12 9v4" />
-                    <path d="M12 17h.01" />
-                  </svg>
-                </span>
-                Без себестоимости
-                {noCost.length > 0 && (
-                  <span className="pb-an-count">{noCost.length}</span>
-                )}
-              </div>
-              {noCost.length === 0 ? (
-                <div className="pb-an-empty">
-                  У всех товаров указана себестоимость
-                </div>
-              ) : (
-                <>
-                  <ol className="pb-an-list">
-                    {noCost.slice(0, 10).map((r, i) => (
-                      <li className="pb-an-item" key={r.article + i}>
-                        <span className="pb-an-rank pb-rank-warn">
-                          {i + 1}
-                        </span>
-                        <span className="pb-an-name" title={r.name}>
-                          <b>{r.article}</b>
-                          <i>{r.name}</i>
-                        </span>
-                        <span className="pb-an-val muted">
-                          {formatRub(r.revenue)}
-                        </span>
-                      </li>
-                    ))}
-                  </ol>
-                  {noCost.length > 10 && (
-                    <div className="pb-an-more">
-                      …и ещё {noCost.length - 10}
-                    </div>
-                  )}
-                  {user && (
-                    <div className="pb-an-hint">
-                      Добавьте их в «Каталог товаров» — прибыль посчитается
-                      автоматически.
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          </div>
         </>
       )}
     </section>
+
+      {!loading && !loadError && (
+        <section className="pba">
+          <div className="pba-head">
+            <div>
+              <h2 className="pba-title">Аналитика товаров</h2>
+              <p className="pba-sub">
+                Лучшие и убыточные товары по уже рассчитанной прибыли.
+              </p>
+            </div>
+            {scored.length > 0 && (
+              <button
+                type="button"
+                className="pba-export"
+                onClick={handleAnalyticsExport}
+                disabled={exportingAnalytics}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <path d="M7 10l5 5 5-5" />
+                  <path d="M12 15V3" />
+                </svg>
+                {exportingAnalytics ? "Готовим…" : "Скачать аналитику"}
+              </button>
+            )}
+          </div>
+
+          {scored.length === 0 ? (
+            <div className="pba-note">
+              Аналитика прибыли появится, когда товары из отчёта получат
+              себестоимость из «Каталога товаров».
+            </div>
+          ) : (
+            <>
+              {/* Герои: лучший и самый убыточный */}
+              <div className="pba-heroes">
+                <div className="pba-hero pba-hero-best">
+                  <div className="pba-hero-h">
+                    <span className="pba-hero-ic pba-ic-best" aria-hidden="true">
+                      <svg viewBox="0 0 24 24">
+                        <path d="M12 2v20M5 9l7-7 7 7" />
+                      </svg>
+                    </span>
+                    Лучший товар месяца
+                  </div>
+                  {bestProduct ? (
+                    <>
+                      <div className="pba-hero-name">{bestProduct.name}</div>
+                      <div className="pba-hero-art">{bestProduct.article}</div>
+                      <div className="pba-stats">
+                        <div className="pba-stat">
+                          <span className="pba-stat-l">Выручка</span>
+                          <span className="pba-stat-v">
+                            {formatRub(bestProduct.revenue)}
+                          </span>
+                        </div>
+                        <div className="pba-stat">
+                          <span className="pba-stat-l">Прибыль</span>
+                          <span
+                            className={
+                              "pba-stat-v " +
+                              ((bestProduct.profit ?? 0) >= 0 ? "pos" : "neg")
+                            }
+                          >
+                            {formatSignedRub(bestProduct.profit ?? 0)}
+                          </span>
+                        </div>
+                        <div className="pba-stat">
+                          <span className="pba-stat-l">Маржа</span>
+                          <span
+                            className={
+                              "pba-stat-v " +
+                              ((bestProduct.margin ?? 0) >= 0 ? "pos" : "neg")
+                            }
+                          >
+                            {(bestProduct.margin ?? 0).toFixed(1)}%
+                          </span>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="pba-hero-empty">Нет данных</div>
+                  )}
+                </div>
+
+                <div className="pba-hero pba-hero-worst">
+                  <div className="pba-hero-h">
+                    <span className="pba-hero-ic pba-ic-worst" aria-hidden="true">
+                      <svg viewBox="0 0 24 24">
+                        <path d="M12 22V2M5 15l7 7 7-7" />
+                      </svg>
+                    </span>
+                    Самый убыточный товар
+                  </div>
+                  {worstProduct ? (
+                    <>
+                      <div className="pba-hero-name">{worstProduct.name}</div>
+                      <div className="pba-hero-art">{worstProduct.article}</div>
+                      <div className="pba-stats">
+                        <div className="pba-stat">
+                          <span className="pba-stat-l">Выручка</span>
+                          <span className="pba-stat-v">
+                            {formatRub(worstProduct.revenue)}
+                          </span>
+                        </div>
+                        <div className="pba-stat">
+                          <span className="pba-stat-l">Убыток</span>
+                          <span className="pba-stat-v neg">
+                            {formatSignedRub(worstProduct.profit ?? 0)}
+                          </span>
+                        </div>
+                        <div className="pba-stat">
+                          <span className="pba-stat-l">Маржа</span>
+                          <span className="pba-stat-v neg">
+                            {(worstProduct.margin ?? 0).toFixed(1)}%
+                          </span>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="pba-hero-ok">
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                      Убыточных товаров не найдено
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ТОП-10 прибыльных */}
+              <div className="pba-section">
+                <h3 className="pba-h3">ТОП-10 прибыльных товаров</h3>
+                <div
+                  className="pba-table"
+                  role="table"
+                  aria-label="ТОП-10 прибыльных товаров"
+                >
+                  <div className="pba-thead" role="row">
+                    <span role="columnheader">Артикул</span>
+                    <span role="columnheader">Название</span>
+                    <span role="columnheader" className="pba-num">
+                      Выручка
+                    </span>
+                    <span role="columnheader" className="pba-num">
+                      Прибыль
+                    </span>
+                    <span role="columnheader" className="pba-num">
+                      Маржа
+                    </span>
+                  </div>
+                  {topProfitable.map((r, i) => (
+                    <div className="pba-row" role="row" key={r.article + "#" + i}>
+                      <span
+                        className="pba-cell pba-c-art"
+                        role="cell"
+                        data-label="Артикул"
+                      >
+                        {r.article}
+                      </span>
+                      <span
+                        className="pba-cell pba-c-name"
+                        role="cell"
+                        data-label="Название"
+                      >
+                        {r.name}
+                      </span>
+                      <span
+                        className="pba-cell pba-num"
+                        role="cell"
+                        data-label="Выручка"
+                      >
+                        {formatRub(r.revenue)}
+                      </span>
+                      <span
+                        className="pba-cell pba-num"
+                        role="cell"
+                        data-label="Прибыль"
+                      >
+                        <span className={(r.profit ?? 0) >= 0 ? "pos" : "neg"}>
+                          {formatSignedRub(r.profit ?? 0)}
+                        </span>
+                      </span>
+                      <span
+                        className="pba-cell pba-num"
+                        role="cell"
+                        data-label="Маржа"
+                      >
+                        <span className={(r.margin ?? 0) >= 0 ? "pos" : "neg"}>
+                          {(r.margin ?? 0).toFixed(1)}%
+                        </span>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* ТОП-10 убыточных */}
+              <div className="pba-section">
+                <h3 className="pba-h3">ТОП-10 убыточных товаров</h3>
+                {topLosses.length === 0 ? (
+                  <div className="pba-ok">
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                    Убыточных товаров не найдено
+                  </div>
+                ) : (
+                  <div
+                    className="pba-table"
+                    role="table"
+                    aria-label="ТОП-10 убыточных товаров"
+                  >
+                    <div className="pba-thead" role="row">
+                      <span role="columnheader">Артикул</span>
+                      <span role="columnheader">Название</span>
+                      <span role="columnheader" className="pba-num">
+                        Выручка
+                      </span>
+                      <span role="columnheader" className="pba-num">
+                        Прибыль
+                      </span>
+                      <span role="columnheader" className="pba-num">
+                        Маржа
+                      </span>
+                    </div>
+                    {topLosses.map((r, i) => (
+                      <div
+                        className="pba-row"
+                        role="row"
+                        key={r.article + "#" + i}
+                      >
+                        <span
+                          className="pba-cell pba-c-art"
+                          role="cell"
+                          data-label="Артикул"
+                        >
+                          {r.article}
+                        </span>
+                        <span
+                          className="pba-cell pba-c-name"
+                          role="cell"
+                          data-label="Название"
+                        >
+                          {r.name}
+                        </span>
+                        <span
+                          className="pba-cell pba-num"
+                          role="cell"
+                          data-label="Выручка"
+                        >
+                          {formatRub(r.revenue)}
+                        </span>
+                        <span
+                          className="pba-cell pba-num"
+                          role="cell"
+                          data-label="Прибыль"
+                        >
+                          <span className="neg">
+                            {formatSignedRub(r.profit ?? 0)}
+                          </span>
+                        </span>
+                        <span
+                          className="pba-cell pba-num"
+                          role="cell"
+                          data-label="Маржа"
+                        >
+                          <span className="neg">
+                            {(r.margin ?? 0).toFixed(1)}%
+                          </span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </section>
+      )}
 
       {!loading && !loadError && (
         <section className="pbm">
@@ -765,153 +991,6 @@ export function OzonProductBreakdown({ products, user }: Props) {
           margin-bottom: 2px;
         }
 
-        .pb-analytics {
-          display: grid;
-          grid-template-columns: repeat(3, 1fr);
-          gap: 0.9rem;
-          margin-top: 1.3rem;
-        }
-        .pb-an {
-          border: 1px solid var(--edge);
-          border-radius: 13px;
-          padding: 1rem 1.05rem 1.1rem;
-          background: rgba(255, 255, 255, 0.014);
-          min-width: 0;
-        }
-        .pb-an-h {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          font-family: var(--sans);
-          font-size: 0.82rem;
-          font-weight: 700;
-          color: var(--txt);
-          margin-bottom: 0.85rem;
-        }
-        .pb-an-count {
-          margin-left: auto;
-          font-family: var(--mono);
-          font-size: 0.72rem;
-          font-weight: 500;
-          color: var(--gold2);
-          background: var(--gold-bg);
-          border: 1px solid var(--edge2);
-          border-radius: 8px;
-          padding: 1px 7px;
-        }
-        .pb-an-ic {
-          width: 26px;
-          height: 26px;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          border-radius: 8px;
-          border: 1px solid var(--edge2);
-          flex-shrink: 0;
-        }
-        .pb-an-ic svg {
-          width: 15px;
-          height: 15px;
-          stroke: currentColor;
-          stroke-width: 1.9;
-          fill: none;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-        }
-        .pb-ic-gold {
-          color: var(--gold2);
-          background: var(--gold-bg);
-        }
-        .pb-ic-blue {
-          color: #6ea8e8;
-          background: rgba(110, 168, 232, 0.08);
-        }
-        .pb-ic-warn {
-          color: var(--gold2);
-          background: var(--gold-bg);
-        }
-        .pb-an-list {
-          list-style: none;
-          display: flex;
-          flex-direction: column;
-          gap: 1px;
-          margin: 0;
-          padding: 0;
-        }
-        .pb-an-item {
-          display: grid;
-          grid-template-columns: 20px 1fr auto;
-          align-items: center;
-          gap: 9px;
-          padding: 0.42rem 0;
-        }
-        .pb-an-item + .pb-an-item {
-          border-top: 1px solid rgba(255, 255, 255, 0.04);
-        }
-        .pb-an-rank {
-          font-family: var(--mono);
-          font-size: 0.74rem;
-          font-weight: 600;
-          color: var(--txt3);
-          text-align: center;
-        }
-        .pb-rank-warn {
-          color: var(--gold2);
-        }
-        .pb-an-name {
-          display: flex;
-          flex-direction: column;
-          gap: 1px;
-          min-width: 0;
-        }
-        .pb-an-name b {
-          font-family: var(--mono);
-          font-size: 0.78rem;
-          font-weight: 500;
-          color: var(--txt);
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-        .pb-an-name i {
-          font-style: normal;
-          font-size: 0.72rem;
-          color: var(--txt3);
-          white-space: nowrap;
-          overflow: hidden;
-          text-overflow: ellipsis;
-        }
-        .pb-an-val {
-          font-family: var(--mono);
-          font-size: 0.8rem;
-          font-weight: 500;
-          color: var(--txt);
-          white-space: nowrap;
-        }
-        .pb-an-val.muted {
-          color: var(--txt2);
-        }
-        .pb-an-empty {
-          font-size: 0.8rem;
-          color: var(--txt3);
-          padding: 0.6rem 0;
-          line-height: 1.5;
-        }
-        .pb-an-more {
-          font-size: 0.76rem;
-          color: var(--txt3);
-          margin-top: 0.5rem;
-          font-family: var(--mono);
-        }
-        .pb-an-hint {
-          font-size: 0.76rem;
-          color: var(--txt2);
-          margin-top: 0.7rem;
-          padding-top: 0.7rem;
-          border-top: 1px solid var(--edge);
-          line-height: 1.45;
-        }
-
         .pb-state {
           display: flex;
           align-items: center;
@@ -1102,8 +1181,313 @@ export function OzonProductBreakdown({ products, user }: Props) {
           margin-bottom: 2px;
         }
 
+        /* ===== Блок «Аналитика товаров» ===== */
+        .pba {
+          background: var(--glass);
+          border: 1px solid var(--edge);
+          border-radius: 16px;
+          padding: 1.4rem 1.5rem 1.6rem;
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.24);
+          margin-top: 1.1rem;
+        }
+        .pba-head {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 1rem;
+          flex-wrap: wrap;
+        }
+        .pba-title {
+          font-family: var(--display);
+          font-size: 1.3rem;
+          font-weight: 700;
+          color: var(--txt);
+          letter-spacing: -0.01em;
+        }
+        .pba-sub {
+          font-size: 0.85rem;
+          color: var(--txt2);
+          margin-top: 0.25rem;
+          font-weight: 300;
+        }
+        .pba-export {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          min-height: 44px;
+          padding: 0 16px;
+          font-family: var(--sans);
+          font-size: 0.86rem;
+          font-weight: 600;
+          color: var(--txt2);
+          cursor: pointer;
+          border: 1px solid var(--edge2);
+          border-radius: 11px;
+          background: rgba(255, 255, 255, 0.03);
+          transition: color 0.18s ease, border-color 0.18s ease,
+            background 0.18s ease;
+          white-space: nowrap;
+        }
+        .pba-export:hover:not(:disabled) {
+          color: var(--gold2);
+          border-color: var(--gold);
+          background: var(--gold-bg);
+        }
+        .pba-export:disabled {
+          opacity: 0.65;
+          cursor: default;
+        }
+        .pba-export svg {
+          width: 16px;
+          height: 16px;
+          stroke: currentColor;
+          stroke-width: 2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .pba-note {
+          margin-top: 1.1rem;
+          padding: 0.95rem 1.1rem;
+          border: 1px solid var(--edge2);
+          border-radius: 12px;
+          background: var(--gold-bg);
+          color: var(--txt2);
+          font-size: 0.85rem;
+          line-height: 1.5;
+        }
+
+        .pba-heroes {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 0.9rem;
+          margin-top: 1.3rem;
+        }
+        .pba-hero {
+          border: 1px solid var(--edge);
+          border-radius: 14px;
+          padding: 1.1rem 1.15rem 1.2rem;
+          background: rgba(255, 255, 255, 0.014);
+          min-width: 0;
+        }
+        .pba-hero-best {
+          border-color: rgba(46, 204, 138, 0.32);
+          background: rgba(46, 204, 138, 0.05);
+        }
+        .pba-hero-worst {
+          border-color: rgba(224, 85, 102, 0.3);
+          background: rgba(224, 85, 102, 0.045);
+        }
+        .pba-hero-h {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-family: var(--sans);
+          font-size: 0.82rem;
+          font-weight: 700;
+          color: var(--txt);
+          margin-bottom: 0.85rem;
+        }
+        .pba-hero-ic {
+          width: 26px;
+          height: 26px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 8px;
+          border: 1px solid var(--edge2);
+          flex-shrink: 0;
+        }
+        .pba-hero-ic svg {
+          width: 15px;
+          height: 15px;
+          stroke: currentColor;
+          stroke-width: 1.9;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .pba-ic-best {
+          color: var(--green);
+          background: rgba(46, 204, 138, 0.1);
+        }
+        .pba-ic-worst {
+          color: var(--red);
+          background: rgba(224, 85, 102, 0.1);
+        }
+        .pba-hero-name {
+          font-family: var(--sans);
+          font-size: 0.98rem;
+          font-weight: 600;
+          color: var(--txt);
+          line-height: 1.35;
+          word-break: break-word;
+        }
+        .pba-hero-art {
+          font-family: var(--mono);
+          font-size: 0.76rem;
+          color: var(--txt2);
+          margin-top: 3px;
+        }
+        .pba-stats {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 0.6rem;
+          margin-top: 0.95rem;
+        }
+        .pba-stat {
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+          padding: 0.6rem 0.7rem;
+          border: 1px solid var(--edge);
+          border-radius: 10px;
+          background: rgba(255, 255, 255, 0.02);
+          min-width: 0;
+        }
+        .pba-stat-l {
+          font-size: 0.66rem;
+          font-weight: 600;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--txt3);
+        }
+        .pba-stat-v {
+          font-family: var(--mono);
+          font-size: 0.86rem;
+          font-weight: 500;
+          color: var(--txt);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .pba-hero-empty {
+          font-size: 0.82rem;
+          color: var(--txt3);
+          padding: 0.5rem 0;
+        }
+        .pba-hero-ok {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          padding: 0.5rem 0;
+          color: var(--green);
+          font-size: 0.86rem;
+          font-weight: 500;
+        }
+        .pba-hero-ok svg {
+          width: 18px;
+          height: 18px;
+          stroke: currentColor;
+          stroke-width: 2.2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          flex-shrink: 0;
+        }
+
+        .pba-section {
+          margin-top: 1.4rem;
+        }
+        .pba-h3 {
+          font-family: var(--sans);
+          font-size: 0.95rem;
+          font-weight: 700;
+          color: var(--txt);
+          margin-bottom: 0.7rem;
+        }
+        .pba-ok {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 0.95rem 1.1rem;
+          border: 1px solid rgba(46, 204, 138, 0.3);
+          border-radius: 12px;
+          background: rgba(46, 204, 138, 0.08);
+          color: var(--green);
+          font-size: 0.9rem;
+          font-weight: 500;
+        }
+        .pba-ok svg {
+          width: 20px;
+          height: 20px;
+          stroke: currentColor;
+          stroke-width: 2.2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          flex-shrink: 0;
+        }
+        .pba-table {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          border: 1px solid var(--edge);
+          border-radius: 12px;
+          overflow: hidden;
+        }
+        .pba-thead,
+        .pba-row {
+          display: grid;
+          grid-template-columns: 120px 1.4fr 1fr 1fr 80px;
+          align-items: center;
+          gap: 0.8rem;
+          padding: 0.7rem 1rem;
+        }
+        .pba-thead {
+          background: rgba(255, 255, 255, 0.03);
+          font-size: 0.7rem;
+          font-weight: 700;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--txt3);
+        }
+        .pba-num {
+          text-align: right;
+          justify-self: end;
+        }
+        .pba-row {
+          background: rgba(255, 255, 255, 0.012);
+          transition: background 0.16s ease;
+        }
+        .pba-row:hover {
+          background: rgba(255, 255, 255, 0.035);
+        }
+        .pba-cell {
+          font-size: 0.9rem;
+          color: var(--txt);
+          min-width: 0;
+          word-break: break-word;
+        }
+        .pba-c-art {
+          font-family: var(--mono);
+          font-size: 0.82rem;
+          color: var(--txt2);
+        }
+        .pba-c-name {
+          font-weight: 500;
+        }
+        .pba-cell.pba-num {
+          font-family: var(--mono);
+          font-size: 0.86rem;
+        }
+        .pba-c-art::before,
+        .pba-c-name::before,
+        .pba-cell.pba-num::before {
+          content: attr(data-label);
+          display: none;
+          font-size: 0.68rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: var(--txt3);
+          margin-bottom: 2px;
+        }
+
         @media (max-width: 900px) {
-          .pb-analytics {
+          .pba-heroes {
             grid-template-columns: 1fr;
           }
         }
@@ -1168,6 +1552,41 @@ export function OzonProductBreakdown({ products, user }: Props) {
           .pbm-c-art::before,
           .pbm-c-name::before,
           .pbm-cell.pbm-num::before {
+            display: block;
+          }
+
+          .pba {
+            padding: 1.2rem 1.1rem 1.3rem;
+          }
+          .pba-export {
+            width: 100%;
+            justify-content: center;
+          }
+          .pba-heroes {
+            grid-template-columns: 1fr;
+          }
+          .pba-thead {
+            display: none;
+          }
+          .pba-row {
+            grid-template-columns: 1fr 1fr;
+            gap: 0.55rem 0.8rem;
+            padding: 0.9rem 1rem;
+            border-bottom: 1px solid var(--edge);
+          }
+          .pba-c-art {
+            grid-column: 1 / -1;
+          }
+          .pba-c-name {
+            grid-column: 1 / -1;
+          }
+          .pba-num {
+            text-align: left;
+            justify-self: start;
+          }
+          .pba-c-art::before,
+          .pba-c-name::before,
+          .pba-cell.pba-num::before {
             display: block;
           }
         }
