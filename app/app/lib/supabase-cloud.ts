@@ -509,6 +509,75 @@ export async function deleteProductFromCloud(
 }
 
 // ============================================================================
+// report_history — помесячная история расчётов («Аналитика по месяцам»).
+// Одна строка на сохранённый расчёт; UI группирует по report_month.
+// ============================================================================
+export interface CloudReportHistory {
+  id: string;
+  user_id: string;
+  /** Первое число месяца отчёта, 'YYYY-MM-DD' (date в БД). */
+  report_month: string;
+  revenue: number;
+  expenses: number;
+  profit: number;
+  margin: number;
+  created_at: string;
+}
+
+/** Поля для insert. user_id добавляется helper'ом из текущей сессии. */
+export type ReportHistoryInsertInput = Omit<
+  CloudReportHistory,
+  "id" | "user_id" | "created_at"
+>;
+
+export async function saveReportHistoryToCloud(
+  input: ReportHistoryInsertInput,
+  userId: string
+): Promise<CloudResult<CloudReportHistory>> {
+  try {
+    const payload = { ...input, user_id: userId };
+    const { data, error } = await supabase
+      .from("report_history")
+      .insert([payload])
+      .select()
+      .single();
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error("[cloud] saveReportHistoryToCloud error", fmtError(error));
+      return { data: null, error: fmtError(error) };
+    }
+    return { data: (data as CloudReportHistory | null) ?? null, error: null };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[cloud] saveReportHistoryToCloud throw", fmtError(e));
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+export async function loadReportHistoryFromCloud(
+  userId: string
+): Promise<CloudResult<CloudReportHistory[]>> {
+  try {
+    const { data, error } = await supabase
+      .from("report_history")
+      .select("*")
+      .eq("user_id", userId)
+      .order("report_month", { ascending: true })
+      .order("created_at", { ascending: true });
+    if (error) {
+      // eslint-disable-next-line no-console
+      console.error("[cloud] loadReportHistoryFromCloud error", fmtError(error));
+      return { data: null, error: fmtError(error) };
+    }
+    return { data: ((data as CloudReportHistory[]) ?? []), error: null };
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[cloud] loadReportHistoryFromCloud throw", fmtError(e));
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+// ============================================================================
 // Convenience: проверить доступен ли cloud-режим
 // (есть env и есть залогиненный пользователь). При false — UI остаётся в
 // localStorage fallback'е.

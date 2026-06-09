@@ -410,3 +410,58 @@ drop policy if exists "products_delete_own" on public.products;
 create policy "products_delete_own"
   on public.products for delete
   using (auth.uid() = user_id);
+
+-- ============================================================================
+-- report_history — помесячная история расчётов для блока «Аналитика по месяцам»
+--
+-- Каждый успешный расчёт чистой прибыли пишет сюда одну строку: выручка,
+-- расходы, прибыль, маржа и месяц отчёта (report_month — первое число месяца,
+-- 'YYYY-MM-01'). UI группирует по месяцам (последняя запись за месяц) и строит
+-- карточки текущего месяца + графики прибыли/выручки по месяцам.
+-- Таблица создаётся идемпотентно; RLS — по тому же паттерну (только свои строки).
+-- ============================================================================
+create table if not exists public.report_history (
+  id            uuid        primary key default gen_random_uuid(),
+  user_id       uuid        not null references auth.users(id) on delete cascade,
+  report_month  date        not null,
+  revenue       numeric     not null default 0,
+  expenses      numeric     not null default 0,
+  profit        numeric     not null default 0,
+  margin        numeric     not null default 0,
+  created_at    timestamptz not null default now()
+);
+
+-- Гарантируем нужные колонки, даже если таблица уже существовала ранее.
+alter table public.report_history add column if not exists report_month date    not null default (date_trunc('month', now())::date);
+alter table public.report_history add column if not exists revenue      numeric not null default 0;
+alter table public.report_history add column if not exists expenses     numeric not null default 0;
+alter table public.report_history add column if not exists profit       numeric not null default 0;
+alter table public.report_history add column if not exists margin       numeric not null default 0;
+alter table public.report_history add column if not exists created_at   timestamptz not null default now();
+
+create index if not exists idx_report_history_user_month
+  on public.report_history(user_id, report_month);
+
+-- ROW LEVEL SECURITY — только свои записи
+alter table public.report_history enable row level security;
+
+drop policy if exists "report_history_select_own" on public.report_history;
+create policy "report_history_select_own"
+  on public.report_history for select
+  using (auth.uid() = user_id);
+
+drop policy if exists "report_history_insert_own" on public.report_history;
+create policy "report_history_insert_own"
+  on public.report_history for insert
+  with check (auth.uid() = user_id);
+
+drop policy if exists "report_history_update_own" on public.report_history;
+create policy "report_history_update_own"
+  on public.report_history for update
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+drop policy if exists "report_history_delete_own" on public.report_history;
+create policy "report_history_delete_own"
+  on public.report_history for delete
+  using (auth.uid() = user_id);

@@ -7,6 +7,7 @@ import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { ProductCatalog } from "./components/ProductCatalog"
 import { OzonProductBreakdown } from "./components/OzonProductBreakdown"
+import { MonthlyAnalytics } from "./components/MonthlyAnalytics"
 import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
@@ -19,6 +20,7 @@ import {
   clearCalculationsFromCloud,
   saveUploadedReportToCloud,
   loadUploadedReportsFromCloud,
+  saveReportHistoryToCloud,
   type CloudCalculation,
   type CalcMode as CloudCalcMode,
 } from "./lib/supabase-cloud"
@@ -114,6 +116,8 @@ type NetProfitBreakdown = {
   revenueOzon: number;
   loyaltyPayouts: number;
   profitBeforeCost: number;
+  /** Период отчёта (строка из XLSX) — чтобы report_month восстанавливался. */
+  reportPeriod?: string | null;
 };
 
 /** Безопасно достаёт NetProfitBreakdown из ai_insights (jsonb → unknown). */
@@ -139,7 +143,46 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
     revenueOzon: n(o.revenueOzon),
     loyaltyPayouts: n(o.loyaltyPayouts),
     profitBeforeCost: n(o.profitBeforeCost),
+    reportPeriod: typeof o.reportPeriod === "string" ? o.reportPeriod : null,
   };
+}
+
+/**
+ * Нормализует строку периода отчёта в первое число месяца 'YYYY-MM-01'
+ * (формат колонки report_history.report_month). Понимает ISO (2026-04 /
+ * 2026/04 / 2026-04-30), компактный (20260430) и русские названия месяцев
+ * («Апрель 2026», «За апрель 2026»). Если распознать не удалось — текущий месяц.
+ */
+function deriveReportMonth(period: string | null | undefined): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const fallback = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-01`;
+  if (!period) return fallback;
+  const p = period.toLowerCase();
+  // 20260430 → 2026-04
+  const compact = p.match(/(20\d{2})(\d{2})(\d{2})/);
+  if (compact) {
+    const m = Number(compact[2]);
+    if (m >= 1 && m <= 12) return `${compact[1]}-${pad(m)}-01`;
+  }
+  // 2026-04 / 2026/04 / 2026.04(-30)
+  const iso = p.match(/(20\d{2})[-./](\d{1,2})/);
+  if (iso) {
+    const m = Number(iso[2]);
+    if (m >= 1 && m <= 12) return `${iso[1]}-${pad(m)}-01`;
+  }
+  // Русские месяцы (порядок важен: специфичные основы раньше короткой «ма»).
+  const MONTHS = [
+    "январ", "феврал", "март", "апрел", "ма", "июн", "июл",
+    "август", "сентябр", "октябр", "ноябр", "декабр",
+  ];
+  const yearM = p.match(/20\d{2}/);
+  if (yearM) {
+    for (let i = 0; i < MONTHS.length; i++) {
+      if (p.includes(MONTHS[i])) return `${yearM[0]}-${pad(i + 1)}-01`;
+    }
+  }
+  return fallback;
 }
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
@@ -299,6 +342,8 @@ export default function AppPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [history, setHistory] = useState<CalcResult[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  // Счётчик-триггер перезагрузки «Аналитики по месяцам» после сохранения расчёта.
+  const [historyRefresh, setHistoryRefresh] = useState(0);
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
   const [authMessage, setAuthMessage] = useState("");
@@ -357,6 +402,8 @@ export default function AppPage() {
     updServicesTotal: number;
     updCommissionTotal: number;
     profitBeforeCost: number;
+    /** Период отчёта из XLSX — для report_month в истории по месяцам. */
+    period: string | null;
   } | null>(null);
   const [combinedDebug, setCombinedDebug] = useState<{
     xlsx: OzonDebugInfo | null;
@@ -486,6 +533,7 @@ export default function AppPage() {
       revenueOzon: combinedResult.revenue,
       loyaltyPayouts: combinedResult.loyaltyPayouts,
       profitBeforeCost: combinedResult.profitBeforeCost,
+      reportPeriod: combinedResult.period,
     };
 
     // Поля записи — идентичны для update и insert.
@@ -580,6 +628,25 @@ export default function AppPage() {
       return next;
     });
     setLastUploadCalc({ id: res.id, synced });
+
+    // История по месяцам: снимок (выручка/расходы/прибыль/маржа) с привязкой к
+    // месяцу отчёта — для блока «Аналитика по месяцам». Best-effort: не блокирует
+    // основной сейв и не влияет на расчёт. UI группирует по месяцу (последняя
+    // запись за месяц), поэтому повторные сохранения того же отчёта корректны.
+    if (canPersist && user?.id) {
+      const { error: histErr } = await saveReportHistoryToCloud(
+        {
+          report_month: deriveReportMonth(combinedResult.period),
+          revenue: incomeRevenue,
+          expenses: totalExpenses,
+          profit: profitCalc.netProfit,
+          margin: profitCalc.margin,
+        },
+        user.id
+      );
+      if (!histErr) setHistoryRefresh((k) => k + 1);
+    }
+
     setProfitSaving(false);
     setProfitSaved(true);
 
@@ -810,6 +877,7 @@ export default function AppPage() {
       updServicesTotal: b.updServicesTotal,
       updCommissionTotal: b.updCommissionTotal,
       profitBeforeCost: b.profitBeforeCost,
+      period: b.reportPeriod ?? null,
     });
     // История не хранит per-SKU строки — очищаем, чтобы не показать блок
     // «Прибыль по товарам» от другого, ранее загруженного отчёта.
@@ -1402,6 +1470,7 @@ export default function AppPage() {
       updServicesTotal,
       updCommissionTotal,
       profitBeforeCost,
+      period: xlsxRes.report.period,
     });
 
     // Per-SKU слой из XLSX-отчёта — для блока «Прибыль по товарам».
@@ -1444,6 +1513,7 @@ export default function AppPage() {
         revenueOzon: revenue,
         loyaltyPayouts,
         profitBeforeCost,
+        reportPeriod: xlsxRes.report.period,
       };
 
       const canPersist = !!user?.id;
@@ -5753,6 +5823,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {reportProducts.length > 0 && (
           <OzonProductBreakdown products={reportProducts} user={user} />
         )}
+
+        {/* Аналитика по месяцам — карточки текущего месяца + графики
+            прибыли/выручки. Данные из report_history (Supabase). */}
+        <MonthlyAnalytics user={user} refreshKey={historyRefresh} />
 
         {calcMode === "upload" &&
           uploadedReports.length > 0 &&
