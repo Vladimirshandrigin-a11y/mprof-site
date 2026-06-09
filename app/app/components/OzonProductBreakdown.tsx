@@ -81,6 +81,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
 
   // Загружаем каталог при появлении товаров в отчёте / смене пользователя.
   useEffect(() => {
@@ -197,6 +198,13 @@ export function OzonProductBreakdown({ products, user }: Props) {
   );
   const noCost = useMemo(() => rows.filter((r) => !r.hasCost), [rows]);
 
+  // Блок «Товары без себестоимости» (по ТЗ): unitCost === null ИЛИ matched === false.
+  // Не меняет существующий расчёт — это отдельная производная выборка из rows.
+  const missing = useMemo(
+    () => rows.filter((r) => r.unitCost === null || r.matched === false),
+    [rows]
+  );
+
   // ===== Итоги =====
   const totals = useMemo(() => {
     let revenue = 0;
@@ -221,9 +229,34 @@ export function OzonProductBreakdown({ products, user }: Props) {
     };
   }, [rows]);
 
+  // Выгрузка «Товары без себестоимости» в Excel: колонки sku | name | revenue.
+  async function handleExport() {
+    if (missing.length === 0 || exporting) return;
+    setExporting(true);
+    try {
+      const XLSX = await import("xlsx");
+      const data = missing.map((r) => ({
+        sku: r.article,
+        name: r.name,
+        revenue: r.revenue,
+      }));
+      const ws = XLSX.utils.json_to_sheet(data, {
+        header: ["sku", "name", "revenue"],
+      });
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Без себестоимости");
+      XLSX.writeFile(wb, "tovary-bez-sebestoimosti.xlsx");
+    } catch {
+      // Выгрузка не критична: при сбое файл просто не скачается.
+    } finally {
+      setExporting(false);
+    }
+  }
+
   if (rows.length === 0 && !loading) return null;
 
   return (
+    <>
     <section className="pb">
       <div className="pb-head">
         <div>
@@ -472,6 +505,88 @@ export function OzonProductBreakdown({ products, user }: Props) {
             </div>
           </div>
         </>
+      )}
+    </section>
+
+      {!loading && !loadError && (
+        <section className="pbm">
+          <div className="pbm-head">
+            <div>
+              <h2 className="pbm-title">
+                Товары без себестоимости{" "}
+                <span className="pbm-count">({missing.length})</span>
+              </h2>
+              {missing.length > 0 && (
+                <p className="pbm-sub">
+                  Эти артикулы есть в отчёте, но не найдены в «Каталоге товаров».
+                </p>
+              )}
+            </div>
+            {missing.length > 0 && (
+              <button
+                type="button"
+                className="pbm-export"
+                onClick={handleExport}
+                disabled={exporting}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <path d="M7 10l5 5 5-5" />
+                  <path d="M12 15V3" />
+                </svg>
+                {exporting ? "Готовим…" : "Скачать Excel"}
+              </button>
+            )}
+          </div>
+
+          {missing.length === 0 ? (
+            <div className="pbm-ok">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+              Все товары имеют себестоимость
+            </div>
+          ) : (
+            <div
+              className="pbm-table"
+              role="table"
+              aria-label="Товары без себестоимости"
+            >
+              <div className="pbm-thead" role="row">
+                <span role="columnheader">Артикул</span>
+                <span role="columnheader">Название</span>
+                <span role="columnheader" className="pbm-num">
+                  Выручка
+                </span>
+              </div>
+              {missing.map((r, i) => (
+                <div className="pbm-row" role="row" key={r.article + "#" + i}>
+                  <span
+                    className="pbm-cell pbm-c-art"
+                    role="cell"
+                    data-label="Артикул"
+                  >
+                    {r.article}
+                  </span>
+                  <span
+                    className="pbm-cell pbm-c-name"
+                    role="cell"
+                    data-label="Название"
+                  >
+                    {r.name}
+                  </span>
+                  <span
+                    className="pbm-cell pbm-num"
+                    role="cell"
+                    data-label="Выручка"
+                  >
+                    {formatRub(r.revenue)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
       )}
 
       <style jsx>{`
@@ -823,6 +938,170 @@ export function OzonProductBreakdown({ products, user }: Props) {
           }
         }
 
+        /* ===== Блок «Товары без себестоимости» ===== */
+        .pbm {
+          background: var(--glass);
+          border: 1px solid var(--edge);
+          border-radius: 16px;
+          padding: 1.4rem 1.5rem 1.6rem;
+          backdrop-filter: blur(16px);
+          -webkit-backdrop-filter: blur(16px);
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.24);
+          margin-top: 1.1rem;
+        }
+        .pbm-head {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 1rem;
+          flex-wrap: wrap;
+        }
+        .pbm-title {
+          font-family: var(--display);
+          font-size: 1.3rem;
+          font-weight: 700;
+          color: var(--txt);
+          letter-spacing: -0.01em;
+        }
+        .pbm-count {
+          font-family: var(--mono);
+          font-size: 1.05rem;
+          font-weight: 500;
+          color: var(--gold2);
+        }
+        .pbm-sub {
+          font-size: 0.85rem;
+          color: var(--txt2);
+          margin-top: 0.25rem;
+          font-weight: 300;
+        }
+        .pbm-export {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          min-height: 44px;
+          padding: 0 16px;
+          font-family: var(--sans);
+          font-size: 0.86rem;
+          font-weight: 600;
+          color: var(--txt2);
+          cursor: pointer;
+          border: 1px solid var(--edge2);
+          border-radius: 11px;
+          background: rgba(255, 255, 255, 0.03);
+          transition: color 0.18s ease, border-color 0.18s ease,
+            background 0.18s ease;
+          white-space: nowrap;
+        }
+        .pbm-export:hover:not(:disabled) {
+          color: var(--gold2);
+          border-color: var(--gold);
+          background: var(--gold-bg);
+        }
+        .pbm-export:disabled {
+          opacity: 0.65;
+          cursor: default;
+        }
+        .pbm-export svg {
+          width: 16px;
+          height: 16px;
+          stroke: currentColor;
+          stroke-width: 2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .pbm-ok {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin-top: 1.1rem;
+          padding: 0.95rem 1.1rem;
+          border: 1px solid rgba(46, 204, 138, 0.3);
+          border-radius: 12px;
+          background: rgba(46, 204, 138, 0.08);
+          color: var(--green);
+          font-size: 0.9rem;
+          font-weight: 500;
+        }
+        .pbm-ok svg {
+          width: 20px;
+          height: 20px;
+          stroke: currentColor;
+          stroke-width: 2.2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          flex-shrink: 0;
+        }
+        .pbm-table {
+          margin-top: 1.2rem;
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          border: 1px solid var(--edge);
+          border-radius: 12px;
+          overflow: hidden;
+        }
+        .pbm-thead,
+        .pbm-row {
+          display: grid;
+          grid-template-columns: 160px 1fr 140px;
+          align-items: center;
+          gap: 0.8rem;
+          padding: 0.7rem 1rem;
+        }
+        .pbm-thead {
+          background: rgba(255, 255, 255, 0.03);
+          font-size: 0.7rem;
+          font-weight: 700;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--txt3);
+        }
+        .pbm-num {
+          text-align: right;
+          justify-self: end;
+        }
+        .pbm-row {
+          background: rgba(201, 168, 76, 0.04);
+          transition: background 0.16s ease;
+        }
+        .pbm-row:hover {
+          background: rgba(201, 168, 76, 0.08);
+        }
+        .pbm-cell {
+          font-size: 0.9rem;
+          color: var(--txt);
+          min-width: 0;
+          word-break: break-word;
+        }
+        .pbm-c-art {
+          font-family: var(--mono);
+          font-size: 0.82rem;
+          color: var(--txt2);
+        }
+        .pbm-c-name {
+          font-weight: 500;
+        }
+        .pbm-cell.pbm-num {
+          font-family: var(--mono);
+          font-size: 0.86rem;
+          color: var(--txt);
+        }
+        .pbm-c-art::before,
+        .pbm-c-name::before,
+        .pbm-cell.pbm-num::before {
+          content: attr(data-label);
+          display: none;
+          font-size: 0.68rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+          color: var(--txt3);
+          margin-bottom: 2px;
+        }
+
         @media (max-width: 900px) {
           .pb-analytics {
             grid-template-columns: 1fr;
@@ -859,8 +1138,40 @@ export function OzonProductBreakdown({ products, user }: Props) {
           .pb-cell.pb-num::before {
             display: block;
           }
+
+          .pbm {
+            padding: 1.2rem 1.1rem 1.3rem;
+          }
+          .pbm-export {
+            width: 100%;
+            justify-content: center;
+          }
+          .pbm-thead {
+            display: none;
+          }
+          .pbm-row {
+            grid-template-columns: 1fr 1fr;
+            gap: 0.55rem 0.8rem;
+            padding: 0.9rem 1rem;
+            border-bottom: 1px solid var(--edge);
+          }
+          .pbm-c-art {
+            grid-column: 1 / -1;
+          }
+          .pbm-c-name {
+            grid-column: 1 / -1;
+          }
+          .pbm-num {
+            text-align: left;
+            justify-self: start;
+          }
+          .pbm-c-art::before,
+          .pbm-c-name::before,
+          .pbm-cell.pbm-num::before {
+            display: block;
+          }
         }
       `}</style>
-    </section>
+    </>
   );
 }
