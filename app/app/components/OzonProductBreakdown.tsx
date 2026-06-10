@@ -36,6 +36,12 @@ interface Props {
   /** Тоталы отчёта (estimate) — источник общих расходов для распределения. */
   estimate: OzonEstimate | null;
   user: User | null;
+  /**
+   * Колбэк с суммарной себестоимостью (cost_price × qty по сматченным SKU).
+   * Родитель использует его для автозаполнения поля «Себестоимость товара»
+   * в блоке «Дополнительные расходы». 0 — если каталог пуст / ничего не сматчено.
+   */
+  onCogsTotal?: (cogsTotal: number) => void;
 }
 
 /** Строка результата по одному артикулу (агрегирована по отчёту). */
@@ -85,7 +91,7 @@ function normArticle(s: string | null | undefined): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-export function OzonProductBreakdown({ products, estimate, user }: Props) {
+export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: Props) {
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -286,6 +292,12 @@ export function OzonProductBreakdown({ products, estimate, user }: Props) {
       withoutCost: rows.length - withCost,
     };
   }, [rows]);
+
+  // Пробрасываем суммарную себестоимость каталога в родителя — для автозаполнения
+  // поля «Себестоимость товара» в блоке «Дополнительные расходы».
+  useEffect(() => {
+    onCogsTotal?.(totals.cogs);
+  }, [totals.cogs, onCogsTotal]);
 
   // Выгрузка «Товары без себестоимости» в Excel. Лист «Без себестоимости»:
   // sku | name | revenue | cost_price. Колонка cost_price идёт ПУСТОЙ — её

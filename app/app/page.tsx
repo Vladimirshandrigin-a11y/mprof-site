@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
@@ -232,7 +232,7 @@ const PROFIT_EXPENSE_FIELDS: {
   hint?: string;
 }[] = [
   { key: "costPrice", label: "Себестоимость товара", unit: "₽" },
-  { key: "taxPercent", label: "Налог", unit: "%", hint: "% от выручки Ozon" },
+  { key: "taxPercent", label: "Налог", unit: "%", hint: "Введите вашу ставку налога в процентах" },
   { key: "ads", label: "Реклама", unit: "₽" },
   { key: "packaging", label: "Упаковка", unit: "₽" },
   { key: "deliveryToWarehouse", label: "Доставка до склада", unit: "₽" },
@@ -421,6 +421,15 @@ export default function AppPage() {
   const [reportEstimate, setReportEstimate] = useState<OzonEstimate | null>(
     null
   );
+  /** Сумма себестоимости по сматченным товарам (каталог cost_price × кол-во),
+   *  поднятая из блока «Чистая прибыль по товарам». Источник автозаполнения
+   *  поля «Себестоимость товара» в форме доп. расходов. null — ещё не известна
+   *  (нет per-SKU строк или каталог пуст) → поле остаётся ручным. */
+  const [reportCogsTotal, setReportCogsTotal] = useState<number | null>(null);
+  // Стабильная ссылка — чтобы effect в OzonProductBreakdown не зацикливался.
+  const handleReportCogsTotal = useCallback((cogsTotal: number) => {
+    setReportCogsTotal(cogsTotal);
+  }, []);
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const updServicesInputRef = useRef<HTMLInputElement | null>(null);
   const updCommissionInputRef = useRef<HTMLInputElement | null>(null);
@@ -492,6 +501,20 @@ export default function AppPage() {
       roi,
     };
   }, [combinedResult, profitInputs]);
+
+  // Автозаполнение «Себестоимость товара» суммой COGS из каталога, как только
+  // блок «Чистая прибыль по товарам» её посчитает (каталог cost_price × кол-во
+  // по сматченным SKU). Заполняем ТОЛЬКО пустое поле — ручные правки не
+  // затираем; 0/неизвестно (null) → не трогаем, поле остаётся ручным.
+  useEffect(() => {
+    if (reportCogsTotal !== null && reportCogsTotal > 0) {
+      setProfitInputs((prev) =>
+        prev.costPrice === ""
+          ? { ...prev, costPrice: String(Math.round(reportCogsTotal)) }
+          : prev
+      );
+    }
+  }, [reportCogsTotal]);
 
   /**
    * Сохранение ИТОГОВОЙ чистой прибыли (после себестоимости/налога/прочих
@@ -1342,6 +1365,7 @@ export default function AppPage() {
     setCombinedDebug(null);
     setReportProducts([]);
     setReportEstimate(null);
+    setReportCogsTotal(null);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
     setProfitSaving(false);
@@ -1369,6 +1393,7 @@ export default function AppPage() {
     setCombinedDebug(null);
     setReportProducts([]);
     setReportEstimate(null);
+    setReportCogsTotal(null);
 
     // eslint-disable-next-line no-console
     console.log("[upload-3] starting parallel parse of 3 files", {
@@ -1489,6 +1514,19 @@ export default function AppPage() {
     // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
     setReportProducts(xlsxRes.report.products);
     setReportEstimate(xlsxRes.report.estimate);
+
+    // Автозаполнение блока «Дополнительные расходы».
+    // ads — единственное поле, которое безопасно брать из отчёта: estimate.ads
+    // информационное и НЕ входит в profitBeforeCost, поэтому двойного учёта нет.
+    // Остальные поля остаются ручными: estimate.other = возвраты + лояльность,
+    // которые уже учтены в profitBeforeCost; estimate.cost всегда 0. costPrice
+    // заполняется отдельным эффектом из суммарной себестоимости каталога
+    // (onCogsTotal → reportCogsTotal). tax остаётся ручным процентом (0% по умолч.).
+    const adsFromReport = xlsxRes.report.estimate.ads;
+    setProfitInputs({
+      ...EMPTY_PROFIT,
+      ads: adsFromReport > 0 ? String(Math.round(adsFromReport)) : "",
+    });
 
     // Автозаполнение формы в manual mode (для last-mile проверки/правок).
     // Объединяем доход (revenue + loyaltyPayouts) и расходы (Ozon-комиссии).
@@ -5840,6 +5878,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             products={reportProducts}
             estimate={reportEstimate}
             user={user}
+            onCogsTotal={handleReportCogsTotal}
           />
         )}
 
