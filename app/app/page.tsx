@@ -119,6 +119,15 @@ type NetProfitBreakdown = {
   profitBeforeCost: number;
   /** Период отчёта (строка из XLSX) — чтобы report_month восстанавливался. */
   reportPeriod?: string | null;
+  /**
+   * Per-SKU строки отчёта (артикул/название/выручка/кол-во). Нужны, чтобы при
+   * восстановлении расчёта из «Последних расчётов» заново сопоставить товары с
+   * АКТУАЛЬНЫМ каталогом и пересчитать себестоимость (COGS). Optional —
+   * старые записи без этого поля восстанавливаются по агрегатам, как раньше.
+   */
+  products?: OzonProductRow[];
+  /** Тоталы отчёта (estimate) — источник распределяемых расходов для пересчёта. */
+  estimate?: OzonEstimate | null;
 };
 
 /** Безопасно достаёт NetProfitBreakdown из ai_insights (jsonb → unknown). */
@@ -145,6 +154,36 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
     loyaltyPayouts: n(o.loyaltyPayouts),
     profitBeforeCost: n(o.profitBeforeCost),
     reportPeriod: typeof o.reportPeriod === "string" ? o.reportPeriod : null,
+    products: Array.isArray(o.products)
+      ? o.products
+          .map((r): OzonProductRow | null => {
+            if (!r || typeof r !== "object") return null;
+            const rr = r as Record<string, unknown>;
+            return {
+              article: typeof rr.article === "string" ? rr.article : "",
+              name: typeof rr.name === "string" ? rr.name : "",
+              revenue: n(rr.revenue),
+              quantity: n(rr.quantity),
+            };
+          })
+          .filter((x): x is OzonProductRow => x !== null)
+      : [],
+    estimate:
+      o.estimate && typeof o.estimate === "object"
+        ? ((): OzonEstimate => {
+            const e = o.estimate as Record<string, unknown>;
+            return {
+              revenue: n(e.revenue),
+              commission: n(e.commission),
+              logistics: n(e.logistics),
+              storage: n(e.storage),
+              ads: n(e.ads),
+              tax: n(e.tax),
+              cost: n(e.cost),
+              other: n(e.other),
+            };
+          })()
+        : null,
   };
 }
 
@@ -573,6 +612,10 @@ export default function AppPage() {
       loyaltyPayouts: combinedResult.loyaltyPayouts,
       profitBeforeCost: combinedResult.profitBeforeCost,
       reportPeriod: combinedResult.period,
+      // Per-SKU строки + estimate — чтобы восстановление из истории пересчитало
+      // себестоимость по актуальному каталогу (не по застывшему снапшоту).
+      products: reportProducts,
+      estimate: reportEstimate,
     };
 
     // Поля записи — идентичны для update и insert.
@@ -918,11 +961,16 @@ export default function AppPage() {
       profitBeforeCost: b.profitBeforeCost,
       period: b.reportPeriod ?? null,
     });
-    // История не хранит per-SKU строки — очищаем, чтобы не показать блок
-    // «Прибыль по товарам» от другого, ранее загруженного отчёта.
-    setReportProducts([]);
-    setReportEstimate(null);
+    // Восстанавливаем per-SKU строки + estimate из snapshot (если сохранены).
+    // Это даёт OzonProductBreakdown заново сопоставить товары с АКТУАЛЬНЫМ
+    // каталогом и пересчитать себестоимость (COGS) при открытии старого расчёта.
+    const restoredProducts = b.products ?? [];
+    setReportProducts(restoredProducts);
+    setReportEstimate(b.estimate ?? null);
     setProfitInputs({
+      // b.costPrice — fallback: если per-SKU строк нет или в каталоге нет
+      // совпадений (COGS=0), остаётся сохранённое значение. При наличии строк
+      // и совпадений его перезапишет автосинк с COGS (см. ниже).
       costPrice: s(b.costPrice),
       taxPercent: s(b.taxPercent),
       ads: s(b.ads),
@@ -931,9 +979,12 @@ export default function AppPage() {
       salary: s(b.salary),
       other: s(b.other),
     });
-    // Восстановленная себестоимость — финальное значение пользователя; per-SKU
-    // строк нет (reportProducts=[]), автосинк с COGS не должен её трогать.
-    setCostPriceTouched(true);
+    // Есть per-SKU строки → разблокируем автосинк с COGS: OzonProductBreakdown
+    // загрузит актуальный каталог, посчитает totals.cogs и через onCogsTotal
+    // обновит «Себестоимость товара» свежим значением → чистая прибыль и блок
+    // «Товары без себестоимости» пересчитаются. Нет строк (старый снапшот) →
+    // оставляем сохранённое значение, автосинк его не трогает.
+    setCostPriceTouched(restoredProducts.length === 0);
     setShowProfitForm(true);
     setLastUploadCalc({ id: item.id, synced: item.synced });
     setSelectedId(item.id);
@@ -1581,6 +1632,10 @@ export default function AppPage() {
         loyaltyPayouts,
         profitBeforeCost,
         reportPeriod: xlsxRes.report.period,
+        // Сохраняем per-SKU строки + estimate в snapshot, чтобы клик по истории
+        // мог пересчитать себестоимость по актуальному каталогу товаров.
+        products: xlsxRes.report.products,
+        estimate: xlsxRes.report.estimate,
       };
 
       const canPersist = !!user?.id;
