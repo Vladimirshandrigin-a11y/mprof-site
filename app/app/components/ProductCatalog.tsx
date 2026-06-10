@@ -23,6 +23,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
@@ -385,6 +386,23 @@ export function ProductCatalog({ user, showToast }: Props) {
 
   const count = products.length;
 
+  // Порядок отображения каталога = как в Excel-выгрузке и блоке «без
+  // себестоимости»: сначала по названию, затем по артикулу/SKU (русская
+  // локаль), похожие названия идут рядом. Копия массива ([...products]) →
+  // sort НЕ мутирует исходный state. Зависит только от products → НЕ
+  // пересортировывается при редактировании себестоимости. На сохранение в
+  // Supabase, формулы и другие блоки не влияет. Стабильно (равные сохраняют
+  // исходный порядок).
+  const sortedProducts = useMemo(
+    () =>
+      [...products].sort(
+        (a, b) =>
+          (a.name ?? "").localeCompare(b.name ?? "", "ru") ||
+          (a.sku ?? "").localeCompare(b.sku ?? "", "ru")
+      ),
+    [products]
+  );
+
   return (
     <section className="pc">
       <div className="pc-head">
@@ -606,7 +624,7 @@ export function ProductCatalog({ user, showToast }: Props) {
               Действия
             </span>
           </div>
-          {products.map((p) => (
+          {sortedProducts.map((p) => (
             <div className="pc-row" role="row" key={p.id}>
               <span
                 className="pc-cell pc-c-sku"
