@@ -28,6 +28,7 @@ import {
   parseOzonReport,
   type OzonDebugInfo,
   type OzonProductRow,
+  type OzonEstimate,
 } from "./lib/report-parsers/ozon-parser"
 import {
   parseUpdPdf,
@@ -414,6 +415,12 @@ export default function AppPage() {
    *  себестоимости из каталога и блока «Прибыль по товарам». Заполняется в
    *  обоих flow (одиночный upload и 3-file). Пусто → блок не показывается. */
   const [reportProducts, setReportProducts] = useState<OzonProductRow[]>([]);
+  /** Тоталы (estimate) последнего отчёта — источник общих расходов для
+   *  распределения по SKU в блоке «Чистая прибыль по товарам». Ставится вместе
+   *  с reportProducts в обоих flow, сбрасывается там же. */
+  const [reportEstimate, setReportEstimate] = useState<OzonEstimate | null>(
+    null
+  );
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const updServicesInputRef = useRef<HTMLInputElement | null>(null);
   const updCommissionInputRef = useRef<HTMLInputElement | null>(null);
@@ -882,6 +889,7 @@ export default function AppPage() {
     // История не хранит per-SKU строки — очищаем, чтобы не показать блок
     // «Прибыль по товарам» от другого, ранее загруженного отчёта.
     setReportProducts([]);
+    setReportEstimate(null);
     setProfitInputs({
       costPrice: s(b.costPrice),
       taxPercent: s(b.taxPercent),
@@ -984,6 +992,7 @@ export default function AppPage() {
     setUploadErrorMsg("");
     setUploadDebugInfo(null);
     setReportProducts([]);
+    setReportEstimate(null);
 
     // Запускаем парсинг параллельно со стадиями анимации — пока крутятся
     // фейковые «стадии AI», файл уже реально читается. К концу анимации
@@ -1063,9 +1072,11 @@ export default function AppPage() {
     const mp: Marketplace = report.marketplace;
     const est = report.estimate;
 
-    // Per-SKU слой для блока «Прибыль по товарам» (best-effort: пусто, если
-    // колонки артикула в отчёте не распознаны — тогда блок не показывается).
+    // Per-SKU слой для блока «Чистая прибыль по товарам» (best-effort: пусто,
+    // если колонки артикула в отчёте не распознаны — тогда блок не показывается).
     setReportProducts(report.products);
+    // estimate — источник общих расходов для распределения по SKU.
+    setReportEstimate(est);
 
     // Финансовая модель из реального отчёта (cost обычно 0 — Ozon не отдаёт
     // себестоимость, юзер может дозаполнить в ручном расчёте).
@@ -1330,6 +1341,7 @@ export default function AppPage() {
     setCombinedResult(null);
     setCombinedDebug(null);
     setReportProducts([]);
+    setReportEstimate(null);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
     setProfitSaving(false);
@@ -1356,6 +1368,7 @@ export default function AppPage() {
     setCombinedResult(null);
     setCombinedDebug(null);
     setReportProducts([]);
+    setReportEstimate(null);
 
     // eslint-disable-next-line no-console
     console.log("[upload-3] starting parallel parse of 3 files", {
@@ -1473,8 +1486,9 @@ export default function AppPage() {
       period: xlsxRes.report.period,
     });
 
-    // Per-SKU слой из XLSX-отчёта — для блока «Прибыль по товарам».
+    // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
     setReportProducts(xlsxRes.report.products);
+    setReportEstimate(xlsxRes.report.estimate);
 
     // Автозаполнение формы в manual mode (для last-mile проверки/правок).
     // Объединяем доход (revenue + loyaltyPayouts) и расходы (Ozon-комиссии).
@@ -5818,10 +5832,15 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
         )}
 
-        {/* Прибыль по товарам — подстановка себестоимости из каталога по sku.
+        {/* Чистая прибыль по товарам — себестоимость из каталога по sku +
+            распределение общих расходов отчёта пропорционально выручке.
             Показывается, когда в распарсенном отчёте есть per-SKU строки. */}
         {reportProducts.length > 0 && (
-          <OzonProductBreakdown products={reportProducts} user={user} />
+          <OzonProductBreakdown
+            products={reportProducts}
+            estimate={reportEstimate}
+            user={user}
+          />
         )}
 
         {/* Аналитика по месяцам — карточки текущего месяца + графики
@@ -5898,7 +5917,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </p>
             <ul className="tariff-list tariff-status-list">
               <li>Неограниченное количество расчётов</li>
-              <li>AI-аналитика и рекомендации</li>
               <li>Полная история без ограничений</li>
               <li>Приоритетный доступ к новым функциям</li>
             </ul>

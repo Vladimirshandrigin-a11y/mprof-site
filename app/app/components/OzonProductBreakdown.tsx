@@ -1,32 +1,40 @@
 "use client";
 
 // ============================================================================
-// OzonProductBreakdown — прибыль по товарам после загрузки отчёта Ozon.
+// OzonProductBreakdown — ЧИСТАЯ прибыль по товарам после загрузки отчёта Ozon.
 //
-// Логика (по ТЗ):
+// Логика:
 //   1. Берём per-SKU строки из распарсенного отчёта (report.products).
 //   2. Для каждого артикула ищем товар в каталоге пользователя (products.sku).
-//   3. Найден  → берём cost_price, считаем себестоимость продаж и прибыль.
-//      Не найден → «Себестоимость не указана».
-//   4. Таблица результатов: Артикул | Товар | Выручка | Себестоимость |
-//      Прибыль | Маржа.
-//   5. Аналитика: ТОП-10 по прибыли, ТОП-10 по выручке, товары без себестоимости.
+//   3. Общие расходы отчёта (estimate: комиссия, логистика, хранение, реклама,
+//      налог, прочее) распределяем по товарам ПРОПОРЦИОНАЛЬНО выручке.
+//   4. Найден + есть cost_price → считаем себестоимость и чистую прибыль.
+//      Не найден / cost_price = 0 → блок «Товары без себестоимости».
+//   5. Аналитика: самые прибыльные, товары в минус, товары без себестоимости.
 //
 // Формулы (на товар, агрегировано по артикулу):
-//   себестоимость продаж = cost_price × количество
-//   прибыль              = выручка − себестоимость продаж
-//   маржа, %             = выручка > 0 ? прибыль / выручка × 100 : 0
+//   доля в выручке   = выручка товара / выручка отчёта        (guard ÷0)
+//   распред. расходы = (комиссия+логистика+хранение+реклама+налог+прочее) × доля
+//   себестоимость    = cost_price × количество
+//   чистая прибыль   = выручка − себестоимость − распред. расходы
+//   чистая маржа, %  = выручка > 0 ? чистая прибыль / выручка × 100 : 0
 //
+// НЕ меняет общий расчёт отчёта — это отдельный производный слой поверх него.
 // Стиль — тема M-PROF (глобальные CSS-переменные --gold/--txt/--green/…).
 // ============================================================================
 
 import { useEffect, useMemo, useState } from "react";
 import type { User } from "@supabase/supabase-js";
 import { loadProductsFromCloud, type Product } from "../lib/supabase-cloud";
-import type { OzonProductRow } from "../lib/report-parsers/ozon-parser";
+import type {
+  OzonProductRow,
+  OzonEstimate,
+} from "../lib/report-parsers/ozon-parser";
 
 interface Props {
   products: OzonProductRow[];
+  /** Тоталы отчёта (estimate) — источник общих расходов для распределения. */
+  estimate: OzonEstimate | null;
   user: User | null;
 }
 
@@ -40,13 +48,13 @@ interface BreakdownRow {
   matched: boolean;
   /** Себестоимость за единицу (из каталога). null — товар не найден. */
   unitCost: number | null;
-  /** Себестоимость продаж = unitCost × quantity. null — не найден. */
+  /** Себестоимость продаж = unitCost × quantity. null — нет себестоимости. */
   cogs: number | null;
-  /** Прибыль = revenue − cogs. null — не найден. */
+  /** Чистая прибыль = revenue − cogs − распред. расходы. null — нет cost. */
   profit: number | null;
-  /** Маржа, %. null — не найден. */
+  /** Чистая маржа, %. null — нет себестоимости. */
   margin: number | null;
-  /** Есть пригодная (>0) себестоимость — для ранжирования по прибыли. */
+  /** Есть пригодная (>0) себестоимость — иначе чистую прибыль не считаем. */
   hasCost: boolean;
 }
 
@@ -77,7 +85,7 @@ function normArticle(s: string | null | undefined): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-export function OzonProductBreakdown({ products, user }: Props) {
+export function OzonProductBreakdown({ products, estimate, user }: Props) {
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -110,7 +118,11 @@ export function OzonProductBreakdown({ products, user }: Props) {
     };
   }, [user, products]);
 
-  // ===== Матчинг + расчёт =====
+  // ===== Матчинг + расчёт чистой прибыли по SKU =====
+  // Общие расходы отчёта (комиссия, логистика, хранение, реклама, налог,
+  // прочее) берём из estimate и распределяем по товарам ПРОПОРЦИОНАЛЬНО
+  // выручке. Себестоимость в этот пул НЕ входит — она считается отдельно по
+  // каждому товару из каталога (cost_price × quantity).
   const rows = useMemo<BreakdownRow[]>(() => {
     // Индекс каталога по нормализованному sku.
     const bySku = new Map<string, Product>();
@@ -118,6 +130,17 @@ export function OzonProductBreakdown({ products, user }: Props) {
       const key = normArticle(p.sku);
       if (key && !bySku.has(key)) bySku.set(key, p);
     }
+
+    // Тоталы отчёта для распределения расходов. estimate может быть null —
+    // тогда расходы 0, и чистая прибыль вырождается в выручка − себестоимость.
+    const totalRevenue = estimate?.revenue ?? 0;
+    const totalExpenses =
+      (estimate?.commission ?? 0) +
+      (estimate?.logistics ?? 0) +
+      (estimate?.storage ?? 0) +
+      (estimate?.ads ?? 0) +
+      (estimate?.tax ?? 0) +
+      (estimate?.other ?? 0);
 
     // Агрегируем строки отчёта по артикулу (один товар может встречаться
     // несколькими строками — суммируем выручку и количество).
@@ -145,11 +168,19 @@ export function OzonProductBreakdown({ products, user }: Props) {
 
     const out: BreakdownRow[] = [];
     for (const [key, a] of agg) {
+      // Доля товара в общей выручке отчёта (guard против деления на ноль).
+      const revenueShare = totalRevenue > 0 ? a.revenue / totalRevenue : 0;
+      // Распределённые на товар общие расходы (без себестоимости).
+      const allocated = totalExpenses * revenueShare;
+
       const match = bySku.get(key);
-      if (match) {
-        const unitCost = match.cost_price;
+      const unitCost = match ? match.cost_price : null;
+      const hasCost = unitCost !== null && unitCost > 0;
+
+      if (match && hasCost) {
         const cogs = unitCost * a.quantity;
-        const profit = a.revenue - cogs;
+        // Чистая прибыль = выручка − себестоимость − распределённые расходы.
+        const profit = a.revenue - cogs - allocated;
         const margin = a.revenue > 0 ? (profit / a.revenue) * 100 : 0;
         out.push({
           article: a.article,
@@ -161,16 +192,19 @@ export function OzonProductBreakdown({ products, user }: Props) {
           cogs,
           profit,
           margin,
-          hasCost: unitCost > 0,
+          hasCost: true,
         });
       } else {
+        // Нет пригодной себестоимости (товар не в каталоге ИЛИ cost_price = 0):
+        // чистую прибыль не считаем — она была бы неточной. Товар уходит в
+        // блок «Товары без себестоимости».
         out.push({
           article: a.article,
-          name: a.name || a.article,
+          name: (match ? a.name || match.name : a.name) || a.article,
           revenue: a.revenue,
           quantity: a.quantity,
-          matched: false,
-          unitCost: null,
+          matched: !!match,
+          unitCost,
           cogs: null,
           profit: null,
           margin: null,
@@ -182,14 +216,14 @@ export function OzonProductBreakdown({ products, user }: Props) {
     // По умолчанию — по выручке убыванию.
     out.sort((x, y) => y.revenue - x.revenue);
     return out;
-  }, [products, catalog]);
+  }, [products, catalog, estimate]);
 
   // ===== Аналитика товаров =====
-  // Используем уже рассчитанные значения (revenue/profit/margin/unitCost) —
-  // ничего не пересчитываем. Берём только товары с найденной себестоимостью,
-  // т.е. для которых прибыль реально посчитана (matched && profit !== null).
+  // Используем уже рассчитанные значения (revenue/profit/margin) — ничего не
+  // пересчитываем. Берём только товары с себестоимостью, т.е. для которых
+  // чистая прибыль реально посчитана (hasCost && profit !== null).
   const scored = useMemo(
-    () => rows.filter((r) => r.matched && r.profit !== null),
+    () => rows.filter((r) => r.hasCost && r.profit !== null),
     [rows]
   );
   // ТОП-10 прибыльных — по прибыли по убыванию.
@@ -221,10 +255,11 @@ export function OzonProductBreakdown({ products, user }: Props) {
     return (min.profit ?? 0) < 0 ? min : null;
   }, [scored]);
 
-  // Блок «Товары без себестоимости» (по ТЗ): unitCost === null ИЛИ matched === false.
-  // Не меняет существующий расчёт — это отдельная производная выборка из rows.
+  // Блок «Товары без себестоимости»: товары без пригодной cost_price — нет в
+  // каталоге ИЛИ cost_price = 0. Для них чистая прибыль не считается (была бы
+  // неточной). Производная выборка из rows — общий расчёт не меняет.
   const missing = useMemo(
-    () => rows.filter((r) => r.unitCost === null || r.matched === false),
+    () => rows.filter((r) => !r.hasCost),
     [rows]
   );
 
@@ -233,26 +268,29 @@ export function OzonProductBreakdown({ products, user }: Props) {
     let revenue = 0;
     let cogs = 0;
     let profit = 0;
-    let matchedCount = 0;
+    let withCost = 0;
     for (const r of rows) {
       revenue += r.revenue;
-      if (r.matched) {
+      if (r.hasCost) {
         cogs += r.cogs ?? 0;
         profit += r.profit ?? 0;
-        matchedCount++;
+        withCost++;
       }
     }
     return {
       revenue,
       cogs,
       profit,
-      matchedCount,
+      withCost,
       total: rows.length,
-      unmatched: rows.length - matchedCount,
+      withoutCost: rows.length - withCost,
     };
   }, [rows]);
 
-  // Выгрузка «Товары без себестоимости» в Excel: колонки sku | name | revenue.
+  // Выгрузка «Товары без себестоимости» в Excel: sku | name | revenue |
+  // cost_price. Колонка cost_price идёт ПУСТОЙ — её заполняет пользователь и
+  // загружает файл обратно в «Каталог товаров». Заголовок именно `cost_price`,
+  // чтобы импорт каталога распознал его (регэксп /cost[\s_]*price/).
   async function handleExport() {
     if (missing.length === 0 || exporting) return;
     setExporting(true);
@@ -262,9 +300,10 @@ export function OzonProductBreakdown({ products, user }: Props) {
         sku: r.article,
         name: r.name,
         revenue: r.revenue,
+        cost_price: "", // пустая ячейка для ручного ввода себестоимости
       }));
       const ws = XLSX.utils.json_to_sheet(data, {
-        header: ["sku", "name", "revenue"],
+        header: ["sku", "name", "revenue", "cost_price"],
       });
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Без себестоимости");
@@ -284,14 +323,14 @@ export function OzonProductBreakdown({ products, user }: Props) {
     setExportingAnalytics(true);
     try {
       const XLSX = await import("xlsx");
-      const header = ["sku", "name", "revenue", "profit", "margin"];
+      const header = ["sku", "name", "revenue", "net_profit", "net_margin"];
       const toRows = (list: BreakdownRow[]) =>
         list.map((r) => ({
           sku: r.article,
           name: r.name,
           revenue: r.revenue,
-          profit: r.profit ?? 0,
-          margin: r.margin !== null ? Number(r.margin.toFixed(2)) : 0,
+          net_profit: r.profit ?? 0,
+          net_margin: r.margin !== null ? Number(r.margin.toFixed(2)) : 0,
         }));
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(
@@ -319,19 +358,24 @@ export function OzonProductBreakdown({ products, user }: Props) {
     <section className="pb">
       <div className="pb-head">
         <div>
-          <h2 className="pb-title">Прибыль по товарам</h2>
+          <h2 className="pb-title">Чистая прибыль по товарам</h2>
           <p className="pb-sub">
             {totals.total} {pluralProducts(totals.total)} в отчёте ·{" "}
-            <b className="pb-sub-ok">{totals.matchedCount}</b> найдено в каталоге
-            {totals.unmatched > 0 && (
+            <b className="pb-sub-ok">{totals.withCost}</b> с себестоимостью
+            {totals.withoutCost > 0 && (
               <>
                 {" "}
-                · <b className="pb-sub-warn">{totals.unmatched}</b> без
+                · <b className="pb-sub-warn">{totals.withoutCost}</b> без
                 себестоимости
               </>
             )}
           </p>
         </div>
+      </div>
+
+      <div className="pb-note">
+        Общие расходы распределяются по товарам пропорционально выручке. Это
+        позволяет оценить чистую прибыль по каждому SKU.
       </div>
 
       {!user && (
@@ -363,7 +407,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
               <span className="pb-chip-v">{formatRub(totals.cogs)}</span>
             </div>
             <div className="pb-chip">
-              <span className="pb-chip-l">Прибыль</span>
+              <span className="pb-chip-l">Чистая прибыль</span>
               <span
                 className={
                   "pb-chip-v " + (totals.profit >= 0 ? "pos" : "neg")
@@ -373,9 +417,9 @@ export function OzonProductBreakdown({ products, user }: Props) {
               </span>
             </div>
             <div className="pb-chip">
-              <span className="pb-chip-l">Найдено</span>
+              <span className="pb-chip-l">С себестоимостью</span>
               <span className="pb-chip-v">
-                {totals.matchedCount} / {totals.total}
+                {totals.withCost} / {totals.total}
               </span>
             </div>
           </div>
@@ -384,7 +428,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
           <div
             className="pb-table"
             role="table"
-            aria-label="Прибыль по товарам"
+            aria-label="Чистая прибыль по товарам"
           >
             <div className="pb-thead" role="row">
               <span role="columnheader">Артикул</span>
@@ -396,15 +440,15 @@ export function OzonProductBreakdown({ products, user }: Props) {
                 Себестоимость
               </span>
               <span role="columnheader" className="pb-num">
-                Прибыль
+                Чистая прибыль
               </span>
               <span role="columnheader" className="pb-num">
-                Маржа
+                Чистая маржа
               </span>
             </div>
             {rows.map((r, i) => (
               <div
-                className={"pb-row" + (r.matched ? "" : " pb-row-nocost")}
+                className={"pb-row" + (r.hasCost ? "" : " pb-row-nocost")}
                 role="row"
                 key={r.article + "#" + i}
               >
@@ -423,13 +467,17 @@ export function OzonProductBreakdown({ products, user }: Props) {
                   role="cell"
                   data-label="Себестоимость"
                 >
-                  {r.matched ? (
+                  {r.hasCost ? (
                     formatRub(r.cogs ?? 0)
                   ) : (
                     <span className="pb-nocost">Не указана</span>
                   )}
                 </span>
-                <span className="pb-cell pb-num" role="cell" data-label="Прибыль">
+                <span
+                  className="pb-cell pb-num"
+                  role="cell"
+                  data-label="Чистая прибыль"
+                >
                   {r.profit === null ? (
                     <span className="pb-dash">—</span>
                   ) : (
@@ -438,7 +486,11 @@ export function OzonProductBreakdown({ products, user }: Props) {
                     </span>
                   )}
                 </span>
-                <span className="pb-cell pb-num" role="cell" data-label="Маржа">
+                <span
+                  className="pb-cell pb-num"
+                  role="cell"
+                  data-label="Чистая маржа"
+                >
                   {r.margin === null ? (
                     <span className="pb-dash">—</span>
                   ) : (
@@ -460,7 +512,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
             <div>
               <h2 className="pba-title">Аналитика товаров</h2>
               <p className="pba-sub">
-                Лучшие и убыточные товары по уже рассчитанной прибыли.
+                Лучшие и убыточные товары по расчётной чистой прибыли.
               </p>
             </div>
             {scored.length > 0 && (
@@ -510,7 +562,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                           </span>
                         </div>
                         <div className="pba-stat">
-                          <span className="pba-stat-l">Прибыль</span>
+                          <span className="pba-stat-l">Чистая прибыль</span>
                           <span
                             className={
                               "pba-stat-v " +
@@ -521,7 +573,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                           </span>
                         </div>
                         <div className="pba-stat">
-                          <span className="pba-stat-l">Маржа</span>
+                          <span className="pba-stat-l">Чистая маржа</span>
                           <span
                             className={
                               "pba-stat-v " +
@@ -565,7 +617,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                           </span>
                         </div>
                         <div className="pba-stat">
-                          <span className="pba-stat-l">Маржа</span>
+                          <span className="pba-stat-l">Чистая маржа</span>
                           <span className="pba-stat-v neg">
                             {(worstProduct.margin ?? 0).toFixed(1)}%
                           </span>
@@ -583,13 +635,13 @@ export function OzonProductBreakdown({ products, user }: Props) {
                 </div>
               </div>
 
-              {/* ТОП-10 прибыльных */}
+              {/* Самые прибыльные */}
               <div className="pba-section">
-                <h3 className="pba-h3">ТОП-10 прибыльных товаров</h3>
+                <h3 className="pba-h3">Самые прибыльные товары</h3>
                 <div
                   className="pba-table"
                   role="table"
-                  aria-label="ТОП-10 прибыльных товаров"
+                  aria-label="Самые прибыльные товары"
                 >
                   <div className="pba-thead" role="row">
                     <span role="columnheader">Артикул</span>
@@ -598,10 +650,10 @@ export function OzonProductBreakdown({ products, user }: Props) {
                       Выручка
                     </span>
                     <span role="columnheader" className="pba-num">
-                      Прибыль
+                      Чистая прибыль
                     </span>
                     <span role="columnheader" className="pba-num">
-                      Маржа
+                      Чистая маржа
                     </span>
                   </div>
                   {topProfitable.map((r, i) => (
@@ -630,7 +682,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                       <span
                         className="pba-cell pba-num"
                         role="cell"
-                        data-label="Прибыль"
+                        data-label="Чистая прибыль"
                       >
                         <span className={(r.profit ?? 0) >= 0 ? "pos" : "neg"}>
                           {formatSignedRub(r.profit ?? 0)}
@@ -639,7 +691,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                       <span
                         className="pba-cell pba-num"
                         role="cell"
-                        data-label="Маржа"
+                        data-label="Чистая маржа"
                       >
                         <span className={(r.margin ?? 0) >= 0 ? "pos" : "neg"}>
                           {(r.margin ?? 0).toFixed(1)}%
@@ -650,9 +702,9 @@ export function OzonProductBreakdown({ products, user }: Props) {
                 </div>
               </div>
 
-              {/* ТОП-10 убыточных */}
+              {/* Товары в минус */}
               <div className="pba-section">
-                <h3 className="pba-h3">ТОП-10 убыточных товаров</h3>
+                <h3 className="pba-h3">Товары в минус</h3>
                 {topLosses.length === 0 ? (
                   <div className="pba-ok">
                     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -664,7 +716,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                   <div
                     className="pba-table"
                     role="table"
-                    aria-label="ТОП-10 убыточных товаров"
+                    aria-label="Товары в минус"
                   >
                     <div className="pba-thead" role="row">
                       <span role="columnheader">Артикул</span>
@@ -709,7 +761,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                         <span
                           className="pba-cell pba-num"
                           role="cell"
-                          data-label="Прибыль"
+                          data-label="Чистая прибыль"
                         >
                           <span className="neg">
                             {formatSignedRub(r.profit ?? 0)}
@@ -718,7 +770,7 @@ export function OzonProductBreakdown({ products, user }: Props) {
                         <span
                           className="pba-cell pba-num"
                           role="cell"
-                          data-label="Маржа"
+                          data-label="Чистая маржа"
                         >
                           <span className="neg">
                             {(r.margin ?? 0).toFixed(1)}%
@@ -744,7 +796,9 @@ export function OzonProductBreakdown({ products, user }: Props) {
               </h2>
               {missing.length > 0 && (
                 <p className="pbm-sub">
-                  Эти артикулы есть в отчёте, но не найдены в «Каталоге товаров».
+                  Эти артикулы есть в отчёте, но для них не указана
+                  себестоимость в «Каталоге товаров». Чистая прибыль по ним не
+                  рассчитывается.
                 </p>
               )}
             </div>
@@ -764,6 +818,14 @@ export function OzonProductBreakdown({ products, user }: Props) {
               </button>
             )}
           </div>
+
+          {missing.length > 0 && (
+            <p className="pbm-hint">
+              Скачайте файл, заполните колонку{" "}
+              <span className="pbm-hint-k">cost_price</span> и загрузите его
+              обратно в «Каталог товаров».
+            </p>
+          )}
 
           {missing.length === 0 ? (
             <div className="pbm-ok">
@@ -1053,6 +1115,24 @@ export function OzonProductBreakdown({ products, user }: Props) {
           color: var(--txt2);
           margin-top: 0.25rem;
           font-weight: 300;
+        }
+        .pbm-hint {
+          margin-top: 1rem;
+          padding: 0.7rem 0.9rem;
+          border: 1px solid var(--edge2);
+          border-radius: 11px;
+          background: var(--gold-bg);
+          color: var(--txt2);
+          font-size: 0.83rem;
+          line-height: 1.5;
+        }
+        .pbm-hint-k {
+          font-family: var(--mono);
+          font-size: 0.8rem;
+          color: var(--gold2);
+          background: rgba(201, 168, 76, 0.12);
+          padding: 1px 6px;
+          border-radius: 5px;
         }
         .pbm-export {
           display: inline-flex;

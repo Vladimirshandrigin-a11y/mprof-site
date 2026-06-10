@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useState } from "react";
 import { supabase } from "../app/lib/supabase-cloud";
 
@@ -40,43 +39,25 @@ const TIER_DATA: Record<
     period: "Подписка на 30 дней",
     perks: [
       "Неограниченное число расчётов в месяц",
-      "AI аналитика и рекомендации",
+      "Приоритетный доступ к новым функциям",
       "Полная история без ограничений",
       "Приоритетная поддержка",
     ],
   },
 };
 
-const PROCESSING_DELAY_MS = 2400;
-
-// === RELEASE v1.0 ===
-// Premium РАЗБЛОКИРОВАН — модалка показывает рабочий интерфейс тарифа (шаги 1–3).
-// Реальная онлайн-оплата (ЮKassa) ещё подключается: шаг 3 честно сообщает, что
-// оплата завершается, все функции пока бесплатны. «🔒 Скоро»-состояние модалки
-// сохранено в коде ниже (поставь флаг → true), ничего не удалено.
-const PAYMENT_COMING_SOON: boolean = false;
-
 export function TariffModal({ open, tier, onClose }: Props) {
-  const [step, setStep] = useState<1 | 2 | 3>(1);
-  // Этап 1.5: реальная оплата через POST /api/payment/create.
+  // Реальная оплата через POST /api/payment/create → redirect в ЮKassa.
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Сбрасываем шаг и платёжное состояние при каждом открытии модалки
+  // Сбрасываем платёжное состояние при каждом открытии модалки
   useEffect(() => {
     if (open) {
-      setStep(1);
       setLoading(false);
       setError(null);
     }
   }, [open, tier]);
-
-  // Auto-advance step 2 → 3
-  useEffect(() => {
-    if (!open || step !== 2) return;
-    const t = window.setTimeout(() => setStep(3), PROCESSING_DELAY_MS);
-    return () => window.clearTimeout(t);
-  }, [open, step]);
 
   // Esc + body-lock
   useEffect(() => {
@@ -232,30 +213,6 @@ export function TariffModal({ open, tier, onClose }: Props) {
         }
         .tm-close svg{width:13px;height:13px;display:block}
 
-        /* === Progress steps (Linear/Stripe-style: thin, clean, no visual noise) === */
-        .tm-steps{
-          display:flex;align-items:center;gap:.45rem;
-          margin:0 0 1.5rem;
-          /* отступ справа гарантирует что pills никогда не подходят
-             вплотную к закрывающему крестику */
-          padding-right:54px
-        }
-        .tm-step-dot{
-          width:18px;height:3px;border-radius:2px;
-          background:rgba(255,255,255,.10);
-          transition:width .4s cubic-bezier(.22,1,.36,1),
-            background .25s ease, box-shadow .25s ease
-        }
-        .tm-step-dot.active{
-          width:28px;
-          background:linear-gradient(90deg,#C9A84C 0%,#E8C97A 100%);
-          box-shadow:0 0 10px rgba(201,168,76,.32)
-        }
-        .tm-step-dot.done{
-          width:18px;
-          background:rgba(201,168,76,.32)
-        }
-
         .tm-step{
           display:flex;flex-direction:column;flex:1;min-height:0;
           animation:stepIn .38s cubic-bezier(.22,1,.36,1) both
@@ -323,95 +280,6 @@ export function TariffModal({ open, tier, onClose }: Props) {
         }
         .tm-check svg{width:11px;height:11px;display:block}
 
-        /* === STEP 2 processing === */
-        .tm-loader{display:flex;align-items:center;justify-content:center;
-          margin:2rem 0 1.6rem}
-        .tm-spinner{
-          width:84px;height:84px;border-radius:50%;
-          display:flex;align-items:center;justify-content:center;
-          background:linear-gradient(135deg,
-            rgba(201,168,76,.18),
-            rgba(201,168,76,.04));
-          border:1px solid rgba(201,168,76,.3);
-          box-shadow:0 14px 38px rgba(201,168,76,.22),
-            inset 0 1px 0 rgba(255,255,255,.08);
-          animation:tmSpinnerPulse 2.4s ease-in-out infinite;
-          position:relative
-        }
-        @keyframes tmSpinnerPulse{
-          0%,100%{box-shadow:0 14px 38px rgba(201,168,76,.22),
-            inset 0 1px 0 rgba(255,255,255,.08),
-            0 0 0 0 rgba(201,168,76,.16)}
-          50%{box-shadow:0 16px 42px rgba(201,168,76,.32),
-            inset 0 1px 0 rgba(255,255,255,.08),
-            0 0 0 14px rgba(201,168,76,.04)}
-        }
-        .tm-ring{
-          width:40px;height:40px;border-radius:50%;
-          border:2.5px solid rgba(201,168,76,.18);
-          border-top-color:#E8C97A;
-          animation:tmRing .85s linear infinite
-        }
-        @keyframes tmRing{to{transform:rotate(360deg)}}
-
-        .tm-progress{
-          width:100%;height:6px;border-radius:3px;
-          background:rgba(255,255,255,.05);
-          overflow:hidden;position:relative;
-          margin-top:1.5rem
-        }
-        .tm-progress::before{
-          content:"";position:absolute;top:0;left:-35%;width:35%;height:100%;
-          border-radius:3px;
-          background:linear-gradient(90deg,
-            rgba(201,168,76,0) 0%,
-            rgba(201,168,76,.6) 30%,
-            rgba(232,201,122,1) 50%,
-            rgba(201,168,76,.6) 70%,
-            rgba(201,168,76,0) 100%);
-          animation:tmProgress 1.6s ease-in-out infinite;
-          box-shadow:0 0 14px rgba(201,168,76,.45)
-        }
-        @keyframes tmProgress{
-          0%{left:-35%}
-          100%{left:100%}
-        }
-
-        /* === STEP 3 success === */
-        .tm-success-icon{
-          width:88px;height:88px;border-radius:24px;align-self:center;
-          display:inline-flex;align-items:center;justify-content:center;
-          background:linear-gradient(135deg,
-            rgba(46,204,138,.28),
-            rgba(46,204,138,.06));
-          border:1px solid rgba(46,204,138,.42);
-          color:#7DEAB2;margin:1.2rem 0 1.4rem;
-          box-shadow:0 16px 42px rgba(46,204,138,.32),
-            inset 0 1px 0 rgba(255,255,255,.08);
-          animation:tmSuccessIn .55s cubic-bezier(.34,1.56,.64,1) both,
-            tmSuccessPulse 3s ease-in-out infinite 0.55s
-        }
-        @keyframes tmSuccessIn{
-          from{opacity:0;transform:scale(.55) rotate(-14deg)}
-          to{opacity:1;transform:scale(1) rotate(0)}
-        }
-        @keyframes tmSuccessPulse{
-          0%,100%{box-shadow:0 16px 42px rgba(46,204,138,.32),
-            inset 0 1px 0 rgba(255,255,255,.08),
-            0 0 0 0 rgba(46,204,138,.16)}
-          50%{box-shadow:0 18px 48px rgba(46,204,138,.38),
-            inset 0 1px 0 rgba(255,255,255,.08),
-            0 0 0 14px rgba(46,204,138,.04)}
-        }
-        .tm-success-icon svg{width:40px;height:40px;display:block}
-
-        .tm-sub{
-          font-size:.93rem;color:#8A9FBB;font-weight:300;line-height:1.6;
-          margin:.6rem 0 1.8rem;text-align:center;
-          max-width:380px;margin-left:auto;margin-right:auto
-        }
-        .tm-text-center{text-align:center}
-
         /* === Buttons === */
         .tm-actions{
           display:flex;gap:.7rem;flex-wrap:wrap;margin-top:auto
@@ -461,14 +329,6 @@ export function TariffModal({ open, tier, onClose }: Props) {
           border-radius:10px;padding:.7rem .85rem
         }
 
-        /* === RELEASE v1.0 — «Скоро» (disabled) button === */
-        .tm-btn.tm-btn-soon{
-          background:linear-gradient(135deg,rgba(201,168,76,.22),rgba(201,168,76,.10));
-          color:#E8C97A;border:1px solid rgba(201,168,76,.4);
-          box-shadow:none;cursor:default;letter-spacing:.04em
-        }
-        .tm-btn.tm-btn-soon:hover{transform:none;box-shadow:none}
-
         @media(max-width:640px){
           .tm-card{padding:2.1rem 1.45rem 1.6rem;border-radius:18px;min-height:340px}
           .tm-title{font-size:1.3rem}
@@ -479,10 +339,9 @@ export function TariffModal({ open, tier, onClose }: Props) {
         }
 
         @media (prefers-reduced-motion: reduce){
-          .tm-overlay, .tm-card, .tm-step,
-          .tm-spinner, .tm-ring,
-          .tm-progress::before, .tm-success-icon,
-          .tm-step-dot{animation:none !important;transform:none !important;opacity:1 !important}
+          .tm-overlay, .tm-card, .tm-step{
+            animation:none !important;transform:none !important;opacity:1 !important
+          }
         }
       `}</style>
 
@@ -506,181 +365,64 @@ export function TariffModal({ open, tier, onClose }: Props) {
             </svg>
           </button>
 
-          {PAYMENT_COMING_SOON ? (
-            <div className="tm-step" key="soon">
-              <span className="tm-pro-badge">🔒 Скоро</span>
-              <h3 id="tm-title" className="tm-title">
-                {data.name}
-              </h3>
+          <div className="tm-step">
+            <span className="tm-pro-badge">
+              <svg viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
+              </svg>
+              PRO
+            </span>
+            <h3 id="tm-title" className="tm-title">
+              {data.name}
+            </h3>
 
-              <div className="tm-price-row">
-                <div className="tm-price">
-                  <em>{data.priceNumber}</em> ₽
-                </div>
-                {data.isSub && <span className="tm-mo">/мес</span>}
+            <div className="tm-price-row">
+              <div className="tm-price">
+                <em>{data.priceNumber}</em> ₽
               </div>
-              <p className="tm-period">{data.period}</p>
-
-              <ul className="tm-perks">
-                {data.perks.map((p, i) => (
-                  <li key={i}>
-                    <span className="tm-check" aria-hidden="true">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                        strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="m5 12 5 5L20 7" />
-                      </svg>
-                    </span>
-                    {p}
-                  </li>
-                ))}
-              </ul>
-
-              <p
-                className="tm-sub"
-                style={{ textAlign: "left", maxWidth: "none", margin: "0 0 1.4rem" }}
-              >
-                Онлайн-оплата скоро заработает. Пока все функции расчёта
-                доступны бесплатно — без подписки и платежей.
-              </p>
-
-              <div className="tm-actions">
-                <button
-                  type="button"
-                  className="tm-btn tm-btn-soon"
-                  disabled
-                  aria-disabled="true"
-                >
-                  Скоро
-                </button>
-              </div>
+              {data.isSub && <span className="tm-mo">/мес</span>}
             </div>
-          ) : (
-            <>
-          {/* Progress dots */}
-          <div className="tm-steps" aria-hidden="true">
-            <span className={"tm-step-dot " + (step === 1 ? "active" : "done")} />
-            <span className={"tm-step-dot " + (step === 2 ? "active" : step > 2 ? "done" : "")} />
-            <span className={"tm-step-dot " + (step === 3 ? "active" : "")} />
-          </div>
+            <p className="tm-period">{data.period}</p>
 
-          <div className="tm-step" key={step}>
-            {step === 1 && (
-              <>
-                <span className="tm-pro-badge">
-                  <svg viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
-                  </svg>
-                  PRO
-                </span>
-                <h3 id="tm-title" className="tm-title">
-                  {data.name}
-                </h3>
+            <ul className="tm-perks">
+              {data.perks.map((p, i) => (
+                <li key={i}>
+                  <span className="tm-check" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                      strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="m5 12 5 5L20 7" />
+                    </svg>
+                  </span>
+                  {p}
+                </li>
+              ))}
+            </ul>
 
-                <div className="tm-price-row">
-                  <div className="tm-price">
-                    <em>{data.priceNumber}</em> ₽
-                  </div>
-                  {data.isSub && <span className="tm-mo">/мес</span>}
-                </div>
-                <p className="tm-period">{data.period}</p>
-
-                <ul className="tm-perks">
-                  {data.perks.map((p, i) => (
-                    <li key={i}>
-                      <span className="tm-check" aria-hidden="true">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                          strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="m5 12 5 5L20 7" />
-                        </svg>
-                      </span>
-                      {p}
-                    </li>
-                  ))}
-                </ul>
-
-                {error && (
-                  <p className="tm-error" role="alert">
-                    {error}
-                  </p>
-                )}
-
-                <div className="tm-actions">
-                  <button
-                    type="button"
-                    className="tm-btn tm-btn-gold"
-                    onClick={handlePay}
-                    disabled={loading}
-                    aria-busy={loading}
-                  >
-                    {loading ? (
-                      "Создаём платёж…"
-                    ) : (
-                      <>
-                        Продолжить
-                        <span className="arr" aria-hidden="true">→</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-              </>
+            {error && (
+              <p className="tm-error" role="alert">
+                {error}
+              </p>
             )}
 
-            {step === 2 && (
-              <>
-                <div className="tm-loader" aria-hidden="true">
-                  <div className="tm-spinner">
-                    <span className="tm-ring" />
-                  </div>
-                </div>
-                <h3 id="tm-title" className="tm-title tm-text-center">
-                  Подключаем оплату…
-                </h3>
-                <p className="tm-sub">
-                  Проверяем платёжный шлюз и активируем тариф «{data.name}».
-                </p>
-                <div className="tm-progress" aria-hidden="true" />
-              </>
-            )}
-
-            {step === 3 && (
-              <>
-                <div className="tm-success-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m8 12.5 2.8 2.8L16.5 9.5" />
-                  </svg>
-                </div>
-                <h3 id="tm-title" className="tm-title tm-text-center">
-                  Premium скоро станет доступен
-                </h3>
-                <p className="tm-sub">
-                  Мы завершаем подключение оплаты. Пока вы можете пользоваться
-                  всеми функциями бесплатно.
-                </p>
-
-                <div className="tm-actions">
-                  <button
-                    type="button"
-                    className="tm-btn tm-btn-ghost"
-                    onClick={onClose}
-                  >
+            <div className="tm-actions">
+              <button
+                type="button"
+                className="tm-btn tm-btn-gold"
+                onClick={handlePay}
+                disabled={loading}
+                aria-busy={loading}
+              >
+                {loading ? (
+                  "Создаём платёж…"
+                ) : (
+                  <>
                     Продолжить
-                  </button>
-                  <Link
-                    href="/app"
-                    className="tm-btn tm-btn-gold"
-                    onClick={onClose}
-                  >
-                    Вернуться в Dashboard
                     <span className="arr" aria-hidden="true">→</span>
-                  </Link>
-                </div>
-              </>
-            )}
+                  </>
+                )}
+              </button>
+            </div>
           </div>
-            </>
-          )}
         </div>
       </div>
     </>
