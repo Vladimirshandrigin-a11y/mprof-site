@@ -25,7 +25,12 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { User } from "@supabase/supabase-js";
-import { loadProductsFromCloud, type Product } from "../lib/supabase-cloud";
+import {
+  addProductToCloud,
+  loadProductsFromCloud,
+  updateProductInCloud,
+  type Product,
+} from "../lib/supabase-cloud";
 import type {
   OzonProductRow,
   OzonEstimate,
@@ -86,6 +91,20 @@ function pluralProducts(n: number): string {
   return "товаров";
 }
 
+/**
+ * Парсинг себестоимости из инлайн-поля «за 1 шт.»: запятая→точка, схлоп пробелов.
+ * Возвращает число СТРОГО > 0 (0/пусто/NaN/отрицательное → null), т.к. нулевая
+ * себестоимость не выводит товар из «без себестоимости». Зеркало parseCost в
+ * ProductCatalog, но с порогом > 0.
+ */
+function parseCostInput(raw: string): number | null {
+  const cleaned = raw.replace(/\s/g, "").replace(",", ".");
+  if (cleaned === "") return null;
+  const n = Number(cleaned);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+
 /** Нормализация артикула/sku для матчинга: trim + lower + схлопывание пробелов. */
 function normArticle(s: string | null | undefined): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
@@ -97,6 +116,16 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
   const [loadError, setLoadError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportingAnalytics, setExportingAnalytics] = useState(false);
+
+  // Инлайн-ввод себестоимости в блоке «Товары без себестоимости».
+  // costDraft — значения полей ввода по нормализованному артикулу.
+  const [costDraft, setCostDraft] = useState<Record<string, string>>({});
+  // Артикул строки, которая сейчас сохраняется (для спиннера/блокировки).
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+  // Идёт массовое сохранение «Сохранить себестоимость».
+  const [bulkSaving, setBulkSaving] = useState(false);
+  // Ошибки сохранения по строкам (по нормализованному артикулу).
+  const [rowError, setRowError] = useState<Record<string, string>>({});
 
   // Загружаем каталог при появлении товаров в отчёте / смене пользователя.
   useEffect(() => {
@@ -268,6 +297,91 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
     () => rows.filter((r) => !r.hasCost),
     [rows]
   );
+
+  // ===== Инлайн-сохранение себестоимости =====
+  // Сохраняем cost_price «за 1 штуку» прямо из таблицы «без себестоимости».
+  // Логика «обновить или создать по sku» зеркалит массовый импорт каталога:
+  //   • товар уже в каталоге (по нормализованному sku) → updateProductInCloud;
+  //   • товара нет → addProductToCloud по article/name.
+  // После успеха ЛОКАЛЬНО обновляем catalog → rows/totals/missing/onCogsTotal
+  // пересчитываются реактивно (товар уходит из таблицы, агрегат COGS в
+  // «Дополнительных расходах» обновляется) БЕЗ перезагрузки страницы и без
+  // повторного парсинга отчёта. Supabase-схему, оплату и формулы не трогаем.
+  async function persistCost(row: BreakdownRow): Promise<boolean> {
+    if (!user) return false;
+    const key = normArticle(row.article);
+    const cost = parseCostInput(costDraft[key] ?? "");
+    if (cost === null) {
+      setRowError((p) => ({ ...p, [key]: "Введите число больше 0" }));
+      return false;
+    }
+    // Чистим прежнюю ошибку строки.
+    setRowError((p) => {
+      const next = { ...p };
+      delete next[key];
+      return next;
+    });
+
+    const existing = catalog.find((p) => normArticle(p.sku) === key);
+    if (existing) {
+      const { data, error } = await updateProductInCloud(
+        existing.id,
+        { cost_price: cost },
+        user.id
+      );
+      if (error) {
+        setRowError((p) => ({ ...p, [key]: error.message }));
+        return false;
+      }
+      setCatalog((prev) =>
+        prev.map((p) =>
+          p.id === existing.id ? data ?? { ...p, cost_price: cost } : p
+        )
+      );
+    } else {
+      const { data, error } = await addProductToCloud(
+        { sku: row.article, name: row.name || row.article, cost_price: cost },
+        user.id
+      );
+      if (error) {
+        setRowError((p) => ({ ...p, [key]: error.message }));
+        return false;
+      }
+      if (data) setCatalog((prev) => [data, ...prev]);
+    }
+
+    // Товар уходит из таблицы — чистим его драфт.
+    setCostDraft((p) => {
+      const next = { ...p };
+      delete next[key];
+      return next;
+    });
+    return true;
+  }
+
+  // Сохранение одной строки (кнопка «Сохранить» в строке).
+  async function saveOne(row: BreakdownRow) {
+    if (savingKey || bulkSaving) return;
+    setSavingKey(normArticle(row.article));
+    await persistCost(row);
+    setSavingKey(null);
+  }
+
+  // Массовое сохранение всех заполненных строк (кнопка «Сохранить себестоимость»).
+  async function saveAllFilled() {
+    if (savingKey || bulkSaving) return;
+    const targets = missing.filter(
+      (r) => parseCostInput(costDraft[normArticle(r.article)] ?? "") !== null
+    );
+    if (targets.length === 0) return;
+    setBulkSaving(true);
+    // Последовательно — чтобы не словить гонок по каталогу/RLS.
+    for (const row of targets) {
+      // eslint-disable-next-line no-await-in-loop
+      await persistCost(row);
+    }
+    setBulkSaving(false);
+  }
 
   // ===== Итоги =====
   const totals = useMemo(() => {
@@ -907,9 +1021,11 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
 
           {missing.length > 0 && (
             <p className="pbm-hint">
-              Скачайте файл, заполните{" "}
-              <span className="pbm-hint-k">cost_price</span> — себестоимость за 1
-              штуку товара — и загрузите обратно в каталог товаров.
+              Введите <b>себестоимость одной единицы товара</b> — за 1 шт., не за
+              всю партию и не за оборот — и нажмите «Сохранить». Можно сохранить
+              все строки сразу. Как альтернатива — скачайте файл, заполните{" "}
+              <span className="pbm-hint-k">cost_price</span> и загрузите в «Каталог
+              товаров».
             </p>
           )}
 
@@ -921,44 +1037,125 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
               Все товары имеют себестоимость
             </div>
           ) : (
-            <div
-              className="pbm-table"
-              role="table"
-              aria-label="Товары без себестоимости"
-            >
-              <div className="pbm-thead" role="row">
-                <span role="columnheader">Артикул</span>
-                <span role="columnheader">Название</span>
-                <span role="columnheader" className="pbm-num">
-                  Выручка
-                </span>
-              </div>
-              {missing.map((r, i) => (
-                <div className="pbm-row" role="row" key={r.article + "#" + i}>
-                  <span
-                    className="pbm-cell pbm-c-art"
-                    role="cell"
-                    data-label="Артикул"
-                  >
-                    {r.article}
+            <>
+              <div
+                className="pbm-table"
+                role="table"
+                aria-label="Товары без себестоимости"
+              >
+                <div className="pbm-thead" role="row">
+                  <span role="columnheader">Артикул</span>
+                  <span role="columnheader">Название</span>
+                  <span role="columnheader" className="pbm-num">
+                    Выручка
                   </span>
-                  <span
-                    className="pbm-cell pbm-c-name"
-                    role="cell"
-                    data-label="Название"
-                  >
-                    {r.name}
+                  <span role="columnheader" className="pbm-num">
+                    Кол-во
                   </span>
-                  <span
-                    className="pbm-cell pbm-num"
-                    role="cell"
-                    data-label="Выручка"
-                  >
-                    {formatRub(r.revenue)}
+                  <span role="columnheader" className="pbm-cost-h">
+                    Себестоимость за 1 шт.
                   </span>
                 </div>
-              ))}
-            </div>
+                {missing.map((r, i) => {
+                  const key = normArticle(r.article);
+                  const saving = savingKey === key;
+                  const valid =
+                    parseCostInput(costDraft[key] ?? "") !== null;
+                  const err = rowError[key];
+                  return (
+                    <div className="pbm-row" role="row" key={key + "#" + i}>
+                      <span
+                        className="pbm-cell pbm-c-art"
+                        role="cell"
+                        data-label="Артикул"
+                      >
+                        {r.article}
+                      </span>
+                      <span
+                        className="pbm-cell pbm-c-name"
+                        role="cell"
+                        data-label="Название"
+                      >
+                        {r.name}
+                      </span>
+                      <span
+                        className="pbm-cell pbm-num"
+                        role="cell"
+                        data-label="Выручка"
+                      >
+                        {formatRub(r.revenue)}
+                      </span>
+                      <span
+                        className="pbm-cell pbm-num"
+                        role="cell"
+                        data-label="Кол-во"
+                      >
+                        {r.quantity}
+                      </span>
+                      <span
+                        className="pbm-cell pbm-c-cost"
+                        role="cell"
+                        data-label="Себестоимость за 1 шт."
+                      >
+                        <span className="pbm-cost-ctl">
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            className="pbm-cost-input"
+                            placeholder="за 1 шт."
+                            value={costDraft[key] ?? ""}
+                            disabled={saving || bulkSaving || !user}
+                            aria-label={`Себестоимость за 1 шт. для ${r.article}`}
+                            onChange={(e) =>
+                              setCostDraft((p) => ({
+                                ...p,
+                                [key]: e.target.value,
+                              }))
+                            }
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && valid) saveOne(r);
+                            }}
+                          />
+                          <button
+                            type="button"
+                            className="pbm-cost-save"
+                            onClick={() => saveOne(r)}
+                            disabled={saving || bulkSaving || !valid || !user}
+                          >
+                            {saving ? "…" : "Сохранить"}
+                          </button>
+                        </span>
+                        {err && <span className="pbm-cost-err">{err}</span>}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="pbm-bulk-bar">
+                <span className="pbm-bulk-note">
+                  Себестоимость — за 1 единицу товара.
+                </span>
+                <button
+                  type="button"
+                  className="pbm-bulk"
+                  onClick={saveAllFilled}
+                  disabled={
+                    bulkSaving ||
+                    savingKey !== null ||
+                    !user ||
+                    missing.every(
+                      (m) =>
+                        parseCostInput(
+                          costDraft[normArticle(m.article)] ?? ""
+                        ) === null
+                    )
+                  }
+                >
+                  {bulkSaving ? "Сохраняем…" : "Сохранить себестоимость"}
+                </button>
+              </div>
+            </>
           )}
         </section>
       )}
@@ -1291,7 +1488,7 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
         .pbm-thead,
         .pbm-row {
           display: grid;
-          grid-template-columns: 160px 1fr 140px;
+          grid-template-columns: 140px 1fr 110px 64px 224px;
           align-items: center;
           gap: 0.8rem;
           padding: 0.7rem 1rem;
@@ -1334,9 +1531,98 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
           font-size: 0.86rem;
           color: var(--txt);
         }
+        .pbm-cost-h {
+          text-align: left;
+        }
+        .pbm-c-cost {
+          display: flex;
+          flex-direction: column;
+          gap: 0.3rem;
+        }
+        .pbm-cost-ctl {
+          display: flex;
+          gap: 0.4rem;
+          align-items: stretch;
+        }
+        .pbm-cost-input {
+          width: 100%;
+          min-width: 0;
+          padding: 0.4rem 0.55rem;
+          border-radius: 8px;
+          border: 1px solid var(--edge);
+          background: rgba(0, 0, 0, 0.18);
+          color: var(--txt);
+          font-family: var(--mono);
+          font-size: 0.84rem;
+          outline: none;
+          transition: border-color 0.16s ease, box-shadow 0.16s ease;
+        }
+        .pbm-cost-input:focus {
+          border-color: var(--gold2);
+          box-shadow: 0 0 0 2px rgba(201, 168, 76, 0.18);
+        }
+        .pbm-cost-input:disabled {
+          opacity: 0.55;
+          cursor: not-allowed;
+        }
+        .pbm-cost-save {
+          flex: 0 0 auto;
+          padding: 0.4rem 0.7rem;
+          border-radius: 8px;
+          border: 1px solid var(--gold2);
+          background: rgba(201, 168, 76, 0.16);
+          color: var(--gold2);
+          font-weight: 700;
+          font-size: 0.78rem;
+          cursor: pointer;
+          white-space: nowrap;
+          transition: background 0.16s ease, opacity 0.16s ease;
+        }
+        .pbm-cost-save:hover:not(:disabled) {
+          background: rgba(201, 168, 76, 0.28);
+        }
+        .pbm-cost-save:disabled {
+          opacity: 0.45;
+          cursor: not-allowed;
+        }
+        .pbm-cost-err {
+          font-size: 0.72rem;
+          color: var(--red, #e5484d);
+        }
+        .pbm-bulk-bar {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 0.9rem;
+          flex-wrap: wrap;
+          margin-top: 1rem;
+        }
+        .pbm-bulk-note {
+          font-size: 0.78rem;
+          color: var(--txt3);
+        }
+        .pbm-bulk {
+          padding: 0.6rem 1.1rem;
+          border-radius: 10px;
+          border: 1px solid var(--gold2);
+          background: rgba(201, 168, 76, 0.18);
+          color: var(--gold2);
+          font-weight: 700;
+          font-size: 0.85rem;
+          cursor: pointer;
+          transition: background 0.16s ease, opacity 0.16s ease;
+        }
+        .pbm-bulk:hover:not(:disabled) {
+          background: rgba(201, 168, 76, 0.3);
+        }
+        .pbm-bulk:disabled {
+          opacity: 0.45;
+          cursor: not-allowed;
+        }
         .pbm-c-art::before,
         .pbm-c-name::before,
-        .pbm-cell.pbm-num::before {
+        .pbm-cell.pbm-num::before,
+        .pbm-c-cost::before {
           content: attr(data-label);
           display: none;
           font-size: 0.68rem;
@@ -1711,13 +1997,17 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
           .pbm-c-name {
             grid-column: 1 / -1;
           }
+          .pbm-c-cost {
+            grid-column: 1 / -1;
+          }
           .pbm-num {
             text-align: left;
             justify-self: start;
           }
           .pbm-c-art::before,
           .pbm-c-name::before,
-          .pbm-cell.pbm-num::before {
+          .pbm-cell.pbm-num::before,
+          .pbm-c-cost::before {
             display: block;
           }
 

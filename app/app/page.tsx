@@ -443,6 +443,11 @@ export default function AppPage() {
   const [profitInputs, setProfitInputs] = useState<ProfitInputs>({
     ...EMPTY_PROFIT,
   });
+  // Пользователь вручную правил поле «Себестоимость товара» в доп. расходах?
+  // Пока false — поле автоматически синхронизируется с суммарной COGS каталога
+  // (включая инлайн-сохранения в «Товары без себестоимости»). После ручной
+  // правки — true, и автосинк прекращается (ручное значение не затираем).
+  const [costPriceTouched, setCostPriceTouched] = useState(false);
   const [profitSaving, setProfitSaving] = useState(false);
   const [profitSaved, setProfitSaved] = useState(false);
   // Хэндл авто-сохранённой записи 3-файлового анализа, чтобы «Сохранить
@@ -454,6 +459,8 @@ export default function AppPage() {
   } | null>(null);
   const handleProfitInput = (key: keyof ProfitInputs, value: string) => {
     setProfitInputs((prev) => ({ ...prev, [key]: value }));
+    // Ручная правка «Себестоимость товара» → отключаем автосинк с COGS каталога.
+    if (key === "costPrice") setCostPriceTouched(true);
     // Любая правка расходов → разрешаем повторное сохранение нового результата.
     setProfitSaved(false);
   };
@@ -502,19 +509,21 @@ export default function AppPage() {
     };
   }, [combinedResult, profitInputs]);
 
-  // Автозаполнение «Себестоимость товара» суммой COGS из каталога, как только
-  // блок «Чистая прибыль по товарам» её посчитает (каталог cost_price × кол-во
-  // по сматченным SKU). Заполняем ТОЛЬКО пустое поле — ручные правки не
-  // затираем; 0/неизвестно (null) → не трогаем, поле остаётся ручным.
+  // Синхронизация «Себестоимость товара» с суммарной COGS каталога (cost_price ×
+  // кол-во по сматченным SKU), которую считает блок «Чистая прибыль по товарам».
+  // Пока пользователь не правил поле руками (costPriceTouched=false) — поле
+  // всегда отражает актуальную сумму, в т.ч. после инлайн-сохранения себестоимости
+  // в «Товары без себестоимости». После ручной правки автосинк прекращается, чтобы
+  // не затирать введённое значение. 0/неизвестно (null) → не трогаем.
   useEffect(() => {
     if (reportCogsTotal !== null && reportCogsTotal > 0) {
       setProfitInputs((prev) =>
-        prev.costPrice === ""
-          ? { ...prev, costPrice: String(Math.round(reportCogsTotal)) }
-          : prev
+        costPriceTouched
+          ? prev
+          : { ...prev, costPrice: String(Math.round(reportCogsTotal)) }
       );
     }
-  }, [reportCogsTotal]);
+  }, [reportCogsTotal, costPriceTouched]);
 
   /**
    * Сохранение ИТОГОВОЙ чистой прибыли (после себестоимости/налога/прочих
@@ -922,6 +931,9 @@ export default function AppPage() {
       salary: s(b.salary),
       other: s(b.other),
     });
+    // Восстановленная себестоимость — финальное значение пользователя; per-SKU
+    // строк нет (reportProducts=[]), автосинк с COGS не должен её трогать.
+    setCostPriceTouched(true);
     setShowProfitForm(true);
     setLastUploadCalc({ id: item.id, synced: item.synced });
     setSelectedId(item.id);
@@ -1368,6 +1380,7 @@ export default function AppPage() {
     setReportCogsTotal(null);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
+    setCostPriceTouched(false);
     setProfitSaving(false);
     setProfitSaved(false);
     setLastUploadCalc(null);
@@ -1527,6 +1540,8 @@ export default function AppPage() {
       ...EMPTY_PROFIT,
       ads: adsFromReport > 0 ? String(Math.round(adsFromReport)) : "",
     });
+    // Новый отчёт → поле «Себестоимость товара» снова под автосинком с COGS.
+    setCostPriceTouched(false);
 
     // Автозаполнение формы в manual mode (для last-mile проверки/правок).
     // Объединяем доход (revenue + loyaltyPayouts) и расходы (Ozon-комиссии).
