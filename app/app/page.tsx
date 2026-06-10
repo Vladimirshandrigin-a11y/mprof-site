@@ -3004,6 +3004,17 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   color:var(--txt);font-weight:500
 }
 .upload-3-row.subtotal .num{color:var(--txt)}
+.upload-3-note{
+  margin-top:1rem;padding:.85rem 1rem;border-radius:10px;
+  background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);
+  border-left:3px solid rgba(201,168,76,.55)
+}
+.upload-3-note-title{
+  font-size:.82rem;font-weight:700;color:var(--txt);margin-bottom:.35rem
+}
+.upload-3-note-text{
+  font-size:.78rem;line-height:1.5;color:var(--txt2);margin:0;font-weight:300
+}
 
 /* ===== Финальный калькулятор чистой прибыли ===== */
 .profit-calc{
@@ -5641,6 +5652,19 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     </span>
                   </div>
                 </div>
+                <div className="upload-3-note" role="note">
+                  <div className="upload-3-note-title">
+                    Почему сумма может отличаться от выплаты Ozon?
+                  </div>
+                  <p className="upload-3-note-text">
+                    M-PROF считает прибыль по отчёту реализации и УПД. Раздел
+                    «Выплаты» в личном кабинете Ozon показывает сумму будущего
+                    перечисления на расчётный счёт. Эти суммы могут отличаться
+                    из-за отсрочки выплат, резервов, факторинга, компенсаций,
+                    возвратов и переносов между периодами.
+                  </p>
+                </div>
+
                 <button
                   type="button"
                   className="upload-3-btn primary"
