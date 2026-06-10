@@ -294,7 +294,19 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
   // каталоге ИЛИ cost_price = 0. Для них чистая прибыль не считается (была бы
   // неточной). Производная выборка из rows — общий расчёт не меняет.
   const missing = useMemo(
-    () => rows.filter((r) => !r.hasCost),
+    () =>
+      rows
+        .filter((r) => !r.hasCost)
+        // Порядок отображения = как в Excel-выгрузке: сначала по названию,
+        // затем по артикулу (русская локаль). Похожие/одинаковые названия идут
+        // рядом, внутри группы — по article/sku. Стабильно (равные сохраняют
+        // исходный порядок). .filter() даёт новый массив → .sort() не мутирует
+        // rows. Строки НЕ объединяются; формулы/totals/общий расчёт не меняются.
+        .sort(
+          (a, b) =>
+            a.name.localeCompare(b.name, "ru") ||
+            a.article.localeCompare(b.article, "ru")
+        ),
     [rows]
   );
 
