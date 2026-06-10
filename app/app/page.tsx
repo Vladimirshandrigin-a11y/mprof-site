@@ -4511,17 +4511,26 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .hist-mp.ozon{border-color:rgba(61,123,255,.35);color:#7fb0ff;background:rgba(61,123,255,.08)}
 .hist-mp.wb{border-color:rgba(203,17,171,.35);color:#e878d6;background:rgba(203,17,171,.08)}
 .hist-info{flex:1;min-width:0}
-.hist-rev{font-size:.82rem;color:var(--txt);font-weight:500}
-.hist-period{font-family:var(--mono);font-size:.64rem;color:var(--txt2);margin-top:2px;letter-spacing:.02em}
+.hist-rev{font-size:.82rem;color:var(--txt);font-weight:600}
+.hist-period{font-family:var(--mono);font-size:.72rem;color:var(--gold2);font-weight:600;margin-top:3px;letter-spacing:.01em}
+.hist-revenue{font-size:.7rem;color:var(--txt2);font-weight:400;margin-top:3px}
 .hist-date{font-family:var(--mono);font-size:.62rem;color:var(--txt3);margin-top:1px}
-.hist-profit{font-family:var(--display);font-size:1.05rem;font-weight:700;letter-spacing:-.02em;flex-shrink:0;text-align:right}
+.hist-profit{font-family:var(--display);font-size:1.05rem;font-weight:700;letter-spacing:-.02em;flex-shrink:0;text-align:right;max-width:46%}
 .hist-profit.pos{color:var(--green)}
 .hist-profit.neg{color:var(--red)}
-.hist-profit .hm{display:block;font-family:var(--mono);font-size:.6rem;font-weight:400;color:var(--txt3);letter-spacing:.04em}
+.hist-profit-label{display:block;font-family:var(--mono);font-size:.56rem;font-weight:400;color:var(--txt2);letter-spacing:.03em;margin-bottom:2px;white-space:normal;line-height:1.25}
+.hist-profit-num{display:block;white-space:nowrap}
+.hist-profit .hm{display:block;font-family:var(--mono);font-size:.6rem;font-weight:400;color:var(--txt3);letter-spacing:.04em;margin-top:1px}
 .hist-del{flex-shrink:0;width:28px;height:28px;border-radius:8px;border:1px solid var(--edge2);
   background:transparent;color:var(--txt3);font-size:1.05rem;line-height:1;cursor:pointer;
   display:inline-flex;align-items:center;justify-content:center;transition:all .18s;padding:0}
 .hist-del:hover{border-color:rgba(224,85,102,.4);color:var(--red);background:rgba(224,85,102,.08)}
+@media(max-width:560px){
+  .hist-item{gap:.6rem;padding:.8rem 1rem}
+  .hist-profit{font-size:.95rem;max-width:42%}
+  .hist-profit-label{font-size:.54rem}
+  .hist-period{font-size:.68rem}
+}
 .stats-grid{
   display:grid;
   grid-template-columns:repeat(4,1fr);
@@ -6183,10 +6192,21 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             <div className="hist-list">
               {filteredHistory.map((h) => {
                 const removing = removingIds.has(h.id);
-                // Период отчёта Ozon из снапшота расчёта (ai_insights.reportPeriod).
-                // Ручные/старые записи без периода → null → «Период не указан».
-                const reportPeriod =
-                  asNetProfitBreakdown(h.aiInsights)?.reportPeriod ?? null;
+                // Разбор upload-расчёта из ai_insights. null → ручной/старый расчёт.
+                const breakdown = asNetProfitBreakdown(h.aiInsights);
+                const isReport = !!breakdown;
+                // Период отчёта Ozon. Нет периода → «Период не указан».
+                const reportPeriod = breakdown?.reportPeriod ?? null;
+                // Введена ли себестоимость → прибыль уже «чистая»; иначе «до себестоимости».
+                const hasCost = (breakdown?.costPrice ?? 0) > 0;
+                const mpName = h.marketplace === "ozon" ? "Ozon" : "WB";
+                const histTitle = isReport
+                  ? `Отчёт ${mpName}`
+                  : `Ручной расчёт ${mpName}`;
+                const profitLabel =
+                  isReport && !hasCost
+                    ? "Прибыль до себестоимости"
+                    : "Чистая прибыль";
                 return (
                   <div
                     className={
@@ -6202,19 +6222,25 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     </div>
 
                     <div className="hist-info">
-                      <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
+                      <div className="hist-rev">{histTitle}</div>
                       <div className="hist-period">
                         {reportPeriod
-                          ? `Период: ${reportPeriod}`
-                          : "Период не указан"}
+                          ? `Период отчёта: ${reportPeriod}`
+                          : "Период отчёта: не указан"}
+                      </div>
+                      <div className="hist-revenue">
+                        Выручка: {fmt(h.revenue)} ₽
                       </div>
                       <div className="hist-date">Создан: {h.date}</div>
                     </div>
 
                     <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
-                      {h.profit >= 0 ? "+" : "−"}
-                      {fmt(Math.abs(h.profit))} ₽
-                      <span className="hm">маржа {h.margin.toFixed(1)}%</span>
+                      <span className="hist-profit-label">{profitLabel}</span>
+                      <span className="hist-profit-num">
+                        {h.profit >= 0 ? "+" : "−"}
+                        {fmt(Math.abs(h.profit))} ₽
+                      </span>
+                      <span className="hm">Маржа: {h.margin.toFixed(1)}%</span>
                     </div>
 
                     <button
