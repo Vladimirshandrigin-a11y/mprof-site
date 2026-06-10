@@ -4512,6 +4512,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .hist-mp.wb{border-color:rgba(203,17,171,.35);color:#e878d6;background:rgba(203,17,171,.08)}
 .hist-info{flex:1;min-width:0}
 .hist-rev{font-size:.82rem;color:var(--txt);font-weight:500}
+.hist-period{font-family:var(--mono);font-size:.64rem;color:var(--txt2);margin-top:2px;letter-spacing:.02em}
 .hist-date{font-family:var(--mono);font-size:.62rem;color:var(--txt3);margin-top:1px}
 .hist-profit{font-family:var(--display);font-size:1.05rem;font-weight:700;letter-spacing:-.02em;flex-shrink:0;text-align:right}
 .hist-profit.pos{color:var(--green)}
@@ -6182,6 +6183,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             <div className="hist-list">
               {filteredHistory.map((h) => {
                 const removing = removingIds.has(h.id);
+                // Период отчёта Ozon из снапшота расчёта (ai_insights.reportPeriod).
+                // Ручные/старые записи без периода → null → «Период не указан».
+                const reportPeriod =
+                  asNetProfitBreakdown(h.aiInsights)?.reportPeriod ?? null;
                 return (
                   <div
                     className={
@@ -6198,7 +6203,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
                     <div className="hist-info">
                       <div className="hist-rev">Выручка {fmt(h.revenue)} ₽</div>
-                      <div className="hist-date">{h.date}</div>
+                      <div className="hist-period">
+                        {reportPeriod
+                          ? `Период: ${reportPeriod}`
+                          : "Период не указан"}
+                      </div>
+                      <div className="hist-date">Создан: {h.date}</div>
                     </div>
 
                     <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
