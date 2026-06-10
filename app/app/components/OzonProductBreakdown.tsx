@@ -287,26 +287,100 @@ export function OzonProductBreakdown({ products, estimate, user }: Props) {
     };
   }, [rows]);
 
-  // Выгрузка «Товары без себестоимости» в Excel: sku | name | revenue |
-  // cost_price. Колонка cost_price идёт ПУСТОЙ — её заполняет пользователь и
-  // загружает файл обратно в «Каталог товаров». Заголовок именно `cost_price`,
-  // чтобы импорт каталога распознал его (регэксп /cost[\s_]*price/).
+  // Выгрузка «Товары без себестоимости» в Excel. Лист «Без себестоимости»:
+  // sku | name | revenue | cost_price. Колонка cost_price идёт ПУСТОЙ — её
+  // заполняет пользователь (себестоимость ЗА 1 ШТУКУ) и загружает файл обратно
+  // в «Каталог товаров». Заголовок именно `cost_price`, чтобы импорт каталога
+  // распознал его (регэксп /cost[\s_]*price/).
+  //
+  // Оформление (жирная шапка, ширина колонок, автофильтр, формат рублей,
+  // подсветка колонки для ввода) делается через xlsx-js-style — это
+  // API-совместимый форк SheetJS, поддерживающий стили ячеек. Базовый `xlsx`
+  // (которым читает импорт каталога) стили НЕ пишет, поэтому здесь форк.
   async function handleExport() {
     if (missing.length === 0 || exporting) return;
     setExporting(true);
     try {
-      const XLSX = await import("xlsx");
-      const data = missing.map((r) => ({
+      const XLSX = await import("xlsx-js-style");
+
+      // 1) СОРТИРОВКА: сначала по названию, потом по артикулу (русская локаль),
+      //    чтобы одинаковые/похожие товары стояли рядом и группировались.
+      const sorted = [...missing].sort(
+        (a, b) =>
+          a.name.localeCompare(b.name, "ru") ||
+          a.article.localeCompare(b.article, "ru")
+      );
+
+      const data = sorted.map((r) => ({
         sku: r.article,
         name: r.name,
         revenue: r.revenue,
-        cost_price: "", // пустая ячейка для ручного ввода себестоимости
+        cost_price: "", // пустая ячейка для ручного ввода себестоимости за 1 шт.
       }));
+
       const ws = XLSX.utils.json_to_sheet(data, {
         header: ["sku", "name", "revenue", "cost_price"],
       });
+
+      const lastRow = data.length + 1; // +1 — строка заголовка
+      const RUB = '#,##0.00\\ "₽"'; // числовой формат рублей
+
+      // 2) Ширина колонок — чтобы названия не обрезались.
+      ws["!cols"] = [{ wch: 20 }, { wch: 46 }, { wch: 16 }, { wch: 18 }];
+
+      // 3) Автофильтр на шапку + данные.
+      ws["!autofilter"] = { ref: `A1:D${lastRow}` };
+
+      // 4) ЖИРНАЯ ШАПКА: тёмно-синий фон, белый жирный текст, по центру.
+      const headerStyle = {
+        font: { bold: true, sz: 12, color: { rgb: "FFFFFF" } },
+        fill: { fgColor: { rgb: "1F4E78" } },
+        alignment: { horizontal: "center", vertical: "center" },
+      };
+      for (const addr of ["A1", "B1", "C1", "D1"]) {
+        const cell = ws[addr];
+        if (cell) cell.s = headerStyle;
+      }
+
+      // 5) Данные: тонкая сетка; формат рублей на revenue и cost_price;
+      //    cost_price подсвечиваем мягко-жёлтым — это колонка для ввода.
+      const thin = { style: "thin", color: { rgb: "D9D9D9" } };
+      const grid = { top: thin, bottom: thin, left: thin, right: thin };
+      for (let r = 2; r <= lastRow; r++) {
+        for (const col of ["A", "B", "C", "D"]) {
+          const cell = ws[col + r];
+          if (!cell) continue;
+          if (col === "D") {
+            // колонка ввода cost_price: формат рублей + жёлтая подсветка
+            cell.z = RUB;
+            cell.s = { border: grid, fill: { fgColor: { rgb: "FFF7DD" } } };
+          } else {
+            if (col === "C") cell.z = RUB; // revenue — формат рублей
+            cell.s = { border: grid };
+          }
+        }
+      }
+
       const wb = XLSX.utils.book_new();
+      // ВАЖНО: лист с данными добавляем ПЕРВЫМ — импорт каталога читает
+      // wb.SheetNames[0]. «Инструкция» идёт ВТОРЫМ листом, чтобы не сломать импорт.
       XLSX.utils.book_append_sheet(wb, ws, "Без себестоимости");
+
+      // 6) Отдельный лист «Инструкция» — короткая памятка для продавца.
+      const instr = XLSX.utils.aoa_to_sheet([
+        ["Как заполнить себестоимость"],
+        [""],
+        ["Заполните колонку cost_price — это себестоимость ОДНОЙ единицы товара (за 1 штуку)."],
+        ["Не указывайте себестоимость всей партии или всей выручки."],
+        ["Колонка revenue (выручка) дана только для ориентира — менять её не нужно."],
+        ["После заполнения сохраните файл и загрузите его обратно в раздел «Каталог товаров»."],
+        [""],
+        ["Пример: если 1 штука товара обходится вам в 250 ₽ — впишите в cost_price число 250."],
+      ]);
+      instr["!cols"] = [{ wch: 96 }];
+      if (instr["A1"]) instr["A1"].s = { font: { bold: true, sz: 14 } };
+      XLSX.utils.book_append_sheet(wb, instr, "Инструкция");
+
       XLSX.writeFile(wb, "tovary-bez-sebestoimosti.xlsx");
     } catch {
       // Выгрузка не критична: при сбое файл просто не скачается.
@@ -821,9 +895,9 @@ export function OzonProductBreakdown({ products, estimate, user }: Props) {
 
           {missing.length > 0 && (
             <p className="pbm-hint">
-              Скачайте файл, заполните колонку{" "}
-              <span className="pbm-hint-k">cost_price</span> и загрузите его
-              обратно в «Каталог товаров».
+              Скачайте файл, заполните{" "}
+              <span className="pbm-hint-k">cost_price</span> — себестоимость за 1
+              штуку товара — и загрузите обратно в каталог товаров.
             </p>
           )}
 
