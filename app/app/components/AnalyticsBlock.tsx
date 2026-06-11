@@ -17,6 +17,9 @@ interface AnalyticsCalc {
   tax: number;
   other: number;
   date: string;
+  /** ai_insights расчёта (net-profit-3file breakdown) — нужно лишь чтобы выбрать
+   *  подпись прибыли: «Чистая прибыль» vs «Прибыль до себестоимости». */
+  aiInsights?: unknown;
 }
 
 interface Props {
@@ -59,13 +62,15 @@ interface DemoRecent {
   profit: number;
   margin: number;
   date: string;
+  /** Подпись над суммой: «Чистая прибыль» или «Прибыль до себестоимости». */
+  profitLabel: string;
 }
 
 const DEMO_RECENT: DemoRecent[] = [
-  { product: "Куртка зимняя унисекс", marketplace: "ozon", profit: 24580, margin: 22.4, date: "сегодня" },
-  { product: "Кроссовки беговые",     marketplace: "wb",   profit: 18920, margin: 19.8, date: "вчера" },
-  { product: "Платье летнее",         marketplace: "ozon", profit: 12450, margin: 17.2, date: "2 дня назад" },
-  { product: "Рюкзак городской",      marketplace: "wb",   profit:  9870, margin: 21.0, date: "3 дня назад" },
+  { product: "Куртка зимняя унисекс", marketplace: "ozon", profit: 24580, margin: 22.4, date: "сегодня",     profitLabel: "Чистая прибыль" },
+  { product: "Кроссовки беговые",     marketplace: "wb",   profit: 18920, margin: 19.8, date: "вчера",       profitLabel: "Чистая прибыль" },
+  { product: "Платье летнее",         marketplace: "ozon", profit: 12450, margin: 17.2, date: "2 дня назад", profitLabel: "Чистая прибыль" },
+  { product: "Рюкзак городской",      marketplace: "wb",   profit:  9870, margin: 21.0, date: "3 дня назад", profitLabel: "Чистая прибыль" },
 ];
 
 /* ---------- ICONS ---------- */
@@ -189,6 +194,28 @@ const fmt = (n: number) =>
 
 const fmtSigned = (n: number) =>
   (n >= 0 ? "+" : "−") + fmt(Math.abs(n));
+
+/**
+ * Подпись к сумме прибыли в «Последних расчётах». Зеркалит логику детальной
+ * «Истории расчётов» (page.tsx): «Прибыль до себестоимости» показываем ТОЛЬКО
+ * для отчёта (net-profit-3file) без введённой себестоимости (costPrice ≤ 0).
+ * Во всех остальных случаях (ручной расчёт, или отчёт с себестоимостью) число
+ * уже финальное → «Чистая прибыль». Старые записи без ai_insights → безопасный
+ * дефолт «Чистая прибыль». Формулы не трогаем — берём готовое значение profit.
+ */
+function profitLabelFor(aiInsights: unknown): string {
+  if (aiInsights && typeof aiInsights === "object") {
+    const o = aiInsights as Record<string, unknown>;
+    if (o.kind === "net-profit-3file") {
+      const cp =
+        typeof o.costPrice === "number" && Number.isFinite(o.costPrice)
+          ? o.costPrice
+          : 0;
+      if (cp <= 0) return "Прибыль до себестоимости";
+    }
+  }
+  return "Чистая прибыль";
+}
 
 function computeExpenseBreakdown(history: AnalyticsCalc[]): ExpenseSegment[] {
   const totals = history.reduce(
@@ -1119,6 +1146,7 @@ export function AnalyticsBlock({
           profit: h.profit,
           margin: h.margin,
           date: h.date,
+          profitLabel: profitLabelFor(h.aiInsights),
         }))
       : DEMO_RECENT;
 
@@ -1798,6 +1826,9 @@ export function AnalyticsBlock({
           font-weight:600;text-transform:uppercase}
         .rc-mp.ozon{border-color:rgba(61,123,255,.45);color:#9ec6ff;background:rgba(61,123,255,.1)}
         .rc-mp.wb{border-color:rgba(203,17,171,.45);color:#f0a4e6;background:rgba(203,17,171,.1)}
+        .rc-profit-wrap{display:flex;flex-direction:column;gap:.2rem}
+        .rc-profit-label{font-family:'DM Mono',monospace;font-size:.54rem;letter-spacing:.07em;
+          text-transform:uppercase;color:#7C8DB5;line-height:1}
         .rc-profit{font-family:'Playfair Display',Georgia,serif;font-size:1.1rem;font-weight:700;
           letter-spacing:-.022em;line-height:1}
         .rc-profit.pos{color:#2ECC8A}
@@ -2257,8 +2288,11 @@ export function AnalyticsBlock({
                     {r.marketplace === "ozon" ? "Ozon" : "WB"}
                   </span>
                 </div>
-                <div className={"rc-profit " + (r.profit >= 0 ? "pos" : "neg")}>
-                  {fmtSigned(r.profit)} ₽
+                <div className="rc-profit-wrap">
+                  <span className="rc-profit-label">{r.profitLabel}</span>
+                  <div className={"rc-profit " + (r.profit >= 0 ? "pos" : "neg")}>
+                    {fmtSigned(r.profit)} ₽
+                  </div>
                 </div>
                 <div className="rc-meta">
                   <span className="mar">маржа {r.margin.toFixed(1)}%</span>
