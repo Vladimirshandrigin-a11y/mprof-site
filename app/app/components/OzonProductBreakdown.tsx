@@ -117,6 +117,12 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
   const [exporting, setExporting] = useState(false);
   const [exportingAnalytics, setExportingAnalytics] = useState(false);
 
+  // Раскрытие таблицы товаров в блоке «Чистая прибыль по товарам».
+  // Только локальное UI-состояние (без Supabase): по умолчанию таблица
+  // свёрнута, чтобы сводка и итоговые карточки были видны сразу; полную
+  // таблицу пользователь раскрывает по кнопке.
+  const [tableOpen, setTableOpen] = useState(false);
+
   // Инлайн-ввод себестоимости в блоке «Товары без себестоимости».
   // costDraft — значения полей ввода по нормализованному артикулу.
   const [costDraft, setCostDraft] = useState<Record<string, string>>({});
@@ -636,83 +642,102 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
             </div>
           </div>
 
-          {/* Таблица результатов */}
-          <div
-            className="pb-table"
-            role="table"
-            aria-label="Чистая прибыль по товарам"
+          {/* Кнопка раскрытия таблицы товаров */}
+          <button
+            type="button"
+            className={"pb-toggle" + (tableOpen ? " open" : "")}
+            aria-expanded={tableOpen}
+            aria-controls="pb-products-table"
+            onClick={() => setTableOpen((v) => !v)}
           >
-            <div className="pb-thead" role="row">
-              <span role="columnheader">Артикул</span>
-              <span role="columnheader">Товар</span>
-              <span role="columnheader" className="pb-num">
-                Выручка
-              </span>
-              <span role="columnheader" className="pb-num">
-                Себестоимость
-              </span>
-              <span role="columnheader" className="pb-num">
-                Чистая прибыль
-              </span>
-              <span role="columnheader" className="pb-num">
-                Чистая маржа
-              </span>
-            </div>
-            {rows.map((r, i) => (
+            {tableOpen ? "Скрыть товары" : "Показать товары"}
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+
+          {/* Таблица результатов — сворачиваемая */}
+          <div className={"pb-collapse" + (tableOpen ? " open" : "")}>
+            <div className="pb-collapse-inner">
               <div
-                className={"pb-row" + (r.hasCost ? "" : " pb-row-nocost")}
-                role="row"
-                key={r.article + "#" + i}
+                id="pb-products-table"
+                className="pb-table"
+                role="table"
+                aria-label="Чистая прибыль по товарам"
               >
-                <span className="pb-cell pb-c-art" role="cell" data-label="Артикул">
-                  {r.article}
-                </span>
-                <span className="pb-cell pb-c-name" role="cell" data-label="Товар">
-                  {r.name}
-                  <i className="pb-qty">{r.quantity} шт</i>
-                </span>
-                <span className="pb-cell pb-num" role="cell" data-label="Выручка">
-                  {formatRub(r.revenue)}
-                </span>
-                <span
-                  className="pb-cell pb-num"
-                  role="cell"
-                  data-label="Себестоимость"
-                >
-                  {r.hasCost ? (
-                    formatRub(r.cogs ?? 0)
-                  ) : (
-                    <span className="pb-nocost">Не указана</span>
-                  )}
-                </span>
-                <span
-                  className="pb-cell pb-num"
-                  role="cell"
-                  data-label="Чистая прибыль"
-                >
-                  {r.profit === null ? (
-                    <span className="pb-dash">—</span>
-                  ) : (
-                    <span className={r.profit >= 0 ? "pos" : "neg"}>
-                      {formatSignedRub(r.profit)}
+                <div className="pb-thead" role="row">
+                  <span role="columnheader">Артикул</span>
+                  <span role="columnheader">Товар</span>
+                  <span role="columnheader" className="pb-num">
+                    Выручка
+                  </span>
+                  <span role="columnheader" className="pb-num">
+                    Себестоимость
+                  </span>
+                  <span role="columnheader" className="pb-num">
+                    Чистая прибыль
+                  </span>
+                  <span role="columnheader" className="pb-num">
+                    Чистая маржа
+                  </span>
+                </div>
+                {rows.map((r, i) => (
+                  <div
+                    className={"pb-row" + (r.hasCost ? "" : " pb-row-nocost")}
+                    role="row"
+                    key={r.article + "#" + i}
+                  >
+                    <span className="pb-cell pb-c-art" role="cell" data-label="Артикул">
+                      {r.article}
                     </span>
-                  )}
-                </span>
-                <span
-                  className="pb-cell pb-num"
-                  role="cell"
-                  data-label="Чистая маржа"
-                >
-                  {r.margin === null ? (
-                    <span className="pb-dash">—</span>
-                  ) : (
-                    <span className={r.margin >= 0 ? "pos" : "neg"}>
-                      {r.margin.toFixed(1)}%
+                    <span className="pb-cell pb-c-name" role="cell" data-label="Товар">
+                      {r.name}
+                      <i className="pb-qty">{r.quantity} шт</i>
                     </span>
-                  )}
-                </span>
+                    <span className="pb-cell pb-num" role="cell" data-label="Выручка">
+                      {formatRub(r.revenue)}
+                    </span>
+                    <span
+                      className="pb-cell pb-num"
+                      role="cell"
+                      data-label="Себестоимость"
+                    >
+                      {r.hasCost ? (
+                        formatRub(r.cogs ?? 0)
+                      ) : (
+                        <span className="pb-nocost">Не указана</span>
+                      )}
+                    </span>
+                    <span
+                      className="pb-cell pb-num"
+                      role="cell"
+                      data-label="Чистая прибыль"
+                    >
+                      {r.profit === null ? (
+                        <span className="pb-dash">—</span>
+                      ) : (
+                        <span className={r.profit >= 0 ? "pos" : "neg"}>
+                          {formatSignedRub(r.profit)}
+                        </span>
+                      )}
+                    </span>
+                    <span
+                      className="pb-cell pb-num"
+                      role="cell"
+                      data-label="Чистая маржа"
+                    >
+                      {r.margin === null ? (
+                        <span className="pb-dash">—</span>
+                      ) : (
+                        <span className={r.margin >= 0 ? "pos" : "neg"}>
+                          {r.margin.toFixed(1)}%
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                ))}
               </div>
-            ))}
+            </div>
           </div>
         </>
       )}
@@ -1271,6 +1296,59 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
         .pb-chip-v.neg,
         .neg {
           color: var(--red);
+        }
+
+        .pb-toggle {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          width: 100%;
+          min-height: 46px;
+          margin-top: 1.1rem;
+          padding: 0 18px;
+          font-family: var(--sans);
+          font-size: 0.88rem;
+          font-weight: 600;
+          color: var(--txt2);
+          cursor: pointer;
+          border: 1px solid var(--edge2);
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.03);
+          transition: color 0.18s ease, border-color 0.18s ease,
+            background 0.18s ease;
+        }
+        .pb-toggle:hover {
+          color: var(--gold2);
+          border-color: var(--gold);
+          background: var(--gold-bg);
+        }
+        .pb-toggle svg {
+          width: 16px;
+          height: 16px;
+          stroke: currentColor;
+          stroke-width: 2.2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          transition: transform 0.3s ease;
+        }
+        .pb-toggle.open svg {
+          transform: rotate(180deg);
+        }
+        /* Плавное сворачивание: grid 0fr → 1fr, контент скрывается overflow.
+           Расчёты не трогаются — строки всегда в DOM, меняется только высота. */
+        .pb-collapse {
+          display: grid;
+          grid-template-rows: 0fr;
+          transition: grid-template-rows 0.32s ease;
+        }
+        .pb-collapse.open {
+          grid-template-rows: 1fr;
+        }
+        .pb-collapse-inner {
+          overflow: hidden;
+          min-height: 0;
         }
 
         .pb-table {
