@@ -65,15 +65,6 @@ interface ImportResult {
   errorSamples: string[];
 }
 
-function formatRub(n: number): string {
-  return (
-    n.toLocaleString("ru-RU", {
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 2,
-    }) + " ₽"
-  );
-}
-
 // "1 234,56" / "1234.56" / "1234" → number; пустая/некорректная/отрицательная → null.
 function parseCost(raw: string): number | null {
   const cleaned = raw.replace(/\s/g, "").replace(",", ".");
@@ -118,6 +109,14 @@ export function ProductCatalog({ user, showToast }: Props) {
   const [importing, setImporting] = useState(false);
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Inline-редактирование себестоимости прямо в строке таблицы каталога.
+  // costDraft — введённый текст по id товара (контролируемый input);
+  // costSavingId — id строки, которая сейчас сохраняется (блокирует кнопку);
+  // costErr — текст ошибки по id товара (показывается под полем).
+  const [costDraft, setCostDraft] = useState<Record<string, string>>({});
+  const [costSavingId, setCostSavingId] = useState<string | null>(null);
+  const [costErr, setCostErr] = useState<Record<string, string>>({});
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -214,6 +213,74 @@ export function ProductCatalog({ user, showToast }: Props) {
     }
     showToast("Товар удалён", "ok");
     setProducts((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  // --- Inline-редактирование себестоимости в строке -----------------------
+  // Меняем черновик строки и сбрасываем её ошибку (если была).
+  function onCostDraftChange(id: string, value: string) {
+    setCostDraft((d) => ({ ...d, [id]: value }));
+    setCostErr((e) => {
+      if (!e[id]) return e;
+      const next = { ...e };
+      delete next[id];
+      return next;
+    });
+  }
+
+  // Сохранить себестоимость одной строки. Товар всегда уже есть в каталоге
+  // (это его строка) → используем существующую updateProductInCloud, без
+  // addProductToCloud и без изменения schema. Локальный state обновляется
+  // точечно, без reload; сортировка не меняется (cost не входит в ключ).
+  async function saveCost(p: Product) {
+    if (costSavingId === p.id) return; // защита от двойного клика
+    const raw = costDraft[p.id] ?? String(p.cost_price ?? "");
+    const parsed = parseCost(raw); // запятая → точка внутри parseCost
+    // Требование: принимать только число строго больше 0.
+    if (parsed === null || parsed <= 0) {
+      setCostErr((e) => ({ ...e, [p.id]: "Введите число больше 0" }));
+      return;
+    }
+    // Значение не изменилось — сеть не дёргаем, просто подтверждаем.
+    if (parsed === p.cost_price) {
+      setCostErr((e) => {
+        const next = { ...e };
+        delete next[p.id];
+        return next;
+      });
+      showToast("Себестоимость сохранена", "ok");
+      return;
+    }
+
+    setCostSavingId(p.id);
+    const { data, error } = await updateProductInCloud(
+      p.id,
+      { cost_price: parsed },
+      user.id
+    );
+    setCostSavingId(null);
+
+    if (error) {
+      setCostErr((e) => ({ ...e, [p.id]: error.message }));
+      showToast("Не удалось сохранить: " + error.message, "err");
+      return;
+    }
+
+    // Обновляем только эту строку каталога в локальном state.
+    setProducts((prev) =>
+      prev.map((x) => (x.id === p.id ? data ?? { ...x, cost_price: parsed } : x))
+    );
+    // Чистим черновик и ошибку — поле снова берёт значение из state.
+    setCostDraft((d) => {
+      const next = { ...d };
+      delete next[p.id];
+      return next;
+    });
+    setCostErr((e) => {
+      const next = { ...e };
+      delete next[p.id];
+      return next;
+    });
+    showToast("Себестоимость сохранена", "ok");
   }
 
   // --- Массовый импорт из Excel -------------------------------------------
@@ -643,9 +710,45 @@ export function ProductCatalog({ user, showToast }: Props) {
               <span
                 className="pc-cell pc-c-cost"
                 role="cell"
-                data-label="Себестоимость"
+                data-label="Себестоимость за 1 шт."
               >
-                {formatRub(p.cost_price)}
+                <span className="pc-cost-edit">
+                  <span className="pc-cost-input-wrap">
+                    <input
+                      className={`pc-cost-input${
+                        costErr[p.id] ? " has-err" : ""
+                      }`}
+                      value={costDraft[p.id] ?? String(p.cost_price ?? "")}
+                      inputMode="decimal"
+                      aria-label="Себестоимость за 1 шт."
+                      placeholder="Например, 120"
+                      disabled={costSavingId === p.id}
+                      onChange={(e) => onCostDraftChange(p.id, e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          saveCost(p);
+                        }
+                      }}
+                    />
+                    <span className="pc-cost-rub" aria-hidden="true">
+                      ₽
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    className="pc-cost-save"
+                    disabled={costSavingId === p.id}
+                    onClick={() => saveCost(p)}
+                  >
+                    {costSavingId === p.id ? "…" : "Сохранить"}
+                  </button>
+                </span>
+                {costErr[p.id] && (
+                  <span className="pc-cost-err" role="alert">
+                    {costErr[p.id]}
+                  </span>
+                )}
               </span>
               <span className="pc-cell pc-c-act" role="cell">
                 {deletingId === p.id ? (
@@ -1036,7 +1139,7 @@ export function ProductCatalog({ user, showToast }: Props) {
         .pc-thead,
         .pc-row {
           display: grid;
-          grid-template-columns: 150px 1fr 160px 110px;
+          grid-template-columns: 130px minmax(0, 1fr) 240px 110px;
           align-items: center;
           gap: 0.8rem;
           padding: 0.7rem 1rem;
@@ -1077,6 +1180,91 @@ export function ProductCatalog({ user, showToast }: Props) {
           font-family: var(--mono);
           font-weight: 500;
           color: var(--gold2);
+          display: flex;
+          flex-direction: column;
+          align-items: stretch;
+        }
+        .pc-cost-edit {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          width: 100%;
+        }
+        .pc-cost-input-wrap {
+          position: relative;
+          flex: 1;
+          min-width: 0;
+        }
+        .pc-cost-input {
+          width: 100%;
+          background: rgba(255, 255, 255, 0.04);
+          border: 1px solid var(--edge2);
+          border-radius: 9px;
+          padding: 8px 24px 8px 11px;
+          font-family: var(--mono);
+          font-size: 0.86rem;
+          font-weight: 500;
+          color: var(--gold2);
+          transition: border-color 0.2s ease, box-shadow 0.2s ease;
+          outline: none;
+        }
+        .pc-cost-input::placeholder {
+          color: var(--txt3);
+          font-family: var(--sans);
+          font-weight: 400;
+        }
+        .pc-cost-input:focus {
+          border-color: var(--gold);
+          box-shadow: 0 0 0 3px rgba(201, 168, 76, 0.14);
+        }
+        .pc-cost-input:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+        .pc-cost-input.has-err {
+          border-color: rgba(224, 85, 102, 0.6);
+        }
+        .pc-cost-rub {
+          position: absolute;
+          right: 9px;
+          top: 50%;
+          transform: translateY(-50%);
+          font-family: var(--mono);
+          font-size: 0.8rem;
+          color: var(--txt3);
+          pointer-events: none;
+        }
+        .pc-cost-save {
+          flex: none;
+          min-height: 36px;
+          padding: 0 12px;
+          border: 1px solid var(--edge2);
+          border-radius: 9px;
+          background: rgba(255, 255, 255, 0.03);
+          color: var(--txt2);
+          font-family: var(--sans);
+          font-size: 0.8rem;
+          font-weight: 700;
+          cursor: pointer;
+          white-space: nowrap;
+          transition: color 0.18s ease, border-color 0.18s ease,
+            background 0.18s ease;
+        }
+        .pc-cost-save:hover:not(:disabled) {
+          color: var(--gold2);
+          border-color: var(--gold);
+          background: var(--gold-bg);
+        }
+        .pc-cost-save:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+        .pc-cost-err {
+          margin-top: 5px;
+          font-size: 0.74rem;
+          font-family: var(--sans);
+          font-weight: 500;
+          color: var(--red);
         }
         .pc-c-act {
           display: flex;
@@ -1284,14 +1472,16 @@ export function ProductCatalog({ user, showToast }: Props) {
             justify-content: flex-start;
             margin-top: 0.2rem;
           }
-          .pc-input {
+          .pc-input,
+          .pc-cost-input {
             font-size: 16px;
           }
           .pc-icon {
             width: 44px;
             height: 44px;
           }
-          .pc-mini {
+          .pc-mini,
+          .pc-cost-save {
             min-height: 44px;
           }
         }
