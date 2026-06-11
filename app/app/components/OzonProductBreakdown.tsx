@@ -123,6 +123,12 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
   // таблицу пользователь раскрывает по кнопке.
   const [tableOpen, setTableOpen] = useState(false);
 
+  // Раскрытие списков аналитики «Самые прибыльные товары» и «Товары в минус».
+  // Тоже только локальное UI-состояние, по умолчанию свёрнуто — по аналогии с
+  // таблицей выше. На расчёты (topProfitable / topLosses) не влияет.
+  const [profitableOpen, setProfitableOpen] = useState(false);
+  const [lossesOpen, setLossesOpen] = useState(false);
+
   // Инлайн-ввод себестоимости в блоке «Товары без себестоимости».
   // costDraft — значения полей ввода по нормализованному артикулу.
   const [costDraft, setCostDraft] = useState<Record<string, string>>({});
@@ -875,68 +881,95 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
               {/* Самые прибыльные */}
               <div className="pba-section">
                 <h3 className="pba-h3">Самые прибыльные товары</h3>
-                <div
-                  className="pba-table"
-                  role="table"
-                  aria-label="Самые прибыльные товары"
-                >
-                  <div className="pba-thead" role="row">
-                    <span role="columnheader">Артикул</span>
-                    <span role="columnheader">Название</span>
-                    <span role="columnheader" className="pba-num">
-                      Выручка
-                    </span>
-                    <span role="columnheader" className="pba-num">
-                      Чистая прибыль
-                    </span>
-                    <span role="columnheader" className="pba-num">
-                      Чистая маржа
-                    </span>
-                  </div>
-                  {topProfitable.map((r, i) => (
-                    <div className="pba-row" role="row" key={r.article + "#" + i}>
-                      <span
-                        className="pba-cell pba-c-art"
-                        role="cell"
-                        data-label="Артикул"
-                      >
-                        {r.article}
-                      </span>
-                      <span
-                        className="pba-cell pba-c-name"
-                        role="cell"
-                        data-label="Название"
-                      >
-                        {r.name}
-                      </span>
-                      <span
-                        className="pba-cell pba-num"
-                        role="cell"
-                        data-label="Выручка"
-                      >
-                        {formatRub(r.revenue)}
-                      </span>
-                      <span
-                        className="pba-cell pba-num"
-                        role="cell"
-                        data-label="Чистая прибыль"
-                      >
-                        <span className={(r.profit ?? 0) >= 0 ? "pos" : "neg"}>
-                          {formatSignedRub(r.profit ?? 0)}
-                        </span>
-                      </span>
-                      <span
-                        className="pba-cell pba-num"
-                        role="cell"
-                        data-label="Чистая маржа"
-                      >
-                        <span className={(r.margin ?? 0) >= 0 ? "pos" : "neg"}>
-                          {(r.margin ?? 0).toFixed(1)}%
-                        </span>
-                      </span>
+                {topProfitable.length === 0 ? (
+                  <div className="pba-hero-empty">Нет данных</div>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className={"pb-toggle" + (profitableOpen ? " open" : "")}
+                      aria-expanded={profitableOpen}
+                      aria-controls="pba-profitable-table"
+                      onClick={() => setProfitableOpen((v) => !v)}
+                    >
+                      {profitableOpen
+                        ? "Скрыть прибыльные товары"
+                        : "Показать прибыльные товары"}
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M6 9l6 6 6-6" />
+                      </svg>
+                    </button>
+                    <div
+                      className={"pb-collapse" + (profitableOpen ? " open" : "")}
+                    >
+                      <div className="pb-collapse-inner">
+                        <div
+                          id="pba-profitable-table"
+                          className="pba-table"
+                          role="table"
+                          aria-label="Самые прибыльные товары"
+                        >
+                          <div className="pba-thead" role="row">
+                            <span role="columnheader">Артикул</span>
+                            <span role="columnheader">Название</span>
+                            <span role="columnheader" className="pba-num">
+                              Выручка
+                            </span>
+                            <span role="columnheader" className="pba-num">
+                              Чистая прибыль
+                            </span>
+                            <span role="columnheader" className="pba-num">
+                              Чистая маржа
+                            </span>
+                          </div>
+                          {topProfitable.map((r, i) => (
+                            <div className="pba-row" role="row" key={r.article + "#" + i}>
+                              <span
+                                className="pba-cell pba-c-art"
+                                role="cell"
+                                data-label="Артикул"
+                              >
+                                {r.article}
+                              </span>
+                              <span
+                                className="pba-cell pba-c-name"
+                                role="cell"
+                                data-label="Название"
+                              >
+                                {r.name}
+                              </span>
+                              <span
+                                className="pba-cell pba-num"
+                                role="cell"
+                                data-label="Выручка"
+                              >
+                                {formatRub(r.revenue)}
+                              </span>
+                              <span
+                                className="pba-cell pba-num"
+                                role="cell"
+                                data-label="Чистая прибыль"
+                              >
+                                <span className={(r.profit ?? 0) >= 0 ? "pos" : "neg"}>
+                                  {formatSignedRub(r.profit ?? 0)}
+                                </span>
+                              </span>
+                              <span
+                                className="pba-cell pba-num"
+                                role="cell"
+                                data-label="Чистая маржа"
+                              >
+                                <span className={(r.margin ?? 0) >= 0 ? "pos" : "neg"}>
+                                  {(r.margin ?? 0).toFixed(1)}%
+                                </span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
                     </div>
-                  ))}
-                </div>
+                  </>
+                )}
               </div>
 
               {/* Товары в минус */}
@@ -950,72 +983,93 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
                     Убыточных товаров не найдено
                   </div>
                 ) : (
-                  <div
-                    className="pba-table"
-                    role="table"
-                    aria-label="Товары в минус"
-                  >
-                    <div className="pba-thead" role="row">
-                      <span role="columnheader">Артикул</span>
-                      <span role="columnheader">Название</span>
-                      <span role="columnheader" className="pba-num">
-                        Выручка
-                      </span>
-                      <span role="columnheader" className="pba-num">
-                        Прибыль
-                      </span>
-                      <span role="columnheader" className="pba-num">
-                        Маржа
-                      </span>
-                    </div>
-                    {topLosses.map((r, i) => (
-                      <div
-                        className="pba-row"
-                        role="row"
-                        key={r.article + "#" + i}
-                      >
-                        <span
-                          className="pba-cell pba-c-art"
-                          role="cell"
-                          data-label="Артикул"
+                  <>
+                    <button
+                      type="button"
+                      className={"pb-toggle" + (lossesOpen ? " open" : "")}
+                      aria-expanded={lossesOpen}
+                      aria-controls="pba-losses-table"
+                      onClick={() => setLossesOpen((v) => !v)}
+                    >
+                      {lossesOpen
+                        ? "Скрыть товары в минус"
+                        : "Показать товары в минус"}
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M6 9l6 6 6-6" />
+                      </svg>
+                    </button>
+                    <div className={"pb-collapse" + (lossesOpen ? " open" : "")}>
+                      <div className="pb-collapse-inner">
+                        <div
+                          id="pba-losses-table"
+                          className="pba-table"
+                          role="table"
+                          aria-label="Товары в минус"
                         >
-                          {r.article}
-                        </span>
-                        <span
-                          className="pba-cell pba-c-name"
-                          role="cell"
-                          data-label="Название"
-                        >
-                          {r.name}
-                        </span>
-                        <span
-                          className="pba-cell pba-num"
-                          role="cell"
-                          data-label="Выручка"
-                        >
-                          {formatRub(r.revenue)}
-                        </span>
-                        <span
-                          className="pba-cell pba-num"
-                          role="cell"
-                          data-label="Чистая прибыль"
-                        >
-                          <span className="neg">
-                            {formatSignedRub(r.profit ?? 0)}
-                          </span>
-                        </span>
-                        <span
-                          className="pba-cell pba-num"
-                          role="cell"
-                          data-label="Чистая маржа"
-                        >
-                          <span className="neg">
-                            {(r.margin ?? 0).toFixed(1)}%
-                          </span>
-                        </span>
+                          <div className="pba-thead" role="row">
+                            <span role="columnheader">Артикул</span>
+                            <span role="columnheader">Название</span>
+                            <span role="columnheader" className="pba-num">
+                              Выручка
+                            </span>
+                            <span role="columnheader" className="pba-num">
+                              Прибыль
+                            </span>
+                            <span role="columnheader" className="pba-num">
+                              Маржа
+                            </span>
+                          </div>
+                          {topLosses.map((r, i) => (
+                            <div
+                              className="pba-row"
+                              role="row"
+                              key={r.article + "#" + i}
+                            >
+                              <span
+                                className="pba-cell pba-c-art"
+                                role="cell"
+                                data-label="Артикул"
+                              >
+                                {r.article}
+                              </span>
+                              <span
+                                className="pba-cell pba-c-name"
+                                role="cell"
+                                data-label="Название"
+                              >
+                                {r.name}
+                              </span>
+                              <span
+                                className="pba-cell pba-num"
+                                role="cell"
+                                data-label="Выручка"
+                              >
+                                {formatRub(r.revenue)}
+                              </span>
+                              <span
+                                className="pba-cell pba-num"
+                                role="cell"
+                                data-label="Чистая прибыль"
+                              >
+                                <span className="neg">
+                                  {formatSignedRub(r.profit ?? 0)}
+                                </span>
+                              </span>
+                              <span
+                                className="pba-cell pba-num"
+                                role="cell"
+                                data-label="Чистая маржа"
+                              >
+                                <span className="neg">
+                                  {(r.margin ?? 0).toFixed(1)}%
+                                </span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                    ))}
-                  </div>
+                    </div>
+                  </>
                 )}
               </div>
             </>
@@ -1993,6 +2047,15 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
           font-weight: 700;
           color: var(--txt);
           margin-bottom: 0.7rem;
+        }
+        /* Та же кнопка/анимация «Показать товары» внутри аналитики: убираем
+           верхний отступ кнопки под подзаголовком и даём таблице воздух при
+           раскрытии (отступ скрывается вместе с содержимым). */
+        .pba-section .pb-toggle {
+          margin-top: 0;
+        }
+        .pba-section .pb-collapse-inner {
+          padding-top: 0.8rem;
         }
         .pba-ok {
           display: flex;
