@@ -3080,35 +3080,85 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   text-transform:uppercase;letter-spacing:.1em;margin-bottom:.8rem
 }
 .profit-grid{margin-bottom:.4rem}
+/* ГЛАВНЫЙ ИТОГ расчёта — намеренно выделен сильнее обычных карточек/полей формы,
+   чтобы взгляд падал сюда первым. Прибыль → зелёно-золотой акцент, убыток →
+   красно-розовый. Только UI: формулы netProfit/margin/roi не затронуты. */
 .profit-summary{
-  margin-top:1.3rem;padding:1.2rem 1.3rem;border-radius:12px;
-  background:rgba(255,255,255,.025);border:1px solid var(--edge)
+  margin-top:1.6rem;padding:2.1rem 1.9rem;border-radius:18px;
+  border:2px solid var(--edge);background:rgba(255,255,255,.025);
+  transition:border-color .25s ease, box-shadow .25s ease, background .25s ease
+}
+.profit-summary.pos{
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(46,204,138,.16) 0%, rgba(46,204,138,0) 55%),
+    linear-gradient(135deg, rgba(123,232,178,.10) 0%, rgba(201,168,76,.085) 100%);
+  border-color:rgba(123,232,178,.55);
+  box-shadow:0 24px 60px rgba(0,0,0,.34), 0 0 70px rgba(46,204,138,.20),
+    inset 0 1px 0 rgba(255,255,255,.06)
+}
+.profit-summary.neg{
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(224,85,102,.18) 0%, rgba(224,85,102,0) 55%),
+    linear-gradient(135deg, rgba(232,154,153,.12) 0%, rgba(224,85,102,.07) 100%);
+  border-color:rgba(232,120,128,.62);
+  box-shadow:0 24px 60px rgba(0,0,0,.34), 0 0 70px rgba(224,85,102,.22),
+    inset 0 1px 0 rgba(255,255,255,.05)
+}
+.profit-summary-head{
+  display:flex;flex-direction:column;gap:.4rem;margin-bottom:1rem
+}
+.profit-summary-kicker{
+  align-self:flex-start;display:inline-flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:.58rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.14em;
+  padding:3px 10px;border-radius:999px;border:1px solid transparent
+}
+.profit-summary.pos .profit-summary-kicker{
+  color:#bfe9cf;background:rgba(46,204,138,.14);border-color:rgba(46,204,138,.3)
+}
+.profit-summary.neg .profit-summary-kicker{
+  color:#f0b8bb;background:rgba(224,85,102,.16);border-color:rgba(224,85,102,.34)
 }
 .profit-summary-title{
-  font-family:var(--mono);font-size:.6rem;color:var(--txt3);
-  text-transform:uppercase;letter-spacing:.1em;margin-bottom:.4rem
+  font-family:var(--display);font-size:1.3rem;font-weight:600;
+  letter-spacing:-.01em;line-height:1.1;color:var(--txt);margin-bottom:0
+}
+.profit-summary-caption{
+  font-size:.84rem;color:var(--txt2);font-weight:300;line-height:1.4;max-width:42ch
 }
 .profit-summary-big{
-  font-family:var(--display);font-style:italic;font-size:2.2rem;
-  color:#7be8b2;letter-spacing:-.01em;line-height:1.1
+  font-family:var(--display);font-style:italic;font-size:3.6rem;
+  color:#7be8b2;letter-spacing:-.02em;line-height:1;margin-top:.2rem
+}
+.profit-summary.pos .profit-summary-big{
+  text-shadow:0 0 40px rgba(46,204,138,.38), 0 0 10px rgba(46,204,138,.18)
+}
+.profit-summary.neg .profit-summary-big{
+  text-shadow:0 0 40px rgba(224,85,102,.36), 0 0 10px rgba(224,85,102,.18)
 }
 .profit-summary-big.neg{color:#e89a99}
 .profit-stats{
-  display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:1rem
+  display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:1.4rem
 }
 .profit-stat{
-  display:flex;flex-direction:column;gap:3px;padding:.7rem .9rem;
-  background:rgba(255,255,255,.025);border:1px solid var(--edge);border-radius:10px
+  display:flex;flex-direction:column;gap:3px;padding:.6rem .85rem;
+  background:rgba(255,255,255,.02);border:1px solid var(--edge);border-radius:10px
 }
 .profit-stat-label{
-  font-family:var(--mono);font-size:.58rem;color:var(--txt3);
+  font-family:var(--mono);font-size:.56rem;color:var(--txt3);
   text-transform:uppercase;letter-spacing:.08em
 }
 .profit-stat-val{
-  font-family:var(--mono);font-size:1.15rem;color:var(--txt);
+  font-family:var(--mono);font-size:1.05rem;color:var(--txt2);
   font-variant-numeric:tabular-nums
 }
 .profit-stat-val.neg{color:#e89a99}
+@media (max-width: 600px){
+  .profit-summary{padding:1.5rem 1.25rem}
+  .profit-summary-title{font-size:1.15rem}
+  .profit-summary-big{font-size:2.4rem}
+  .profit-summary-caption{font-size:.8rem}
+}
 .profit-breakdown{
   display:grid;grid-template-columns:1fr;gap:6px;margin-top:1.1rem;
   padding-top:.9rem;border-top:1px solid rgba(255,255,255,.06)
@@ -5769,9 +5819,22 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       ))}
                     </div>
 
-                    <div className="profit-summary">
-                      <div className="profit-summary-title">
-                        Чистая прибыль
+                    <div
+                      className={
+                        "profit-summary" +
+                        (profitCalc.netProfit < 0 ? " neg" : " pos")
+                      }
+                    >
+                      <div className="profit-summary-head">
+                        <span className="profit-summary-kicker">
+                          {profitCalc.netProfit < 0 ? "Убыток" : "Прибыль"}
+                        </span>
+                        <div className="profit-summary-title">
+                          Чистая прибыль
+                        </div>
+                        <div className="profit-summary-caption">
+                          Главный итог расчёта после всех расходов
+                        </div>
                       </div>
                       <div
                         className={
