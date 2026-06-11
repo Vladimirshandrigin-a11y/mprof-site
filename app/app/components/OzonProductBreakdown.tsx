@@ -999,7 +999,7 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
       )}
 
       {!loading && !loadError && (
-        <section className="pbm">
+        <section className={"pbm" + (missing.length > 0 ? " pbm-alert" : "")}>
           <div className="pbm-head">
             <div>
               <h2 className="pbm-title">
@@ -1030,6 +1030,20 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
               </button>
             )}
           </div>
+
+          {missing.length > 0 && (
+            <div className="pbm-cta" role="note">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                <path d="M12 9v4" />
+                <path d="M12 17h.01" />
+              </svg>
+              <span>
+                Заполните себестоимость этих товаров, чтобы <b>M-PROF</b> точно
+                рассчитал чистую прибыль.
+              </span>
+            </div>
+          )}
 
           {missing.length > 0 && (
             <p className="pbm-hint">
@@ -1384,6 +1398,46 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
           -webkit-backdrop-filter: blur(16px);
           box-shadow: 0 16px 40px rgba(0, 0, 0, 0.24);
           margin-top: 1.1rem;
+        }
+        .pbm-alert {
+          border-color: rgba(201, 168, 76, 0.45);
+          box-shadow: 0 16px 40px rgba(0, 0, 0, 0.24),
+            0 0 0 1px rgba(201, 168, 76, 0.14),
+            0 0 48px rgba(201, 168, 76, 0.1);
+        }
+        .pbm-cta {
+          display: flex;
+          align-items: flex-start;
+          gap: 12px;
+          margin-top: 1.1rem;
+          padding: 0.95rem 1.15rem;
+          border: 1px solid rgba(201, 168, 76, 0.4);
+          border-left: 3px solid var(--gold);
+          border-radius: 12px;
+          background: linear-gradient(
+            135deg,
+            rgba(201, 168, 76, 0.16) 0%,
+            rgba(201, 168, 76, 0.05) 100%
+          );
+          color: var(--txt);
+          font-size: 0.95rem;
+          font-weight: 500;
+          line-height: 1.45;
+        }
+        .pbm-cta svg {
+          width: 22px;
+          height: 22px;
+          stroke: var(--gold);
+          stroke-width: 2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+          flex-shrink: 0;
+          margin-top: 1px;
+        }
+        .pbm-cta b {
+          color: var(--gold2);
+          font-weight: 700;
         }
         .pbm-head {
           display: flex;
