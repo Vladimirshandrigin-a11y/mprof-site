@@ -117,6 +117,11 @@ type NetProfitBreakdown = {
   revenueOzon: number;
   loyaltyPayouts: number;
   profitBeforeCost: number;
+  /** Выбранный график выплат Ozon (jsonb — без миграции схемы). Старые записи
+   *  без поля восстанавливаются как «стандартный» (0%). */
+  payoutSchedule?: PayoutSchedule;
+  /** Денормализованная корректировка прибыли от графика (для истории/PDF). */
+  payoutScheduleAdjustment?: number;
   /** Период отчёта (строка из XLSX) — чтобы report_month восстанавливался. */
   reportPeriod?: string | null;
   /**
@@ -153,6 +158,8 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
     revenueOzon: n(o.revenueOzon),
     loyaltyPayouts: n(o.loyaltyPayouts),
     profitBeforeCost: n(o.profitBeforeCost),
+    payoutSchedule: asPayoutSchedule(o.payoutSchedule),
+    payoutScheduleAdjustment: n(o.payoutScheduleAdjustment),
     reportPeriod: typeof o.reportPeriod === "string" ? o.reportPeriod : null,
     products: Array.isArray(o.products)
       ? o.products
@@ -278,6 +285,117 @@ const PROFIT_EXPENSE_FIELDS: {
   { key: "salary", label: "Зарплата / подрядчики", unit: "₽" },
   { key: "other", label: "Прочие расходы", unit: "₽" },
 ];
+
+/* ===== График выплат Ozon (ручная настройка продавца) =====
+   Ozon берёт комиссию за раннюю/ежедневную выплату или даёт скидку на
+   вознаграждение за продажу при отсрочке. Это НЕ интеграция с Ozon — продавец
+   выбирает свой график вручную, а M-PROF учитывает его в итоговой чистой
+   прибыли (payoutScheduleAdjustment). Проценты — из тарифов Ozon; продавец
+   сверяет актуальные значения с личным кабинетом. */
+type PayoutScheduleType = "standard" | "early" | "deferred";
+type PayoutBank = "ozon" | "other";
+type PayoutEarlyVariant = "daily" | "week2" | "week1" | "nextweek";
+type PayoutDeferredDays = 14 | 28 | 42 | 56 | 84 | 112 | 168;
+
+type PayoutSchedule = {
+  type: PayoutScheduleType;
+  /** Под-вариант ранней выплаты (актуально при type === "early"). */
+  earlyVariant: PayoutEarlyVariant;
+  /** Банк получения (актуально при type === "early"). */
+  bank: PayoutBank;
+  /** Срок отсрочки в днях (актуально при type === "deferred"). */
+  deferredDays: PayoutDeferredDays;
+};
+
+const DEFAULT_PAYOUT_SCHEDULE: PayoutSchedule = {
+  type: "standard",
+  earlyVariant: "daily",
+  bank: "ozon",
+  deferredDays: 14,
+};
+
+/** Ранняя/ежедневная выплата — КОМИССИЯ (% от суммы к перечислению, уменьшает
+ *  прибыль). Ключи: ежедневная выплата + еженедельная с переносом. */
+const PAYOUT_EARLY_PCT: Record<
+  PayoutEarlyVariant,
+  { ozon: number; other: number }
+> = {
+  daily: { ozon: 4.96, other: 5.99 }, // Ежедневная выплата
+  week2: { ozon: 2.47, other: 2.69 }, // Через 2 недели
+  week1: { ozon: 3.37, other: 3.89 }, // Через 1 неделю
+  nextweek: { ozon: 4.16, other: 4.99 }, // На следующей неделе
+};
+
+/** Отсрочка выплаты — СКИДКА на вознаграждение за продажу (% от суммы к
+ *  перечислению, увеличивает прибыль). */
+const PAYOUT_DEFERRED_PCT: Record<PayoutDeferredDays, number> = {
+  14: 0.45,
+  28: 0.9,
+  42: 1.35,
+  56: 1.8,
+  84: 2.7,
+  112: 3.6,
+  168: 5.4,
+};
+
+const PAYOUT_EARLY_VARIANTS: { key: PayoutEarlyVariant; label: string }[] = [
+  { key: "daily", label: "Ежедневно" },
+  { key: "week1", label: "Через 1 неделю" },
+  { key: "week2", label: "Через 2 недели" },
+  { key: "nextweek", label: "На следующей неделе" },
+];
+
+const PAYOUT_DEFERRED_OPTIONS: PayoutDeferredDays[] = [
+  14, 28, 42, 56, 84, 112, 168,
+];
+
+/** Процент выбранного графика (0 для стандартного). */
+function payoutPercentOf(s: PayoutSchedule): number {
+  if (s.type === "early") return PAYOUT_EARLY_PCT[s.earlyVariant][s.bank];
+  if (s.type === "deferred") return PAYOUT_DEFERRED_PCT[s.deferredDays];
+  return 0;
+}
+
+/** Направление корректировки: комиссия уменьшает, скидка увеличивает прибыль. */
+function payoutDirectionOf(s: PayoutSchedule): "fee" | "discount" | "none" {
+  if (s.type === "early") return "fee";
+  if (s.type === "deferred") return "discount";
+  return "none";
+}
+
+/** Человекочитаемая подпись графика — для строки в разбивке и PDF. */
+function payoutScheduleLabel(s: PayoutSchedule): string {
+  if (s.type === "early") {
+    const v =
+      PAYOUT_EARLY_VARIANTS.find((x) => x.key === s.earlyVariant)?.label ?? "";
+    const bank = s.bank === "ozon" ? "Ozon Банк" : "Другой банк";
+    return `Ранняя выплата · ${v} · ${bank}`;
+  }
+  if (s.type === "deferred") return `Отсрочка ${s.deferredDays} дн.`;
+  return "Стандартный";
+}
+
+/** Безопасно достаёт PayoutSchedule из jsonb (старые записи → стандартный). */
+function asPayoutSchedule(v: unknown): PayoutSchedule {
+  if (!v || typeof v !== "object") return { ...DEFAULT_PAYOUT_SCHEDULE };
+  const o = v as Record<string, unknown>;
+  const type: PayoutScheduleType =
+    o.type === "early" || o.type === "deferred" ? o.type : "standard";
+  const earlyVariant: PayoutEarlyVariant =
+    o.earlyVariant === "week2" ||
+    o.earlyVariant === "week1" ||
+    o.earlyVariant === "nextweek"
+      ? o.earlyVariant
+      : "daily";
+  const bank: PayoutBank = o.bank === "other" ? "other" : "ozon";
+  const days = typeof o.deferredDays === "number" ? o.deferredDays : 14;
+  const deferredDays: PayoutDeferredDays = (
+    PAYOUT_DEFERRED_OPTIONS as number[]
+  ).includes(days)
+    ? (days as PayoutDeferredDays)
+    : 14;
+  return { type, earlyVariant, bank, deferredDays };
+}
 
 interface UploadedReport {
   id: string;
@@ -482,6 +600,11 @@ export default function AppPage() {
   const [profitInputs, setProfitInputs] = useState<ProfitInputs>({
     ...EMPTY_PROFIT,
   });
+  // График выплат Ozon (ручной выбор) — учитывается в итоговой чистой прибыли
+  // через payoutScheduleAdjustment. По умолчанию «стандартный» (0%).
+  const [payoutSchedule, setPayoutSchedule] = useState<PayoutSchedule>({
+    ...DEFAULT_PAYOUT_SCHEDULE,
+  });
   // Пользователь вручную правил поле «Себестоимость товара» в доп. расходах?
   // Пока false — поле автоматически синхронизируется с суммарной COGS каталога
   // (включая инлайн-сохранения в «Товары без себестоимости»). После ручной
@@ -501,6 +624,12 @@ export default function AppPage() {
     // Ручная правка «Себестоимость товара» → отключаем автосинк с COGS каталога.
     if (key === "costPrice") setCostPriceTouched(true);
     // Любая правка расходов → разрешаем повторное сохранение нового результата.
+    setProfitSaved(false);
+  };
+  // Изменение графика выплат Ozon → меняет итоговую прибыль, поэтому тоже
+  // разрешаем повторное сохранение результата.
+  const updatePayoutSchedule = (patch: Partial<PayoutSchedule>) => {
+    setPayoutSchedule((prev) => ({ ...prev, ...patch }));
     setProfitSaved(false);
   };
   /** Итоговый расчёт чистой прибыли поверх данных из 3 отчётов. */
@@ -526,7 +655,26 @@ export default function AppPage() {
     const otherExpensesGroup =
       ads + packaging + deliveryToWarehouse + salary + other;
     const totalExtraExpenses = costPrice + tax + otherExpensesGroup;
-    const netProfit = profitBeforeCost - totalExtraExpenses;
+    // Чистая прибыль ДО учёта графика выплат Ozon (прежняя формула — не меняем).
+    const netProfitBeforePayout = profitBeforeCost - totalExtraExpenses;
+
+    // ── График выплат Ozon ──
+    // База — сумма к перечислению Ozon (profitBeforeCost = выручка + выплаты
+    // партнёров − УПД услуги − агентское). Если она ≤ 0 (расходы Ozon съели
+    // доход) — безопасный fallback на выручку.
+    const payoutBase = profitBeforeCost > 0 ? profitBeforeCost : revenue;
+    const payoutPercent = payoutPercentOf(payoutSchedule);
+    const payoutDirection = payoutDirectionOf(payoutSchedule);
+    // Комиссия (ранняя/ежедневная выплата) уменьшает прибыль, скидка (отсрочка)
+    // — увеличивает. Стандартный график → 0 (прибыль не меняется).
+    const payoutScheduleAdjustment =
+      payoutDirection === "fee"
+        ? -(payoutBase * payoutPercent) / 100
+        : payoutDirection === "discount"
+        ? (payoutBase * payoutPercent) / 100
+        : 0;
+
+    const netProfit = netProfitBeforePayout + payoutScheduleAdjustment;
     const incomeBase = revenue + loyaltyPayouts;
     const margin = incomeBase > 0 ? (netProfit / incomeBase) * 100 : 0;
     const roi = costPrice > 0 ? (netProfit / costPrice) * 100 : 0;
@@ -542,11 +690,16 @@ export default function AppPage() {
       other,
       otherExpensesGroup,
       totalExtraExpenses,
+      netProfitBeforePayout,
+      payoutBase,
+      payoutPercent,
+      payoutDirection,
+      payoutScheduleAdjustment,
       netProfit,
       margin,
       roi,
     };
-  }, [combinedResult, profitInputs]);
+  }, [combinedResult, profitInputs, payoutSchedule]);
 
   // Синхронизация «Себестоимость товара» с суммарной COGS каталога (cost_price ×
   // кол-во по сматченным SKU), которую считает блок «Чистая прибыль по товарам».
@@ -585,15 +738,18 @@ export default function AppPage() {
       profitCalc.deliveryToWarehouse +
       profitCalc.salary +
       profitCalc.other;
-    // total_expenses включает Ozon-комиссии + все доп. расходы, поэтому
-    // identity profit = revenue − total_expenses = netProfit сохраняется.
+    // total_expenses включает Ozon-комиссии + все доп. расходы. График выплат
+    // вычитаем как корректировку расходов (комиссия за раннюю выплату → расходы
+    // растут; скидка за отсрочку → падают), чтобы тождество
+    // profit = revenue − total_expenses = netProfit сохранялось.
     const totalExpenses =
       combinedResult.updServicesTotal +
       combinedResult.updCommissionTotal +
       profitCalc.costPrice +
       profitCalc.tax +
       profitCalc.ads +
-      otherGroup;
+      otherGroup -
+      profitCalc.payoutScheduleAdjustment;
 
     const breakdown: NetProfitBreakdown = {
       kind: "net-profit-3file",
@@ -611,6 +767,8 @@ export default function AppPage() {
       revenueOzon: combinedResult.revenue,
       loyaltyPayouts: combinedResult.loyaltyPayouts,
       profitBeforeCost: combinedResult.profitBeforeCost,
+      payoutSchedule,
+      payoutScheduleAdjustment: profitCalc.payoutScheduleAdjustment,
       reportPeriod: combinedResult.period,
       // Per-SKU строки + estimate — чтобы восстановление из истории пересчитало
       // себестоимость по актуальному каталогу (не по застывшему снапшоту).
@@ -804,6 +962,15 @@ export default function AppPage() {
         { label: "Зарплата / подрядчики", value: "−" + money(pc.salary) },
         { label: "Прочие расходы", value: "−" + money(pc.other) },
       ];
+      // График выплат Ozon — добавляем строку только при ненулевой корректировке,
+      // чтобы стандартный график не менял привычный вид отчёта.
+      if (pc.payoutScheduleAdjustment !== 0) {
+        const adj = pc.payoutScheduleAdjustment;
+        rows.push({
+          label: "График выплат Ozon",
+          value: (adj > 0 ? "+" : "−") + money(Math.abs(adj)),
+        });
+      }
 
       // ── Canvas (A4 @96dpi = 794×1123), scale ×2 для чёткости ──
       const scale = 2;
@@ -961,6 +1128,8 @@ export default function AppPage() {
       profitBeforeCost: b.profitBeforeCost,
       period: b.reportPeriod ?? null,
     });
+    // Восстанавливаем выбранный график выплат (старые записи → стандартный 0%).
+    setPayoutSchedule(b.payoutSchedule ?? { ...DEFAULT_PAYOUT_SCHEDULE });
     // Восстанавливаем per-SKU строки + estimate из snapshot (если сохранены).
     // Это даёт OzonProductBreakdown заново сопоставить товары с АКТУАЛЬНЫМ
     // каталогом и пересчитать себестоимость (COGS) при открытии старого расчёта.
@@ -1431,6 +1600,7 @@ export default function AppPage() {
     setReportCogsTotal(null);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
+    setPayoutSchedule({ ...DEFAULT_PAYOUT_SCHEDULE });
     setCostPriceTouched(false);
     setProfitSaving(false);
     setProfitSaved(false);
@@ -1591,6 +1761,8 @@ export default function AppPage() {
       ...EMPTY_PROFIT,
       ads: adsFromReport > 0 ? String(Math.round(adsFromReport)) : "",
     });
+    // Новый отчёт → график выплат снова стандартный (0%).
+    setPayoutSchedule({ ...DEFAULT_PAYOUT_SCHEDULE });
     // Новый отчёт → поле «Себестоимость товара» снова под автосинком с COGS.
     setCostPriceTouched(false);
 
@@ -3099,6 +3271,57 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   color:var(--txt);font-weight:500
 }
 .upload-3-row.subtotal .num{color:var(--txt)}
+.upload-3-row.payout-zero .num{color:var(--txt3)}
+/* ===== График выплат Ozon ===== */
+.payout-sched{
+  margin-top:1.25rem;padding:1.1rem 1.15rem;border-radius:14px;
+  background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.08)
+}
+.payout-sched-head{margin-bottom:.85rem}
+.payout-sched-title{
+  font-family:var(--display);font-size:1.02rem;font-weight:600;
+  letter-spacing:-.01em;color:var(--txt)
+}
+.payout-sched-sub{
+  font-size:.82rem;color:var(--txt2);font-weight:300;line-height:1.45;
+  margin-top:.3rem;max-width:52ch
+}
+.payout-row-label{
+  font-family:var(--mono);font-size:.62rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--txt3);margin:.85rem 0 .45rem
+}
+.payout-chips{display:flex;flex-wrap:wrap;gap:.5rem}
+.payout-chip{
+  font-family:var(--sans);font-size:.8rem;font-weight:500;color:var(--txt2);
+  padding:.5rem .85rem;border-radius:10px;cursor:pointer;
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);
+  transition:all .16s ease;white-space:nowrap
+}
+.payout-chip:hover{
+  color:var(--txt);border-color:rgba(201,168,76,.4);background:rgba(201,168,76,.08)
+}
+.payout-chip.active{
+  color:#1a1408;font-weight:600;border-color:transparent;
+  background:linear-gradient(135deg,var(--gold),var(--gold2));
+  box-shadow:0 4px 14px rgba(201,168,76,.28)
+}
+.payout-hint{
+  font-size:.76rem;color:var(--txt3);font-weight:300;line-height:1.45;margin-top:.9rem
+}
+.payout-impact{
+  display:flex;align-items:center;justify-content:space-between;gap:.75rem;
+  margin-top:.9rem;padding-top:.85rem;border-top:1px dashed rgba(255,255,255,.1)
+}
+.payout-impact-label{font-size:.84rem;color:var(--txt2);font-weight:500}
+.payout-impact-val{
+  font-family:var(--mono);font-size:.95rem;font-weight:600;color:var(--txt3);
+  font-variant-numeric:tabular-nums
+}
+.payout-impact-val.pos{color:#7be8b2}
+.payout-impact-val.neg{color:#e89a99}
+@media(max-width:560px){
+  .payout-impact{flex-direction:column;align-items:flex-start;gap:.35rem}
+}
 .upload-3-note{
   margin-top:1rem;padding:.85rem 1rem;border-radius:10px;
   background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);
@@ -5894,6 +6117,157 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       ))}
                     </div>
 
+                    {/* График выплат Ozon — ручной выбор, влияет на чистую прибыль */}
+                    <div className="payout-sched">
+                      <div className="payout-sched-head">
+                        <div className="payout-sched-title">
+                          График выплат Ozon
+                        </div>
+                        <div className="payout-sched-sub">
+                          Выберите график выплат, чтобы M-PROF учёл комиссию за
+                          ранние выплаты или скидку за отсрочку.
+                        </div>
+                      </div>
+
+                      {/* Шаг 1 — тип графика */}
+                      <div className="payout-chips" role="group">
+                        {(
+                          [
+                            { k: "standard", l: "Стандартный" },
+                            { k: "early", l: "Ранняя выплата" },
+                            { k: "deferred", l: "Отсрочка выплат" },
+                          ] as { k: PayoutScheduleType; l: string }[]
+                        ).map((t) => (
+                          <button
+                            key={t.k}
+                            type="button"
+                            className={
+                              "payout-chip" +
+                              (payoutSchedule.type === t.k ? " active" : "")
+                            }
+                            onClick={() => updatePayoutSchedule({ type: t.k })}
+                          >
+                            {t.l}
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* Шаг 2a — ранняя выплата: периодичность + банк */}
+                      {payoutSchedule.type === "early" && (
+                        <>
+                          <div className="payout-row-label">Периодичность</div>
+                          <div className="payout-chips" role="group">
+                            {PAYOUT_EARLY_VARIANTS.map((v) => (
+                              <button
+                                key={v.key}
+                                type="button"
+                                className={
+                                  "payout-chip" +
+                                  (payoutSchedule.earlyVariant === v.key
+                                    ? " active"
+                                    : "")
+                                }
+                                onClick={() =>
+                                  updatePayoutSchedule({ earlyVariant: v.key })
+                                }
+                              >
+                                {v.label}
+                              </button>
+                            ))}
+                          </div>
+                          <div className="payout-row-label">Банк получения</div>
+                          <div className="payout-chips" role="group">
+                            {(
+                              [
+                                { k: "ozon", l: "Ozon Банк" },
+                                { k: "other", l: "Другой банк" },
+                              ] as { k: PayoutBank; l: string }[]
+                            ).map((b) => (
+                              <button
+                                key={b.k}
+                                type="button"
+                                className={
+                                  "payout-chip" +
+                                  (payoutSchedule.bank === b.k ? " active" : "")
+                                }
+                                onClick={() =>
+                                  updatePayoutSchedule({ bank: b.k })
+                                }
+                              >
+                                {b.l}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+
+                      {/* Шаг 2b — отсрочка: срок */}
+                      {payoutSchedule.type === "deferred" && (
+                        <>
+                          <div className="payout-row-label">Срок отсрочки</div>
+                          <div className="payout-chips" role="group">
+                            {PAYOUT_DEFERRED_OPTIONS.map((d) => (
+                              <button
+                                key={d}
+                                type="button"
+                                className={
+                                  "payout-chip" +
+                                  (payoutSchedule.deferredDays === d
+                                    ? " active"
+                                    : "")
+                                }
+                                onClick={() =>
+                                  updatePayoutSchedule({ deferredDays: d })
+                                }
+                              >
+                                {d} дн.
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      )}
+
+                      <div className="payout-hint">
+                        Процент считается от суммы выручки/выплат Ozon. Проверьте
+                        актуальный процент в кабинете Ozon.
+                      </div>
+
+                      <div className="payout-impact">
+                        <span className="payout-impact-label">
+                          Влияние на прибыль
+                        </span>
+                        <span
+                          className={
+                            "payout-impact-val" +
+                            (profitCalc.payoutScheduleAdjustment > 0
+                              ? " pos"
+                              : profitCalc.payoutScheduleAdjustment < 0
+                              ? " neg"
+                              : "")
+                          }
+                        >
+                          {profitCalc.payoutScheduleAdjustment > 0 ? "+" : ""}
+                          {profitCalc.payoutScheduleAdjustment === 0
+                            ? "0"
+                            : profitCalc.payoutScheduleAdjustment.toLocaleString(
+                                "ru-RU",
+                                {
+                                  minimumFractionDigits: 2,
+                                  maximumFractionDigits: 2,
+                                }
+                              )}{" "}
+                          ₽
+                          {payoutSchedule.type !== "standard" &&
+                          profitCalc.payoutPercent > 0
+                            ? ` · ${profitCalc.payoutPercent.toLocaleString(
+                                "ru-RU",
+                                { maximumFractionDigits: 2 }
+                              )}%`
+                            : ""}
+                        </span>
+                      </div>
+                    </div>
+
                     <div
                       className={
                         "profit-summary" +
@@ -6067,6 +6441,31 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 maximumFractionDigits: 2,
                               }
                             )}{" "}
+                            ₽
+                          </span>
+                        </div>
+                        <div
+                          className={
+                            "upload-3-row" +
+                            (profitCalc.payoutScheduleAdjustment < 0
+                              ? " negative"
+                              : profitCalc.payoutScheduleAdjustment === 0
+                              ? " payout-zero"
+                              : "")
+                          }
+                        >
+                          <span>График выплат Ozon</span>
+                          <span className="num">
+                            {profitCalc.payoutScheduleAdjustment > 0 ? "+" : ""}
+                            {profitCalc.payoutScheduleAdjustment === 0
+                              ? "0"
+                              : profitCalc.payoutScheduleAdjustment.toLocaleString(
+                                  "ru-RU",
+                                  {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  }
+                                )}{" "}
                             ₽
                           </span>
                         </div>
