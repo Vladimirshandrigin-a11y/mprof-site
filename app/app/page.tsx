@@ -1789,10 +1789,21 @@ export default function AppPage() {
   type FilterPeriod = "7" | "14" | "30" | "all";
   type FilterMp = "all" | "ozon" | "wb";
   type FilterResult = "all" | "profit" | "loss";
+  // Быстрый фильтр по прибыли ВНУТРИ блока «Последние расчёты»:
+  // net — чистая прибыль (ручной/с себестоимостью, ≥0);
+  // before — прибыль до себестоимости (отчёт без себестоимости, ≥0);
+  // loss — убыток (profit < 0).
+  type HistProfitFilter = "all" | "net" | "before" | "loss";
   const [filterPeriod, setFilterPeriod] = useState<FilterPeriod>("all");
   const [filterMp, setFilterMp] = useState<FilterMp>("all");
   const [filterResult, setFilterResult] = useState<FilterResult>("all");
   const [filtersOpen, setFiltersOpen] = useState(false);
+  // Поиск (по периоду отчёта / дате создания / типу расчёта) и быстрый фильтр
+  // по прибыли. Чисто фронтовая фильтрация уже загруженной истории — на
+  // статистику, AnalyticsBlock, формулы, Supabase и сохранение НЕ влияет.
+  const [histSearch, setHistSearch] = useState("");
+  const [histProfitFilter, setHistProfitFilter] =
+    useState<HistProfitFilter>("all");
 
   const filterPeriodLabel =
     filterPeriod === "all" ? "всё время" : `${filterPeriod} дней`;
@@ -1836,6 +1847,35 @@ export default function AppPage() {
 
     return arr;
   }, [history, filterPeriod, filterMp, filterResult]);
+
+  // Список «Последние расчёты» = filteredHistory + локальные поиск и быстрый
+  // фильтр по прибыли. Отдельная деривация, чтобы НЕ влиять на статистику и
+  // AnalyticsBlock (они продолжают читать filteredHistory). Категория прибыли
+  // зеркалит подпись в строке: убыток → loss; отчёт без себестоимости → before;
+  // иначе (ручной/с себестоимостью) → net.
+  const visibleHistory = useMemo(() => {
+    const q = histSearch.trim().toLowerCase();
+    return filteredHistory.filter((h) => {
+      if (histProfitFilter !== "all") {
+        let cat: HistProfitFilter;
+        if (h.profit < 0) {
+          cat = "loss";
+        } else {
+          const b = asNetProfitBreakdown(h.aiInsights);
+          cat = b && (b.costPrice ?? 0) <= 0 ? "before" : "net";
+        }
+        if (cat !== histProfitFilter) return false;
+      }
+      if (q !== "") {
+        const b = asNetProfitBreakdown(h.aiInsights);
+        const mpName = h.marketplace === "ozon" ? "Ozon" : "WB";
+        const title = b ? `Отчёт ${mpName}` : `Ручной расчёт ${mpName}`;
+        const hay = `${title} ${b?.reportPeriod ?? ""} ${h.date}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [filteredHistory, histSearch, histProfitFilter]);
 
   const totalRevenue = filteredHistory.reduce((sum, h) => sum + h.revenue, 0);
   const totalProfit = filteredHistory.reduce((sum, h) => sum + h.profit, 0);
@@ -4327,6 +4367,41 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .filter-toggle-dot{transition:none !important;animation:none !important}
 }
 
+.hist-tools{
+  display:flex;align-items:center;gap:.7rem 1rem;flex-wrap:wrap;
+  padding:.85rem 1.25rem;border-top:1px solid var(--edge)
+}
+.hist-search{position:relative;flex:1 1 240px;min-width:200px}
+.hist-search-ic{
+  position:absolute;left:12px;top:50%;transform:translateY(-50%);
+  width:16px;height:16px;stroke:var(--txt3);stroke-width:2;fill:none;
+  stroke-linecap:round;pointer-events:none
+}
+.hist-search-input{
+  width:100%;background:rgba(255,255,255,.04);border:1px solid var(--edge2);
+  border-radius:10px;padding:10px 36px;font-family:var(--sans);font-size:.86rem;
+  color:var(--txt);transition:border-color .2s ease,box-shadow .2s ease;
+  outline:none;-webkit-appearance:none;appearance:none
+}
+.hist-search-input::placeholder{color:var(--txt3)}
+.hist-search-input::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none}
+.hist-search-input:focus{
+  border-color:var(--gold);box-shadow:0 0 0 3px rgba(201,168,76,.14)
+}
+.hist-search-clear{
+  position:absolute;right:8px;top:50%;transform:translateY(-50%);
+  display:inline-flex;align-items:center;justify-content:center;
+  width:24px;height:24px;padding:0;font-size:1.2rem;line-height:1;
+  color:var(--txt3);background:transparent;border:0;border-radius:6px;
+  cursor:pointer;transition:color .18s ease,background .18s ease
+}
+.hist-search-clear:hover{color:var(--txt);background:rgba(255,255,255,.06)}
+@media(max-width:760px){
+  .hist-tools{flex-direction:column;align-items:stretch}
+  .hist-search{flex-basis:auto;width:100%}
+  .hist-search-input{font-size:16px}
+}
+
 .hist-filter-empty{
   padding:2.4rem 1.5rem;text-align:center;
   font-family:var(--mono);font-size:.78rem;letter-spacing:.04em;
@@ -6247,13 +6322,68 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </button>
             </div>
 
-            {filteredHistory.length === 0 ? (
-              <div className="hist-filter-empty">
-                Нет расчётов по выбранным фильтрам
+            <div className="hist-tools">
+              <div className="hist-search">
+                <svg
+                  className="hist-search-ic"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="M21 21l-4.3-4.3" />
+                </svg>
+                <input
+                  type="search"
+                  className="hist-search-input"
+                  value={histSearch}
+                  onChange={(e) => setHistSearch(e.target.value)}
+                  placeholder="Поиск по периоду, дате или типу расчёта"
+                  aria-label="Поиск по истории расчётов"
+                />
+                {histSearch && (
+                  <button
+                    type="button"
+                    className="hist-search-clear"
+                    aria-label="Очистить поиск"
+                    onClick={() => setHistSearch("")}
+                  >
+                    ×
+                  </button>
+                )}
               </div>
+              <div
+                className="filter-pills"
+                role="group"
+                aria-label="Быстрый фильтр по прибыли"
+              >
+                {(
+                  [
+                    ["all", "Все"],
+                    ["net", "С чистой прибылью"],
+                    ["before", "Прибыль до себестоимости"],
+                    ["loss", "Убыток"],
+                  ] as [HistProfitFilter, string][]
+                ).map(([v, label]) => (
+                  <button
+                    key={v}
+                    type="button"
+                    className={
+                      "filter-pill" + (histProfitFilter === v ? " active" : "")
+                    }
+                    aria-pressed={histProfitFilter === v}
+                    onClick={() => setHistProfitFilter(v)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {visibleHistory.length === 0 ? (
+              <div className="hist-filter-empty">Расчёты не найдены</div>
             ) : (
             <div className="hist-list">
-              {filteredHistory.map((h) => {
+              {visibleHistory.map((h) => {
                 const removing = removingIds.has(h.id);
                 // Разбор upload-расчёта из ai_insights. null → ручной/старый расчёт.
                 const breakdown = asNetProfitBreakdown(h.aiInsights);
