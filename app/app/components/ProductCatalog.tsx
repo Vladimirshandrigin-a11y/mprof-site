@@ -128,6 +128,18 @@ export function ProductCatalog({ user, showToast }: Props) {
     "all"
   );
 
+  // Массовое редактирование себестоимости. Чисто UI-слой поверх уже
+  // существующей функции сохранения (updateProductInCloud) — новой
+  // Supabase-логики не добавляем. selectedIds — выбранные товары (учитываются
+  // только пока видимы в текущем поиске/фильтре); bulkCost — себестоимость за
+  // 1 шт. для всех выбранных; bulkErr — ошибка валидации рядом с полем;
+  // bulkSaving — идёт массовое сохранение (блокирует кнопку).
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkCost, setBulkCost] = useState("");
+  const [bulkErr, setBulkErr] = useState<string | null>(null);
+  const [bulkSaving, setBulkSaving] = useState(false);
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
+
   const reload = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
@@ -511,6 +523,125 @@ export function ProductCatalog({ user, showToast }: Props) {
     });
   }, [sortedProducts, search, costFilter]);
 
+  // Эффективная выборка для массового действия = выбранные ∩ видимые. Так
+  // массовое сохранение НИКОГДА не трогает скрытые поиском/фильтром товары
+  // (требование «применять только к видимым/выбранным»), а сама выборка
+  // переживает смену фильтра — скрытые товары вернутся при сбросе фильтра.
+  const selectedVisible = useMemo(
+    () => visibleProducts.filter((p) => selectedIds.has(p.id)),
+    [visibleProducts, selectedIds]
+  );
+  const selectedVisibleCount = selectedVisible.length;
+  const allVisibleSelected =
+    visibleProducts.length > 0 &&
+    selectedVisibleCount === visibleProducts.length;
+
+  // «Выбрать все видимые» в промежуточном состоянии, когда выбрана лишь часть.
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate =
+        selectedVisibleCount > 0 &&
+        selectedVisibleCount < visibleProducts.length;
+    }
+  }, [selectedVisibleCount, visibleProducts.length]);
+
+  function toggleSelect(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  // Выбрать/снять все ВИДИМЫЕ (с учётом текущего поиска и фильтра).
+  function toggleSelectAllVisible() {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      const allSel =
+        visibleProducts.length > 0 &&
+        visibleProducts.every((p) => next.has(p.id));
+      for (const p of visibleProducts) {
+        if (allSel) next.delete(p.id);
+        else next.add(p.id);
+      }
+      return next;
+    });
+  }
+
+  function clearSelection() {
+    setSelectedIds(new Set());
+    setBulkCost("");
+    setBulkErr(null);
+  }
+
+  // Применить себестоимость ко всем выбранным (видимым) товарам. Для каждого —
+  // существующая updateProductInCloud (товар всегда уже в каталоге, ведь это
+  // его строка → addProductToCloud не нужен). Локальный state обновляется
+  // точечно, без reload; сортировка не ломается (cost_price не в ключе сорта).
+  async function applyBulkCost() {
+    if (bulkSaving) return;
+    const parsed = parseCost(bulkCost); // запятая → точка внутри parseCost
+    // Требование: число строго больше 0; иначе ошибка и НЕ шлём запросы.
+    if (parsed === null || parsed <= 0) {
+      setBulkErr("Введите число больше 0");
+      return;
+    }
+    const targets = selectedVisible;
+    if (targets.length === 0) {
+      setBulkErr("Выберите хотя бы один товар");
+      return;
+    }
+    setBulkErr(null);
+    setBulkSaving(true);
+
+    let ok = 0;
+    let failed = 0;
+    const updatedById = new Map<string, Product>();
+    for (const p of targets) {
+      const { data, error } = await updateProductInCloud(
+        p.id,
+        { cost_price: parsed },
+        user.id
+      );
+      if (error) {
+        failed++;
+      } else {
+        ok++;
+        updatedById.set(p.id, data ?? { ...p, cost_price: parsed });
+      }
+    }
+
+    // Точечно обновляем затронутые строки в локальном state (без reload).
+    if (updatedById.size > 0) {
+      setProducts((prev) => prev.map((x) => updatedById.get(x.id) ?? x));
+    }
+    setBulkSaving(false);
+
+    // Родительный после «для N»: 1 → «товара», иначе → «товаров».
+    const gen = ok === 1 ? "товара" : "товаров";
+    if (failed === 0) {
+      showToast(`Себестоимость сохранена для ${ok} ${gen}`, "ok");
+      setSelectedIds(new Set());
+      setBulkCost("");
+      setBulkErr(null);
+    } else if (ok > 0) {
+      // Часть сохранилась: снимаем выбор с успешных, проблемные оставляем.
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        updatedById.forEach((_, id) => next.delete(id));
+        return next;
+      });
+      showToast(`Сохранено для ${ok} ${gen}, не удалось — ${failed}`, "warn");
+      setBulkErr(
+        `Не удалось сохранить ${failed} ${pluralProducts(failed)}. Попробуйте ещё раз.`
+      );
+    } else {
+      showToast("Не удалось сохранить себестоимость", "err");
+      setBulkErr("Не удалось сохранить. Попробуйте ещё раз.");
+    }
+  }
+
   return (
     <section className="pc">
       <div className="pc-head">
@@ -792,8 +923,82 @@ export function ProductCatalog({ user, showToast }: Props) {
           {visibleProducts.length === 0 ? (
             <div className="pc-noresults">Товары не найдены</div>
           ) : (
-            <div className="pc-table" role="table" aria-label="Список товаров">
+            <>
+              <div className="pc-bulkbar">
+                <label className="pc-selall">
+                  <input
+                    ref={selectAllRef}
+                    type="checkbox"
+                    className="pc-check"
+                    checked={allVisibleSelected}
+                    onChange={toggleSelectAllVisible}
+                    aria-label="Выбрать все видимые товары"
+                  />
+                  <span>Выбрать все видимые</span>
+                </label>
+                {selectedVisibleCount > 0 && (
+                  <div className="pc-bulk">
+                    <span className="pc-bulk-count">
+                      Выбрано товаров: {selectedVisibleCount}
+                    </span>
+                    <span className="pc-bulk-field">
+                      <span className="pc-cost-input-wrap pc-bulk-input-wrap">
+                        <input
+                          className={`pc-cost-input${
+                            bulkErr ? " has-err" : ""
+                          }`}
+                          value={bulkCost}
+                          inputMode="decimal"
+                          placeholder="Себестоимость за 1 шт."
+                          aria-label="Себестоимость за 1 шт. для выбранных товаров"
+                          disabled={bulkSaving}
+                          onChange={(e) => {
+                            setBulkCost(e.target.value);
+                            if (bulkErr) setBulkErr(null);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              applyBulkCost();
+                            }
+                          }}
+                        />
+                        <span className="pc-cost-rub" aria-hidden="true">
+                          ₽
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        className="pc-bulk-apply"
+                        disabled={bulkSaving}
+                        onClick={applyBulkCost}
+                      >
+                        {bulkSaving ? "Сохраняем…" : "Применить к выбранным"}
+                      </button>
+                    </span>
+                    <button
+                      type="button"
+                      className="pc-bulk-clear"
+                      onClick={clearSelection}
+                      disabled={bulkSaving}
+                    >
+                      Снять выбор
+                    </button>
+                    {bulkErr && (
+                      <span className="pc-bulk-err" role="alert">
+                        {bulkErr}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+              <div className="pc-table" role="table" aria-label="Список товаров">
               <div className="pc-thead" role="row">
+                <span
+                  role="columnheader"
+                  className="pc-th-check"
+                  aria-hidden="true"
+                />
                 <span role="columnheader">Артикул</span>
                 <span role="columnheader">Название</span>
                 <span role="columnheader">Себестоимость</span>
@@ -802,7 +1007,20 @@ export function ProductCatalog({ user, showToast }: Props) {
                 </span>
               </div>
               {visibleProducts.map((p) => (
-                <div className="pc-row" role="row" key={p.id}>
+                <div
+                  className={"pc-row" + (selectedIds.has(p.id) ? " selected" : "")}
+                  role="row"
+                  key={p.id}
+                >
+                  <span className="pc-cell pc-c-check" role="cell">
+                    <input
+                      type="checkbox"
+                      className="pc-check"
+                      checked={selectedIds.has(p.id)}
+                      onChange={() => toggleSelect(p.id)}
+                      aria-label={`Выбрать товар ${p.name}`}
+                    />
+                  </span>
                   <span
                     className="pc-cell pc-c-sku"
                     role="cell"
@@ -916,7 +1134,8 @@ export function ProductCatalog({ user, showToast }: Props) {
                   </span>
                 </div>
               ))}
-            </div>
+              </div>
+            </>
           )}
         </>
       )}
@@ -1253,7 +1472,7 @@ export function ProductCatalog({ user, showToast }: Props) {
         .pc-thead,
         .pc-row {
           display: grid;
-          grid-template-columns: 130px minmax(0, 1fr) 240px 110px;
+          grid-template-columns: 34px 130px minmax(0, 1fr) 240px 110px;
           align-items: center;
           gap: 0.8rem;
           padding: 0.7rem 1rem;
@@ -1275,6 +1494,26 @@ export function ProductCatalog({ user, showToast }: Props) {
         }
         .pc-row:hover {
           background: rgba(255, 255, 255, 0.035);
+        }
+        .pc-row.selected {
+          background: rgba(201, 168, 76, 0.07);
+        }
+        .pc-row.selected:hover {
+          background: rgba(201, 168, 76, 0.1);
+        }
+        .pc-th-check,
+        .pc-c-check {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .pc-check {
+          width: 18px;
+          height: 18px;
+          margin: 0;
+          accent-color: var(--gold);
+          cursor: pointer;
+          flex: none;
         }
         .pc-cell {
           font-size: 0.9rem;
@@ -1691,6 +1930,108 @@ export function ProductCatalog({ user, showToast }: Props) {
           border-radius: 12px;
           background: rgba(255, 255, 255, 0.012);
         }
+        .pc-bulkbar {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 0.7rem 1rem;
+          margin-top: 1rem;
+          padding: 0.75rem 0.95rem;
+          border: 1px solid var(--edge2);
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.02);
+        }
+        .pc-selall {
+          display: inline-flex;
+          align-items: center;
+          gap: 9px;
+          font-family: var(--sans);
+          font-size: 0.86rem;
+          font-weight: 600;
+          color: var(--txt2);
+          cursor: pointer;
+          user-select: none;
+          white-space: nowrap;
+        }
+        .pc-bulk {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 0.55rem 0.8rem;
+          margin-left: auto;
+        }
+        .pc-bulk-count {
+          font-family: var(--sans);
+          font-size: 0.84rem;
+          font-weight: 700;
+          color: var(--txt);
+          white-space: nowrap;
+        }
+        .pc-bulk-field {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .pc-bulk-input-wrap {
+          flex: 0 0 auto;
+          width: 230px;
+        }
+        .pc-bulk-apply {
+          flex: none;
+          min-height: 38px;
+          padding: 0 16px;
+          border: 0;
+          border-radius: 10px;
+          font-family: var(--sans);
+          font-size: 0.84rem;
+          font-weight: 700;
+          color: var(--void);
+          cursor: pointer;
+          background: linear-gradient(135deg, var(--gold) 0%, var(--gold2) 100%);
+          box-shadow: 0 6px 18px rgba(201, 168, 76, 0.26);
+          transition: transform 0.18s ease, box-shadow 0.18s ease,
+            opacity 0.18s ease;
+          white-space: nowrap;
+        }
+        .pc-bulk-apply:hover:not(:disabled) {
+          transform: translateY(-1px);
+          box-shadow: 0 10px 26px rgba(201, 168, 76, 0.34);
+        }
+        .pc-bulk-apply:disabled {
+          opacity: 0.6;
+          cursor: default;
+        }
+        .pc-bulk-clear {
+          flex: none;
+          min-height: 38px;
+          padding: 0 12px;
+          border: 1px solid var(--edge2);
+          border-radius: 10px;
+          background: transparent;
+          color: var(--txt3);
+          font-family: var(--sans);
+          font-size: 0.8rem;
+          font-weight: 600;
+          cursor: pointer;
+          transition: color 0.18s ease, border-color 0.18s ease;
+          white-space: nowrap;
+        }
+        .pc-bulk-clear:hover:not(:disabled) {
+          color: var(--txt);
+          border-color: var(--edge);
+        }
+        .pc-bulk-clear:disabled {
+          opacity: 0.5;
+          cursor: default;
+        }
+        .pc-bulk-err {
+          flex: 1 1 100%;
+          font-family: var(--sans);
+          font-size: 0.78rem;
+          font-weight: 500;
+          color: var(--red);
+          text-align: right;
+        }
 
         @media (max-width: 760px) {
           .pc-form-grid {
@@ -1756,6 +2097,33 @@ export function ProductCatalog({ user, showToast }: Props) {
           .pc-mini,
           .pc-cost-save {
             min-height: 44px;
+          }
+          .pc-c-check {
+            justify-content: flex-start;
+          }
+          .pc-bulkbar {
+            flex-direction: column;
+            align-items: stretch;
+          }
+          .pc-bulk {
+            margin-left: 0;
+            flex-direction: column;
+            align-items: stretch;
+          }
+          .pc-bulk-field {
+            flex-direction: column;
+            align-items: stretch;
+          }
+          .pc-bulk-input-wrap {
+            width: 100%;
+          }
+          .pc-bulk-apply,
+          .pc-bulk-clear {
+            min-height: 44px;
+            text-align: center;
+          }
+          .pc-bulk-err {
+            text-align: left;
           }
         }
       `}</style>
