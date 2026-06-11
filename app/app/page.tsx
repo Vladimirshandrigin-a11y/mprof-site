@@ -194,6 +194,92 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
   };
 }
 
+/** Тип строки мини-разбивки в «Последних расчётах». */
+type HistDetailRow = {
+  label: string;
+  /** Значение (число) или null → данных нет, показываем «—». */
+  value: number | null;
+  /** Тип строки: доход (зелёный +), расход (красный −), подытог (нейтральный),
+   *  итог (выделенный) или нейтральная строка (например, нулевой график). */
+  kind: "income" | "expense" | "subtotal" | "total" | "neutral";
+};
+
+/**
+ * Строит мини-разбивку расчёта для раскрытия строки в «Последних расчётах».
+ * ТОЛЬКО отображение уже сохранённых данных — ничего не пересчитывает.
+ *   • Отчёт Ozon (есть breakdown из ai_insights) → полная разбивка по ТЗ.
+ *   • Ручной расчёт (breakdown=null) → разбивка из полей CalcResult (нулевые
+ *     расходы скрываются). Старые записи без части полей не ломаются: парсер
+ *     уже коалесцирует отсутствующие числа в 0.
+ */
+function buildHistDetailRows(
+  h: CalcResult,
+  breakdown: NetProfitBreakdown | null
+): HistDetailRow[] {
+  if (breakdown) {
+    const b = breakdown;
+    const otherExpenses =
+      b.ads + b.packaging + b.deliveryToWarehouse + b.salary + b.other;
+    // График выплат: скидка (>0) — доход/зелёный, комиссия (<0) — расход/красный,
+    // стандартный (0) — нейтральный. Уже сохранённое значение, не пересчитываем.
+    const adj = b.payoutScheduleAdjustment ?? 0;
+    const adjKind: HistDetailRow["kind"] =
+      adj > 0 ? "income" : adj < 0 ? "expense" : "neutral";
+    const taxLabel =
+      b.taxPercent > 0
+        ? `Налог (${b.taxPercent.toLocaleString("ru-RU", {
+            maximumFractionDigits: 2,
+          })}%)`
+        : "Налог";
+    return [
+      { label: "Выручка Ozon", value: b.revenueOzon, kind: "income" },
+      {
+        label: "Выплаты от партнёров",
+        value: b.loyaltyPayouts,
+        kind: "income",
+      },
+      {
+        label: "Расходы Ozon по УПД",
+        value: b.updServicesTotal,
+        kind: "expense",
+      },
+      {
+        label: "Агентское вознаграждение",
+        value: b.updCommissionTotal,
+        kind: "expense",
+      },
+      {
+        label: "Прибыль до себестоимости",
+        value: b.profitBeforeCost,
+        kind: "subtotal",
+      },
+      { label: "Себестоимость", value: b.costPrice, kind: "expense" },
+      { label: taxLabel, value: b.tax, kind: "expense" },
+      { label: "Прочие расходы", value: otherExpenses, kind: "expense" },
+      { label: "График выплат Ozon", value: adj, kind: adjKind },
+      { label: "Итоговая чистая прибыль", value: h.profit, kind: "total" },
+    ];
+  }
+  // Ручной расчёт: доход + ненулевые расходы + итог.
+  const rows: HistDetailRow[] = [
+    { label: "Выручка", value: h.revenue, kind: "income" },
+  ];
+  const manualExpenses: [string, number][] = [
+    ["Комиссия", h.commission],
+    ["Логистика", h.logistics],
+    ["Хранение", h.storage],
+    ["Реклама", h.ads],
+    ["Налог", h.tax],
+    ["Себестоимость", h.cost],
+    ["Прочие расходы", h.other],
+  ];
+  for (const [label, value] of manualExpenses) {
+    if (value > 0) rows.push({ label, value, kind: "expense" });
+  }
+  rows.push({ label: "Чистая прибыль", value: h.profit, kind: "total" });
+  return rows;
+}
+
 /**
  * Нормализует строку периода отчёта в первое число месяца 'YYYY-MM-01'
  * (формат колонки report_history.report_month). Понимает ISO (2026-04 /
@@ -1976,6 +2062,19 @@ export default function AppPage() {
   const [histSearch, setHistSearch] = useState("");
   const [histProfitFilter, setHistProfitFilter] =
     useState<HistProfitFilter>("all");
+  // Раскрытые строки «Последних расчётов» (мини-разбивка). Множественное
+  // раскрытие — каждая строка независима. Только UI, данные не пересчитываются.
+  const [expandedHist, setExpandedHist] = useState<Set<string>>(
+    () => new Set()
+  );
+  const toggleHistDetails = (id: string) => {
+    setExpandedHist((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const filterPeriodLabel =
     filterPeriod === "all" ? "всё время" : `${filterPeriod} дней`;
@@ -2418,6 +2517,24 @@ export default function AppPage() {
 
   const fmt = (n: number) =>
     n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
+
+  // Формат значения строки мини-разбивки «Последних расчётов» (только показ).
+  const histDetailValue = (r: HistDetailRow): string => {
+    if (r.value === null) return "—";
+    const money = `${fmt(Math.abs(r.value))} ₽`;
+    switch (r.kind) {
+      case "income":
+        return r.value === 0 ? "0 ₽" : `+${money}`;
+      case "expense":
+        return r.value === 0 ? "0 ₽" : `−${money}`;
+      case "subtotal":
+        return `${fmt(r.value)} ₽`;
+      case "neutral":
+        return r.value === 0 ? "0 ₽" : `${fmt(r.value)} ₽`;
+      case "total":
+        return `${r.value >= 0 ? "+" : "−"}${money}`;
+    }
+  };
 
   const handleField = (key: string, value: string) => {
     if (value !== "" && !/^-?\d*[.,]?\d*$/.test(value)) return;
@@ -4839,13 +4956,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .hist-list{display:flex;flex-direction:column}
 .hist-item{
   display:flex;
-  align-items:center;
-  gap:1rem;
+  flex-direction:column;
+  align-items:stretch;
   padding:.85rem 1.5rem;
   border-bottom:1px solid var(--edge);
   cursor:pointer;
   transition:.2s ease;
 }
+.hist-row{display:flex;align-items:center;gap:1rem;width:100%}
 
 .hist-item:hover{
   background:rgba(255,255,255,.03);
@@ -4873,11 +4991,39 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   background:transparent;color:var(--txt3);font-size:1.05rem;line-height:1;cursor:pointer;
   display:inline-flex;align-items:center;justify-content:center;transition:all .18s;padding:0}
 .hist-del:hover{border-color:rgba(224,85,102,.4);color:var(--red);background:rgba(224,85,102,.08)}
+/* Кнопка раскрытия мини-разбивки + сама разбивка */
+.hist-toggle{flex-shrink:0;width:28px;height:28px;border-radius:8px;border:1px solid var(--edge2);
+  background:transparent;color:var(--txt3);cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;transition:all .18s;padding:0}
+.hist-toggle:hover,.hist-toggle.open{border-color:rgba(201,168,76,.45);color:var(--gold2);background:rgba(201,168,76,.08)}
+.hist-toggle svg{transition:transform .2s ease}
+.hist-toggle.open svg{transform:rotate(180deg)}
+.hist-details{cursor:default;margin-top:.7rem;padding:.7rem .85rem;border-radius:10px;
+  background:rgba(255,255,255,.022);border:1px solid rgba(255,255,255,.07);
+  display:flex;flex-direction:column;gap:1px}
+.hd-row{display:flex;justify-content:space-between;align-items:baseline;gap:1rem;
+  font-size:.78rem;padding:3px 0;color:var(--txt2)}
+.hd-label{min-width:0;font-weight:400}
+.hd-val{font-family:var(--mono);font-size:.78rem;font-weight:600;color:var(--txt2);
+  font-variant-numeric:tabular-nums;white-space:nowrap;flex-shrink:0}
+.hd-income .hd-val{color:#7be8b2}
+.hd-expense .hd-val{color:#e89a99}
+.hd-neutral .hd-val{color:var(--txt3)}
+.hd-subtotal{border-top:1px dashed rgba(255,255,255,.1);margin-top:3px;padding-top:6px}
+.hd-subtotal .hd-label{color:var(--txt);font-weight:600}
+.hd-subtotal .hd-val{color:var(--txt)}
+.hd-total{border-top:1px solid rgba(201,168,76,.3);margin-top:5px;padding-top:8px}
+.hd-total .hd-label{color:var(--txt);font-weight:700;font-size:.82rem}
+.hd-total .hd-val{color:var(--gold2);font-weight:700;font-size:.9rem}
 @media(max-width:560px){
-  .hist-item{gap:.6rem;padding:.8rem 1rem}
+  .hist-item{padding:.8rem 1rem}
+  .hist-row{gap:.6rem}
   .hist-profit{font-size:.95rem;max-width:42%}
   .hist-profit-label{font-size:.54rem}
   .hist-period{font-size:.68rem}
+  .hist-details{padding:.6rem .7rem}
+  .hd-row{font-size:.75rem}
+  .hd-val{font-size:.75rem}
 }
 .stats-grid{
   display:grid;
@@ -6799,6 +6945,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   isReport && !hasCost
                     ? "Прибыль до себестоимости"
                     : "Чистая прибыль";
+                const expanded = expandedHist.has(h.id);
+                const detailRows = buildHistDetailRows(h, breakdown);
                 return (
                   <div
                     className={
@@ -6809,45 +6957,97 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     key={h.id}
                     onClick={() => loadCalcIntoCalculator(h)}
                   >
-                    <div className={"hist-mp " + h.marketplace}>
-                      {h.marketplace === "ozon" ? "Ozon" : "WB"}
-                    </div>
-
-                    <div className="hist-info">
-                      <div className="hist-rev">{histTitle}</div>
-                      <div className="hist-period">
-                        {reportPeriod
-                          ? `Период отчёта: ${reportPeriod}`
-                          : "Период отчёта: не указан"}
+                    <div className="hist-row">
+                      <div className={"hist-mp " + h.marketplace}>
+                        {h.marketplace === "ozon" ? "Ozon" : "WB"}
                       </div>
-                      <div className="hist-revenue">
-                        Выручка: {fmt(h.revenue)} ₽
+
+                      <div className="hist-info">
+                        <div className="hist-rev">{histTitle}</div>
+                        <div className="hist-period">
+                          {reportPeriod
+                            ? `Период отчёта: ${reportPeriod}`
+                            : "Период отчёта: не указан"}
+                        </div>
+                        <div className="hist-revenue">
+                          Выручка: {fmt(h.revenue)} ₽
+                        </div>
+                        <div className="hist-date">Создан: {h.date}</div>
                       </div>
-                      <div className="hist-date">Создан: {h.date}</div>
+
+                      <div
+                        className={
+                          "hist-profit " + (h.profit >= 0 ? "pos" : "neg")
+                        }
+                      >
+                        <span className="hist-profit-label">{profitLabel}</span>
+                        <span className="hist-profit-num">
+                          {h.profit >= 0 ? "+" : "−"}
+                          {fmt(Math.abs(h.profit))} ₽
+                        </span>
+                        <span className="hm">
+                          Маржа: {h.margin.toFixed(1)}%
+                        </span>
+                      </div>
+
+                      <button
+                        type="button"
+                        className={"hist-toggle" + (expanded ? " open" : "")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          toggleHistDetails(h.id);
+                        }}
+                        aria-expanded={expanded}
+                        aria-label={
+                          expanded ? "Скрыть подробности" : "Показать подробности"
+                        }
+                        title="Подробнее"
+                      >
+                        <svg
+                          viewBox="0 0 16 16"
+                          width="14"
+                          height="14"
+                          fill="none"
+                          aria-hidden="true"
+                        >
+                          <path
+                            d="M4 6l4 4 4-4"
+                            stroke="currentColor"
+                            strokeWidth="1.6"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                      </button>
+
+                      <button
+                        type="button"
+                        className="hist-del"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteHistoryItem(h.id);
+                        }}
+                        disabled={removing}
+                        aria-label="Удалить расчёт"
+                        title="Удалить"
+                      >
+                        {removing ? <span className="hist-del-spin" /> : "×"}
+                      </button>
                     </div>
 
-                    <div className={"hist-profit " + (h.profit >= 0 ? "pos" : "neg")}>
-                      <span className="hist-profit-label">{profitLabel}</span>
-                      <span className="hist-profit-num">
-                        {h.profit >= 0 ? "+" : "−"}
-                        {fmt(Math.abs(h.profit))} ₽
-                      </span>
-                      <span className="hm">Маржа: {h.margin.toFixed(1)}%</span>
-                    </div>
-
-                    <button
-                      type="button"
-                      className="hist-del"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteHistoryItem(h.id);
-                      }}
-                      disabled={removing}
-                      aria-label="Удалить расчёт"
-                      title="Удалить"
-                    >
-                      {removing ? <span className="hist-del-spin" /> : "×"}
-                    </button>
+                    {expanded && (
+                      <div
+                        className="hist-details"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {detailRows.map((r, i) => (
+                          <div key={i} className={"hd-row hd-" + r.kind}>
+                            <span className="hd-label">{r.label}</span>
+                            <span className="hd-val">{histDetailValue(r)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 );
               })}
