@@ -118,6 +118,16 @@ export function ProductCatalog({ user, showToast }: Props) {
   const [costSavingId, setCostSavingId] = useState<string | null>(null);
   const [costErr, setCostErr] = useState<Record<string, string>>({});
 
+  // Поиск и фильтры каталога. Чисто UI-слой: фильтруют уже отсортированный
+  // список для отображения и НЕ трогают Supabase, формулы прибыли, парсеры,
+  // Excel или сохранение себестоимости.
+  // search — живой текстовый поиск (по названию и артикулу/SKU, без кнопки);
+  // costFilter — активный фильтр по наличию себестоимости.
+  const [search, setSearch] = useState("");
+  const [costFilter, setCostFilter] = useState<"all" | "without" | "with">(
+    "all"
+  );
+
   const reload = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
@@ -470,6 +480,37 @@ export function ProductCatalog({ user, showToast }: Props) {
     [products]
   );
 
+  // Счётчики для кнопок-фильтров. «С себестоимостью» = cost_price конечное
+  // число > 0; всё остальное (0, null, NaN, невалидное) — «без себестоимости».
+  // Считаем по полному products, чтобы цифры не зависели от поиска/фильтра.
+  const withCostCount = useMemo(
+    () =>
+      products.filter((p) => Number.isFinite(p.cost_price) && p.cost_price > 0)
+        .length,
+    [products]
+  );
+  const withoutCostCount = products.length - withCostCount;
+
+  // Видимый список = отсортированный каталог, к которому применены фильтр по
+  // себестоимости и текстовый поиск. Деривация из sortedProducts гарантирует,
+  // что порядок (name → sku, русская локаль) НЕ ломается после фильтрации.
+  // Поиск регистронезависимый, по названию и артикулу/SKU; пустой запрос
+  // ничего не отсекает.
+  const visibleProducts = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return sortedProducts.filter((p) => {
+      const hasCost = Number.isFinite(p.cost_price) && p.cost_price > 0;
+      if (costFilter === "with" && !hasCost) return false;
+      if (costFilter === "without" && hasCost) return false;
+      if (q !== "") {
+        const name = (p.name ?? "").toLowerCase();
+        const sku = (p.sku ?? "").toLowerCase();
+        if (!name.includes(q) && !sku.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [sortedProducts, search, costFilter]);
+
   return (
     <section className="pc">
       <div className="pc-head">
@@ -682,129 +723,202 @@ export function ProductCatalog({ user, showToast }: Props) {
           )}
         </div>
       ) : (
-        <div className="pc-table" role="table" aria-label="Список товаров">
-          <div className="pc-thead" role="row">
-            <span role="columnheader">Артикул</span>
-            <span role="columnheader">Название</span>
-            <span role="columnheader">Себестоимость</span>
-            <span role="columnheader" className="pc-th-act">
-              Действия
-            </span>
-          </div>
-          {sortedProducts.map((p) => (
-            <div className="pc-row" role="row" key={p.id}>
-              <span
-                className="pc-cell pc-c-sku"
-                role="cell"
-                data-label="Артикул"
+        <>
+          <div className="pc-toolbar">
+            <div className="pc-search">
+              <svg
+                className="pc-search-ic"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
               >
-                {p.sku || "—"}
-              </span>
-              <span
-                className="pc-cell pc-c-name"
-                role="cell"
-                data-label="Название"
-              >
-                {p.name}
-              </span>
-              <span
-                className="pc-cell pc-c-cost"
-                role="cell"
-                data-label="Себестоимость за 1 шт."
-              >
-                <span className="pc-cost-edit">
-                  <span className="pc-cost-input-wrap">
-                    <input
-                      className={`pc-cost-input${
-                        costErr[p.id] ? " has-err" : ""
-                      }`}
-                      value={costDraft[p.id] ?? String(p.cost_price ?? "")}
-                      inputMode="decimal"
-                      aria-label="Себестоимость за 1 шт."
-                      placeholder="Например, 120"
-                      disabled={costSavingId === p.id}
-                      onChange={(e) => onCostDraftChange(p.id, e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          saveCost(p);
-                        }
-                      }}
-                    />
-                    <span className="pc-cost-rub" aria-hidden="true">
-                      ₽
-                    </span>
-                  </span>
-                  <button
-                    type="button"
-                    className="pc-cost-save"
-                    disabled={costSavingId === p.id}
-                    onClick={() => saveCost(p)}
-                  >
-                    {costSavingId === p.id ? "…" : "Сохранить"}
-                  </button>
-                </span>
-                {costErr[p.id] && (
-                  <span className="pc-cost-err" role="alert">
-                    {costErr[p.id]}
-                  </span>
-                )}
-              </span>
-              <span className="pc-cell pc-c-act" role="cell">
-                {deletingId === p.id ? (
-                  <span className="pc-confirm">
-                    <span className="pc-confirm-q">Удалить?</span>
-                    <button
-                      type="button"
-                      className="pc-mini pc-mini-yes"
-                      disabled={busyId === p.id}
-                      onClick={() => confirmDelete(p.id)}
-                    >
-                      {busyId === p.id ? "…" : "Да"}
-                    </button>
-                    <button
-                      type="button"
-                      className="pc-mini"
-                      disabled={busyId === p.id}
-                      onClick={() => setDeletingId(null)}
-                    >
-                      Нет
-                    </button>
-                  </span>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      className="pc-icon"
-                      title="Редактировать"
-                      aria-label="Редактировать"
-                      onClick={() => openEdit(p)}
-                    >
-                      <svg viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M12 20h9" />
-                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
-                      </svg>
-                    </button>
-                    <button
-                      type="button"
-                      className="pc-icon pc-icon-del"
-                      title="Удалить"
-                      aria-label="Удалить"
-                      onClick={() => setDeletingId(p.id)}
-                    >
-                      <svg viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M3 6h18" />
-                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                        <path d="M10 11v6M14 11v6" />
-                      </svg>
-                    </button>
-                  </>
-                )}
-              </span>
+                <circle cx="11" cy="11" r="7" />
+                <path d="M21 21l-4.3-4.3" />
+              </svg>
+              <input
+                type="search"
+                className="pc-search-input"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Поиск по названию или артикулу"
+                aria-label="Поиск по товарам"
+              />
+              {search && (
+                <button
+                  type="button"
+                  className="pc-search-clear"
+                  aria-label="Очистить поиск"
+                  onClick={() => setSearch("")}
+                >
+                  ×
+                </button>
+              )}
             </div>
-          ))}
-        </div>
+            <div
+              className="pc-filters"
+              role="group"
+              aria-label="Фильтр по себестоимости"
+            >
+              <button
+                type="button"
+                className={`pc-chip${costFilter === "all" ? " active" : ""}`}
+                aria-pressed={costFilter === "all"}
+                onClick={() => setCostFilter("all")}
+              >
+                Все товары
+                <span className="pc-chip-n">{count}</span>
+              </button>
+              <button
+                type="button"
+                className={`pc-chip${
+                  costFilter === "without" ? " active" : ""
+                }`}
+                aria-pressed={costFilter === "without"}
+                onClick={() => setCostFilter("without")}
+              >
+                Без себестоимости
+                <span className="pc-chip-n">{withoutCostCount}</span>
+              </button>
+              <button
+                type="button"
+                className={`pc-chip${costFilter === "with" ? " active" : ""}`}
+                aria-pressed={costFilter === "with"}
+                onClick={() => setCostFilter("with")}
+              >
+                С себестоимостью
+                <span className="pc-chip-n">{withCostCount}</span>
+              </button>
+            </div>
+          </div>
+          {visibleProducts.length === 0 ? (
+            <div className="pc-noresults">Товары не найдены</div>
+          ) : (
+            <div className="pc-table" role="table" aria-label="Список товаров">
+              <div className="pc-thead" role="row">
+                <span role="columnheader">Артикул</span>
+                <span role="columnheader">Название</span>
+                <span role="columnheader">Себестоимость</span>
+                <span role="columnheader" className="pc-th-act">
+                  Действия
+                </span>
+              </div>
+              {visibleProducts.map((p) => (
+                <div className="pc-row" role="row" key={p.id}>
+                  <span
+                    className="pc-cell pc-c-sku"
+                    role="cell"
+                    data-label="Артикул"
+                  >
+                    {p.sku || "—"}
+                  </span>
+                  <span
+                    className="pc-cell pc-c-name"
+                    role="cell"
+                    data-label="Название"
+                  >
+                    {p.name}
+                  </span>
+                  <span
+                    className="pc-cell pc-c-cost"
+                    role="cell"
+                    data-label="Себестоимость за 1 шт."
+                  >
+                    <span className="pc-cost-edit">
+                      <span className="pc-cost-input-wrap">
+                        <input
+                          className={`pc-cost-input${
+                            costErr[p.id] ? " has-err" : ""
+                          }`}
+                          value={costDraft[p.id] ?? String(p.cost_price ?? "")}
+                          inputMode="decimal"
+                          aria-label="Себестоимость за 1 шт."
+                          placeholder="Например, 120"
+                          disabled={costSavingId === p.id}
+                          onChange={(e) =>
+                            onCostDraftChange(p.id, e.target.value)
+                          }
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              saveCost(p);
+                            }
+                          }}
+                        />
+                        <span className="pc-cost-rub" aria-hidden="true">
+                          ₽
+                        </span>
+                      </span>
+                      <button
+                        type="button"
+                        className="pc-cost-save"
+                        disabled={costSavingId === p.id}
+                        onClick={() => saveCost(p)}
+                      >
+                        {costSavingId === p.id ? "…" : "Сохранить"}
+                      </button>
+                    </span>
+                    {costErr[p.id] && (
+                      <span className="pc-cost-err" role="alert">
+                        {costErr[p.id]}
+                      </span>
+                    )}
+                  </span>
+                  <span className="pc-cell pc-c-act" role="cell">
+                    {deletingId === p.id ? (
+                      <span className="pc-confirm">
+                        <span className="pc-confirm-q">Удалить?</span>
+                        <button
+                          type="button"
+                          className="pc-mini pc-mini-yes"
+                          disabled={busyId === p.id}
+                          onClick={() => confirmDelete(p.id)}
+                        >
+                          {busyId === p.id ? "…" : "Да"}
+                        </button>
+                        <button
+                          type="button"
+                          className="pc-mini"
+                          disabled={busyId === p.id}
+                          onClick={() => setDeletingId(null)}
+                        >
+                          Нет
+                        </button>
+                      </span>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          className="pc-icon"
+                          title="Редактировать"
+                          aria-label="Редактировать"
+                          onClick={() => openEdit(p)}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M12 20h9" />
+                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          className="pc-icon pc-icon-del"
+                          title="Удалить"
+                          aria-label="Удалить"
+                          onClick={() => setDeletingId(p.id)}
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M3 6h18" />
+                            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                            <path d="M10 11v6M14 11v6" />
+                          </svg>
+                        </button>
+                      </>
+                    )}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       <style jsx>{`
@@ -1436,6 +1550,148 @@ export function ProductCatalog({ user, showToast }: Props) {
           margin-top: 0.8rem;
         }
 
+        .pc-toolbar {
+          display: flex;
+          align-items: center;
+          gap: 0.8rem;
+          flex-wrap: wrap;
+          margin-top: 1.4rem;
+        }
+        .pc-search {
+          position: relative;
+          flex: 1 1 240px;
+          min-width: 200px;
+        }
+        .pc-search-ic {
+          position: absolute;
+          left: 12px;
+          top: 50%;
+          transform: translateY(-50%);
+          width: 17px;
+          height: 17px;
+          stroke: var(--txt3);
+          stroke-width: 2;
+          fill: none;
+          stroke-linecap: round;
+          pointer-events: none;
+        }
+        .pc-search-input {
+          width: 100%;
+          background: rgba(255, 255, 255, 0.04);
+          border: 1px solid var(--edge2);
+          border-radius: 11px;
+          padding: 11px 38px;
+          font-family: var(--sans);
+          font-size: 0.92rem;
+          color: var(--txt);
+          transition: border-color 0.2s ease, box-shadow 0.2s ease;
+          outline: none;
+          -webkit-appearance: none;
+          appearance: none;
+        }
+        .pc-search-input::placeholder {
+          color: var(--txt3);
+        }
+        .pc-search-input::-webkit-search-cancel-button {
+          -webkit-appearance: none;
+          appearance: none;
+        }
+        .pc-search-input:focus {
+          border-color: var(--gold);
+          box-shadow: 0 0 0 3px rgba(201, 168, 76, 0.14);
+        }
+        .pc-search-clear {
+          position: absolute;
+          right: 8px;
+          top: 50%;
+          transform: translateY(-50%);
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 26px;
+          height: 26px;
+          padding: 0;
+          font-size: 1.25rem;
+          line-height: 1;
+          color: var(--txt3);
+          background: transparent;
+          border: 0;
+          border-radius: 7px;
+          cursor: pointer;
+          transition: color 0.18s ease, background 0.18s ease;
+        }
+        .pc-search-clear:hover {
+          color: var(--txt);
+          background: rgba(255, 255, 255, 0.06);
+        }
+        .pc-filters {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+          flex-wrap: wrap;
+        }
+        .pc-chip {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          min-height: 44px;
+          padding: 0 14px;
+          font-family: var(--sans);
+          font-size: 0.84rem;
+          font-weight: 600;
+          color: var(--txt2);
+          cursor: pointer;
+          border: 1px solid var(--edge2);
+          border-radius: 11px;
+          background: rgba(255, 255, 255, 0.03);
+          transition: color 0.18s ease, border-color 0.18s ease,
+            background 0.18s ease, box-shadow 0.18s ease;
+          white-space: nowrap;
+        }
+        .pc-chip:hover:not(.active) {
+          color: var(--gold2);
+          border-color: var(--gold);
+          background: var(--gold-bg);
+        }
+        .pc-chip.active {
+          color: var(--void);
+          border-color: transparent;
+          background: linear-gradient(135deg, var(--gold) 0%, var(--gold2) 100%);
+          box-shadow: 0 6px 18px rgba(201, 168, 76, 0.26);
+        }
+        .pc-chip-n {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 22px;
+          height: 20px;
+          padding: 0 6px;
+          font-family: var(--mono);
+          font-size: 0.74rem;
+          font-weight: 700;
+          color: var(--txt3);
+          background: rgba(255, 255, 255, 0.06);
+          border-radius: 6px;
+          transition: color 0.18s ease, background 0.18s ease;
+        }
+        .pc-chip:hover:not(.active) .pc-chip-n {
+          color: var(--gold2);
+        }
+        .pc-chip.active .pc-chip-n {
+          color: var(--void);
+          background: rgba(0, 0, 0, 0.18);
+        }
+        .pc-noresults {
+          margin-top: 1.2rem;
+          padding: 2.2rem 1rem;
+          text-align: center;
+          font-size: 0.92rem;
+          color: var(--txt3);
+          border: 1px dashed var(--edge2);
+          border-radius: 12px;
+          background: rgba(255, 255, 255, 0.012);
+        }
+
         @media (max-width: 760px) {
           .pc-form-grid {
             grid-template-columns: 1fr;
@@ -1452,6 +1708,22 @@ export function ProductCatalog({ user, showToast }: Props) {
           .pc-add,
           .pc-import-btn {
             width: 100%;
+            justify-content: center;
+          }
+          .pc-toolbar {
+            flex-direction: column;
+            align-items: stretch;
+            gap: 0.6rem;
+          }
+          .pc-search {
+            flex-basis: auto;
+            width: 100%;
+          }
+          .pc-filters {
+            width: 100%;
+          }
+          .pc-chip {
+            flex: 1 1 auto;
             justify-content: center;
           }
           .pc-thead {
@@ -1473,7 +1745,8 @@ export function ProductCatalog({ user, showToast }: Props) {
             margin-top: 0.2rem;
           }
           .pc-input,
-          .pc-cost-input {
+          .pc-cost-input,
+          .pc-search-input {
             font-size: 16px;
           }
           .pc-icon {
