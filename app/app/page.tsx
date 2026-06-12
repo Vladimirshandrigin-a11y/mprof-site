@@ -3979,6 +3979,21 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .calc-check-status.warn{
   background:rgba(232,176,75,.08);border:1px solid rgba(232,176,75,.28);color:#f0cd84
 }
+/* ===== Save hint — что будет после сохранения ===== */
+.save-hint{
+  display:flex;align-items:flex-start;gap:.55rem;
+  margin-top:14px;padding:.7rem .85rem;
+  background:rgba(255,255,255,.022);
+  border:1px solid var(--edge);
+  border-radius:10px;
+  min-width:0
+}
+.save-hint-ico{flex:0 0 auto;display:flex;color:var(--txt3);margin-top:.05rem}
+.save-hint-text{
+  flex:1 1 auto;min-width:0;
+  font-size:.76rem;color:var(--txt2);line-height:1.45;
+  overflow-wrap:anywhere
+}
 
 .upload-3-error{
   margin-top:1.2rem;padding:1.1rem 1.3rem;border-radius:12px;
@@ -7316,6 +7331,29 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         </div>
                       );
                     })()}
+
+                    <div className="save-hint">
+                      <span className="save-hint-ico" aria-hidden="true">
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <circle cx="12" cy="12" r="9" />
+                          <polyline points="12 7 12 12 15.5 14" />
+                        </svg>
+                      </span>
+                      <span className="save-hint-text">
+                        После сохранения расчёт появится в истории: период
+                        отчёта, чистая прибыль, маржинальность, график выплат
+                        Ozon и статус точности.
+                      </span>
+                    </div>
 
                     <button
                       type="button"
