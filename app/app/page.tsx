@@ -1020,43 +1020,81 @@ export default function AppPage() {
         }) + " %";
       const netPositive = pc.netProfit >= 0;
 
-      // Строки таблицы основных показателей (порядок — как в форме на экране).
+      // Тип строки разбивки: kind управляет цветом и оформлением (доход +зелёный,
+      // расход −красный, подытог белый, нейтраль серый, итог золотой).
+      type RowKind = "income" | "expense" | "subtotal" | "neutral" | "total";
+      type ProfitPdfRow = {
+        label: string;
+        value: string;
+        kind: RowKind;
+        sub?: string;
+      };
+
+      // Метка налога с процентом (если задан).
       const taxLabel =
         pc.taxPercent > 0
           ? `Налог (${pc.taxPercent.toLocaleString("ru-RU", {
               maximumFractionDigits: 2,
             })}%)`
           : "Налог";
-      const rows: { label: string; value: string; bold?: boolean }[] = [
-        { label: "Выручка Ozon", value: "+" + money(cr.revenue) },
-        { label: "Выплаты от партнёров", value: "+" + money(cr.loyaltyPayouts) },
-        { label: "Расходы Ozon по УПД", value: "−" + money(cr.updServicesTotal) },
+
+      // График выплат Ozon. fee (ранняя/ежедневная выплата) — комиссия, уменьшает
+      // прибыль (−); discount (отсрочка) — скидка, увеличивает (+); стандартный
+      // график → 0. У старых расчётов adjustment отсутствует → profitCalc отдаёт 0,
+      // поэтому строка показывает «0 ₽» и не ломает скачивание.
+      const adj = pc.payoutScheduleAdjustment;
+      const payoutKind: RowKind =
+        adj > 0 ? "income" : adj < 0 ? "expense" : "neutral";
+      const payoutValue =
+        adj === 0 ? money(0) : (adj > 0 ? "+" : "−") + money(Math.abs(adj));
+
+      // Полная разбивка расчёта — 10 строк по ТЗ. «Прочие расходы» — свёрнутая
+      // группа (реклама + упаковка + доставка + зарплата + прочее).
+      const rows: ProfitPdfRow[] = [
+        { label: "Выручка Ozon", value: "+" + money(cr.revenue), kind: "income" },
+        {
+          label: "Выплаты от партнёров",
+          value: "+" + money(cr.loyaltyPayouts),
+          kind: "income",
+        },
+        {
+          label: "Расходы Ozon по УПД",
+          value: "−" + money(cr.updServicesTotal),
+          kind: "expense",
+        },
         {
           label: "Агентское вознаграждение",
           value: "−" + money(cr.updCommissionTotal),
+          kind: "expense",
         },
         {
           label: "Прибыль до себестоимости",
           value: money(cr.profitBeforeCost),
-          bold: true,
+          kind: "subtotal",
         },
-        { label: "Себестоимость", value: "−" + money(pc.costPrice) },
-        { label: taxLabel, value: "−" + money(pc.tax) },
-        { label: "Реклама", value: "−" + money(pc.ads) },
-        { label: "Упаковка", value: "−" + money(pc.packaging) },
-        { label: "Доставка до склада", value: "−" + money(pc.deliveryToWarehouse) },
-        { label: "Зарплата / подрядчики", value: "−" + money(pc.salary) },
-        { label: "Прочие расходы", value: "−" + money(pc.other) },
-      ];
-      // График выплат Ozon — добавляем строку только при ненулевой корректировке,
-      // чтобы стандартный график не менял привычный вид отчёта.
-      if (pc.payoutScheduleAdjustment !== 0) {
-        const adj = pc.payoutScheduleAdjustment;
-        rows.push({
+        {
+          label: "Себестоимость",
+          value: "−" + money(pc.costPrice),
+          kind: "expense",
+        },
+        { label: taxLabel, value: "−" + money(pc.tax), kind: "expense" },
+        {
+          label: "Прочие расходы",
+          value: "−" + money(pc.otherExpensesGroup),
+          kind: "expense",
+        },
+        {
           label: "График выплат Ozon",
-          value: (adj > 0 ? "+" : "−") + money(Math.abs(adj)),
-        });
-      }
+          value: payoutValue,
+          kind: payoutKind,
+          sub: payoutScheduleLabel(payoutSchedule),
+        },
+        {
+          label: "Итоговая чистая прибыль",
+          value: (pc.netProfit >= 0 ? "+" : "−") + money(Math.abs(pc.netProfit)),
+          kind: "total",
+        },
+      ];
 
       // ── Canvas (A4 @96dpi = 794×1123), scale ×2 для чёткости ──
       const scale = 2;
@@ -1069,111 +1107,263 @@ export default function AppPage() {
       if (!ctx) throw new Error("canvas 2d context недоступен");
       ctx.scale(scale, scale);
 
+      // ── Палитра M-Prof (тёмная премиальная, hex из CSS-переменных сайта) ──
+      const C = {
+        bgTop: "#080a14",
+        bgBot: "#05070f",
+        panel: "#0d1020",
+        panelHi: "#11152b",
+        gold: "#C9A84C",
+        gold2: "#E8C97A",
+        gold3: "#F5DFA0",
+        txt: "#E8EEF8",
+        txt2: "#8A9FBB",
+        txt3: "#56678a",
+        green: "#2ECC8A",
+        red: "#E05566",
+        edge: "rgba(255,255,255,0.08)",
+        edge2: "rgba(255,255,255,0.14)",
+      };
       const SANS = "'Helvetica Neue', Arial, sans-serif";
-      const ML = 64;
-      const MR = W - 64;
+      const MONO = "'SF Mono', 'Roboto Mono', Menlo, monospace";
+      const ML = 56;
+      const MR = W - 56;
+      const CW = MR - ML;
 
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = "#0e1525";
-      ctx.fillRect(0, 0, W, 8);
-
-      ctx.textBaseline = "alphabetic";
-      let y = 90;
-      ctx.fillStyle = "#0e1525";
-      ctx.font = `700 25px ${SANS}`;
-      ctx.fillText("M-Prof — отчёт о чистой прибыли", ML, y);
-
-      y += 30;
-      ctx.font = `400 13px ${SANS}`;
-      ctx.fillStyle = "#5b6677";
-      ctx.fillText(`Дата формирования: ${dateStr}`, ML, y);
-      y += 20;
-      ctx.fillText("Marketplace: Ozon", ML, y);
-
-      y += 22;
-      ctx.strokeStyle = "#e3e7ee";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(ML, y);
-      ctx.lineTo(MR, y);
-      ctx.stroke();
-
-      y += 32;
-      ctx.font = `700 15px ${SANS}`;
-      ctx.fillStyle = "#0e1525";
-      ctx.fillText("Основные показатели", ML, y);
-
-      const rowH = 30;
-      const drawRow = (
-        label: string,
-        value: string,
-        opts?: { bold?: boolean; size?: number; color?: string }
-      ) => {
-        const size = opts?.size ?? 13;
-        ctx.font = `${opts?.bold ? "700" : "400"} ${size}px ${SANS}`;
-        ctx.fillStyle = "#384150";
-        ctx.textAlign = "left";
-        ctx.fillText(label, ML, y + 20);
-        ctx.font = `${opts?.bold ? "700" : "600"} ${size}px ${SANS}`;
-        ctx.fillStyle = opts?.color ?? "#0e1525";
-        ctx.textAlign = "right";
-        ctx.fillText(value, MR, y + 20);
-        ctx.textAlign = "left";
-        ctx.strokeStyle = "#f0f2f6";
-        ctx.lineWidth = 1;
+      // Путь скруглённого прямоугольника (без зависимости от ctx.roundRect —
+      // совместимо со всеми движками canvas).
+      const rr = (x: number, yy: number, w: number, h: number, r: number) => {
+        const rad = Math.min(r, w / 2, h / 2);
         ctx.beginPath();
-        ctx.moveTo(ML, y + rowH);
-        ctx.lineTo(MR, y + rowH);
-        ctx.stroke();
-        y += rowH;
+        ctx.moveTo(x + rad, yy);
+        ctx.arcTo(x + w, yy, x + w, yy + h, rad);
+        ctx.arcTo(x + w, yy + h, x, yy + h, rad);
+        ctx.arcTo(x, yy + h, x, yy, rad);
+        ctx.arcTo(x, yy, x + w, yy, rad);
+        ctx.closePath();
       };
 
-      y += 12;
-      rows.forEach((r) => drawRow(r.label, r.value, { bold: r.bold }));
+      // ── Фон: вертикальный градиент + золотое свечение + верхняя полоса ──
+      const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+      bgGrad.addColorStop(0, C.bgTop);
+      bgGrad.addColorStop(1, C.bgBot);
+      ctx.fillStyle = bgGrad;
+      ctx.fillRect(0, 0, W, H);
+      const glow = ctx.createRadialGradient(W / 2, -140, 40, W / 2, -140, 540);
+      glow.addColorStop(0, "rgba(201,168,76,0.18)");
+      glow.addColorStop(1, "rgba(201,168,76,0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, W, 380);
+      const topBar = ctx.createLinearGradient(0, 0, W, 0);
+      topBar.addColorStop(0, C.gold);
+      topBar.addColorStop(0.5, C.gold3);
+      topBar.addColorStop(1, C.gold);
+      ctx.fillStyle = topBar;
+      ctx.fillRect(0, 0, W, 4);
 
-      // Разделитель перед итоговым результатом.
-      y += 10;
-      ctx.strokeStyle = "#cfd5df";
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.moveTo(ML, y);
-      ctx.lineTo(MR, y);
-      ctx.stroke();
-      y += 6;
+      ctx.textBaseline = "alphabetic";
 
-      drawRow("Чистая прибыль", money(pc.netProfit), {
-        bold: true,
-        size: 18,
-        color: netPositive ? "#1d8a4f" : "#c0392b",
-      });
-      drawRow("Маржинальность", pctv(pc.margin), {
-        bold: true,
-        color: pc.margin < 0 ? "#c0392b" : "#0e1525",
-      });
-      drawRow("ROI", pctv(pc.roi), {
-        bold: true,
-        color: pc.roi < 0 ? "#c0392b" : "#0e1525",
-      });
-
-      // Короткий вывод.
-      y += 26;
-      const conclusion = netPositive
-        ? "Бизнес-модель прибыльная по загруженным данным."
-        : "Расчёт показывает убыток. Проверьте себестоимость и расходы.";
-      const boxH = 44;
-      ctx.fillStyle = netPositive ? "#eaf7ef" : "#fdecea";
-      ctx.fillRect(ML, y, MR - ML, boxH);
-      ctx.font = `600 13px ${SANS}`;
-      ctx.fillStyle = netPositive ? "#1d8a4f" : "#c0392b";
+      // ── Шапка: бренд + тег + дата/маркетплейс ──
       ctx.textAlign = "left";
-      ctx.fillText(conclusion, ML + 16, y + 27);
+      ctx.font = `800 30px ${SANS}`;
+      ctx.fillStyle = C.txt;
+      ctx.fillText("M-", ML, 72);
+      const brandW = ctx.measureText("M-").width;
+      ctx.fillStyle = C.gold2;
+      ctx.fillText("Prof", ML + brandW, 72);
+      ctx.font = `600 10px ${MONO}`;
+      ctx.fillStyle = C.txt2;
+      ctx.fillText("ОТЧЁТ О ЧИСТОЙ ПРИБЫЛИ", ML, 92);
+      ctx.textAlign = "right";
+      ctx.font = `700 13px ${SANS}`;
+      ctx.fillStyle = C.gold2;
+      ctx.fillText("Ozon", MR, 60);
+      ctx.font = `400 11px ${MONO}`;
+      ctx.fillStyle = C.txt2;
+      ctx.fillText(dateStr, MR, 80);
 
-      // Подпись внизу страницы.
-      ctx.font = `400 12px ${SANS}`;
-      ctx.fillStyle = "#8a93a3";
+      // ── Главный итог (hero): крупная чистая прибыль + карточки маржа/ROI ──
+      const heroY = 116;
+      const heroH = 150;
+      const heroGrad = ctx.createLinearGradient(ML, heroY, ML, heroY + heroH);
+      heroGrad.addColorStop(0, C.panelHi);
+      heroGrad.addColorStop(1, C.panel);
+      rr(ML, heroY, CW, heroH, 16);
+      ctx.fillStyle = heroGrad;
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = "rgba(201,168,76,0.30)";
+      rr(ML, heroY, CW, heroH, 16);
+      ctx.stroke();
+
+      const heroPad = 28;
+      ctx.textAlign = "left";
+      ctx.font = `600 11px ${MONO}`;
+      ctx.fillStyle = C.txt2;
+      ctx.fillText("ИТОГОВАЯ ЧИСТАЯ ПРИБЫЛЬ", ML + heroPad, heroY + 38);
+      ctx.font = `800 46px ${SANS}`;
+      ctx.fillStyle = netPositive ? C.green : C.red;
+      ctx.fillText(
+        (pc.netProfit >= 0 ? "+" : "−") + money(Math.abs(pc.netProfit)),
+        ML + heroPad,
+        heroY + 94
+      );
+      ctx.font = `500 12px ${SANS}`;
+      ctx.fillStyle = C.txt3;
+      ctx.fillText(
+        netPositive
+          ? "Бизнес-модель прибыльна по загруженным данным"
+          : "Расчёт показывает убыток — проверьте себестоимость и расходы",
+        ML + heroPad,
+        heroY + 122
+      );
+
+      const cardW = 156;
+      const cardH = 54;
+      const cardX = MR - heroPad - cardW;
+      const drawStat = (
+        cy: number,
+        label: string,
+        value: string,
+        neg: boolean
+      ) => {
+        rr(cardX, cy, cardW, cardH, 12);
+        ctx.fillStyle = "rgba(255,255,255,0.035)";
+        ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = C.edge;
+        rr(cardX, cy, cardW, cardH, 12);
+        ctx.stroke();
+        ctx.textAlign = "left";
+        ctx.font = `600 9.5px ${MONO}`;
+        ctx.fillStyle = C.txt2;
+        ctx.fillText(label, cardX + 16, cy + 21);
+        ctx.font = `700 21px ${SANS}`;
+        ctx.fillStyle = neg ? C.red : C.gold2;
+        ctx.fillText(value, cardX + 16, cy + 44);
+      };
+      drawStat(heroY + 19, "МАРЖИНАЛЬНОСТЬ", pctv(pc.margin), pc.margin < 0);
+      drawStat(heroY + 19 + cardH + 9, "ROI", pctv(pc.roi), pc.roi < 0);
+
+      // ── Заголовок раздела разбивки ──
+      let y = heroY + heroH + 40;
+      ctx.textAlign = "left";
+      ctx.font = `700 12px ${MONO}`;
+      ctx.fillStyle = C.gold2;
+      ctx.fillText("РАЗБИВКА РАСЧЁТА", ML, y);
+      const headW = ctx.measureText("РАЗБИВКА РАСЧЁТА").width;
+      ctx.strokeStyle = C.edge;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(ML + headW + 16, y - 4);
+      ctx.lineTo(MR, y - 4);
+      ctx.stroke();
+
+      // ── Таблица разбивки (панель + строки) ──
+      y += 18;
+      const rowH = 42;
+      const tableTop = y;
+      const tableH = rows.length * rowH + 14;
+      rr(ML, tableTop, CW, tableH, 14);
+      ctx.fillStyle = "rgba(255,255,255,0.02)";
+      ctx.fill();
+      ctx.strokeStyle = C.edge;
+      ctx.lineWidth = 1;
+      rr(ML, tableTop, CW, tableH, 14);
+      ctx.stroke();
+
+      const padX = 24;
+      const colorFor = (kind: RowKind) =>
+        kind === "income"
+          ? C.green
+          : kind === "expense"
+          ? C.red
+          : kind === "total"
+          ? C.gold2
+          : kind === "subtotal"
+          ? C.txt
+          : C.txt2;
+      let ry = tableTop + 7;
+      rows.forEach((r) => {
+        const isTotal = r.kind === "total";
+        const isSub = r.kind === "subtotal";
+        // Итог — золотая «пилюля» (визуально выделяем отдельно).
+        if (isTotal) {
+          rr(ML + 8, ry + 3, CW - 16, rowH - 6, 10);
+          ctx.fillStyle = "rgba(201,168,76,0.10)";
+          ctx.fill();
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = "rgba(201,168,76,0.38)";
+          rr(ML + 8, ry + 3, CW - 16, rowH - 6, 10);
+          ctx.stroke();
+        }
+        // Подытог — пунктирный разделитель сверху.
+        if (isSub) {
+          ctx.strokeStyle = C.edge2;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(ML + padX, ry + 1);
+          ctx.lineTo(MR - padX, ry + 1);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+        const baseY = ry + rowH / 2 + 5;
+        ctx.textAlign = "left";
+        if (r.sub) {
+          // Строка с под-меткой (график выплат) — лейбл выше, описание ниже.
+          ctx.font = `${isTotal ? "700" : "500"} 13px ${SANS}`;
+          ctx.fillStyle = isTotal ? C.txt : C.txt2;
+          ctx.fillText(r.label, ML + padX, ry + rowH / 2 - 1);
+          ctx.font = `400 9px ${MONO}`;
+          ctx.fillStyle = C.txt3;
+          ctx.fillText(r.sub, ML + padX, ry + rowH / 2 + 13);
+        } else {
+          ctx.font = `${isTotal ? "700" : isSub ? "600" : "500"} ${
+            isTotal ? 15 : 13
+          }px ${SANS}`;
+          ctx.fillStyle = isTotal || isSub ? C.txt : C.txt2;
+          ctx.fillText(r.label, ML + padX, baseY);
+        }
+        ctx.textAlign = "right";
+        ctx.font = `${isTotal ? "800" : "700"} ${isTotal ? 17 : 13}px ${SANS}`;
+        ctx.fillStyle = colorFor(r.kind);
+        ctx.fillText(r.value, MR - padX, baseY);
+        ry += rowH;
+      });
+      ctx.textAlign = "left";
+
+      // ── Примечание о методике расчёта ──
+      y = tableTop + tableH + 26;
+      const noteH = 98;
+      rr(ML, y, CW, noteH, 14);
+      ctx.fillStyle = "rgba(255,255,255,0.02)";
+      ctx.fill();
+      ctx.strokeStyle = C.edge;
+      ctx.lineWidth = 1;
+      rr(ML, y, CW, noteH, 14);
+      ctx.stroke();
+      ctx.font = `700 10px ${MONO}`;
+      ctx.fillStyle = C.gold2;
+      ctx.fillText("КАК СЧИТАЕМ", ML + 22, y + 26);
+      ctx.font = `400 11px ${SANS}`;
+      ctx.fillStyle = C.txt2;
+      const notes = [
+        "Прибыль до себестоимости = Выручка Ozon + Выплаты партнёров − Расходы по УПД − Агентское.",
+        "Чистая прибыль = Прибыль до себестоимости − Себестоимость − Налог − Прочие ± График выплат Ozon.",
+        "Налог считается от выручки Ozon. График выплат: комиссия за раннюю выплату (−), скидка за отсрочку (+).",
+      ];
+      notes.forEach((line, i) => ctx.fillText(line, ML + 22, y + 48 + i * 17));
+
+      // ── Подвал ──
       ctx.textAlign = "center";
-      ctx.fillText("Отчёт сформирован сервисом M-Prof", W / 2, H - 46);
+      ctx.font = `500 10.5px ${MONO}`;
+      ctx.fillStyle = C.txt3;
+      ctx.fillText(
+        "Сформировано сервисом M-Prof · аналитика прибыли для маркетплейсов",
+        W / 2,
+        H - 46
+      );
       ctx.textAlign = "left";
 
       // ── Canvas → картинка → A4 PDF ──
