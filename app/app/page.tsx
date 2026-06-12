@@ -3893,25 +3893,33 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   font-family:var(--mono);font-size:.6rem;color:var(--txt3);
   text-transform:uppercase;letter-spacing:.13em;margin-bottom:.8rem
 }
-.calc-check-list{display:grid;grid-template-columns:1fr;gap:1px}
+.calc-check-list{display:grid;grid-template-columns:1fr;gap:2px}
 .calc-check-row{
-  display:flex;align-items:baseline;gap:.6rem;padding:5px 0;
+  display:flex;align-items:flex-start;gap:.6rem;padding:5px 0;
   font-size:.83rem;color:var(--txt2);line-height:1.3
 }
 .calc-check-ico{
   flex:0 0 1.1rem;text-align:center;font-family:var(--mono);
-  font-size:.76rem;color:var(--txt3)
+  font-size:.76rem;line-height:1.45;color:var(--txt3)
 }
 .calc-check-row.ok .calc-check-ico{color:var(--green)}
 .calc-check-row.warn .calc-check-ico{color:#E8B04B}
-.calc-check-row.bad .calc-check-ico{color:var(--red)}
-.calc-check-label{flex:1 1 auto;min-width:0}
+.calc-check-body{flex:1 1 auto;min-width:0}
+.calc-check-line{
+  display:flex;align-items:baseline;gap:.6rem;justify-content:space-between
+}
+.calc-check-label{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+.calc-check-row.warn .calc-check-label{color:var(--gold2)}
 .calc-check-val{
   font-family:var(--mono);font-size:.79rem;color:var(--txt);
   font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;flex:0 0 auto
 }
 .calc-check-row.warn .calc-check-val{color:#E8B04B}
-.calc-check-row.bad .calc-check-val{color:#e89a99}
+.calc-check-hint{
+  font-size:.72rem;color:var(--txt3);line-height:1.36;margin-top:1px;
+  overflow-wrap:anywhere
+}
+.calc-check-row.warn .calc-check-hint{color:#bfa468}
 .calc-check-status{
   display:flex;align-items:flex-start;gap:.6rem;margin-top:.85rem;
   padding:.7rem .9rem;border-radius:11px
@@ -7014,8 +7022,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       const withoutCost = cov?.withoutCost ?? 0;
                       const hasProducts = total > 0;
                       const costWarn = hasProducts && withoutCost > 0;
-                      const allImportant = updOk && agencyOk;
                       const taxPct = profitCalc?.taxPercent ?? 0;
+                      const taxWarn = taxPct <= 0;
+                      const adj = profitCalc?.payoutScheduleAdjustment ?? 0;
+                      const payoutType = payoutSchedule.type;
+                      const reportOk = !!combinedResult;
                       const pluralTov = (n: number) => {
                         const a = Math.abs(n) % 100;
                         const b = a % 10;
@@ -7024,65 +7035,126 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         if (b > 1 && b < 5) return "товара";
                         return "товаров";
                       };
-                      const checks: {
-                        state: "ok" | "warn" | "bad" | "muted";
-                        ico: string;
+                      const fmtRub = (n: number) =>
+                        n.toLocaleString("ru-RU", {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        }) + " ₽";
+                      const signedRub = (n: number) =>
+                        (n > 0 ? "+" : n < 0 ? "−" : "") + fmtRub(Math.abs(n));
+
+                      type Row = {
+                        state: "ok" | "warn" | "muted";
                         label: string;
                         value?: string;
-                      }[] = [
-                        {
-                          state: "ok",
-                          ico: "✓",
-                          label: "Отчёт Ozon загружен",
-                        },
-                        {
-                          state: updOk ? "ok" : "bad",
-                          ico: updOk ? "✓" : "✗",
-                          label: updOk
-                            ? "Расходы по УПД учтены"
-                            : "Расходы по УПД не загружены",
-                        },
-                        {
-                          state: agencyOk ? "ok" : "bad",
-                          ico: agencyOk ? "✓" : "✗",
-                          label: agencyOk
-                            ? "Агентское вознаграждение учтено"
-                            : "Агентское вознаграждение не загружено",
-                        },
-                        {
-                          state: hasProducts
-                            ? withoutCost === 0
-                              ? "ok"
-                              : "warn"
-                            : "muted",
-                          ico: hasProducts
-                            ? withoutCost === 0
-                              ? "✓"
-                              : "⚠"
-                            : "•",
-                          label: "Себестоимость заполнена",
-                          value: hasProducts
-                            ? `${withCost} / ${total} ${pluralTov(total)}`
-                            : "нет данных по товарам",
-                        },
-                        {
-                          state: "muted",
-                          ico: "•",
-                          label: "График выплат Ozon",
-                          value: payoutScheduleLabel(payoutSchedule),
-                        },
-                        {
-                          state: "muted",
-                          ico: "•",
-                          label: "Налог",
-                          value:
-                            taxPct > 0
-                              ? `${taxPct.toLocaleString("ru-RU", {
-                                  maximumFractionDigits: 2,
-                                })}%`
-                              : "не указан",
-                        },
+                        hint?: string;
+                      };
+                      const checks: Row[] = [
+                        reportOk
+                          ? { state: "ok", label: "Отчёт Ozon загружен" }
+                          : {
+                              state: "warn",
+                              label: "Загрузите отчёт Ozon",
+                              hint: "без него расчёт невозможен",
+                            },
+                        updOk
+                          ? { state: "ok", label: "Расходы по УПД учтены" }
+                          : {
+                              state: "warn",
+                              label: "Расходы по УПД не загружены",
+                              hint: "прибыль может быть завышена",
+                            },
+                        agencyOk
+                          ? {
+                              state: "ok",
+                              label: "Агентское вознаграждение учтено",
+                            }
+                          : {
+                              state: "warn",
+                              label: "Агентское вознаграждение не загружено",
+                              hint: "прибыль может быть завышена",
+                            },
+                        !hasProducts
+                          ? {
+                              state: "muted",
+                              label: "Себестоимость по товарам",
+                              value: "нет данных",
+                            }
+                          : withoutCost === 0
+                          ? {
+                              state: "ok",
+                              label: "Себестоимость заполнена",
+                              value: `${withCost} / ${total} ${pluralTov(
+                                total
+                              )}`,
+                            }
+                          : {
+                              state: "warn",
+                              label: `У ${withoutCost} ${pluralTov(
+                                withoutCost
+                              )} нет себестоимости`,
+                              value: `${withCost} / ${total} ${pluralTov(
+                                total
+                              )}`,
+                              hint: "чистая прибыль может быть неточной",
+                            },
+                        payoutType === "early"
+                          ? {
+                              state: "warn",
+                              label: `График выплат Ozon: ${payoutScheduleLabel(
+                                payoutSchedule
+                              )}`,
+                              value: signedRub(adj),
+                              hint: "комиссия уменьшает прибыль",
+                            }
+                          : payoutType === "deferred"
+                          ? {
+                              state: "ok",
+                              label: `График выплат Ozon: ${payoutScheduleLabel(
+                                payoutSchedule
+                              )}`,
+                              value: signedRub(adj),
+                              hint: "скидка увеличивает прибыль",
+                            }
+                          : {
+                              state: "ok",
+                              label: "График выплат Ozon: Стандартный",
+                              value: "0 ₽",
+                              hint: "корректировка не применяется",
+                            },
+                        taxWarn
+                          ? {
+                              state: "warn",
+                              label: "Налог не указан",
+                              hint: "итоговая прибыль может быть завышена",
+                            }
+                          : {
+                              state: "ok",
+                              label: "Налог указан",
+                              value: `${taxPct.toLocaleString("ru-RU", {
+                                maximumFractionDigits: 2,
+                              })}%`,
+                            },
                       ];
+
+                      const critical = !reportOk || !updOk || !agencyOk;
+                      const inaccurate = costWarn || taxWarn;
+                      const missingCore: string[] = [];
+                      if (!reportOk) missingCore.push("отчёт Ozon");
+                      if (!updOk) missingCore.push("расходы по УПД");
+                      if (!agencyOk)
+                        missingCore.push("агентское вознаграждение");
+                      const softIssues: string[] = [];
+                      if (costWarn)
+                        softIssues.push(
+                          `${withoutCost} ${pluralTov(
+                            withoutCost
+                          )} без себестоимости`
+                        );
+                      if (taxWarn) softIssues.push("не указан налог");
+                      const icoFor = (s: Row["state"]) =>
+                        s === "ok" ? "✓" : s === "warn" ? "⚠" : "•";
+
                       return (
                         <div className="calc-check">
                           <div className="calc-check-title">
@@ -7094,38 +7166,49 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 key={i}
                                 className={"calc-check-row " + c.state}
                               >
-                                <span className="calc-check-ico">{c.ico}</span>
-                                <span className="calc-check-label">
-                                  {c.label}
+                                <span className="calc-check-ico">
+                                  {icoFor(c.state)}
                                 </span>
-                                {c.value && (
-                                  <span className="calc-check-val">
-                                    {c.value}
-                                  </span>
-                                )}
+                                <div className="calc-check-body">
+                                  <div className="calc-check-line">
+                                    <span className="calc-check-label">
+                                      {c.label}
+                                    </span>
+                                    {c.value && (
+                                      <span className="calc-check-val">
+                                        {c.value}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {c.hint && (
+                                    <div className="calc-check-hint">
+                                      {c.hint}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
                             ))}
                           </div>
-                          {!allImportant ? (
+                          {critical ? (
                             <div className="calc-check-status warn">
                               <span className="calc-check-status-ico">⚠</span>
                               <span>
-                                <b>Не все данные загружены</b>
+                                <b>Недостаточно данных для точного расчёта</b>
                                 <em>
-                                  Загрузите УПД и агентское вознаграждение для
-                                  точного расчёта
+                                  Не загружено: {missingCore.join(", ")}.
+                                  Сохранить можно, но прибыль будет неточной.
                                 </em>
                               </span>
                             </div>
-                          ) : costWarn ? (
+                          ) : inaccurate ? (
                             <div className="calc-check-status warn">
                               <span className="calc-check-status-ico">⚠</span>
                               <span>
-                                <b>Чистая прибыль может быть неточной</b>
-                                <em>
-                                  {withoutCost} {pluralTov(withoutCost)} без
-                                  себестоимости — заполните для точного расчёта
-                                </em>
+                                <b>
+                                  Расчёт можно сохранить, но он может быть
+                                  неточным
+                                </b>
+                                <em>Проверьте: {softIssues.join(", ")}.</em>
                               </span>
                             </div>
                           ) : (
@@ -7133,6 +7216,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                               <span className="calc-check-status-ico">✓</span>
                               <span>
                                 <b>Расчёт готов к сохранению</b>
+                                <em>Все ключевые данные на месте.</em>
                               </span>
                             </div>
                           )}
