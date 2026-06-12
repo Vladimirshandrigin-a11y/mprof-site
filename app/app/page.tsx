@@ -9,6 +9,7 @@ import { ProductCatalog } from "./components/ProductCatalog"
 import {
   OzonProductBreakdown,
   type KeyProductsSnapshot,
+  type CostCoverageSnapshot,
 } from "./components/OzonProductBreakdown"
 import { MonthlyAnalytics } from "./components/MonthlyAnalytics"
 import { ComingSoon } from "./components/ComingSoon"
@@ -685,6 +686,15 @@ export default function AppPage() {
   // Стабильная ссылка — как handleReportCogsTotal, чтобы effect не зацикливался.
   const handleReportKeyProducts = useCallback((data: KeyProductsSnapshot) => {
     setReportKeyProducts(data);
+  }, []);
+  /** Покрытие себестоимостью (всего / с себестоимостью / без) последнего отчёта —
+   *  для блока «Проверка расчёта» перед «Сохранить результат». Заполняется
+   *  колбэком из OzonProductBreakdown (read-only). null — нет per-SKU данных. */
+  const [reportCostCoverage, setReportCostCoverage] =
+    useState<CostCoverageSnapshot | null>(null);
+  // Стабильная ссылка — как handleReportCogsTotal, чтобы effect не зацикливался.
+  const handleReportCostCoverage = useCallback((data: CostCoverageSnapshot) => {
+    setReportCostCoverage(data);
   }, []);
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const updServicesInputRef = useRef<HTMLInputElement | null>(null);
@@ -1545,6 +1555,7 @@ export default function AppPage() {
     // Сбрасываем ключевые товары — OzonProductBreakdown пересчитает и пробросит
     // свежие best/worst (или оставит null, если совпадений нет).
     setReportKeyProducts(null);
+    setReportCostCoverage(null);
     setProfitInputs({
       // b.costPrice — fallback: если per-SKU строк нет или в каталоге нет
       // совпадений (COGS=0), остаётся сохранённое значение. При наличии строк
@@ -1658,6 +1669,7 @@ export default function AppPage() {
     setReportProducts([]);
     setReportEstimate(null);
     setReportKeyProducts(null);
+    setReportCostCoverage(null);
 
     // Запускаем парсинг параллельно со стадиями анимации — пока крутятся
     // фейковые «стадии AI», файл уже реально читается. К концу анимации
@@ -2008,6 +2020,7 @@ export default function AppPage() {
     setReportProducts([]);
     setReportEstimate(null);
     setReportKeyProducts(null);
+    setReportCostCoverage(null);
     setReportCogsTotal(null);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
@@ -2039,6 +2052,7 @@ export default function AppPage() {
     setReportProducts([]);
     setReportEstimate(null);
     setReportKeyProducts(null);
+    setReportCostCoverage(null);
     setReportCogsTotal(null);
 
     // eslint-disable-next-line no-console
@@ -3868,6 +3882,51 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .profit-breakdown{
   display:grid;grid-template-columns:1fr;gap:6px;margin-top:1.1rem;
   padding-top:.9rem;border-top:1px solid rgba(255,255,255,.06)
+}
+
+/* ===== Проверка расчёта (перед «Сохранить результат») ===== */
+.calc-check{
+  margin-top:1.25rem;padding:1.05rem 1.15rem;border-radius:14px;
+  background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.08)
+}
+.calc-check-title{
+  font-family:var(--mono);font-size:.6rem;color:var(--txt3);
+  text-transform:uppercase;letter-spacing:.13em;margin-bottom:.8rem
+}
+.calc-check-list{display:grid;grid-template-columns:1fr;gap:1px}
+.calc-check-row{
+  display:flex;align-items:baseline;gap:.6rem;padding:5px 0;
+  font-size:.83rem;color:var(--txt2);line-height:1.3
+}
+.calc-check-ico{
+  flex:0 0 1.1rem;text-align:center;font-family:var(--mono);
+  font-size:.76rem;color:var(--txt3)
+}
+.calc-check-row.ok .calc-check-ico{color:var(--green)}
+.calc-check-row.warn .calc-check-ico{color:#E8B04B}
+.calc-check-row.bad .calc-check-ico{color:var(--red)}
+.calc-check-label{flex:1 1 auto;min-width:0}
+.calc-check-val{
+  font-family:var(--mono);font-size:.79rem;color:var(--txt);
+  font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap;flex:0 0 auto
+}
+.calc-check-row.warn .calc-check-val{color:#E8B04B}
+.calc-check-row.bad .calc-check-val{color:#e89a99}
+.calc-check-status{
+  display:flex;align-items:flex-start;gap:.6rem;margin-top:.85rem;
+  padding:.7rem .9rem;border-radius:11px
+}
+.calc-check-status-ico{flex:0 0 auto;font-size:.88rem;line-height:1.35}
+.calc-check-status b{display:block;font-size:.85rem;font-weight:600;letter-spacing:-.01em}
+.calc-check-status em{
+  display:block;font-style:normal;font-size:.75rem;font-weight:300;
+  margin-top:2px;opacity:.9;line-height:1.4
+}
+.calc-check-status.ok{
+  background:rgba(46,204,138,.08);border:1px solid rgba(46,204,138,.24);color:#7be8b2
+}
+.calc-check-status.warn{
+  background:rgba(232,176,75,.08);border:1px solid rgba(232,176,75,.28);color:#f0cd84
 }
 
 .upload-3-error{
@@ -6944,6 +7003,143 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </div>
                     </div>
 
+                    {(() => {
+                      const updOk =
+                        (combinedResult?.updServicesTotal ?? 0) > 0;
+                      const agencyOk =
+                        (combinedResult?.updCommissionTotal ?? 0) > 0;
+                      const cov = reportCostCoverage;
+                      const total = cov?.total ?? 0;
+                      const withCost = cov?.withCost ?? 0;
+                      const withoutCost = cov?.withoutCost ?? 0;
+                      const hasProducts = total > 0;
+                      const costWarn = hasProducts && withoutCost > 0;
+                      const allImportant = updOk && agencyOk;
+                      const taxPct = profitCalc?.taxPercent ?? 0;
+                      const pluralTov = (n: number) => {
+                        const a = Math.abs(n) % 100;
+                        const b = a % 10;
+                        if (a > 10 && a < 20) return "товаров";
+                        if (b === 1) return "товар";
+                        if (b > 1 && b < 5) return "товара";
+                        return "товаров";
+                      };
+                      const checks: {
+                        state: "ok" | "warn" | "bad" | "muted";
+                        ico: string;
+                        label: string;
+                        value?: string;
+                      }[] = [
+                        {
+                          state: "ok",
+                          ico: "✓",
+                          label: "Отчёт Ozon загружен",
+                        },
+                        {
+                          state: updOk ? "ok" : "bad",
+                          ico: updOk ? "✓" : "✗",
+                          label: updOk
+                            ? "Расходы по УПД учтены"
+                            : "Расходы по УПД не загружены",
+                        },
+                        {
+                          state: agencyOk ? "ok" : "bad",
+                          ico: agencyOk ? "✓" : "✗",
+                          label: agencyOk
+                            ? "Агентское вознаграждение учтено"
+                            : "Агентское вознаграждение не загружено",
+                        },
+                        {
+                          state: hasProducts
+                            ? withoutCost === 0
+                              ? "ok"
+                              : "warn"
+                            : "muted",
+                          ico: hasProducts
+                            ? withoutCost === 0
+                              ? "✓"
+                              : "⚠"
+                            : "•",
+                          label: "Себестоимость заполнена",
+                          value: hasProducts
+                            ? `${withCost} / ${total} ${pluralTov(total)}`
+                            : "нет данных по товарам",
+                        },
+                        {
+                          state: "muted",
+                          ico: "•",
+                          label: "График выплат Ozon",
+                          value: payoutScheduleLabel(payoutSchedule),
+                        },
+                        {
+                          state: "muted",
+                          ico: "•",
+                          label: "Налог",
+                          value:
+                            taxPct > 0
+                              ? `${taxPct.toLocaleString("ru-RU", {
+                                  maximumFractionDigits: 2,
+                                })}%`
+                              : "не указан",
+                        },
+                      ];
+                      return (
+                        <div className="calc-check">
+                          <div className="calc-check-title">
+                            Проверка расчёта
+                          </div>
+                          <div className="calc-check-list">
+                            {checks.map((c, i) => (
+                              <div
+                                key={i}
+                                className={"calc-check-row " + c.state}
+                              >
+                                <span className="calc-check-ico">{c.ico}</span>
+                                <span className="calc-check-label">
+                                  {c.label}
+                                </span>
+                                {c.value && (
+                                  <span className="calc-check-val">
+                                    {c.value}
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                          {!allImportant ? (
+                            <div className="calc-check-status warn">
+                              <span className="calc-check-status-ico">⚠</span>
+                              <span>
+                                <b>Не все данные загружены</b>
+                                <em>
+                                  Загрузите УПД и агентское вознаграждение для
+                                  точного расчёта
+                                </em>
+                              </span>
+                            </div>
+                          ) : costWarn ? (
+                            <div className="calc-check-status warn">
+                              <span className="calc-check-status-ico">⚠</span>
+                              <span>
+                                <b>Чистая прибыль может быть неточной</b>
+                                <em>
+                                  {withoutCost} {pluralTov(withoutCost)} без
+                                  себестоимости — заполните для точного расчёта
+                                </em>
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="calc-check-status ok">
+                              <span className="calc-check-status-ico">✓</span>
+                              <span>
+                                <b>Расчёт готов к сохранению</b>
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
                     <button
                       type="button"
                       className="upload-3-btn primary"
@@ -6993,6 +7189,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             user={user}
             onCogsTotal={handleReportCogsTotal}
             onKeyProducts={handleReportKeyProducts}
+            onCostCoverage={handleReportCostCoverage}
           />
         )}
 

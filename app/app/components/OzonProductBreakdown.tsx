@@ -53,6 +53,17 @@ export interface KeyProductsSnapshot {
   worst: KeyProduct | null;
 }
 
+/**
+ * Снимок покрытия себестоимостью: total — всего товаров в отчёте, withCost —
+ * сколько с заполненной себестоимостью, withoutCost — сколько без. Read-only
+ * проброс уже посчитанных totals для блока «Проверка расчёта» родителя.
+ */
+export interface CostCoverageSnapshot {
+  total: number;
+  withCost: number;
+  withoutCost: number;
+}
+
 interface Props {
   products: OzonProductRow[];
   /** Тоталы отчёта (estimate) — источник общих расходов для распределения. */
@@ -70,6 +81,12 @@ interface Props {
    * Ничего не пересчитывает и не меняет поведение блока.
    */
   onKeyProducts?: (data: KeyProductsSnapshot) => void;
+  /**
+   * Колбэк с покрытием себестоимостью (всего / с себестоимостью / без) —
+   * read-only проброс уже посчитанных totals для блока «Проверка расчёта».
+   * Ничего не пересчитывает и не меняет поведение блока.
+   */
+  onCostCoverage?: (data: CostCoverageSnapshot) => void;
 }
 
 /** Строка результата по одному артикулу (агрегирована по отчёту). */
@@ -139,6 +156,7 @@ export function OzonProductBreakdown({
   user,
   onCogsTotal,
   onKeyProducts,
+  onCostCoverage,
 }: Props) {
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
@@ -482,6 +500,17 @@ export function OzonProductBreakdown({
         : null;
     onKeyProducts({ best: toKey(bestProduct), worst: toKey(worstProduct) });
   }, [bestProduct, worstProduct, onKeyProducts]);
+
+  // Пробрасываем покрытие себестоимостью (всего/с/без) в родителя — ТОЛЬКО для
+  // блока «Проверка расчёта». Read-only: используем уже посчитанные totals,
+  // ничего не пересчитываем и не меняем поведение блока.
+  useEffect(() => {
+    onCostCoverage?.({
+      total: totals.total,
+      withCost: totals.withCost,
+      withoutCost: totals.withoutCost,
+    });
+  }, [totals.total, totals.withCost, totals.withoutCost, onCostCoverage]);
 
   // Выгрузка «Товары без себестоимости» в Excel. Лист «Без себестоимости»:
   // sku | name | revenue | cost_price. Колонка cost_price идёт ПУСТОЙ — её
