@@ -6,7 +6,10 @@ import type { User } from "@supabase/supabase-js"
 import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { ProductCatalog } from "./components/ProductCatalog"
-import { OzonProductBreakdown } from "./components/OzonProductBreakdown"
+import {
+  OzonProductBreakdown,
+  type KeyProductsSnapshot,
+} from "./components/OzonProductBreakdown"
 import { MonthlyAnalytics } from "./components/MonthlyAnalytics"
 import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
@@ -673,6 +676,16 @@ export default function AppPage() {
   const handleReportCogsTotal = useCallback((cogsTotal: number) => {
     setReportCogsTotal(cogsTotal);
   }, []);
+  /** Ключевые товары (самый прибыльный / самый убыточный) последнего отчёта —
+   *  для компактного блока «Ключевые товары» в PDF. Заполняется колбэком из
+   *  OzonProductBreakdown (read-only). null — нет per-SKU данных → блок в PDF не
+   *  рисуется и отчёт работает как раньше. */
+  const [reportKeyProducts, setReportKeyProducts] =
+    useState<KeyProductsSnapshot | null>(null);
+  // Стабильная ссылка — как handleReportCogsTotal, чтобы effect не зацикливался.
+  const handleReportKeyProducts = useCallback((data: KeyProductsSnapshot) => {
+    setReportKeyProducts(data);
+  }, []);
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const updServicesInputRef = useRef<HTMLInputElement | null>(null);
   const updCommissionInputRef = useRef<HTMLInputElement | null>(null);
@@ -1333,8 +1346,125 @@ export default function AppPage() {
       });
       ctx.textAlign = "left";
 
+      // ── Ключевые товары (компактно): самый прибыльный / самый убыточный ──
+      // Данные — read-only снимок из OzonProductBreakdown (reportKeyProducts).
+      // Рисуем блок ТОЛЬКО при наличии данных по товарам; иначе PDF как раньше.
+      let yAfter = tableTop + tableH;
+      // Обрезка длинного текста под ширину карточки (по текущему шрифту ctx).
+      const ellipsize = (text: string, maxW: number) => {
+        if (ctx.measureText(text).width <= maxW) return text;
+        let t = text;
+        while (t.length > 1 && ctx.measureText(t + "…").width > maxW)
+          t = t.slice(0, -1);
+        return t + "…";
+      };
+      const drawProductCard = (
+        x: number,
+        cy: number,
+        w: number,
+        h: number,
+        kind: "best" | "worst",
+        p: { article: string; name: string; profit: number; margin: number } | null
+      ) => {
+        rr(x, cy, w, h, 12);
+        ctx.fillStyle = "rgba(255,255,255,0.02)";
+        ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = C.edge;
+        rr(x, cy, w, h, 12);
+        ctx.stroke();
+        const accent = kind === "best" ? C.green : C.red;
+        ctx.textAlign = "left";
+        ctx.font = `700 9.5px ${MONO}`;
+        ctx.fillStyle = kind === "best" ? C.green : p ? C.red : C.txt2;
+        ctx.fillText(
+          kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : "САМЫЙ УБЫТОЧНЫЙ",
+          x + 16,
+          cy + 22
+        );
+        // Убыточных товаров нет — аккуратная зелёная строка вместо карточки.
+        if (kind === "worst" && !p) {
+          const pillY = cy + h / 2 - 1;
+          rr(x + 16, pillY, w - 32, 30, 8);
+          ctx.fillStyle = "rgba(46,204,138,0.10)";
+          ctx.fill();
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = "rgba(46,204,138,0.30)";
+          rr(x + 16, pillY, w - 32, 30, 8);
+          ctx.stroke();
+          ctx.textAlign = "center";
+          ctx.font = `600 11px ${SANS}`;
+          ctx.fillStyle = C.green;
+          ctx.fillText("Убыточных товаров не найдено", x + w / 2, pillY + 20);
+          ctx.textAlign = "left";
+          return;
+        }
+        if (!p) return;
+        // Название (обрезаем) + артикул/SKU.
+        ctx.font = `700 13px ${SANS}`;
+        ctx.fillStyle = C.txt;
+        ctx.fillText(ellipsize(p.name || p.article, w - 32), x + 16, cy + 46);
+        ctx.font = `400 9px ${MONO}`;
+        ctx.fillStyle = C.txt3;
+        ctx.fillText(ellipsize("SKU: " + p.article, w - 32), x + 16, cy + 63);
+        ctx.strokeStyle = C.edge;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x + 16, cy + 77);
+        ctx.lineTo(x + w - 16, cy + 77);
+        ctx.stroke();
+        // Чистая прибыль (слева) + маржа (справа).
+        ctx.font = `600 8px ${MONO}`;
+        ctx.fillStyle = C.txt3;
+        ctx.fillText("ЧИСТАЯ ПРИБЫЛЬ", x + 16, cy + 92);
+        ctx.font = `800 15px ${SANS}`;
+        ctx.fillStyle = accent;
+        ctx.fillText(
+          (p.profit >= 0 ? "+" : "−") + money(Math.abs(p.profit)),
+          x + 16,
+          cy + 106
+        );
+        ctx.textAlign = "right";
+        ctx.font = `600 8px ${MONO}`;
+        ctx.fillStyle = C.txt3;
+        ctx.fillText("МАРЖА", x + w - 16, cy + 92);
+        ctx.font = `700 14px ${SANS}`;
+        ctx.fillStyle = p.margin < 0 ? C.red : C.txt;
+        ctx.fillText(pctv(p.margin), x + w - 16, cy + 106);
+        ctx.textAlign = "left";
+      };
+      const keyProducts = reportKeyProducts;
+      if (keyProducts?.best) {
+        yAfter += 30;
+        ctx.textAlign = "left";
+        ctx.font = `700 12px ${MONO}`;
+        ctx.fillStyle = C.gold2;
+        ctx.fillText("КЛЮЧЕВЫЕ ТОВАРЫ", ML, yAfter);
+        const kHeadW = ctx.measureText("КЛЮЧЕВЫЕ ТОВАРЫ").width;
+        ctx.strokeStyle = C.edge;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(ML + kHeadW + 16, yAfter - 4);
+        ctx.lineTo(MR, yAfter - 4);
+        ctx.stroke();
+        yAfter += 16;
+        const kGap = 16;
+        const kcW = (CW - kGap) / 2;
+        const kcH = 112;
+        drawProductCard(ML, yAfter, kcW, kcH, "best", keyProducts.best);
+        drawProductCard(
+          ML + kcW + kGap,
+          yAfter,
+          kcW,
+          kcH,
+          "worst",
+          keyProducts.worst
+        );
+        yAfter += kcH;
+      }
+
       // ── Примечание о методике расчёта ──
-      y = tableTop + tableH + 26;
+      y = yAfter + 26;
       const noteH = 98;
       rr(ML, y, CW, noteH, 14);
       ctx.fillStyle = "rgba(255,255,255,0.02)";
@@ -1412,6 +1542,9 @@ export default function AppPage() {
     const restoredProducts = b.products ?? [];
     setReportProducts(restoredProducts);
     setReportEstimate(b.estimate ?? null);
+    // Сбрасываем ключевые товары — OzonProductBreakdown пересчитает и пробросит
+    // свежие best/worst (или оставит null, если совпадений нет).
+    setReportKeyProducts(null);
     setProfitInputs({
       // b.costPrice — fallback: если per-SKU строк нет или в каталоге нет
       // совпадений (COGS=0), остаётся сохранённое значение. При наличии строк
@@ -1524,6 +1657,7 @@ export default function AppPage() {
     setUploadDebugInfo(null);
     setReportProducts([]);
     setReportEstimate(null);
+    setReportKeyProducts(null);
 
     // Запускаем парсинг параллельно со стадиями анимации — пока крутятся
     // фейковые «стадии AI», файл уже реально читается. К концу анимации
@@ -1873,6 +2007,7 @@ export default function AppPage() {
     setCombinedDebug(null);
     setReportProducts([]);
     setReportEstimate(null);
+    setReportKeyProducts(null);
     setReportCogsTotal(null);
     setShowProfitForm(false);
     setProfitInputs({ ...EMPTY_PROFIT });
@@ -1903,6 +2038,7 @@ export default function AppPage() {
     setCombinedDebug(null);
     setReportProducts([]);
     setReportEstimate(null);
+    setReportKeyProducts(null);
     setReportCogsTotal(null);
 
     // eslint-disable-next-line no-console
@@ -6856,6 +6992,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             estimate={reportEstimate}
             user={user}
             onCogsTotal={handleReportCogsTotal}
+            onKeyProducts={handleReportKeyProducts}
           />
         )}
 

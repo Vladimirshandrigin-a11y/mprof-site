@@ -36,6 +36,23 @@ import type {
   OzonEstimate,
 } from "../lib/report-parsers/ozon-parser";
 
+/** Ключевой товар для PDF-отчёта родителя (подмножество BreakdownRow). */
+export interface KeyProduct {
+  article: string;
+  name: string;
+  profit: number;
+  margin: number;
+}
+/**
+ * Снимок ключевых товаров: best — самый прибыльный (null, если нет товаров с
+ * себестоимостью), worst — самый убыточный (null, если убыточных нет).
+ * Пробрасывается в родителя ТОЛЬКО для блока «Ключевые товары» в PDF.
+ */
+export interface KeyProductsSnapshot {
+  best: KeyProduct | null;
+  worst: KeyProduct | null;
+}
+
 interface Props {
   products: OzonProductRow[];
   /** Тоталы отчёта (estimate) — источник общих расходов для распределения. */
@@ -47,6 +64,12 @@ interface Props {
    * в блоке «Дополнительные расходы». 0 — если каталог пуст / ничего не сматчено.
    */
   onCogsTotal?: (cogsTotal: number) => void;
+  /**
+   * Колбэк с ключевыми товарами (самый прибыльный / самый убыточный) — read-only
+   * проброс уже посчитанных bestProduct/worstProduct для PDF-отчёта родителя.
+   * Ничего не пересчитывает и не меняет поведение блока.
+   */
+  onKeyProducts?: (data: KeyProductsSnapshot) => void;
 }
 
 /** Строка результата по одному артикулу (агрегирована по отчёту). */
@@ -110,7 +133,13 @@ function normArticle(s: string | null | undefined): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: Props) {
+export function OzonProductBreakdown({
+  products,
+  estimate,
+  user,
+  onCogsTotal,
+  onKeyProducts,
+}: Props) {
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -436,6 +465,23 @@ export function OzonProductBreakdown({ products, estimate, user, onCogsTotal }: 
   useEffect(() => {
     onCogsTotal?.(totals.cogs);
   }, [totals.cogs, onCogsTotal]);
+
+  // Пробрасываем ключевые товары (best/worst) в родителя — ТОЛЬКО для PDF-отчёта.
+  // Read-only: берём уже посчитанные bestProduct/worstProduct, ничего не
+  // пересчитываем и не меняем поведение блока «Чистая прибыль по товарам».
+  useEffect(() => {
+    if (!onKeyProducts) return;
+    const toKey = (r: BreakdownRow | null): KeyProduct | null =>
+      r
+        ? {
+            article: r.article,
+            name: r.name,
+            profit: r.profit ?? 0,
+            margin: r.margin ?? 0,
+          }
+        : null;
+    onKeyProducts({ best: toKey(bestProduct), worst: toKey(worstProduct) });
+  }, [bestProduct, worstProduct, onKeyProducts]);
 
   // Выгрузка «Товары без себестоимости» в Excel. Лист «Без себестоимости»:
   // sku | name | revenue | cost_price. Колонка cost_price идёт ПУСТОЙ — её
