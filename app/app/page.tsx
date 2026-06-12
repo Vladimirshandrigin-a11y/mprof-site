@@ -3754,6 +3754,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   font-family:var(--display);font-style:italic;font-size:2.4rem;
   color:var(--txt);margin-bottom:1rem;letter-spacing:-.01em;line-height:1.1
 }
+.upload-3-result-cap{
+  margin-top:-.6rem;margin-bottom:1rem;
+  font-size:.78rem;color:var(--txt2);line-height:1.4;
+  min-width:0;overflow-wrap:anywhere
+}
 .upload-3-result-breakdown{
   display:grid;grid-template-columns:1fr;gap:6px;padding:.7rem 0 .3rem;
   border-top:1px solid rgba(255,255,255,.06)
@@ -6666,9 +6671,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   })}{" "}
                   ₽
                 </div>
+                <div className="upload-3-result-cap">
+                  Это ещё не чистая прибыль — ниже добавьте себестоимость и
+                  налог.
+                </div>
                 <div className="upload-3-result-breakdown">
                   <div className="upload-3-row">
-                    <span>Revenue (Итого реализовано)</span>
+                    <span>Выручка (Итого реализовано)</span>
                     <span className="num">
                       +
                       {combinedResult.revenue.toLocaleString("ru-RU", {
