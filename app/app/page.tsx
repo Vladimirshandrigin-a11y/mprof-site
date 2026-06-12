@@ -3597,6 +3597,49 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   font-size:.85rem;color:var(--txt2);line-height:1.5;margin:0;max-width:680px
 }
 .upload-3-sub b{color:var(--gold2);font-weight:500}
+/* ===== Upload guide — какие файлы нужны ===== */
+.upload-guide{
+  margin-bottom:1.2rem;padding:.85rem 1rem;
+  background:var(--gold-bg);
+  border:1px solid var(--edge2);
+  border-left:2px solid var(--gold);
+  border-radius:12px;
+  min-width:0;overflow:hidden
+}
+.upload-guide-head{
+  display:flex;align-items:center;gap:.5rem;margin-bottom:.65rem
+}
+.upload-guide-ico{flex:0 0 auto;display:flex;color:var(--gold2)}
+.upload-guide-title{
+  font-family:var(--display);font-style:italic;font-size:1rem;
+  color:var(--txt);letter-spacing:.005em;overflow-wrap:anywhere
+}
+.upload-guide-list{
+  list-style:none;margin:0;padding:0;
+  display:flex;flex-direction:column;gap:.4rem
+}
+.upload-guide-item{display:flex;align-items:flex-start;gap:.55rem;min-width:0}
+.upload-guide-num{
+  flex:0 0 1.3rem;height:1.3rem;margin-top:.05rem;
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:.72rem;font-weight:600;
+  color:var(--gold3);
+  background:var(--gold-bg2);
+  border:1px solid var(--gold-d);
+  border-radius:6px
+}
+.upload-guide-text{
+  flex:1 1 auto;min-width:0;
+  font-size:.82rem;color:var(--txt2);line-height:1.45;
+  overflow-wrap:anywhere
+}
+.upload-guide-text b{color:var(--txt);font-weight:500}
+.upload-guide-foot{
+  margin-top:.7rem;padding-top:.6rem;
+  border-top:1px solid var(--edge);
+  font-size:.78rem;color:var(--gold2);line-height:1.45;
+  overflow-wrap:anywhere
+}
 .upload-3-slots{
   display:grid;
   grid-template-columns:repeat(3,minmax(0,1fr));
@@ -6316,6 +6359,56 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 агентское вознаграждение). Прибыль до себестоимости считается
                 по формуле: <b>revenue + loyaltyPayouts − updServices − updCommission</b>.
               </p>
+            </div>
+
+            <div className="upload-guide">
+              <div className="upload-guide-head">
+                <span className="upload-guide-ico" aria-hidden="true">
+                  <svg
+                    width="15"
+                    height="15"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <circle cx="12" cy="12" r="10" />
+                    <line x1="12" y1="16" x2="12" y2="12" />
+                    <line x1="12" y1="8" x2="12.01" y2="8" />
+                  </svg>
+                </span>
+                <span className="upload-guide-title">
+                  Какие файлы нужны для точного расчёта
+                </span>
+              </div>
+              <ol className="upload-guide-list">
+                <li className="upload-guide-item">
+                  <span className="upload-guide-num" aria-hidden="true">1</span>
+                  <span className="upload-guide-text">
+                    <b>Отчёт о реализации Ozon</b> — основной Excel-файл с
+                    выручкой и товарами.
+                  </span>
+                </li>
+                <li className="upload-guide-item">
+                  <span className="upload-guide-num" aria-hidden="true">2</span>
+                  <span className="upload-guide-text">
+                    <b>УПД по услугам Ozon</b> — PDF с расходами Ozon по услугам.
+                  </span>
+                </li>
+                <li className="upload-guide-item">
+                  <span className="upload-guide-num" aria-hidden="true">3</span>
+                  <span className="upload-guide-text">
+                    <b>УПД агентского вознаграждения</b> — PDF с
+                    комиссией/вознаграждением Ozon.
+                  </span>
+                </li>
+              </ol>
+              <div className="upload-guide-foot">
+                Можно начать с одного Excel-отчёта, но для максимально точной
+                чистой прибыли загрузите все 3 файла.
+              </div>
             </div>
 
             <div className="upload-3-slots">
