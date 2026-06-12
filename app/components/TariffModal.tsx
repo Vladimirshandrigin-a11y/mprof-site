@@ -48,13 +48,13 @@ const TIER_DATA: Record<
 
 export function TariffModal({ open, tier, onClose }: Props) {
   // Реальная оплата через POST /api/payment/create → redirect в ЮKassa.
-  const [loading, setLoading] = useState(false);
+  const [loadingPlan, setLoadingPlan] = useState<TariffTier | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Сбрасываем платёжное состояние при каждом открытии модалки
   useEffect(() => {
     if (open) {
-      setLoading(false);
+      setLoadingPlan(null);
       setError(null);
     }
   }, [open, tier]);
@@ -76,14 +76,19 @@ export function TariffModal({ open, tier, onClose }: Props) {
 
   if (!open) return null;
 
+  // tier === null → режим выбора: показываем оба тарифа сразу (после
+  // бесплатного расчёта). tier !== null → карточка одного тарифа (клик по
+  // конкретному тарифу в прайсинге).
+  const dual = tier === null;
   const data = TIER_DATA[tier ?? "unlimited"];
   const plan: TariffTier = tier ?? "unlimited";
 
   // Создаёт платёж на бэкенде и редиректит в ЮKassa. Сумма и провайдер —
-  // на сервере (PLAN_PRICING); сюда приходит только confirmationUrl.
-  const handlePay = async () => {
+  // на сервере (PLAN_PRICING); сюда приходит только confirmationUrl. Какой
+  // тариф оплачивать — приходит из нажатой кнопки (payPlan).
+  const handlePay = async (payPlan: TariffTier) => {
     setError(null);
-    setLoading(true);
+    setLoadingPlan(payPlan);
     try {
       const {
         data: { session },
@@ -91,7 +96,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
       const token = session?.access_token;
       if (!token) {
         setError("Войдите в аккаунт, чтобы оформить тариф.");
-        setLoading(false);
+        setLoadingPlan(null);
         return;
       }
 
@@ -101,7 +106,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ plan }),
+        body: JSON.stringify({ plan: payPlan }),
       });
       const result = (await res.json().catch(() => null)) as {
         ok?: boolean;
@@ -110,17 +115,17 @@ export function TariffModal({ open, tier, onClose }: Props) {
       } | null;
 
       if (result?.ok && result.confirmationUrl) {
-        // Уходим на страницу оплаты ЮKassa — loading не снимаем.
+        // Уходим на страницу оплаты ЮKassa — loadingPlan не снимаем.
         window.location.href = result.confirmationUrl;
         return;
       }
 
       // ЮKassa не настроена / любая иная ошибка — честное сообщение в модалке.
       setError("Оплата пока не настроена. Попробуйте позже.");
-      setLoading(false);
+      setLoadingPlan(null);
     } catch {
       setError("Оплата пока не настроена. Попробуйте позже.");
-      setLoading(false);
+      setLoadingPlan(null);
     }
   };
 
@@ -329,6 +334,50 @@ export function TariffModal({ open, tier, onClose }: Props) {
           border-radius:10px;padding:.7rem .85rem
         }
 
+        /* === Режим выбора тарифа: оба тарифа сразу === */
+        .tm-sub{
+          font-size:.9rem;color:#8A9FBB;font-weight:300;
+          margin:.6rem 0 0;line-height:1.5
+        }
+        .tm-tiers{
+          display:flex;flex-direction:column;gap:.85rem;margin:1.3rem 0 0
+        }
+        .tm-tier{
+          border:1px solid rgba(255,255,255,.12);border-radius:14px;
+          padding:1.05rem 1.15rem;background:rgba(255,255,255,.03);
+          display:flex;flex-direction:column;gap:.7rem
+        }
+        .tm-tier-hot{
+          border-color:rgba(201,168,76,.4);
+          background:linear-gradient(160deg,
+            rgba(201,168,76,.10),rgba(255,255,255,.02))
+        }
+        .tm-tier-head{
+          display:flex;align-items:baseline;justify-content:space-between;gap:.8rem
+        }
+        .tm-tier-name{
+          font-family:'Playfair Display',Georgia,serif;
+          font-size:1.15rem;font-weight:700;color:#E8EEF8
+        }
+        .tm-tier-price{
+          font-family:'Playfair Display',Georgia,serif;
+          font-size:1.5rem;font-weight:700;letter-spacing:-.02em;
+          color:#E8EEF8;white-space:nowrap
+        }
+        .tm-tier-price em{font-style:normal;
+          background:linear-gradient(135deg,#C9A84C 0%,#E8C97A 60%,#C9A84C 100%);
+          -webkit-background-clip:text;background-clip:text;
+          -webkit-text-fill-color:transparent}
+        .tm-tier-price .per{
+          font-family:'DM Mono',monospace;font-size:.62rem;
+          color:#8A9FBB;letter-spacing:.06em;margin-left:.3rem
+        }
+        .tm-tier-desc{
+          font-size:.82rem;color:#8A9FBB;font-weight:300;
+          line-height:1.45;margin:0
+        }
+        .tm-tier .tm-btn{width:100%;min-width:0}
+
         @media(max-width:640px){
           .tm-card{padding:2.1rem 1.45rem 1.6rem;border-radius:18px;min-height:340px}
           .tm-title{font-size:1.3rem}
@@ -336,6 +385,8 @@ export function TariffModal({ open, tier, onClose }: Props) {
           .tm-actions{flex-direction:column}
           .tm-btn{width:100%;min-width:0}
           .tm-close{width:44px;height:44px}
+          .tm-tier-name{font-size:1.05rem}
+          .tm-tier-price{font-size:1.3rem}
         }
 
         @media (prefers-reduced-motion: reduce){
@@ -372,56 +423,131 @@ export function TariffModal({ open, tier, onClose }: Props) {
               </svg>
               PRO
             </span>
-            <h3 id="tm-title" className="tm-title">
-              {data.name}
-            </h3>
+            {dual ? (
+              <>
+                <h3 id="tm-title" className="tm-title">
+                  Выберите <em>тариф</em>
+                </h3>
+                <p className="tm-sub">
+                  Бесплатный расчёт использован. Чтобы продолжить, выберите
+                  подходящий тариф.
+                </p>
 
-            <div className="tm-price-row">
-              <div className="tm-price">
-                <em>{data.priceNumber}</em> ₽
-              </div>
-              {data.isSub && <span className="tm-mo">/мес</span>}
-            </div>
-            <p className="tm-period">{data.period}</p>
-
-            <ul className="tm-perks">
-              {data.perks.map((p, i) => (
-                <li key={i}>
-                  <span className="tm-check" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                      strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="m5 12 5 5L20 7" />
-                    </svg>
-                  </span>
-                  {p}
-                </li>
-              ))}
-            </ul>
-
-            {error && (
-              <p className="tm-error" role="alert">
-                {error}
-              </p>
-            )}
-
-            <div className="tm-actions">
-              <button
-                type="button"
-                className="tm-btn tm-btn-gold"
-                onClick={handlePay}
-                disabled={loading}
-                aria-busy={loading}
-              >
-                {loading ? (
-                  "Создаём платёж…"
-                ) : (
-                  <>
-                    Продолжить
-                    <span className="arr" aria-hidden="true">→</span>
-                  </>
+                {error && (
+                  <p className="tm-error" role="alert">
+                    {error}
+                  </p>
                 )}
-              </button>
-            </div>
+
+                <div className="tm-tiers">
+                  <div className="tm-tier">
+                    <div className="tm-tier-head">
+                      <span className="tm-tier-name">Разовый расчёт</span>
+                      <span className="tm-tier-price">
+                        <em>149</em> ₽
+                      </span>
+                    </div>
+                    <p className="tm-tier-desc">
+                      Один расчёт за месячный отчёт · без подписки и
+                      автосписаний.
+                    </p>
+                    <button
+                      type="button"
+                      className="tm-btn tm-btn-ghost"
+                      onClick={() => handlePay("single")}
+                      disabled={loadingPlan !== null}
+                      aria-busy={loadingPlan === "single"}
+                    >
+                      {loadingPlan === "single"
+                        ? "Создаём платёж…"
+                        : "Купить разовый расчёт — 149 ₽"}
+                    </button>
+                  </div>
+
+                  <div className="tm-tier tm-tier-hot">
+                    <div className="tm-tier-head">
+                      <span className="tm-tier-name">Безлимит</span>
+                      <span className="tm-tier-price">
+                        <em>449</em> ₽<span className="per">/30 дней</span>
+                      </span>
+                    </div>
+                    <p className="tm-tier-desc">
+                      Неограниченные расчёты 30 дней · полная история ·
+                      приоритетная поддержка.
+                    </p>
+                    <button
+                      type="button"
+                      className="tm-btn tm-btn-gold"
+                      onClick={() => handlePay("unlimited")}
+                      disabled={loadingPlan !== null}
+                      aria-busy={loadingPlan === "unlimited"}
+                    >
+                      {loadingPlan === "unlimited" ? (
+                        "Создаём платёж…"
+                      ) : (
+                        <>
+                          Оформить безлимит — 449 ₽
+                          <span className="arr" aria-hidden="true">→</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <h3 id="tm-title" className="tm-title">
+                  {data.name}
+                </h3>
+
+                <div className="tm-price-row">
+                  <div className="tm-price">
+                    <em>{data.priceNumber}</em> ₽
+                  </div>
+                  {data.isSub && <span className="tm-mo">/мес</span>}
+                </div>
+                <p className="tm-period">{data.period}</p>
+
+                <ul className="tm-perks">
+                  {data.perks.map((p, i) => (
+                    <li key={i}>
+                      <span className="tm-check" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                          strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="m5 12 5 5L20 7" />
+                        </svg>
+                      </span>
+                      {p}
+                    </li>
+                  ))}
+                </ul>
+
+                {error && (
+                  <p className="tm-error" role="alert">
+                    {error}
+                  </p>
+                )}
+
+                <div className="tm-actions">
+                  <button
+                    type="button"
+                    className="tm-btn tm-btn-gold"
+                    onClick={() => handlePay(plan)}
+                    disabled={loadingPlan !== null}
+                    aria-busy={loadingPlan === plan}
+                  >
+                    {loadingPlan === plan ? (
+                      "Создаём платёж…"
+                    ) : (
+                      <>
+                        Продолжить
+                        <span className="arr" aria-hidden="true">→</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </div>

@@ -689,12 +689,15 @@ export function OzonProductBreakdown({
           <span className="pb-spinner" aria-hidden="true" />
           <span>Сопоставляем товары с каталогом…</span>
         </div>
-      ) : loadError ? (
-        <div className="pb-state pb-state-err">
-          Не удалось загрузить каталог: {loadError}
-        </div>
       ) : (
         <>
+          {loadError && (
+            <div className="pb-note pb-note-warn">
+              Каталог себестоимости временно недоступен — товары показаны без
+              себестоимости. Проверьте подключение к интернету и обновите
+              страницу.
+            </div>
+          )}
           {/* Итоговые чипы */}
           <div className="pb-summary">
             <div className="pb-chip">
@@ -1388,6 +1391,11 @@ export function OzonProductBreakdown({
           color: var(--txt2);
           font-size: 0.85rem;
           line-height: 1.5;
+        }
+        .pb-note-warn {
+          border-color: rgba(232, 176, 75, 0.35);
+          background: rgba(232, 176, 75, 0.08);
+          color: #f0cd84;
         }
 
         .pb-summary {

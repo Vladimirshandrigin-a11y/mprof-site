@@ -602,7 +602,7 @@ export default function AppPage() {
   const [apiSaveMessage, setApiSaveMessage] = useState("");
   const [showOzonKey, setShowOzonKey] = useState(false);
   const [showWbKey, setShowWbKey] = useState(false);
-  const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("manual");
+  const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("upload");
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
   // когда user отсутствует, и тогда всегда показываем калькулятор.
@@ -1657,7 +1657,7 @@ export default function AppPage() {
       console.warn(
         "[upload] analyzeUpload blocked by paywall (canCalculate=false)"
       );
-      setSelectedTier("unlimited");
+      setSelectedTier(null);
       setTariffModalOpen(true);
       return;
     }
@@ -1732,7 +1732,7 @@ export default function AppPage() {
       // eslint-disable-next-line no-console
       console.warn("[upload] consume blocked → paywall", consumed.reason);
       setUploadStatus("ready");
-      setSelectedTier("unlimited");
+      setSelectedTier(null);
       setTariffModalOpen(true);
       return;
     }
@@ -2040,7 +2040,7 @@ export default function AppPage() {
     if (!canCalculate) {
       // eslint-disable-next-line no-console
       console.warn("[upload-3] blocked by paywall");
-      setSelectedTier("unlimited");
+      setSelectedTier(null);
       setTariffModalOpen(true);
       return;
     }
@@ -2143,7 +2143,7 @@ export default function AppPage() {
       // eslint-disable-next-line no-console
       console.warn("[upload-3] consume blocked → paywall", consumed.reason);
       setCombinedStatus("idle");
-      setSelectedTier("unlimited");
+      setSelectedTier(null);
       setTariffModalOpen(true);
       return;
     }
@@ -2885,7 +2885,7 @@ export default function AppPage() {
     if (isCalculating) return;
     // Защита: UI подменяет кнопку на paywall, но на всякий случай.
     if (!canCalculate) {
-      setSelectedTier("unlimited");
+      setSelectedTier(null);
       setTariffModalOpen(true);
       return;
     }
@@ -2898,7 +2898,7 @@ export default function AppPage() {
       if (!consumed.ok) {
         // eslint-disable-next-line no-console
         console.warn("[calc] consume blocked → paywall", consumed.reason);
-        setSelectedTier("unlimited");
+        setSelectedTier(null);
         setTariffModalOpen(true);
         return;
       }
@@ -7222,7 +7222,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 payoutSchedule
                               )}`,
                               value: signedRub(adj),
-                              hint: "комиссия уменьшает прибыль",
+                              hint: "ранняя выплата уменьшает прибыль · проверьте график перед сохранением",
                             }
                           : payoutType === "deferred"
                           ? {
@@ -7231,13 +7231,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 payoutSchedule
                               )}`,
                               value: signedRub(adj),
-                              hint: "скидка увеличивает прибыль",
+                              hint: "отсрочка увеличивает прибыль · проверьте график перед сохранением",
                             }
                           : {
                               state: "ok",
                               label: "График выплат Ozon: Стандартный",
                               value: "0 ₽",
-                              hint: "корректировка не применяется",
+                              hint: "корректировка 0 ₽ · обязательно проверьте график выплат перед сохранением",
                             },
                         taxWarn
                           ? {
