@@ -3994,6 +3994,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   font-size:.76rem;color:var(--txt2);line-height:1.45;
   overflow-wrap:anywhere
 }
+/* ===== PDF hint — что попадёт в PDF (ещё компактнее) ===== */
+.pdf-hint{display:flex;align-items:flex-start;gap:.45rem;margin-top:14px;min-width:0}
+.pdf-hint-ico{flex:0 0 auto;display:flex;color:var(--txt3);margin-top:.1rem}
+.pdf-hint-text{
+  flex:1 1 auto;min-width:0;
+  font-size:.72rem;color:var(--txt3);line-height:1.4;
+  overflow-wrap:anywhere
+}
 
 .upload-3-error{
   margin-top:1.2rem;padding:1.1rem 1.3rem;border-radius:12px;
@@ -7368,6 +7376,29 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         ? "Сохранено ✓"
                         : "Сохранить результат"}
                     </button>
+
+                    <div className="pdf-hint">
+                      <span className="pdf-hint-ico" aria-hidden="true">
+                        <svg
+                          width="13"
+                          height="13"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        >
+                          <path d="M14 3v4a1 1 0 0 0 1 1h4" />
+                          <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2z" />
+                        </svg>
+                      </span>
+                      <span className="pdf-hint-text">
+                        PDF-отчёт содержит итоговую чистую прибыль,
+                        маржинальность, ROI, разбивку расчёта, график выплат
+                        Ozon и ключевые товары.
+                      </span>
+                    </div>
 
                     <button
                       type="button"
