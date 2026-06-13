@@ -2596,10 +2596,14 @@ export default function AppPage() {
       return;
     }
 
-    // Куда вернуть пользователя по ссылке из письма. На проде — NEXT_PUBLIC_SITE_URL
-    // (Railway-домен), в dev (переменная не задана) — origin текущего окна.
-    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "");
-    const emailRedirectTo = `${siteUrl || window.location.origin}/app`;
+    // Куда вернуть пользователя по ссылке из письма. Берём origin ТЕКУЩЕГО окна —
+    // тогда один и тот же билд корректно работает на любом хосте (Railway, Timeweb,
+    // будущий домен) и не уводит на чужой домен. NEXT_PUBLIC_SITE_URL — только
+    // fallback, когда window недоступен (SSR/пререндер).
+    const fallbackUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "");
+    const baseUrl =
+      typeof window !== "undefined" ? window.location.origin : fallbackUrl;
+    const emailRedirectTo = `${baseUrl}/app`;
 
     const { error } = await supabase.auth.signInWithOtp({
       email: email.trim(),
