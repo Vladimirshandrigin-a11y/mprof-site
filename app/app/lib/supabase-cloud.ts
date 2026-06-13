@@ -132,6 +132,37 @@ function fmtError(err: unknown): CloudErrorInfo {
 }
 
 // ============================================================================
+// withReadTimeout — страховка от «вечной загрузки».
+//
+// supabase-js НЕ ставит таймаут на запрос. Если маршрут до Supabase (AWS) висит
+// без ответа (типично для РФ без VPN), `await supabase.from(...).select()` не
+// завершается, и UI остаётся в loading навсегда. Здесь гоним запрос против
+// таймера: не ответил за READ_TIMEOUT_MS → Error «Supabase не ответил вовремя»,
+// который ловит обычный catch вызывающей функции и отдаёт его как
+// CloudResult.error (UI уже умеет показать ошибку и погасить спиннер).
+//
+// Применяется ТОЛЬКО к read-функциям (история/каталог/аналитика). Запись и RPC
+// списания квоты не трогаем. clearTimeout снимает таймер, если запрос успел
+// ответить раньше; поздний ответ проигравшего гонку запроса игнорируется
+// Promise.race (реакция уже навешана — unhandledrejection не возникает).
+// ============================================================================
+const READ_TIMEOUT_MS = 13000;
+
+function withReadTimeout<T>(query: PromiseLike<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error("Supabase не ответил вовремя")),
+      READ_TIMEOUT_MS
+    );
+  });
+  const wrapped = Promise.resolve(query).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+  return Promise.race([wrapped, timeout]);
+}
+
+// ============================================================================
 // Auth
 // ============================================================================
 export async function getCurrentUser(): Promise<{
@@ -306,12 +337,14 @@ export async function loadCalculationsFromCloud(
   try {
     // eslint-disable-next-line no-console
     console.log("[cloud] loadCalculationsFromCloud", { userId, limit });
-    const { data, error } = await supabase
-      .from("calculations")
-      .select("*")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(limit);
+    const { data, error } = await withReadTimeout(
+      supabase
+        .from("calculations")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(limit)
+    );
     if (error) {
       // eslint-disable-next-line no-console
       console.error("[cloud] loadCalculationsFromCloud error", fmtError(error));
@@ -441,11 +474,13 @@ export async function loadProductsFromCloud(
   userId: string
 ): Promise<CloudResult<Product[]>> {
   try {
-    const { data, error } = await supabase
-      .from("products")
-      .select("*")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false });
+    const { data, error } = await withReadTimeout(
+      supabase
+        .from("products")
+        .select("*")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+    );
     if (error) return { data: null, error: fmtError(error) };
     return { data: (data as Product[]) ?? [], error: null };
   } catch (e) {
@@ -558,12 +593,14 @@ export async function loadReportHistoryFromCloud(
   userId: string
 ): Promise<CloudResult<CloudReportHistory[]>> {
   try {
-    const { data, error } = await supabase
-      .from("report_history")
-      .select("*")
-      .eq("user_id", userId)
-      .order("report_month", { ascending: true })
-      .order("created_at", { ascending: true });
+    const { data, error } = await withReadTimeout(
+      supabase
+        .from("report_history")
+        .select("*")
+        .eq("user_id", userId)
+        .order("report_month", { ascending: true })
+        .order("created_at", { ascending: true })
+    );
     if (error) {
       // eslint-disable-next-line no-console
       console.error("[cloud] loadReportHistoryFromCloud error", fmtError(error));
