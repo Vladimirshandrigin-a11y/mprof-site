@@ -216,6 +216,47 @@ async function cloudGet<T>(path: string): Promise<CloudResult<T>> {
   }
 }
 
+/**
+ * POST/PATCH к нашему cloud-proxy route с JSON-телом. Тот же CloudResult shape,
+ * что и прямые supabase-функции, поэтому call-sites не меняются. Сетевой шаг
+ * обёрнут в withReadTimeout — зависший прокси не держит кнопку «Сохранение…».
+ * user_id на сервер НЕ передаём: route берёт его из токена.
+ */
+async function cloudSend<T>(
+  path: string,
+  method: "POST" | "PATCH",
+  body: unknown
+): Promise<CloudResult<T>> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return { data: null, error: { message: "Требуется авторизация" } };
+    const json = await withReadTimeout<{ data?: T; error?: string }>(
+      (async () => {
+        const res = await fetch(path, {
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          cache: "no-store",
+          body: JSON.stringify(body),
+        });
+        const parsed = (await res.json().catch(() => ({}))) as {
+          data?: T;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(parsed.error || `Ошибка сервера (${res.status})`);
+        }
+        return parsed;
+      })()
+    );
+    return { data: (json.data ?? null) as T | null, error: null };
+  } catch (e) {
+    return { data: null, error: fmtError(e) };
+  }
+}
+
 // ============================================================================
 // Auth
 // ============================================================================
@@ -322,28 +363,18 @@ export async function saveCalculationToCloud(
   input: CalculationInsertInput,
   userId: string
 ): Promise<CloudResult<CloudCalculation>> {
-  try {
-    const payload = { ...input, user_id: userId };
+  // eslint-disable-next-line no-console
+  console.log("[cloud] saveCalculationToCloud", { userId });
+  const res = await cloudSend<CloudCalculation>(
+    "/api/cloud/calculations",
+    "POST",
+    input
+  );
+  if (res.error) {
     // eslint-disable-next-line no-console
-    console.log("[cloud] saveCalculationToCloud payload", payload);
-    const { data, error } = await supabase
-      .from("calculations")
-      .insert([payload])
-      .select()
-      .single();
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.error("[cloud] saveCalculationToCloud error", fmtError(error));
-      return { data: null, error: fmtError(error) };
-    }
-    // eslint-disable-next-line no-console
-    console.log("[cloud] saveCalculationToCloud ok", { id: (data as { id?: string } | null)?.id });
-    return { data: (data as CloudCalculation | null) ?? null, error: null };
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error("[cloud] saveCalculationToCloud throw", fmtError(e));
-    return { data: null, error: fmtError(e) };
+    console.error("[cloud] saveCalculationToCloud error", res.error);
   }
+  return res;
 }
 
 /**
@@ -359,29 +390,18 @@ export async function updateCalculationInCloud(
   fields: Partial<CalculationInsertInput>,
   userId: string
 ): Promise<CloudResult<CloudCalculation>> {
-  try {
+  // eslint-disable-next-line no-console
+  console.log("[cloud] updateCalculationInCloud", { calculationId, userId });
+  const res = await cloudSend<CloudCalculation>(
+    "/api/cloud/calculations",
+    "PATCH",
+    { id: calculationId, fields }
+  );
+  if (res.error) {
     // eslint-disable-next-line no-console
-    console.log("[cloud] updateCalculationInCloud", { calculationId });
-    const { data, error } = await supabase
-      .from("calculations")
-      .update(fields)
-      .eq("id", calculationId)
-      .eq("user_id", userId)
-      .select()
-      .single();
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.error("[cloud] updateCalculationInCloud error", fmtError(error));
-      return { data: null, error: fmtError(error) };
-    }
-    // eslint-disable-next-line no-console
-    console.log("[cloud] updateCalculationInCloud ok", { id: (data as { id?: string } | null)?.id });
-    return { data: (data as CloudCalculation | null) ?? null, error: null };
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error("[cloud] updateCalculationInCloud throw", fmtError(e));
-    return { data: null, error: fmtError(e) };
+    console.error("[cloud] updateCalculationInCloud error", res.error);
   }
+  return res;
 }
 
 export async function loadCalculationsFromCloud(
@@ -606,24 +626,18 @@ export async function saveReportHistoryToCloud(
   input: ReportHistoryInsertInput,
   userId: string
 ): Promise<CloudResult<CloudReportHistory>> {
-  try {
-    const payload = { ...input, user_id: userId };
-    const { data, error } = await supabase
-      .from("report_history")
-      .insert([payload])
-      .select()
-      .single();
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.error("[cloud] saveReportHistoryToCloud error", fmtError(error));
-      return { data: null, error: fmtError(error) };
-    }
-    return { data: (data as CloudReportHistory | null) ?? null, error: null };
-  } catch (e) {
+  // eslint-disable-next-line no-console
+  console.log("[cloud] saveReportHistoryToCloud", { userId });
+  const res = await cloudSend<CloudReportHistory>(
+    "/api/cloud/report-history",
+    "POST",
+    input
+  );
+  if (res.error) {
     // eslint-disable-next-line no-console
-    console.error("[cloud] saveReportHistoryToCloud throw", fmtError(e));
-    return { data: null, error: fmtError(e) };
+    console.error("[cloud] saveReportHistoryToCloud error", res.error);
   }
+  return res;
 }
 
 export async function loadReportHistoryFromCloud(
