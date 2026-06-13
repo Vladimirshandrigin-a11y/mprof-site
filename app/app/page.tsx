@@ -595,6 +595,8 @@ export default function AppPage() {
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
   const [authMessage, setAuthMessage] = useState("");
+  // Идёт отправка magic-link (signInWithOtp): блокируем кнопку/инпут «Войти».
+  const [signingIn, setSigningIn] = useState(false);
   const [ozonClientId, setOzonClientId] = useState("");
   const [ozonApiKey, setOzonApiKey] = useState("");
   const [wbApiKey, setWbApiKey] = useState("");
@@ -2591,6 +2593,7 @@ export default function AppPage() {
   }, []);
 
   const signIn = async () => {
+    if (signingIn) return; // защита от двойной отправки
     if (!email.trim()) {
       setAuthMessage("Введите email");
       return;
@@ -2605,17 +2608,26 @@ export default function AppPage() {
       typeof window !== "undefined" ? window.location.origin : fallbackUrl;
     const emailRedirectTo = `${baseUrl}/app`;
 
-    const { error } = await supabase.auth.signInWithOtp({
-      email: email.trim(),
-      options: {
-        emailRedirectTo,
-      },
-    });
+    setSigningIn(true);
+    setAuthMessage("");
+    try {
+      const { error } = await supabase.auth.signInWithOtp({
+        email: email.trim(),
+        options: {
+          emailRedirectTo,
+        },
+      });
 
-    if (error) {
-      setAuthMessage(error.message);
-    } else {
-      setAuthMessage("Письмо для входа отправлено на email");
+      if (error) {
+        setAuthMessage(error.message);
+      } else {
+        setAuthMessage(
+          `Ссылку для входа отправили на ${email.trim()}. Проверьте почту.`
+        );
+      }
+    } finally {
+      // Любой исход — снимаем pending: при ошибке кнопка вернётся в норму.
+      setSigningIn(false);
     }
   };
 
@@ -3210,6 +3222,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   padding:0 22px;border:none;border-radius:9px;cursor:pointer;letter-spacing:.02em;
   transition:all .18s;box-shadow:0 8px 28px rgba(201,168,76,.28);white-space:nowrap}
 .auth-btn:hover{transform:translateY(-1px);box-shadow:0 14px 38px rgba(201,168,76,.38)}
+.auth-btn:disabled{opacity:.6;cursor:default;box-shadow:0 8px 28px rgba(201,168,76,.18)}
+.auth-btn:disabled:hover{transform:none;box-shadow:0 8px 28px rgba(201,168,76,.18)}
 .auth-msg{margin:.8rem 0 0;font-family:var(--mono);font-size:.72rem;color:var(--txt2);letter-spacing:.02em}
 @media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}}
 
@@ -5590,13 +5604,20 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 placeholder="Ваш email"
                 autoComplete="email"
                 value={email}
+                disabled={signingIn}
                 onChange={(e) => setEmail(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") signIn();
                 }}
               />
-              <button type="button" className="auth-btn" onClick={signIn}>
-                Войти
+              <button
+                type="button"
+                className="auth-btn"
+                onClick={signIn}
+                disabled={signingIn}
+                aria-busy={signingIn}
+              >
+                {signingIn ? "Отправляем ссылку…" : "Войти"}
               </button>
             </div>
 
@@ -7596,8 +7617,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             <div className="card-head">
               <div className="card-title">Последние расчёты</div>
             </div>
-            <div className="card-body">
-              Загрузка истории...
+            <div
+              className="card-body"
+              role="status"
+              aria-live="polite"
+              style={{ display: "flex", alignItems: "center", gap: "10px" }}
+            >
+              <span className="auth-loading-ring" aria-hidden="true" />
+              <span>Загружаем историю расчётов…</span>
             </div>
           </div>
         )}
