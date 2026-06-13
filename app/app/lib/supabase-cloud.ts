@@ -163,6 +163,60 @@ function withReadTimeout<T>(query: PromiseLike<T>): Promise<T> {
 }
 
 // ============================================================================
+// Cloud read-proxy — чтение истории/каталога/аналитики идёт через наши API
+// routes на Timeweb (браузер → /api/cloud/... → Supabase server-side), а НЕ
+// напрямую в Supabase. Зачем: из РФ без VPN прямой маршрут браузер→Supabase
+// (AWS) виснет без ответа; серверный прокси на Timeweb ходит в Supabase сам.
+//
+// SERVICE_ROLE_KEY живёт ТОЛЬКО на сервере (в route), сюда не попадает. Клиент
+// шлёт лишь свой access_token; user_id сервер берёт из токена и фильтрует по
+// нему. withReadTimeout сохраняем — спиннер гаснет, даже если прокси молчит.
+// ============================================================================
+
+/** access_token текущей сессии для Authorization: Bearer. null — нет сессии. */
+async function getAccessToken(): Promise<string | null> {
+  try {
+    const { data } = await supabase.auth.getSession();
+    return data.session?.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GET к нашему cloud-proxy route. Возвращает CloudResult — тот же shape, что и
+ * прямые supabase-функции, поэтому call-sites и fallback-UI не меняются. Весь
+ * сетевой шаг (fetch + разбор тела) обёрнут в withReadTimeout: молчащий прокси
+ * → Error «Supabase не ответил вовремя» → CloudResult.error, спиннер гаснет.
+ */
+async function cloudGet<T>(path: string): Promise<CloudResult<T>> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return { data: null, error: { message: "Требуется авторизация" } };
+    const json = await withReadTimeout<{ data?: T; error?: string }>(
+      (async () => {
+        const res = await fetch(path, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        const parsed = (await res.json().catch(() => ({}))) as {
+          data?: T;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(parsed.error || `Ошибка сервера (${res.status})`);
+        }
+        return parsed;
+      })()
+    );
+    return { data: (json.data ?? null) as T | null, error: null };
+  } catch (e) {
+    return { data: null, error: fmtError(e) };
+  }
+}
+
+// ============================================================================
 // Auth
 // ============================================================================
 export async function getCurrentUser(): Promise<{
@@ -334,30 +388,21 @@ export async function loadCalculationsFromCloud(
   userId: string,
   limit = 50
 ): Promise<CloudResult<CloudCalculation[]>> {
-  try {
+  // eslint-disable-next-line no-console
+  console.log("[cloud] loadCalculationsFromCloud", { userId, limit });
+  const res = await cloudGet<CloudCalculation[]>(
+    `/api/cloud/calculations?limit=${encodeURIComponent(limit)}`
+  );
+  if (res.error) {
     // eslint-disable-next-line no-console
-    console.log("[cloud] loadCalculationsFromCloud", { userId, limit });
-    const { data, error } = await withReadTimeout(
-      supabase
-        .from("calculations")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false })
-        .limit(limit)
-    );
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.error("[cloud] loadCalculationsFromCloud error", fmtError(error));
-      return { data: null, error: fmtError(error) };
-    }
-    // eslint-disable-next-line no-console
-    console.log("[cloud] loadCalculationsFromCloud ok", { count: data?.length ?? 0 });
-    return { data: ((data as CloudCalculation[]) ?? []), error: null };
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error("[cloud] loadCalculationsFromCloud throw", fmtError(e));
-    return { data: null, error: fmtError(e) };
+    console.error("[cloud] loadCalculationsFromCloud error", res.error);
+    return res;
   }
+  // eslint-disable-next-line no-console
+  console.log("[cloud] loadCalculationsFromCloud ok", {
+    count: res.data?.length ?? 0,
+  });
+  return { data: res.data ?? [], error: null };
 }
 
 export async function deleteCalculationFromCloud(
@@ -473,19 +518,11 @@ export type ProductUpdateInput = Partial<ProductInsertInput>;
 export async function loadProductsFromCloud(
   userId: string
 ): Promise<CloudResult<Product[]>> {
-  try {
-    const { data, error } = await withReadTimeout(
-      supabase
-        .from("products")
-        .select("*")
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false })
-    );
-    if (error) return { data: null, error: fmtError(error) };
-    return { data: (data as Product[]) ?? [], error: null };
-  } catch (e) {
-    return { data: null, error: fmtError(e) };
-  }
+  // eslint-disable-next-line no-console
+  console.log("[cloud] loadProductsFromCloud", { userId });
+  const res = await cloudGet<Product[]>("/api/cloud/products");
+  if (res.error) return res;
+  return { data: res.data ?? [], error: null };
 }
 
 export async function addProductToCloud(
@@ -592,26 +629,15 @@ export async function saveReportHistoryToCloud(
 export async function loadReportHistoryFromCloud(
   userId: string
 ): Promise<CloudResult<CloudReportHistory[]>> {
-  try {
-    const { data, error } = await withReadTimeout(
-      supabase
-        .from("report_history")
-        .select("*")
-        .eq("user_id", userId)
-        .order("report_month", { ascending: true })
-        .order("created_at", { ascending: true })
-    );
-    if (error) {
-      // eslint-disable-next-line no-console
-      console.error("[cloud] loadReportHistoryFromCloud error", fmtError(error));
-      return { data: null, error: fmtError(error) };
-    }
-    return { data: ((data as CloudReportHistory[]) ?? []), error: null };
-  } catch (e) {
+  // eslint-disable-next-line no-console
+  console.log("[cloud] loadReportHistoryFromCloud", { userId });
+  const res = await cloudGet<CloudReportHistory[]>("/api/cloud/report-history");
+  if (res.error) {
     // eslint-disable-next-line no-console
-    console.error("[cloud] loadReportHistoryFromCloud throw", fmtError(e));
-    return { data: null, error: fmtError(e) };
+    console.error("[cloud] loadReportHistoryFromCloud error", res.error);
+    return res;
   }
+  return { data: res.data ?? [], error: null };
 }
 
 // ============================================================================
