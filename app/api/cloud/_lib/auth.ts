@@ -26,6 +26,25 @@ export function getSupabaseAdmin(): SupabaseClient | null {
   });
 }
 
+/**
+ * USER-SCOPED клиент: публичный (anon) ключ + JWT пользователя в заголовке
+ * Authorization. Нужен для RPC, которые опираются на auth.uid()
+ * (например consume_calculation): service-role ОБХОДИТ auth, и auth.uid()
+ * вернул бы NULL → RPC ответил бы not_authenticated. Здесь запрос идёт «от имени
+ * пользователя», поэтому auth.uid() в SQL резолвится корректно. Сам JWT
+ * проверяет Supabase: невалидный токен → auth.uid()=NULL → fail-closed.
+ * Возвращает null, если env не настроен (route отдаёт 503).
+ */
+export function getUserScopedClient(token: string): SupabaseClient | null {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+  if (!url || !anonKey) return null;
+  return createClient(url, anonKey, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
 export type AuthSuccess = {
   ok: true;
   admin: SupabaseClient;

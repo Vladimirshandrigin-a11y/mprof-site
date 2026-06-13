@@ -141,9 +141,11 @@ function fmtError(err: unknown): CloudErrorInfo {
 // который ловит обычный catch вызывающей функции и отдаёт его как
 // CloudResult.error (UI уже умеет показать ошибку и погасить спиннер).
 //
-// Применяется ТОЛЬКО к read-функциям (история/каталог/аналитика). Запись и RPC
-// списания квоты не трогаем. clearTimeout снимает таймер, если запрос успел
-// ответить раньше; поздний ответ проигравшего гонку запроса игнорируется
+// Применяется к сетевым шагам cloud-proxy: чтения (история/каталог/аналитика/
+// профиль/кредиты), записи и проксированный RPC списания квоты
+// (/api/cloud/consume). Благодаря этому спиннер анализа гаснет, даже если
+// маршрут Timeweb→Supabase молчит. clearTimeout снимает таймер, если запрос
+// успел ответить раньше; поздний ответ проигравшего гонку запроса игнорируется
 // Promise.race (реакция уже навешана — unhandledrejection не возникает).
 // ============================================================================
 const READ_TIMEOUT_MS = 13000;
@@ -279,17 +281,11 @@ export async function getCurrentUser(): Promise<{
 export async function getUserProfile(
   userId: string
 ): Promise<CloudResult<UserProfile>> {
-  try {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", userId)
-      .maybeSingle();
-    if (error) return { data: null, error: fmtError(error) };
-    return { data: (data as UserProfile | null) ?? null, error: null };
-  } catch (e) {
-    return { data: null, error: fmtError(e) };
-  }
+  // userId сохранён в сигнатуре для совместимости с вызывающим кодом
+  // (useEntitlements). Сервер берёт user_id из токена — клиент его не передаёт.
+  // eslint-disable-next-line no-console
+  console.log("[cloud] getUserProfile", { userId });
+  return cloudGet<UserProfile>("/api/cloud/profile");
 }
 
 /**
@@ -302,16 +298,33 @@ export async function getUserProfile(
  * RLS subscriptions_select_own отдаёт только свои строки. Сбой → 0 (fail-closed).
  */
 export async function countActiveSingleCredits(userId: string): Promise<number> {
+  // userId сохранён в сигнатуре для совместимости; сервер фильтрует по user_id
+  // из токена. Идём через cloud-proxy (Timeweb), а не напрямую в Supabase.
+  // eslint-disable-next-line no-console
+  console.log("[cloud] countActiveSingleCredits", { userId });
   try {
-    const { count, error } = await supabase
-      .from("subscriptions")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .eq("plan", "single")
-      .eq("status", "active");
-    if (error) return 0;
-    return count ?? 0;
+    const token = await getAccessToken();
+    if (!token) return 0;
+    const count = await withReadTimeout<number>(
+      (async () => {
+        const res = await fetch("/api/cloud/single-credits", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        const parsed = (await res.json().catch(() => ({}))) as {
+          count?: number;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(parsed.error || `Ошибка сервера (${res.status})`);
+        }
+        return typeof parsed.count === "number" ? parsed.count : 0;
+      })()
+    );
+    return count;
   } catch {
+    // fail-closed: любой сбой/таймаут → 0 кредитов (не выдаём лишних расчётов).
     return 0;
   }
 }
@@ -340,10 +353,35 @@ export interface ConsumeResult {
  * Вызывать РОВНО один раз на расчёт, ПЕРЕД сохранением/выдачей результата.
  */
 export async function consumeCalculation(): Promise<ConsumeResult> {
+  // Идём через cloud-proxy POST /api/cloud/consume (Timeweb → Supabase), а НЕ
+  // напрямую в Supabase: прямой RPC из РФ без VPN висел без ответа, из-за чего
+  // analyzeAllThree ждал вечно («бесконечный анализ»). withReadTimeout гасит
+  // ожидание за READ_TIMEOUT_MS. Ответ RPC (включая limit_reached) приходит как
+  // тело { data } с HTTP 200 — маппим его 1:1, как раньше.
   try {
-    const { data, error } = await supabase.rpc("consume_calculation");
-    if (error) return { ok: false, reason: error.message };
-    const r = (data ?? {}) as Partial<ConsumeResult>;
+    const token = await getAccessToken();
+    if (!token) return { ok: false, reason: "not_authenticated" };
+    const r = await withReadTimeout<Partial<ConsumeResult>>(
+      (async () => {
+        const res = await fetch("/api/cloud/consume", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          cache: "no-store",
+          body: "{}",
+        });
+        const parsed = (await res.json().catch(() => ({}))) as {
+          data?: Partial<ConsumeResult>;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(parsed.error || `Ошибка сервера (${res.status})`);
+        }
+        return (parsed.data ?? {}) as Partial<ConsumeResult>;
+      })()
+    );
     return {
       ok: r.ok === true,
       reason: r.reason,
@@ -352,6 +390,7 @@ export async function consumeCalculation(): Promise<ConsumeResult> {
       unlimited: r.unlimited === true,
     };
   } catch (e) {
+    // fail-closed: таймаут/сбоя сети → ok:false (не выдаём бесплатный расчёт).
     return { ok: false, reason: fmtError(e).message };
   }
 }
