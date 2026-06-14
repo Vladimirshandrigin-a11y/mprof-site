@@ -29,10 +29,30 @@ import { supabase } from "../../app/lib/supabase-cloud";
 // сохранения) — то есть после подтверждённой recovery/обычной сессии.
 type Phase = "checking" | "ready" | "invalid" | "saving" | "done";
 
+// Иконки «глаз» / «глаз перечёркнут» для показа/скрытия пароля — те же, что на
+// странице входа. Чисто presentational SVG: на логику восстановления и на
+// recovery-токены не влияет.
+const eyeIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M1.5 12s4-7.5 10.5-7.5S22.5 12 22.5 12 18.5 19.5 12 19.5 1.5 12 1.5 12z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+const eyeOffIcon = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M9.9 5.1A11.7 11.7 0 0 1 12 4.5C18.5 4.5 22.5 12 22.5 12a18 18 0 0 1-3.3 4.3M6.3 6.3A18 18 0 0 0 1.5 12s4 7.5 10.5 7.5a11.7 11.7 0 0 0 4.8-1" />
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+    <line x1="3" y1="3" x2="21" y2="21" />
+  </svg>
+);
+
 export default function UpdatePasswordPage() {
   const [phase, setPhase] = useState<Phase>("checking");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  // Показ/скрытие пароля — отдельным флагом для каждого поля. Только визуально.
+  const [showNew, setShowNew] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
   const [message, setMessage] = useState("");
 
   // Подтверждение recovery-сессии. Ссылка из письма приводит сюда с токенами в
@@ -208,30 +228,56 @@ export default function UpdatePasswordPage() {
             </p>
 
             <div className="up-fields">
-              <input
-                className="up-input"
-                type="password"
-                placeholder="Новый пароль"
-                autoComplete="new-password"
-                value={newPassword}
-                disabled={phase === "saving"}
-                onChange={(e) => setNewPassword(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleSave();
-                }}
-              />
-              <input
-                className="up-input"
-                type="password"
-                placeholder="Повторите пароль"
-                autoComplete="new-password"
-                value={confirmPassword}
-                disabled={phase === "saving"}
-                onChange={(e) => setConfirmPassword(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleSave();
-                }}
-              />
+              <div className="up-pass-wrap">
+                <input
+                  className="up-input"
+                  type={showNew ? "text" : "password"}
+                  placeholder="Новый пароль"
+                  autoComplete="new-password"
+                  value={newPassword}
+                  disabled={phase === "saving"}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleSave();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="up-eye"
+                  onClick={() => setShowNew((v) => !v)}
+                  disabled={phase === "saving"}
+                  aria-label={showNew ? "Скрыть пароль" : "Показать пароль"}
+                  aria-pressed={showNew}
+                  title={showNew ? "Скрыть" : "Показать"}
+                >
+                  {showNew ? eyeOffIcon : eyeIcon}
+                </button>
+              </div>
+              <div className="up-pass-wrap">
+                <input
+                  className="up-input"
+                  type={showConfirm ? "text" : "password"}
+                  placeholder="Повторите пароль"
+                  autoComplete="new-password"
+                  value={confirmPassword}
+                  disabled={phase === "saving"}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handleSave();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="up-eye"
+                  onClick={() => setShowConfirm((v) => !v)}
+                  disabled={phase === "saving"}
+                  aria-label={showConfirm ? "Скрыть пароль" : "Показать пароль"}
+                  aria-pressed={showConfirm}
+                  title={showConfirm ? "Скрыть" : "Показать"}
+                >
+                  {showConfirm ? eyeOffIcon : eyeIcon}
+                </button>
+              </div>
             </div>
 
             <button
@@ -320,6 +366,51 @@ export default function UpdatePasswordPage() {
         }
         .up-input:disabled {
           opacity: 0.6;
+        }
+        .up-pass-wrap {
+          position: relative;
+          display: flex;
+          width: 100%;
+        }
+        .up-pass-wrap .up-input {
+          padding-right: 48px;
+        }
+        .up-eye {
+          position: absolute;
+          top: 50%;
+          right: 8px;
+          transform: translateY(-50%);
+          width: 34px;
+          height: 34px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 0;
+          border: 1px solid transparent;
+          border-radius: 8px;
+          background: transparent;
+          color: #8a93ad;
+          cursor: pointer;
+          transition: color 0.15s, background 0.15s, border-color 0.15s;
+        }
+        .up-eye:hover {
+          color: #f6c86b;
+          background: rgba(255, 255, 255, 0.05);
+        }
+        .up-eye:focus-visible {
+          outline: none;
+          color: #f6c86b;
+          border-color: #c9a84c;
+          box-shadow: 0 0 0 3px rgba(201, 168, 76, 0.18);
+        }
+        .up-eye:disabled {
+          opacity: 0.5;
+          cursor: default;
+        }
+        .up-eye svg {
+          width: 18px;
+          height: 18px;
+          display: block;
         }
         .up-btn {
           width: 100%;

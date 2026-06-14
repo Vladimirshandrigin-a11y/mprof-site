@@ -666,6 +666,8 @@ export default function AppPage() {
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  // Чисто визуальный показ/скрытие пароля (глазок). На auth-логику не влияет.
+  const [showPassword, setShowPassword] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
   // Идёт вход по паролю (signInWithPassword) — блокируем кнопки/инпуты входа.
   const [signingIn, setSigningIn] = useState(false);
@@ -3441,6 +3443,15 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   outline:none;transition:border .18s,box-shadow .18s,background .18s;
   -webkit-text-fill-color:var(--txt);caret-color:var(--gold);
   appearance:none;-webkit-appearance:none}
+.auth-pass-wrap{position:relative;display:flex;flex:1;width:100%}
+.auth-pass-wrap .auth-input{width:100%;padding-right:44px}
+.auth-eye{position:absolute;top:50%;right:6px;transform:translateY(-50%);
+  width:32px;height:32px;border-radius:7px;border:1px solid transparent;background:transparent;
+  color:var(--txt3);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+  padding:0;transition:all .18s}
+.auth-eye:hover{color:var(--gold2);border-color:var(--edge2);background:rgba(255,255,255,.04)}
+.auth-eye:focus-visible{outline:none;color:var(--gold2);border-color:var(--gold);box-shadow:0 0 0 3px rgba(201,168,76,.18)}
+.auth-eye svg{width:16px;height:16px;display:block}
 .auth-input::placeholder{color:var(--txt3);opacity:1}
 .auth-input::-webkit-input-placeholder{color:var(--txt3)}
 .auth-input:hover{border-color:var(--smoke)}
@@ -3492,7 +3503,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .auth-reset-btn:hover{border-color:var(--gold);color:var(--gold);box-shadow:0 6px 20px rgba(201,168,76,.14)}
 .auth-reset-btn:disabled{opacity:.55;cursor:default}
 .auth-reset-btn:disabled:hover{border-color:var(--edge2);color:var(--gold2);box-shadow:none;transform:none}
-@media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}.auth-actions{flex-direction:column}.auth-reset-btn{width:100%}}
+@media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}.auth-actions{flex-direction:column}.auth-reset-btn{width:100%}.auth-eye{width:40px;height:40px}.auth-pass-wrap .auth-input{padding-right:52px}}
 
 .api-card{margin-top:1.25rem}
 .api-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem}
@@ -5882,18 +5893,30 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   if (e.key === "Enter") signIn();
                 }}
               />
-              <input
-                className="auth-input"
-                type="password"
-                placeholder="Пароль"
-                autoComplete="current-password"
-                value={password}
-                disabled={signingIn || signingUp}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") signIn();
-                }}
-              />
+              <div className="auth-pass-wrap">
+                <input
+                  className="auth-input"
+                  type={showPassword ? "text" : "password"}
+                  placeholder="Пароль"
+                  autoComplete="current-password"
+                  value={password}
+                  disabled={signingIn || signingUp}
+                  onChange={(e) => setPassword(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") signIn();
+                  }}
+                />
+                <button
+                  type="button"
+                  className="auth-eye"
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}
+                  aria-pressed={showPassword}
+                  title={showPassword ? "Скрыть" : "Показать"}
+                >
+                  {showPassword ? eyeOffIcon : eyeIcon}
+                </button>
+              </div>
             </div>
 
             <div className="auth-actions">
