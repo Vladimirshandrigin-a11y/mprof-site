@@ -617,6 +617,36 @@ function authErrorRu(message: string): string {
   return message || "Не удалось выполнить вход. Попробуйте ещё раз.";
 }
 
+// Ошибки именно ВХОДА (signInWithPassword) → понятные русские сообщения.
+// Отдельно от authErrorRu (им пользуется регистрация), чтобы тексты входа были
+// ровно те, что нужны, и правка не задевала signUp. Сверяем по подстроке —
+// не зависим от точной формулировки/версии Supabase.
+function loginErrorRu(message: string): string {
+  const m = (message || "").toLowerCase();
+  if (m.includes("invalid login credentials") || m.includes("invalid credentials"))
+    return "Неверный email или пароль.";
+  if (
+    m.includes("logins are disabled") ||
+    m.includes("login is disabled") ||
+    m.includes("email provider is disabled") ||
+    m.includes("provider is not enabled") ||
+    m.includes("email_provider_disabled")
+  )
+    return "Вход по email временно недоступен. Попробуйте позже.";
+  if (
+    m.includes("failed to fetch") ||
+    m.includes("load failed") ||
+    m.includes("network") ||
+    m.includes("fetch")
+  )
+    return "Не удалось подключиться к серверу. Проверьте интернет.";
+  if (m.includes("email not confirmed"))
+    return "Email не подтверждён. Проверьте почту и перейдите по ссылке.";
+  if (m.includes("rate limit") || m.includes("too many requests"))
+    return "Слишком много попыток. Подождите немного и попробуйте снова.";
+  return "Не удалось войти. Попробуйте ещё раз.";
+}
+
 // Простая проверка формата email перед отправкой письма восстановления —
 // чтобы не дёргать сеть на заведомо мусорном вводе. Не строгая RFC-валидация,
 // нам достаточно «что-то@что-то.домен».
@@ -2662,25 +2692,53 @@ export default function AppPage() {
 
     setSigningIn(true);
     setAuthMessage("");
+
+    // ВАЖНО про вечное «Входим…». supabase-js сериализует auth-операции через
+    // navigator LockManager. Если лок держит зависшая операция (например,
+    // getSession при загрузке /app), то signInWithPassword ждёт лок и его промис
+    // не резолвится НИКОГДА: await не возвращается → finally не срабатывает →
+    // кнопка застревает в «Входим…». Лечим гонкой с 15-сек таймаутом — await
+    // гарантированно завершается, и finally всегда снимает loading.
+    const TIMED_OUT = Symbol("auth-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: emailTrim,
-        password,
+      const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), 15000);
       });
+      const outcome = await Promise.race([
+        supabase.auth.signInWithPassword({ email: emailTrim, password }),
+        timeout,
+      ]);
+
+      if (outcome === TIMED_OUT) {
+        // Не «неверный пароль» — счётчик неудач не трогаем. Если запрос всё же
+        // завершится успехом позже, onAuthStateChange(SIGNED_IN) откроет /app.
+        setAuthMessage(
+          "Вход занимает слишком много времени. Проверьте интернет и попробуйте ещё раз."
+        );
+        return;
+      }
+
+      const { error } = outcome;
       if (error) {
         // Неудачный вход → счётчик +1. На 3-й ошибке появится «Забыли пароль?».
         setFailedAttempts((n) => n + 1);
-        setAuthMessage(authErrorRu(error.message));
+        setAuthMessage(loginErrorRu(error.message));
       } else {
-        // Успех: сбрасываем счётчик. onAuthStateChange(SIGNED_IN) покажет /app.
+        // Успех: сбрасываем счётчик. onAuthStateChange(SIGNED_IN) покажет /app
+        // (форма скрыта по `!user`) — мы уже на /app, ручной редирект не нужен.
         setFailedAttempts(0);
       }
     } catch (e) {
+      // e не содержит пароль (его нет в ошибках signInWithPassword) — лог
+      // безопасен; email отдельно не логируем.
       // eslint-disable-next-line no-console
       console.error("[auth] signInWithPassword error", e);
       // Сетевая ошибка — это не «неверный пароль», счётчик не трогаем.
-      setAuthMessage("Ошибка соединения. Проверьте интернет и попробуйте ещё раз.");
+      const msg = e instanceof Error ? e.message : String(e);
+      setAuthMessage(loginErrorRu(msg));
     } finally {
+      if (timer) clearTimeout(timer);
       setSigningIn(false);
     }
   };
