@@ -139,7 +139,24 @@ export default function UpdatePasswordPage() {
     try {
       // updateUser меняет пароль владельца ТЕКУЩЕЙ сессии. Email не передаём —
       // указать чужой аккаунт технически невозможно.
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      // Гонка с 15-сек таймаутом: updateUser идёт через navigator-lock и может
+      // зависнуть — без таймаута кнопка застряла бы на «Сохраняем…» навсегда.
+      const TIMED_OUT = Symbol("update-timeout");
+      const outcome = await Promise.race([
+        supabase.auth.updateUser({ password: newPassword }),
+        new Promise<typeof TIMED_OUT>((resolve) =>
+          setTimeout(() => resolve(TIMED_OUT), 15000)
+        ),
+      ]);
+      if (outcome === TIMED_OUT) {
+        // Разблокируем кнопку и даём повторить — сессия (если жива) не тронута.
+        setPhase("ready");
+        setMessage(
+          "Сохранение занимает слишком много времени. Попробуйте ещё раз."
+        );
+        return;
+      }
+      const { error } = outcome;
       if (error) {
         setPhase("ready");
         const m = (error.message || "").toLowerCase();

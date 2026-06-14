@@ -673,6 +673,8 @@ export default function AppPage() {
   const [signingIn, setSigningIn] = useState(false);
   // Идёт регистрация (signUp) — блокируем кнопки/инпуты входа.
   const [signingUp, setSigningUp] = useState(false);
+  // Идёт выход (signOut) — блокируем кнопку «Выйти» и показываем «Выходим…».
+  const [signingOut, setSigningOut] = useState(false);
   // Счётчик неудачных входов. Кнопку «Забыли пароль?» показываем только после
   // 3 ошибок подряд — чтобы не пугать обычного пользователя и не плодить спам.
   const [failedAttempts, setFailedAttempts] = useState(0);
@@ -2811,13 +2813,37 @@ export default function AppPage() {
     const redirectTo = `${baseUrl}/auth/update-password`;
 
     setResetSending(true);
+    setAuthMessage("");
+
+    // То же лекарство от вечного «Отправляем…», что и у входа: resetPasswordForEmail
+    // идёт через navigator-lock + сеть (Supabase → SMTP). Если лок держит зависшая
+    // auth-операция или SMTP тупит — промис не резолвится, await не возвращается,
+    // finally не снимает loading → кнопка застревает. Гонка с 15-сек таймаутом
+    // гарантирует, что await завершится и finally всегда разблокирует кнопку.
+    const TIMED_OUT = Symbol("reset-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), 15000);
+      });
       // Существование аккаунта НЕ раскрываем: что бы ни вернул Supabase
       // (успех или ошибку уровня API), наружу показываем одно нейтральное
       // сообщение. Реальную ошибку пишем только в консоль для отладки.
-      const { error } = await supabase.auth.resetPasswordForEmail(emailTrim, {
-        redirectTo,
-      });
+      const outcome = await Promise.race([
+        supabase.auth.resetPasswordForEmail(emailTrim, { redirectTo }),
+        timeout,
+      ]);
+
+      if (outcome === TIMED_OUT) {
+        // Нейтральный текст про таймаут — существование email не раскрываем.
+        // Кулдаун НЕ ставим: пользователь должен иметь возможность повторить.
+        setAuthMessage(
+          "Отправка занимает слишком много времени. Попробуйте ещё раз."
+        );
+        return;
+      }
+
+      const { error } = outcome;
       if (error) {
         // eslint-disable-next-line no-console
         console.error("[auth] resetPasswordForEmail error", error.message);
@@ -2836,6 +2862,7 @@ export default function AppPage() {
         "Не удалось отправить письмо восстановления. Попробуйте позже."
       );
     } finally {
+      if (timer) clearTimeout(timer);
       setResetSending(false);
     }
   };
@@ -2894,12 +2921,47 @@ export default function AppPage() {
     // резолвится → строки после await не выполняются → пользователь остаётся
     // «залогинен». Лечим: scope:'local' (без сети, сразу чистит локальную сессию
     // из localStorage) + try/finally, чтобы выход завершился всегда.
+    if (signingOut) return; // анти-дабл-клик: один выход за раз, не плодим запросы
+    setSigningOut(true);
+
+    // Жёсткая зачистка локальной сессии Supabase. Делаем сами на случай, если
+    // signOut зависнет на navigator-lock и сработает таймаут: после перезагрузки
+    // getSession не должен «воскресить» пользователя из localStorage. Ключ
+    // Supabase — sb-<ref>-auth-token; чистим все совпадения, не привязываясь к ref.
+    const purgeLocalSession = () => {
+      try {
+        for (let i = window.localStorage.length - 1; i >= 0; i--) {
+          const key = window.localStorage.key(i);
+          if (key && key.startsWith("sb-") && key.includes("-auth-token")) {
+            window.localStorage.removeItem(key);
+          }
+        }
+      } catch {
+        /* localStorage недоступен — игнор */
+      }
+    };
+
+    // scope:'local' не ходит в сеть, но всё равно проходит через navigator-lock и
+    // может ждать зависшую getSession/refresh. Раньше без таймаута await мог
+    // не вернуться → finally (с редиректом) не выполнялся → выход «требовал
+    // 3–5 кликов». Гонка с 10-сек таймаутом гарантирует завершение await.
+    const TIMED_OUT = Symbol("signout-timeout");
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await supabase.auth.signOut({ scope: "local" });
+      const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), 10000);
+      });
+      await Promise.race([
+        supabase.auth.signOut({ scope: "local" }),
+        timeout,
+      ]);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.error("[auth] signOut error", e);
     } finally {
+      if (timer) clearTimeout(timer);
+      // Принудительная очистка локального auth-state при ЛЮБОМ исходе (в т.ч. таймаут).
+      purgeLocalSession();
       // Сброс in-memory state.
       setUser(null);
       setHistory([]);
@@ -3434,6 +3496,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   border:1px solid var(--edge2);color:var(--txt2);padding:5px 13px;border-radius:8px;
   cursor:pointer;transition:all .18s;line-height:1}
 .dash-signout:hover{border-color:rgba(224,85,102,.4);color:var(--red)}
+.dash-signout:disabled{opacity:.6;cursor:default}
+.dash-signout:disabled:hover{border-color:var(--edge2);color:var(--txt2)}
 
 .auth-card{margin-bottom:1.4rem;padding:1.4rem 1.5rem}
 .auth-title{font-family:var(--display);font-size:1.05rem;font-weight:700;color:var(--txt);margin:0 0 .9rem}
@@ -5852,8 +5916,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {user ? (
           <div className="dash-user">
             <span className="dash-user-email">{user.email}</span>
-            <button className="dash-signout" onClick={signOut}>
-              Выйти
+            <button
+              type="button"
+              className="dash-signout"
+              onClick={signOut}
+              disabled={signingOut}
+              aria-busy={signingOut}
+            >
+              {signingOut ? "Выходим…" : "Выйти"}
             </button>
           </div>
         ) : (
