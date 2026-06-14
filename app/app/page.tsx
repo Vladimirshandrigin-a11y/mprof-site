@@ -663,6 +663,10 @@ export default function AppPage() {
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   // Счётчик-триггер перезагрузки «Аналитики по месяцам» после сохранения расчёта.
   const [historyRefresh, setHistoryRefresh] = useState(0);
+  // Ошибка загрузки истории из облака → показываем error-state с кнопкой «Повторить».
+  const [historyError, setHistoryError] = useState(false);
+  // История грузится дольше 10с → мягкая подсказка (не ошибка) про интернет/обновление.
+  const [historySlow, setHistorySlow] = useState(false);
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -3134,22 +3138,48 @@ export default function AppPage() {
     if (!userId) {
       // Не залогинен → история работает только локально, ничего не подгружаем.
       setHistory([]);
+      setHistoryError(false);
       setIsLoadingHistory(false);
       return [];
     }
 
+    // Новая попытка загрузки → сбрасываем прошлую ошибку.
+    setHistoryError(false);
     const res = await loadCalculationsFromCloud(userId, 50);
     setIsLoadingHistory(false);
 
     if (res.error) {
       console.warn("loadHistory: cloud unavailable", res.error);
-      // Graceful fallback: оставляем текущий локальный state нетронутым.
+      // Облако недоступно. Если показывать ещё нечего — поднимаем error-state
+      // с кнопкой «Повторить»; уже загруженный список не затираем (graceful).
+      setHistoryError(true);
       return [];
     }
 
     const mapped = (res.data ?? []).map(cloudToLocal);
     setHistory(mapped);
     return mapped;
+  };
+
+  // История грузится дольше 10с → показываем мягкую подсказку (не ошибка).
+  // Таймер живёт только пока isLoadingHistory === true; на завершении — сброс.
+  useEffect(() => {
+    if (!isLoadingHistory) {
+      setHistorySlow(false);
+      return;
+    }
+    const t = setTimeout(() => setHistorySlow(true), 10000);
+    return () => clearTimeout(t);
+  }, [isLoadingHistory]);
+
+  // Повторная загрузка истории по кнопке «Повторить» (error-state). Трогает
+  // ТОЛЬКО историю: расчёты, сохранение и фильтры не затрагиваются.
+  const retryLoadHistory = () => {
+    const uid = user?.id ?? null;
+    if (!uid) return; // облачная история только для залогиненного
+    setHistoryError(false);
+    setIsLoadingHistory(true);
+    void loadHistory(uid);
   };
 
   /** Загрузка uploaded_reports после логина. Join'ит profit/margin
@@ -8036,19 +8066,52 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             <div className="card-head">
               <div className="card-title">Последние расчёты</div>
             </div>
-            <div
-              className="card-body"
-              role="status"
-              aria-live="polite"
-              style={{ display: "flex", alignItems: "center", gap: "10px" }}
-            >
-              <span className="auth-loading-ring" aria-hidden="true" />
-              <span>Загружаем историю расчётов…</span>
+            <div className="card-body" role="status" aria-live="polite">
+              <div
+                style={{ display: "flex", alignItems: "center", gap: "10px" }}
+              >
+                <span className="auth-loading-ring" aria-hidden="true" />
+                <span>Загружаем историю расчётов…</span>
+              </div>
+              {historySlow && (
+                <p
+                  style={{
+                    margin: "10px 0 0",
+                    fontSize: "13px",
+                    color: "var(--txt3)",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  История загружается дольше обычного. Проверьте интернет или
+                  попробуйте обновить страницу.
+                </p>
+              )}
             </div>
           </div>
         )}
 
-        {!isLoadingHistory && history.length === 0 && (
+        {!isLoadingHistory && historyError && history.length === 0 && (
+          <div className="card hist-card">
+            <div className="card-head">
+              <div className="card-title">Последние расчёты</div>
+            </div>
+            <div className="hist-filter-empty" role="alert">
+              <p style={{ margin: "0 0 12px" }}>
+                Не удалось загрузить историю расчётов. Проверьте интернет и
+                попробуйте ещё раз.
+              </p>
+              <button
+                type="button"
+                className="auth-reset-btn"
+                onClick={retryLoadHistory}
+              >
+                Повторить
+              </button>
+            </div>
+          </div>
+        )}
+
+        {!isLoadingHistory && !historyError && history.length === 0 && (
           <div className="card hist-card">
             <div className="card-head">
               <div className="card-title">Последние расчёты</div>
