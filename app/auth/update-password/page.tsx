@@ -35,56 +35,70 @@ export default function UpdatePasswordPage() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [message, setMessage] = useState("");
 
-  // Подтверждение recovery/сессии. Событие PASSWORD_RECOVERY может прилететь ещё
-  // до того, как компонент успеет подписаться (клиент Supabase создаётся на
-  // уровне модуля и разбирает URL-хэш при инициализации), поэтому используем
-  // ДВА сигнала: подписку onAuthStateChange + разовый getSession(). Любой из них
-  // с сессией → "ready". Если за отведённое время сессии нет → "invalid".
+  // Подтверждение recovery-сессии. Ссылка из письма приводит сюда с токенами в
+  // URL-хэше (#access_token=...&refresh_token=...&type=recovery). Авто-детект
+  // (detectSessionInUrl) здесь хэш не подхватывал — поэтому разбираем его сами и
+  // явно поднимаем сессию через setSession. Сессия нужна, чтобы updateUser сменил
+  // пароль владельца ИМЕННО этой recovery-сессии (email никуда не передаётся).
   useEffect(() => {
     let settled = false;
-
-    const markReady = () => {
+    const finish = (p: Phase) => {
       if (settled) return;
       settled = true;
-      setPhase("ready");
+      setPhase(p);
     };
 
-    // 1) Подписка на события авторизации (recovery-ссылка обычно даёт
-    //    PASSWORD_RECOVERY; обычный вход — SIGNED_IN).
-    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
-      if (
-        (event === "PASSWORD_RECOVERY" ||
-          event === "SIGNED_IN" ||
-          event === "USER_UPDATED") &&
-        session
-      ) {
-        markReady();
+    const init = async () => {
+      if (typeof window === "undefined") return;
+
+      // Разбираем хэш руками. Токены НЕ логируем.
+      const raw = window.location.hash.startsWith("#")
+        ? window.location.hash.slice(1)
+        : window.location.hash;
+      const params = new URLSearchParams(raw);
+      const accessToken = params.get("access_token");
+      const refreshToken = params.get("refresh_token");
+      // type === "recovery" — справочно; решаем по наличию пары токенов.
+
+      if (accessToken && refreshToken) {
+        try {
+          const { data, error } = await supabase.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+          });
+          if (error || !data.session) {
+            // Ссылка уже использована / просрочена / токены недействительны.
+            finish("invalid");
+            return;
+          }
+          // Успех: сразу убираем токены из адресной строки, чтобы не светить их
+          // в истории браузера и не пересабмитить при перезагрузке.
+          window.history.replaceState(null, "", "/auth/update-password");
+          finish("ready");
+          return;
+        } catch {
+          // Детали/токены не логируем.
+          finish("invalid");
+          return;
+        }
       }
-    });
 
-    // 2) Фолбэк: вдруг событие уже отгремело до подписки — спросим сессию прямо.
-    supabase.auth
-      .getSession()
-      .then(({ data }) => {
-        if (data.session) markReady();
-      })
-      .catch(() => {
-        /* нет сессии / навигатор-лок — отработает таймаут ниже */
-      });
-
-    // 3) Таймаут: если за 4с ни событие, ни getSession не дали сессию — считаем
-    //    ссылку недействительной и блокируем смену пароля.
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        setPhase("invalid");
+      // Токенов в хэше нет. Возможно, сессия уже поднята ранее или пользователь
+      // уже вошёл — тогда менять пароль можно. Иначе ссылку не предъявили.
+      try {
+        const { data } = await supabase.auth.getSession();
+        finish(data.session ? "ready" : "invalid");
+      } catch {
+        finish("invalid");
       }
-    }, 4000);
-
-    return () => {
-      sub.subscription.unsubscribe();
-      clearTimeout(timer);
     };
+
+    void init();
+
+    // Подстраховка от подвисшего setSession/getSession (navigator-lock): если за
+    // 8с ничего не решилось — считаем ссылку недействительной.
+    const timer = setTimeout(() => finish("invalid"), 8000);
+    return () => clearTimeout(timer);
   }, []);
 
   const canSubmit = phase === "ready";
@@ -129,7 +143,7 @@ export default function UpdatePasswordPage() {
       setNewPassword("");
       setConfirmPassword("");
       setPhase("done");
-      setMessage("Пароль обновлён. Теперь можно войти.");
+      setMessage("Пароль успешно обновлён. Теперь можно войти.");
 
       // Best-effort: завершаем ВСЕ сессии (в т.ч. возможные чужие) глобальным
       // выходом, чтобы старый/чужой токен перестал работать. Глобальный signOut
