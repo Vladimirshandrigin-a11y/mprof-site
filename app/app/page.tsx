@@ -583,6 +583,47 @@ function formatRuDate(iso: string | null): string {
   return `${dd}.${mm}.${d.getFullYear()}`;
 }
 
+// Технические тексты ошибок Supabase Auth (английские) → понятные сообщения на
+// русском. Supabase отдаёт error.message строкой; сверяем по подстроке, чтобы не
+// зависеть от точной формулировки/версии.
+function authErrorRu(message: string): string {
+  const m = (message || "").toLowerCase();
+  if (m.includes("invalid login credentials") || m.includes("invalid credentials"))
+    return "Неверный email или пароль.";
+  if (m.includes("email not confirmed"))
+    return "Email не подтверждён. Проверьте почту и перейдите по ссылке.";
+  if (
+    m.includes("already registered") ||
+    m.includes("already been registered") ||
+    m.includes("user already exists")
+  )
+    return "Пользователь с таким email уже существует. Попробуйте войти.";
+  if (
+    m.includes("password should be at least") ||
+    m.includes("weak password") ||
+    m.includes("password is too short")
+  )
+    return "Пароль слишком короткий — минимум 6 символов.";
+  if (
+    m.includes("unable to validate email") ||
+    m.includes("invalid email") ||
+    m.includes("invalid format")
+  )
+    return "Некорректный email.";
+  if (m.includes("rate limit") || m.includes("too many requests"))
+    return "Слишком много попыток. Подождите немного и попробуйте снова.";
+  if (m.includes("network") || m.includes("failed to fetch") || m.includes("fetch"))
+    return "Ошибка соединения. Проверьте интернет и попробуйте ещё раз.";
+  return message || "Не удалось выполнить вход. Попробуйте ещё раз.";
+}
+
+// Простая проверка формата email перед отправкой письма восстановления —
+// чтобы не дёргать сеть на заведомо мусорном вводе. Не строгая RFC-валидация,
+// нам достаточно «что-то@что-то.домен».
+function isValidEmail(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
+}
+
 export default function AppPage() {
   const [marketplace, setMarketplace] = useState<Marketplace>("ozon");
   const [form, setForm] = useState<Record<string, string>>({ ...EMPTY });
@@ -594,9 +635,20 @@ export default function AppPage() {
   const [historyRefresh, setHistoryRefresh] = useState(0);
   const [user, setUser] = useState<User | null>(null);
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [authMessage, setAuthMessage] = useState("");
-  // Идёт отправка magic-link (signInWithOtp): блокируем кнопку/инпут «Войти».
+  // Идёт вход по паролю (signInWithPassword) — блокируем кнопки/инпуты входа.
   const [signingIn, setSigningIn] = useState(false);
+  // Идёт регистрация (signUp) — блокируем кнопки/инпуты входа.
+  const [signingUp, setSigningUp] = useState(false);
+  // Счётчик неудачных входов. Кнопку «Забыли пароль?» показываем только после
+  // 3 ошибок подряд — чтобы не пугать обычного пользователя и не плодить спам.
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  // Идёт отправка письма восстановления (resetPasswordForEmail).
+  const [resetSending, setResetSending] = useState(false);
+  // Анти-спам: после отправки письма блокируем повторную отправку на 60 секунд.
+  // Храним оставшиеся секунды; 0 — отправка снова разрешена.
+  const [resetCooldown, setResetCooldown] = useState(0);
   const [ozonClientId, setOzonClientId] = useState("");
   const [ozonApiKey, setOzonApiKey] = useState("");
   const [wbApiKey, setWbApiKey] = useState("");
@@ -2592,17 +2644,164 @@ export default function AppPage() {
     };
   }, []);
 
+  // ОСНОВНОЙ вход для MVP — email + пароль. Не зависит от SMTP/лимитов писем
+  // (в отличие от magic-link). Supabase signInWithPassword при успехе сам выставит
+  // сессию → onAuthStateChange(SIGNED_IN) подхватит user и покажет дашборд (форма
+  // скрыта по `!user`), мы уже на /app — ручной редирект не нужен.
   const signIn = async () => {
-    if (signingIn) return; // защита от двойной отправки
+    if (signingIn || signingUp) return; // защита от двойного клика
+    const emailTrim = email.trim();
+    if (!emailTrim) {
+      setAuthMessage("Введите email");
+      return;
+    }
+    if (password.length < 6) {
+      setAuthMessage("Пароль слишком короткий — минимум 6 символов.");
+      return;
+    }
+
+    setSigningIn(true);
+    setAuthMessage("");
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: emailTrim,
+        password,
+      });
+      if (error) {
+        // Неудачный вход → счётчик +1. На 3-й ошибке появится «Забыли пароль?».
+        setFailedAttempts((n) => n + 1);
+        setAuthMessage(authErrorRu(error.message));
+      } else {
+        // Успех: сбрасываем счётчик. onAuthStateChange(SIGNED_IN) покажет /app.
+        setFailedAttempts(0);
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[auth] signInWithPassword error", e);
+      // Сетевая ошибка — это не «неверный пароль», счётчик не трогаем.
+      setAuthMessage("Ошибка соединения. Проверьте интернет и попробуйте ещё раз.");
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  // Регистрация email + пароль. Если в Supabase ОТКЛЮЧЕНО подтверждение email
+  // (рекомендуется для MVP) — signUp сразу вернёт session → onAuthStateChange
+  // войдёт в дашборд. Если подтверждение ВКЛЮЧЕНО — session отсутствует, поэтому
+  // просим подтвердить почту (это снова зависит от SMTP).
+  const signUp = async () => {
+    if (signingIn || signingUp) return;
+    const emailTrim = email.trim();
+    if (!emailTrim) {
+      setAuthMessage("Введите email");
+      return;
+    }
+    if (password.length < 6) {
+      setAuthMessage("Пароль слишком короткий — минимум 6 символов.");
+      return;
+    }
+
+    setSigningUp(true);
+    setAuthMessage("");
+    try {
+      const { data, error } = await supabase.auth.signUp({
+        email: emailTrim,
+        password,
+      });
+      if (error) {
+        setAuthMessage(authErrorRu(error.message));
+      } else if (!data.session) {
+        // Подтверждение email включено: письмо ушло, сессии пока нет.
+        setAuthMessage(
+          "Аккаунт создан. Подтвердите email по ссылке в письме, затем войдите."
+        );
+      }
+      // Если session есть — onAuthStateChange(SIGNED_IN) сам покажет дашборд /app.
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("[auth] signUp error", e);
+      setAuthMessage("Ошибка соединения. Проверьте интернет и попробуйте ещё раз.");
+    } finally {
+      setSigningUp(false);
+    }
+  };
+
+  // Восстановление пароля. БЕЗОПАСНОСТЬ: здесь пароль НЕ меняется. Мы лишь
+  // запускаем официальный flow Supabase — на почту уходит ссылка, и только
+  // перейдя по ней (получив recovery-сессию), пользователь сможет задать новый
+  // пароль на /auth/update-password. Сменить пароль «просто по введённому email»
+  // нельзя — без доступа к почте recovery-сессии не будет.
+  const requestPasswordReset = async () => {
+    if (resetSending || resetCooldown > 0) return; // анти-дабл-клик + кулдаун
+    const emailTrim = email.trim();
+    if (!emailTrim) {
+      setAuthMessage("Введите email, чтобы восстановить пароль.");
+      return;
+    }
+    if (!isValidEmail(emailTrim)) {
+      setAuthMessage("Некорректный email.");
+      return;
+    }
+
+    // Ссылка должна вести на ТОТ ЖЕ хост, где открыто приложение; origin окна —
+    // основной источник, NEXT_PUBLIC_SITE_URL — только fallback для SSR.
+    const fallbackUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "");
+    const baseUrl =
+      typeof window !== "undefined" ? window.location.origin : fallbackUrl;
+    const redirectTo = `${baseUrl}/auth/update-password`;
+
+    setResetSending(true);
+    try {
+      // Существование аккаунта НЕ раскрываем: что бы ни вернул Supabase
+      // (успех или ошибку уровня API), наружу показываем одно нейтральное
+      // сообщение. Реальную ошибку пишем только в консоль для отладки.
+      const { error } = await supabase.auth.resetPasswordForEmail(emailTrim, {
+        redirectTo,
+      });
+      if (error) {
+        // eslint-disable-next-line no-console
+        console.error("[auth] resetPasswordForEmail error", error.message);
+      }
+      setAuthMessage(
+        "Если аккаунт с таким email существует, мы отправили ссылку для восстановления пароля."
+      );
+      // Анти-спам: 60 секунд блокируем повторную отправку.
+      setResetCooldown(60);
+    } catch (e) {
+      // Сетевой сбой (до Supabase не достучались) — здесь существование аккаунта
+      // не раскрывается, поэтому можно прямо сказать, что не отправилось.
+      // eslint-disable-next-line no-console
+      console.error("[auth] resetPasswordForEmail exception", e);
+      setAuthMessage(
+        "Не удалось отправить письмо восстановления. Попробуйте позже."
+      );
+    } finally {
+      setResetSending(false);
+    }
+  };
+
+  // Тик кулдауна восстановления: раз в секунду уменьшаем счётчик до нуля.
+  useEffect(() => {
+    if (resetCooldown <= 0) return;
+    const t = setTimeout(
+      () => setResetCooldown((s) => Math.max(0, s - 1)),
+      1000
+    );
+    return () => clearTimeout(t);
+  }, [resetCooldown]);
+
+  // FALLBACK (оставлен намеренно, НЕ удалять): прежний вход по magic-link без
+  // пароля. Сейчас в UI не используется — основной способ email+пароль. Чтобы
+  // быстро вернуть вход по ссылке, повесь этот обработчик на кнопку.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const signInWithMagicLink = async () => {
+    if (signingIn) return;
     if (!email.trim()) {
       setAuthMessage("Введите email");
       return;
     }
-
-    // Куда вернуть пользователя по ссылке из письма. Берём origin ТЕКУЩЕГО окна —
-    // тогда один и тот же билд корректно работает на любом хосте (Railway, Timeweb,
-    // будущий домен) и не уводит на чужой домен. NEXT_PUBLIC_SITE_URL — только
-    // fallback, когда window недоступен (SSR/пререндер).
+    // origin ТЕКУЩЕГО окна — билд работает на любом хосте; NEXT_PUBLIC_SITE_URL —
+    // только fallback для SSR/пререндера.
     const fallbackUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "");
     const baseUrl =
       typeof window !== "undefined" ? window.location.origin : fallbackUrl;
@@ -2613,11 +2812,8 @@ export default function AppPage() {
     try {
       const { error } = await supabase.auth.signInWithOtp({
         email: email.trim(),
-        options: {
-          emailRedirectTo,
-        },
+        options: { emailRedirectTo },
       });
-
       if (error) {
         setAuthMessage(error.message);
       } else {
@@ -2626,7 +2822,6 @@ export default function AppPage() {
         );
       }
     } finally {
-      // Любой исход — снимаем pending: при ошибке кнопка вернётся в норму.
       setSigningIn(false);
     }
   };
@@ -3225,7 +3420,21 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .auth-btn:disabled{opacity:.6;cursor:default;box-shadow:0 8px 28px rgba(201,168,76,.18)}
 .auth-btn:disabled:hover{transform:none;box-shadow:0 8px 28px rgba(201,168,76,.18)}
 .auth-msg{margin:.8rem 0 0;font-family:var(--mono);font-size:.72rem;color:var(--txt2);letter-spacing:.02em}
-@media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}}
+.auth-fields{display:flex;flex-direction:column;gap:10px}
+.auth-actions{display:flex;gap:10px;margin-top:10px}
+.auth-actions .auth-btn{flex:1;padding:12px 18px;text-align:center}
+.auth-btn-2{background:transparent;color:var(--gold2);border:1px solid var(--edge2);box-shadow:none}
+.auth-btn-2:hover{transform:translateY(-1px);border-color:var(--gold);box-shadow:0 8px 24px rgba(201,168,76,.16)}
+.auth-btn-2:disabled,.auth-btn-2:disabled:hover{opacity:.6;cursor:default;transform:none;box-shadow:none;border-color:var(--edge2)}
+.auth-hint{margin:.7rem 0 0;font-family:var(--mono);font-size:.66rem;color:var(--txt3);letter-spacing:.02em;line-height:1.5}
+.auth-reset{margin:.95rem 0 0;padding-top:.95rem;border-top:1px solid var(--edge)}
+.auth-reset-q{margin:0 0 .55rem;font-family:var(--mono);font-size:.7rem;color:var(--txt2);letter-spacing:.02em}
+.auth-reset-btn{font-family:var(--sans);font-size:.82rem;font-weight:600;color:var(--gold2);background:transparent;
+  border:1px solid var(--edge2);border-radius:9px;padding:10px 16px;cursor:pointer;letter-spacing:.02em;transition:all .18s}
+.auth-reset-btn:hover{border-color:var(--gold);color:var(--gold);box-shadow:0 6px 20px rgba(201,168,76,.14)}
+.auth-reset-btn:disabled{opacity:.55;cursor:default}
+.auth-reset-btn:disabled:hover{border-color:var(--edge2);color:var(--gold2);box-shadow:none;transform:none}
+@media(max-width:480px){.auth-row{flex-direction:column}.auth-btn{padding:13px}.auth-actions{flex-direction:column}.auth-reset-btn{width:100%}}
 
 .api-card{margin-top:1.25rem}
 .api-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem}
@@ -5597,29 +5806,88 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           <div className="card auth-card">
             <h3 className="auth-title">Вход в аккаунт</h3>
 
-            <div className="auth-row">
+            <div className="auth-fields">
               <input
                 className="auth-input"
                 type="email"
                 placeholder="Ваш email"
                 autoComplete="email"
                 value={email}
-                disabled={signingIn}
-                onChange={(e) => setEmail(e.target.value)}
+                disabled={signingIn || signingUp}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  // Сменили email — возможно, другой аккаунт: сбрасываем счётчик
+                  // неудачных попыток (кнопка восстановления снова прячется).
+                  if (failedAttempts !== 0) setFailedAttempts(0);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") signIn();
                 }}
               />
+              <input
+                className="auth-input"
+                type="password"
+                placeholder="Пароль"
+                autoComplete="current-password"
+                value={password}
+                disabled={signingIn || signingUp}
+                onChange={(e) => setPassword(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") signIn();
+                }}
+              />
+            </div>
+
+            <div className="auth-actions">
               <button
                 type="button"
                 className="auth-btn"
                 onClick={signIn}
-                disabled={signingIn}
+                disabled={signingIn || signingUp}
                 aria-busy={signingIn}
               >
-                {signingIn ? "Отправляем ссылку…" : "Войти"}
+                {signingIn ? "Входим…" : "Войти"}
+              </button>
+              <button
+                type="button"
+                className="auth-btn auth-btn-2"
+                onClick={signUp}
+                disabled={signingIn || signingUp}
+                aria-busy={signingUp}
+              >
+                {signingUp ? "Создаём…" : "Создать аккаунт"}
               </button>
             </div>
+
+            <p className="auth-hint">
+              Пароль — минимум 6 символов. Нет аккаунта? Нажмите «Создать
+              аккаунт».
+            </p>
+            <p className="auth-hint">
+              Email нужен только для входа, восстановления доступа и привязки
+              оплаты. Рассылок не будет.
+            </p>
+
+            {/* Кнопка восстановления появляется только после 3 неудачных входов —
+               чтобы не отвлекать обычного пользователя и не плодить спам. */}
+            {failedAttempts >= 3 && (
+              <div className="auth-reset">
+                <p className="auth-reset-q">Не получается войти?</p>
+                <button
+                  type="button"
+                  className="auth-reset-btn"
+                  onClick={requestPasswordReset}
+                  disabled={resetSending || resetCooldown > 0}
+                  aria-busy={resetSending}
+                >
+                  {resetSending
+                    ? "Отправляем…"
+                    : resetCooldown > 0
+                    ? `Отправить повторно через ${resetCooldown} с`
+                    : "Забыли пароль? Восстановить пароль"}
+                </button>
+              </div>
+            )}
 
             {authMessage && <p className="auth-msg">{authMessage}</p>}
           </div>
