@@ -967,6 +967,15 @@ export default function AppPage() {
     };
   }, [combinedResult, profitInputs, payoutSchedule]);
 
+  // Готов ли финальный расчёт чистой прибыли: считаем готовым, когда задана
+  // себестоимость (> 0). Без неё показываем next-step вместо итоговой суммы.
+  const netProfitReady = useMemo(() => {
+    const n = parseFloat(
+      profitInputs.costPrice.replace(/\s/g, "").replace(",", ".")
+    );
+    return Number.isFinite(n) && n > 0;
+  }, [profitInputs.costPrice]);
+
   // Синхронизация «Себестоимость товара» с суммарной COGS каталога (cost_price ×
   // кол-во по сматченным SKU), которую считает блок «Чистая прибыль по товарам».
   // Пока пользователь не правил поле руками (costPriceTouched=false) — поле
@@ -4162,6 +4171,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .upload-slot-label{
   font-size:.88rem;color:var(--txt);font-weight:500;margin-bottom:2px;line-height:1.3
 }
+.upload-slot-desc{
+  font-size:.72rem;color:var(--txt2);line-height:1.35;margin-bottom:8px;
+  overflow-wrap:anywhere
+}
 .upload-slot-meta{
   font-family:var(--mono);font-size:.6rem;color:var(--txt3);
   text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px
@@ -4236,6 +4249,41 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   font-size:.78rem;color:var(--txt2);line-height:1.4;
   min-width:0;overflow-wrap:anywhere
 }
+/* Главный итог «Чистая прибыль» вверху результата (Задача 5). */
+.np-hero{
+  margin-bottom:1.2rem;padding:1.1rem 1.2rem;border-radius:13px;
+  border:1px solid var(--edge);position:relative
+}
+.np-hero.pos{
+  background:linear-gradient(135deg,rgba(46,204,138,.12),rgba(46,204,138,.03));
+  border-color:rgba(46,204,138,.30)
+}
+.np-hero.neg{
+  background:linear-gradient(135deg,rgba(232,154,153,.12),rgba(232,154,153,.03));
+  border-color:rgba(232,154,153,.30)
+}
+.np-hero.pending{
+  background:linear-gradient(135deg,rgba(201,168,76,.10),rgba(201,168,76,.02));
+  border-color:rgba(201,168,76,.28)
+}
+.np-hero-lbl{
+  font-family:var(--mono);font-size:.62rem;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--txt2);margin-bottom:.45rem
+}
+.np-hero-val{
+  font-family:var(--display);font-style:italic;font-size:2.6rem;line-height:1.05;
+  letter-spacing:-.01em;color:var(--txt);font-variant-numeric:tabular-nums
+}
+.np-hero.neg .np-hero-val{color:#e89a99}
+.np-hero.pos .np-hero-val{color:#7be8b2}
+.np-hero-sub{
+  margin-top:.5rem;font-size:.76rem;color:var(--txt2);line-height:1.4
+}
+.np-hero-next{
+  font-size:.86rem;color:var(--txt);line-height:1.45;margin-bottom:.9rem;
+  max-width:46ch
+}
+.np-hero-btn{margin-top:.2rem}
 .upload-3-result-breakdown{
   display:grid;grid-template-columns:1fr;gap:6px;padding:.7rem 0 .3rem;
   border-top:1px solid rgba(255,255,255,.06)
@@ -6372,17 +6420,18 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           <button
             type="button"
             role="tab"
-            aria-selected={calcMode === "manual"}
-            className={"calc-tab" + (calcMode === "manual" ? " active" : "")}
-            onClick={() => setCalcMode("manual")}
+            aria-selected={calcMode === "upload"}
+            className={"calc-tab" + (calcMode === "upload" ? " active" : "")}
+            onClick={() => setCalcMode("upload")}
           >
             <span className="calc-tab-ico">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <rect x="4" y="3" width="16" height="18" rx="2.5" />
-                <path d="M8 7h8M8 11h8M8 15h5" />
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <path d="M17 8 12 3 7 8" />
+                <path d="M12 3v13" />
               </svg>
             </span>
-            Ручной расчёт
+            Загрузить отчёт
           </button>
           <button
             type="button"
@@ -6401,18 +6450,17 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           <button
             type="button"
             role="tab"
-            aria-selected={calcMode === "upload"}
-            className={"calc-tab" + (calcMode === "upload" ? " active" : "")}
-            onClick={() => setCalcMode("upload")}
+            aria-selected={calcMode === "manual"}
+            className={"calc-tab" + (calcMode === "manual" ? " active" : "")}
+            onClick={() => setCalcMode("manual")}
           >
             <span className="calc-tab-ico">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <path d="M17 8 12 3 7 8" />
-                <path d="M12 3v13" />
+                <rect x="4" y="3" width="16" height="18" rx="2.5" />
+                <path d="M8 7h8M8 11h8M8 15h5" />
               </svg>
             </span>
-            Загрузить отчёт
+            Ручной расчёт
           </button>
         </div>
 
@@ -6943,55 +6991,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </p>
             </div>
 
-            <div className="upload-guide">
-              <div className="upload-guide-head">
-                <span className="upload-guide-ico" aria-hidden="true">
-                  <svg
-                    width="15"
-                    height="15"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <circle cx="12" cy="12" r="10" />
-                    <line x1="12" y1="16" x2="12" y2="12" />
-                    <line x1="12" y1="8" x2="12.01" y2="8" />
-                  </svg>
-                </span>
-                <span className="upload-guide-title">
-                  Какие файлы нужны для точного расчёта
-                </span>
-              </div>
-              <ol className="upload-guide-list">
-                <li className="upload-guide-item">
-                  <span className="upload-guide-num" aria-hidden="true">1</span>
-                  <span className="upload-guide-text">
-                    <b>Отчёт о реализации Ozon</b> — основной Excel-файл с
-                    выручкой и товарами.
-                  </span>
-                </li>
-                <li className="upload-guide-item">
-                  <span className="upload-guide-num" aria-hidden="true">2</span>
-                  <span className="upload-guide-text">
-                    <b>УПД по услугам Ozon</b> — PDF с расходами Ozon по услугам.
-                  </span>
-                </li>
-                <li className="upload-guide-item">
-                  <span className="upload-guide-num" aria-hidden="true">3</span>
-                  <span className="upload-guide-text">
-                    <b>УПД агентского вознаграждения</b> — PDF с
-                    комиссией/вознаграждением Ozon.
-                  </span>
-                </li>
-              </ol>
-              <div className="upload-guide-foot">
-                Можно начать с одного Excel-отчёта, но для максимально точной
-                чистой прибыли загрузите все 3 файла.
-              </div>
-            </div>
+            {/* Золотой блок «Какие файлы нужны для точного расчёта» убран:
+                подписи к каждому файлу теперь внутри ячеек загрузки
+                (см. upload-slot-desc в каждом слоте ниже). */}
 
             <div className="upload-3-slots">
               {/* Slot 1: XLSX */}
@@ -7023,7 +7025,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 <div className="upload-slot-num" aria-hidden="true">1</div>
                 <div className="upload-slot-body">
                   <div className="upload-slot-label">
-                    Отчёт о реализации товара
+                    Отчёт о реализации Ozon
+                  </div>
+                  <div className="upload-slot-desc">
+                    Основной Excel-файл с выручкой и товарами
                   </div>
                   <div className="upload-slot-meta">XLSX или CSV</div>
                   {slotXlsx ? (
@@ -7088,6 +7093,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 <div className="upload-slot-num" aria-hidden="true">2</div>
                 <div className="upload-slot-body">
                   <div className="upload-slot-label">УПД доп. услуги</div>
+                  <div className="upload-slot-desc">
+                    PDF с расходами Ozon по услугам
+                  </div>
                   <div className="upload-slot-meta">PDF</div>
                   {slotUpdServices ? (
                     <div className="upload-slot-file" title={slotUpdServices.name}>
@@ -7154,6 +7162,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 <div className="upload-slot-body">
                   <div className="upload-slot-label">
                     УПД агентское вознаграждение
+                  </div>
+                  <div className="upload-slot-desc">
+                    PDF с комиссией/вознаграждением Ozon
                   </div>
                   <div className="upload-slot-meta">PDF</div>
                   {slotUpdCommission ? (
@@ -7223,6 +7234,58 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
             {combinedStatus === "success" && combinedResult && (
               <div className="upload-3-result" role="status">
+                {/* Главный итог «Чистая прибыль» — сразу в зоне внимания (Задача 5).
+                    Пока нет себестоимости/налога — показываем понятный next step. */}
+                <div
+                  className={
+                    "np-hero" +
+                    (netProfitReady && profitCalc
+                      ? profitCalc.netProfit < 0
+                        ? " neg"
+                        : " pos"
+                      : " pending")
+                  }
+                >
+                  {netProfitReady && profitCalc ? (
+                    <>
+                      <div className="np-hero-lbl">
+                        {profitCalc.netProfit < 0
+                          ? "Чистый убыток"
+                          : "Чистая прибыль"}
+                      </div>
+                      <div className="np-hero-val">
+                        {profitCalc.netProfit.toLocaleString("ru-RU", {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}{" "}
+                        ₽
+                      </div>
+                      <div className="np-hero-sub">
+                        После себестоимости, налога и графика выплат · маржа{" "}
+                        {profitCalc.margin.toLocaleString("ru-RU", {
+                          minimumFractionDigits: 1,
+                          maximumFractionDigits: 1,
+                        })}
+                        %
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="np-hero-lbl">Чистая прибыль</div>
+                      <div className="np-hero-next">
+                        Добавьте себестоимость и налог, чтобы увидеть финальную
+                        чистую прибыль.
+                      </div>
+                      <button
+                        type="button"
+                        className="upload-3-btn primary np-hero-btn"
+                        onClick={() => setShowProfitForm(true)}
+                      >
+                        Добавить себестоимость и налог →
+                      </button>
+                    </>
+                  )}
+                </div>
                 <div className="upload-3-result-title">
                   ✓ Прибыль до себестоимости
                 </div>
@@ -7304,7 +7367,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 >
                   {showProfitForm
                     ? "Свернуть форму ↑"
-                    : "Открыть форму (себестоимость, налог) →"}
+                    : "Добавить себестоимость и налог →"}
                 </button>
 
                 {showProfitForm && profitCalc && (

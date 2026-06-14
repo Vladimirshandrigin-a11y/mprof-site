@@ -1155,7 +1155,7 @@ export function OzonProductBreakdown({
         </section>
       )}
 
-      {!loading && !loadError && (
+      {!loading && !loadError && missing.length > 0 && (
         <section className={"pbm" + (missing.length > 0 ? " pbm-alert" : "")}>
           <div className="pbm-head">
             <div>
