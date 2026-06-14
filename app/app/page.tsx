@@ -285,30 +285,68 @@ function buildHistDetailRows(
 }
 
 /**
- * Нормализует строку периода отчёта в первое число месяца 'YYYY-MM-01'
- * (формат колонки report_history.report_month). Понимает ISO (2026-04 /
- * 2026/04 / 2026-04-30), компактный (20260430) и русские названия месяцев
- * («Апрель 2026», «За апрель 2026»). Если распознать не удалось — текущий месяц.
+ * Извлекает месяц отчёта из ПРОИЗВОЛЬНОГО текста (строка периода из XLSX,
+ * report_period или ИМЯ ФАЙЛА Ozon) и нормализует в первое число месяца
+ * 'YYYY-MM-01' — формат колонки report_history.report_month (тип date в БД;
+ * MonthlyAnalytics группирует записи по 'YYYY-MM' = report_month.slice(0, 7)).
+ * Возвращает null, если месяц распознать НЕ удалось.
+ *
+ * Поддерживаемые форматы (всё → 'YYYY-MM-01'):
+ *   диапазон   «01.04.2026 - 30.04.2026», «01.04.2026 — 30.04.2026»,
+ *              «01.04.2026 по 30.04.2026»  → берём месяц КОНЕЧНОЙ даты;
+ *   компактный «20260430», в т.ч. внутри имени файла
+ *              «Отчет о реализации товара_20260430.xlsx»,
+ *              «Отчет о реализации товара_20260430 2.xlsx»;
+ *   ISO        «2026-04-30», «2026/04», «2026.04» (год впереди);
+ *   ДД.ММ.ГГГГ «30.04.2026» (день впереди);
+ *   русские    «Апрель 2026», «за апрель 2026».
+ *
+ * Почему месяц КОНЕЧНОЙ даты диапазона: отчёт Ozon за месяц имеет период вида
+ * 01.04.2026–30.04.2026 — обе даты в одном месяце, результат однозначен. Если
+ * период вдруг пересекает два месяца, конечная дата вернее отражает, к какому
+ * расчётному месяцу относятся выручка и выплаты.
  */
-function deriveReportMonth(period: string | null | undefined): string {
-  const now = new Date();
+function extractReportMonthFromText(
+  text: string | null | undefined
+): string | null {
+  if (!text) return null;
   const pad = (n: number) => String(n).padStart(2, "0");
-  const fallback = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-01`;
-  if (!period) return fallback;
-  const p = period.toLowerCase();
-  // 20260430 → 2026-04
+  const p = text.toLowerCase();
+  // Собрать 'YYYY-MM-01' с валидацией номера месяца (отсекает мусор вроде 99).
+  const mk = (year: string, month: number): string | null =>
+    month >= 1 && month <= 12 ? `${year}-${pad(month)}-01` : null;
+
+  // 1) Диапазон ДД.ММ.ГГГГ … ДД.ММ.ГГГГ → месяц КОНЕЧНОЙ даты (группы 4,5,6).
+  const range = p.match(
+    /(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})\s*(?:-|—|–|по|до|to)\s*(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})/
+  );
+  if (range) {
+    const res = mk(range[6], Number(range[5]));
+    if (res) return res;
+  }
+
+  // 2) Компактный YYYYMMDD (в т.ч. в имени файла «_20260430.xlsx»).
   const compact = p.match(/(20\d{2})(\d{2})(\d{2})/);
   if (compact) {
-    const m = Number(compact[2]);
-    if (m >= 1 && m <= 12) return `${compact[1]}-${pad(m)}-01`;
+    const res = mk(compact[1], Number(compact[2]));
+    if (res) return res;
   }
-  // 2026-04 / 2026/04 / 2026.04(-30)
+
+  // 3) ISO — год впереди: 2026-04-30 / 2026/04 / 2026.04.
   const iso = p.match(/(20\d{2})[-./](\d{1,2})/);
   if (iso) {
-    const m = Number(iso[2]);
-    if (m >= 1 && m <= 12) return `${iso[1]}-${pad(m)}-01`;
+    const res = mk(iso[1], Number(iso[2]));
+    if (res) return res;
   }
-  // Русские месяцы (порядок важен: специфичные основы раньше короткой «ма»).
+
+  // 4) Одиночная ДД.ММ.ГГГГ — день впереди: 30.04.2026.
+  const dmy = p.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})/);
+  if (dmy) {
+    const res = mk(dmy[3], Number(dmy[2]));
+    if (res) return res;
+  }
+
+  // 5) Русские месяцы (порядок основ важен: специфичные раньше короткой «ма»).
   const MONTHS = [
     "январ", "феврал", "март", "апрел", "ма", "июн", "июл",
     "август", "сентябр", "октябр", "ноябр", "декабр",
@@ -316,10 +354,35 @@ function deriveReportMonth(period: string | null | undefined): string {
   const yearM = p.match(/20\d{2}/);
   if (yearM) {
     for (let i = 0; i < MONTHS.length; i++) {
-      if (p.includes(MONTHS[i])) return `${yearM[0]}-${pad(i + 1)}-01`;
+      if (p.includes(MONTHS[i])) return mk(yearM[0], i + 1);
     }
   }
-  return fallback;
+
+  return null;
+}
+
+/**
+ * Определяет месяц отчёта ('YYYY-MM-01') по ПРИОРИТЕТУ источников:
+ *   1) период отчёта из XLSX / combinedResult (parsePeriod → combinedResult.period);
+ *   2) имя XLSX-файла Ozon («Отчет о реализации товара_20260430.xlsx»).
+ * Возвращает null, если ни один источник не дал месяц.
+ *
+ * ВАЖНО — почему больше НЕ подставляем текущий месяц: раньше при нераспознанном
+ * периоде месяц МОЛЧА заменялся на текущий. Это ломало «Аналитику по месяцам»:
+ * три отчёта (апрель/май/июнь), залитые в одну сессию, получали ОДИН и тот же
+ * report_month (месяц загрузки) → MonthlyAnalytics видел один месяц → график
+ * динамики не строился (для графика нужно ≥2 разных месяцев). Теперь при неудаче
+ * возвращаем null, и вызывающий код НЕ пишет фейковый месяц как реальный.
+ */
+function resolveReportMonth(
+  period: string | null | undefined,
+  fileName?: string | null
+): string | null {
+  return (
+    extractReportMonthFromText(period) ??
+    extractReportMonthFromText(fileName) ??
+    null
+  );
 }
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
@@ -744,6 +807,8 @@ export default function AppPage() {
     profitBeforeCost: number;
     /** Период отчёта из XLSX — для report_month в истории по месяцам. */
     period: string | null;
+    /** Имя XLSX-файла — fallback-источник месяца, если период не распарсился. */
+    sourceFileName?: string | null;
   } | null>(null);
   const [combinedDebug, setCombinedDebug] = useState<{
     xlsx: OzonDebugInfo | null;
@@ -1075,17 +1140,36 @@ export default function AppPage() {
     // основной сейв и не влияет на расчёт. UI группирует по месяцу (последняя
     // запись за месяц), поэтому повторные сохранения того же отчёта корректны.
     if (canPersist && user?.id) {
-      const { error: histErr } = await saveReportHistoryToCloud(
-        {
-          report_month: deriveReportMonth(combinedResult.period),
-          revenue: incomeRevenue,
-          expenses: totalExpenses,
-          profit: profitCalc.netProfit,
-          margin: profitCalc.margin,
-        },
-        user.id
+      // Месяц отчёта по приоритету: период из XLSX → имя файла Ozon. Если ни
+      // один источник не дал месяц — НЕ сохраняем снимок с фейковым текущим
+      // месяцем (это сливало бы отчёты разных месяцев в одну точку и ломало
+      // график динамики). Пропуск снимка не блокирует основной сейв расчёта.
+      const reportMonth = resolveReportMonth(
+        combinedResult.period,
+        combinedResult.sourceFileName
       );
-      if (!histErr) setHistoryRefresh((k) => k + 1);
+      if (reportMonth) {
+        const { error: histErr } = await saveReportHistoryToCloud(
+          {
+            report_month: reportMonth,
+            revenue: incomeRevenue,
+            expenses: totalExpenses,
+            profit: profitCalc.netProfit,
+            margin: profitCalc.margin,
+          },
+          user.id
+        );
+        if (!histErr) setHistoryRefresh((k) => k + 1);
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[report-history] месяц отчёта не распознан — снимок за месяц пропущен",
+          {
+            period: combinedResult.period,
+            fileName: combinedResult.sourceFileName,
+          }
+        );
+      }
     }
 
     setProfitSaving(false);
@@ -2261,6 +2345,9 @@ export default function AppPage() {
       updCommissionTotal,
       profitBeforeCost,
       period: xlsxRes.report.period,
+      // Имя файла Ozon — fallback для определения месяца, если период из
+      // содержимого XLSX не распознан (приоритет 2 в resolveReportMonth).
+      sourceFileName: slotXlsx?.name ?? null,
     });
 
     // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
