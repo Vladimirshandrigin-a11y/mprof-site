@@ -4284,6 +4284,21 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   max-width:46ch
 }
 .np-hero-btn{margin-top:.2rem}
+/* Спокойная info-подсказка в блоке «Чистая прибыль»: точность итога зависит
+   от полноты загруженных данных. Мягкий золотой акцент, не перетягивает
+   внимание с суммы. */
+.np-hero-note{
+  display:flex;gap:.5rem;align-items:flex-start;
+  margin-top:.9rem;padding:.58rem .72rem;
+  border:1px solid rgba(201,168,76,.22);
+  background:rgba(201,168,76,.07);
+  border-radius:9px
+}
+.np-hero-note-ico{flex:0 0 auto;color:var(--gold);margin-top:.06rem}
+.np-hero-note-ico svg{width:14px;height:14px;display:block}
+.np-hero-note-txt{
+  font-size:.72rem;line-height:1.45;color:var(--txt2);overflow-wrap:anywhere
+}
 .upload-3-result-breakdown{
   display:grid;grid-template-columns:1fr;gap:6px;padding:.7rem 0 .3rem;
   border-top:1px solid rgba(255,255,255,.06)
@@ -7267,6 +7282,28 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           maximumFractionDigits: 1,
                         })}
                         %
+                      </div>
+                      <div className="np-hero-note" role="note">
+                        <span className="np-hero-note-ico" aria-hidden="true">
+                          <svg
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.7"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <circle cx="12" cy="12" r="9" />
+                            <path d="M12 8v5" />
+                            <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
+                          </svg>
+                        </span>
+                        <span className="np-hero-note-txt">
+                          Перед выводом итоговой прибыли проверьте, что загружены
+                          все документы (отчёт Ozon, УПД по услугам и агентскому)
+                          и заполнены себестоимость, налог и прочие расходы. Если
+                          часть данных отсутствует, итог может быть неполным.
+                        </span>
                       </div>
                     </>
                   ) : (

@@ -616,6 +616,10 @@ export function OzonProductBreakdown({
 
   // Выгрузка аналитики: два листа — Top Profitable и Top Losses.
   // Колонки: sku | name | revenue | profit | margin (уже рассчитанные значения).
+  // Кнопка «Скачать аналитику» убрана из UI (UX-решение), но сама функция
+  // экспорта оставлена в коде на будущее — поэтому глушим предупреждение об
+  // unused, чтобы не падал линт.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   async function handleAnalyticsExport() {
     if (exportingAnalytics) return;
     if (topProfitable.length === 0 && topLosses.length === 0) return;
@@ -836,21 +840,8 @@ export function OzonProductBreakdown({
                 Лучшие и убыточные товары по расчётной чистой прибыли.
               </p>
             </div>
-            {scored.length > 0 && (
-              <button
-                type="button"
-                className="pba-export"
-                onClick={handleAnalyticsExport}
-                disabled={exportingAnalytics}
-              >
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                  <path d="M7 10l5 5 5-5" />
-                  <path d="M12 15V3" />
-                </svg>
-                {exportingAnalytics ? "Готовим…" : "Скачать аналитику"}
-              </button>
-            )}
+            {/* Кнопка «Скачать аналитику» убрана из UI по UX-решению.
+                Функция handleAnalyticsExport оставлена в коде на будущее. */}
           </div>
 
           {scored.length === 0 ? (
