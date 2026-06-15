@@ -11,7 +11,6 @@ import {
   type KeyProductsSnapshot,
   type CostCoverageSnapshot,
 } from "./components/OzonProductBreakdown"
-import { MonthlyAnalytics } from "./components/MonthlyAnalytics"
 import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
@@ -385,6 +384,29 @@ function resolveReportMonth(
   );
 }
 
+// Русские названия месяцев (именительный) — для подписи фильтра по месяцам.
+const RU_MONTHS_NOM = [
+  "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+];
+/** 'YYYY-MM' → 'Июнь 2026'. При неожиданном формате — исходная строка. */
+function formatMonthLabel(ym: string): string {
+  const m = /^(\d{4})-(\d{2})$/.exec(ym);
+  if (!m) return ym;
+  const mi = Number(m[2]) - 1;
+  return `${RU_MONTHS_NOM[mi] ?? m[2]} ${m[1]}`;
+}
+/**
+ * Месяц расчёта 'YYYY-MM' из периода отчёта (для фильтра в «Последние расчёты»).
+ * null — период не распознан (ручной/старый расчёт). Чисто UI-деривация: на
+ * формулы, статистику, Supabase и сохранение report_history не влияет.
+ */
+function histReportMonthKey(h: CalcResult): string | null {
+  const b = asNetProfitBreakdown(h.aiInsights);
+  const ym = resolveReportMonth(b?.reportPeriod, null); // 'YYYY-MM-01' | null
+  return ym ? ym.slice(0, 7) : null;
+}
+
 const FIELDS: { key: string; label: string; hint?: string }[] = [
   { key: "revenue", label: "Выручка", hint: "Сумма продаж за период" },
   { key: "commission", label: "Комиссия маркетплейса" },
@@ -725,7 +747,9 @@ export default function AppPage() {
   const [history, setHistory] = useState<CalcResult[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
   // Счётчик-триггер перезагрузки «Аналитики по месяцам» после сохранения расчёта.
-  const [historyRefresh, setHistoryRefresh] = useState(0);
+  // Сеттер используется в save-flow report_history (MonthlyAnalytics-блок убран
+  // с экрана, поэтому само значение больше не читается; счётчик не трогаем).
+  const [, setHistoryRefresh] = useState(0);
   // Ошибка загрузки истории из облака → показываем error-state с кнопкой «Повторить».
   const [historyError, setHistoryError] = useState(false);
   // История грузится дольше 10с → мягкая подсказка (не ошибка) про интернет/обновление.
@@ -2590,6 +2614,8 @@ export default function AppPage() {
   const [histSearch, setHistSearch] = useState("");
   const [histProfitFilter, setHistProfitFilter] =
     useState<HistProfitFilter>("all");
+  // Фильтр по месяцу отчёта в «Последние расчёты»: 'all' | 'YYYY-MM'. Только UI.
+  const [filterMonth, setFilterMonth] = useState<string>("all");
   // Раскрытые строки «Последних расчётов» (мини-разбивка). Множественное
   // раскрытие — каждая строка независима. Только UI, данные не пересчитываются.
   const [expandedHist, setExpandedHist] = useState<Set<string>>(
@@ -2655,6 +2681,9 @@ export default function AppPage() {
   const visibleHistory = useMemo(() => {
     const q = histSearch.trim().toLowerCase();
     return filteredHistory.filter((h) => {
+      if (filterMonth !== "all" && histReportMonthKey(h) !== filterMonth) {
+        return false;
+      }
       if (histProfitFilter !== "all") {
         let cat: HistProfitFilter;
         if (h.profit < 0) {
@@ -2674,7 +2703,20 @@ export default function AppPage() {
       }
       return true;
     });
-  }, [filteredHistory, histSearch, histProfitFilter]);
+  }, [filteredHistory, histSearch, histProfitFilter, filterMonth]);
+
+  // Месяцы для фильтра «Последние расчёты» — из периодов загруженных отчётов.
+  // Сортировка: новые месяцы первыми. Чисто UI; не агрегирует и не пересчитывает.
+  const monthOptions = useMemo(() => {
+    const keys = new Set<string>();
+    for (const h of history) {
+      const k = histReportMonthKey(h);
+      if (k) keys.add(k);
+    }
+    return Array.from(keys)
+      .sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
+      .map((k) => ({ key: k, label: formatMonthLabel(k) }));
+  }, [history]);
 
   const totalRevenue = filteredHistory.reduce((sum, h) => sum + h.revenue, 0);
   const totalProfit = filteredHistory.reduce((sum, h) => sum + h.profit, 0);
@@ -8121,10 +8163,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           />
         )}
 
-        {/* Динамика прибыли — итог + карточки текущего месяца с изменением к
-            прошлому + графики прибыли/выручки + выводы. Данные из
-            report_history (Supabase); ничего не пересчитывается. */}
-        <MonthlyAnalytics user={user} refreshKey={historyRefresh} />
+        {/* Отдельный блок месячной сводки («Динамика прибыли») убран с экрана:
+            у продавца бывает несколько магазинов/отчётов и несколько загрузок
+            за месяц — отдельная сводка может вводить в заблуждение. Месяцы
+            смотрим через фильтр в «Последние расчёты» (привязка к отчётам).
+            Данные в report_history (Supabase) сохраняются как прежде. */}
 
         {calcMode === "upload" &&
           uploadedReports.length > 0 &&
@@ -8414,6 +8457,37 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   </button>
                 ))}
               </div>
+              {monthOptions.length >= 2 && (
+                <div
+                  className="filter-pills"
+                  role="group"
+                  aria-label="Фильтр по месяцу отчёта"
+                >
+                  <button
+                    type="button"
+                    className={
+                      "filter-pill" + (filterMonth === "all" ? " active" : "")
+                    }
+                    aria-pressed={filterMonth === "all"}
+                    onClick={() => setFilterMonth("all")}
+                  >
+                    Все месяцы
+                  </button>
+                  {monthOptions.map((m) => (
+                    <button
+                      key={m.key}
+                      type="button"
+                      className={
+                        "filter-pill" + (filterMonth === m.key ? " active" : "")
+                      }
+                      aria-pressed={filterMonth === m.key}
+                      onClick={() => setFilterMonth(m.key)}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {visibleHistory.length === 0 ? (
