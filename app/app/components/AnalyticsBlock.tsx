@@ -1,6 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  ProfitRecommendations,
+  type ProfitRecommendationsProps,
+} from "./ProfitRecommendations";
 
 interface AnalyticsCalc {
   id: string;
@@ -27,6 +31,10 @@ interface Props {
   hasAnyData?: boolean;
   hasPremium?: boolean;
   onOpenPremium?: () => void;
+  /** Данные для умных рекомендаций внутри карточки «AI Аналитика».
+   *  Считаются на странице (combinedResult + profitCalc + покрытие/товары).
+   *  Если не переданы — карточка показывает пустое состояние. */
+  reco?: ProfitRecommendationsProps;
 }
 
 /* ---------- DEMO ---------- */
@@ -934,18 +942,42 @@ function DonutChart({
 
 /* ---------- MAIN ---------- */
 
-// === RELEASE v1.0 ===
-// AI Аналитика временно показывается в состоянии «🔒 Скоро».
-// Вся реальная логика ниже (запрос /api/ai/analyze, rule-based fallback,
-// отрисовка score/инсайтов/рекомендаций) ПОЛНОСТЬЮ сохранена — чтобы
-// включить функцию, достаточно поставить флаг в false. Ничего не удалено.
+// === RELEASE ===
+// Карточка «AI Аналитика» показывает rule-based умные рекомендации по чистой
+// прибыли (компонент ProfitRecommendations, данные с расчёта на странице).
+// Прежний премиальный AI-кокпит (запрос /api/ai/analyze, score/инсайты)
+// ПОЛНОСТЬЮ сохранён в ветке else ниже и вернётся при AI_COMING_SOON=false —
+// ничего не удалено.
 const AI_COMING_SOON: boolean = true;
+
+// Безопасный фолбэк, когда данные для рекомендаций ещё не переданы со страницы
+// (нет расчёта) — карточка покажет аккуратное пустое состояние.
+const EMPTY_RECO: ProfitRecommendationsProps = {
+  hasReport: false,
+  ready: false,
+  revenue: 0,
+  profitBeforeCost: 0,
+  updServicesTotal: 0,
+  updCommissionTotal: 0,
+  netProfit: 0,
+  margin: 0,
+  roi: 0,
+  costPrice: 0,
+  tax: 0,
+  taxPercent: 0,
+  ads: 0,
+  otherExpenses: 0,
+  coverage: null,
+  best: null,
+  worst: null,
+};
 
 export function AnalyticsBlock({
   realHistory,
   hasAnyData = false,
   hasPremium = false,
   onOpenPremium,
+  reco,
 }: Props) {
   const history = realHistory ?? [];
   // три состояния:
@@ -1312,6 +1344,9 @@ export function AnalyticsBlock({
           50%{filter:brightness(1.2);box-shadow:0 6px 22px rgba(201,168,76,.6)}}
         .ai-sub{font-family:'DM Mono',monospace;font-size:.58rem;
           letter-spacing:.14em;text-transform:uppercase;color:#E8C97A;opacity:.7}
+        /* ===== AI Аналитика — встроенные умные рекомендации ===== */
+        .an-ai-reco{justify-content:flex-start}
+        .ai-reco-body{padding:.2rem 1.05rem 1rem;flex:1;min-width:0}
         /* ===== AI cockpit (premium main feature) ===== */
         .an-ai-card{
           /* layered glassmorphism + усиленный gold-glow по углу */
@@ -2044,29 +2079,25 @@ export function AnalyticsBlock({
               ничего не удалено, вернётся при AI_COMING_SOON=false. */}
           {AI_COMING_SOON ? (
             <div
-              className="an-card an-ai-card an-area-ai an-ai-soon"
+              className="an-card an-ai-card an-area-ai an-ai-reco"
               role="region"
-              aria-label="AI Аналитика — скоро"
+              aria-label="AI Аналитика"
             >
               <span className="ai-card-shine" aria-hidden="true" />
-              <span className="ai-soon-badge">🔒 Скоро</span>
-              <div className="ai-soon-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="currentColor">
-                  <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
-                </svg>
+              <div className="an-card-head">
+                <div className="ai-title-row">
+                  <span className="ai-spark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
+                    </svg>
+                  </span>
+                  AI Аналитика
+                </div>
+                <div className="ai-sub">умные рекомендации</div>
               </div>
-              <h3 className="ai-soon-title">AI Аналитика</h3>
-              <p className="ai-soon-sub">
-                Автоматический AI-разбор прибыли, рисков и рекомендаций.
-              </p>
-              <button
-                type="button"
-                className="ai-soon-btn"
-                disabled
-                aria-disabled="true"
-              >
-                Скоро
-              </button>
+              <div className="ai-reco-body">
+                <ProfitRecommendations {...(reco ?? EMPTY_RECO)} />
+              </div>
             </div>
           ) : (
           <div

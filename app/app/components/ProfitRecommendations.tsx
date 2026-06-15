@@ -1,7 +1,12 @@
 "use client";
 
 // ============================================================================
-// ProfitRecommendations — блок «AI-анализ прибыли».
+// ProfitRecommendations — содержимое умных рекомендаций для блока «AI Аналитика».
+//
+// ВНУТРЕННИЙ компонент: рендерится ТОЛЬКО внутри карточки «AI Аналитика»
+// (AnalyticsBlock). Свой заголовок/секцию не рисует — обёртку и шапку даёт
+// host-карточка. Здесь только контент: вердикт, разбор расходов, товары,
+// что проверить, как увеличить прибыль.
 //
 // Чисто презентационный, БЕЗ state / effect / сети. Все цифры приходят пропсами
 // из уже посчитанных на странице данных (combinedResult + profitCalc +
@@ -10,8 +15,7 @@
 // превращаются в человеческие практические рекомендации.
 //
 // НИЧЕГО не считает заново и не меняет формулы — только интерпретирует готовые
-// значения. Парсеры, загрузка файлов, оплата, Supabase и PDF здесь не
-// затрагиваются.
+// значения. Парсеры, загрузка файлов, оплата, Supabase и PDF не затрагиваются.
 // ============================================================================
 
 interface ProductRef {
@@ -22,7 +26,9 @@ interface ProductRef {
 }
 
 export interface ProfitRecommendationsProps {
-  /** Готов ли итог (в форме задана себестоимость > 0). false → честный fallback. */
+  /** Загружен и распознан ли отчёт. false → аккуратное пустое состояние. */
+  hasReport: boolean;
+  /** Готов ли итог (в форме задана себестоимость > 0). false → «заполните данные». */
   ready: boolean;
   /** Выручка Ozon (XLSX). */
   revenue: number;
@@ -80,20 +86,6 @@ function pluralTov(n: number): string {
   return "товаров";
 }
 
-const CHART_ICON = (
-  <svg
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M3 3v18h18" />
-    <path d="M7 14l4-4 3 3 5-6" />
-  </svg>
-);
-
 const INFO_ICON = (
   <svg
     viewBox="0 0 24 24"
@@ -111,6 +103,7 @@ const INFO_ICON = (
 
 export function ProfitRecommendations(props: ProfitRecommendationsProps) {
   const {
+    hasReport,
     ready,
     revenue,
     profitBeforeCost,
@@ -129,30 +122,30 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
     worst,
   } = props;
 
-  // ── Header (общий для обоих состояний) ──
-  const header = (
-    <div className="pr-head">
-      <div className="pr-head-ico" aria-hidden="true">
-        {CHART_ICON}
+  // ── Состояние 1: отчёт ещё не загружен/не распознан ──
+  if (!hasReport) {
+    return (
+      <div className="pr">
+        <div className="pr-empty">
+          <span className="pr-empty-ico" aria-hidden="true">
+            {INFO_ICON}
+          </span>
+          <p className="pr-empty-tx">
+            Загрузите отчёт и заполните данные, чтобы получить рекомендации по
+            увеличению чистой прибыли.
+          </p>
+        </div>
+        <style jsx>{PR_CSS}</style>
       </div>
-      <div className="pr-head-tx">
-        <h3 className="pr-title">AI-анализ прибыли</h3>
-        <p className="pr-sub">
-          Практические рекомендации по увеличению чистой прибыли на основе вашего
-          отчёта
-        </p>
-      </div>
-      <span className="pr-badge">на основе данных отчёта</span>
-    </div>
-  );
+    );
+  }
 
-  // ── Fallback: расчёт не готов (нет себестоимости) ──
+  // ── Состояние 2: отчёт загружен, но себестоимость не задана ──
   if (!ready) {
     const fbMissing: string[] = ["себестоимость товаров"];
     if (taxPercent === 0) fbMissing.push("ставку налога");
     return (
-      <section className="pr" role="region" aria-label="AI-анализ прибыли">
-        {header}
+      <div className="pr">
         <div className="pr-verdict ok">
           <span className="pr-verdict-ico" aria-hidden="true">
             •
@@ -180,7 +173,7 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
           </span>
         </div>
         <style jsx>{PR_CSS}</style>
-      </section>
+      </div>
     );
   }
 
@@ -320,7 +313,7 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
   if (netProfit < 0)
     checks.push({
       kind: "risk",
-      text: "Магазин в минусе — приоритет №1 закрыть источник убытка: самые крупные статьи расходов слева и убыточные товары.",
+      text: "Магазин в минусе — приоритет №1 закрыть источник убытка: самые крупные статьи расходов и убыточные товары.",
     });
   if (worst && worst.profit < 0)
     checks.push({
@@ -386,9 +379,7 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
   if (taxPercent === 0) missing.push("ставку налога");
 
   return (
-    <section className="pr" role="region" aria-label="AI-анализ прибыли">
-      {header}
-
+    <div className="pr">
       <div className={"pr-verdict " + tone}>
         <span className="pr-verdict-ico" aria-hidden="true">
           {verdictIco}
@@ -492,37 +483,24 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
       )}
 
       <style jsx>{PR_CSS}</style>
-    </section>
+    </div>
   );
 }
 
-// ── Стили M-PROF (тёмный фон, золото/зелёные акценты) ─────────────────────────
+// ── Стили M-PROF (тёмный фон, золото/зелёные акценты). Контент живёт внутри
+//    карточки «AI Аналитика», поэтому .pr — это просто layout-контейнер без
+//    собственной рамки/фона. ─────────────────────────────────────────────────
 const PR_CSS = `
-.pr{
-  margin-top:18px;
-  border:1px solid var(--edge);
-  background:linear-gradient(180deg, rgba(201,168,76,.05), rgba(255,255,255,.02));
-  border-radius:16px;
-  padding:18px 18px 16px;
+.pr{display:block}
+
+.pr-empty{
+  display:flex;gap:11px;align-items:flex-start;
+  border:1px solid rgba(201,168,76,.22);background:rgba(201,168,76,.06);
+  border-radius:13px;padding:16px 16px
 }
-.pr-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:14px}
-.pr-head-ico{
-  flex:0 0 auto;width:34px;height:34px;border-radius:10px;
-  display:flex;align-items:center;justify-content:center;
-  background:rgba(201,168,76,.12);border:1px solid rgba(201,168,76,.3);
-  color:var(--gold2)
-}
-.pr-head-ico svg{width:18px;height:18px;display:block}
-.pr-head-tx{flex:1 1 auto;min-width:0}
-.pr-title{margin:0;font-size:1.02rem;font-weight:600;letter-spacing:-.01em;color:var(--txt)}
-.pr-sub{margin:.18rem 0 0;font-size:.76rem;line-height:1.4;color:var(--txt2)}
-.pr-badge{
-  flex:0 0 auto;font-size:.62rem;letter-spacing:.02em;text-transform:uppercase;
-  color:var(--gold2);border:1px solid rgba(201,168,76,.28);
-  background:rgba(201,168,76,.08);border-radius:999px;padding:.28rem .6rem;
-  white-space:nowrap
-}
-@media (max-width:560px){.pr-badge{display:none}}
+.pr-empty-ico{flex:0 0 auto;color:var(--gold2);margin-top:.1rem}
+.pr-empty-ico svg{width:18px;height:18px;display:block}
+.pr-empty-tx{font-size:.82rem;line-height:1.5;color:var(--txt2);margin:0;overflow-wrap:anywhere}
 
 .pr-verdict{
   display:flex;gap:11px;align-items:flex-start;
