@@ -8121,8 +8121,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           />
         )}
 
-        {/* Аналитика по месяцам — карточки текущего месяца + графики
-            прибыли/выручки. Данные из report_history (Supabase). */}
+        {/* Динамика прибыли — итог + карточки текущего месяца с изменением к
+            прошлому + графики прибыли/выручки + выводы. Данные из
+            report_history (Supabase); ничего не пересчитывается. */}
         <MonthlyAnalytics user={user} refreshKey={historyRefresh} />
 
         {calcMode === "upload" &&
