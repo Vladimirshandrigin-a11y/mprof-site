@@ -2756,6 +2756,26 @@ export default function AppPage() {
       .map((k) => ({ key: k, label: formatMonthLabel(k) }));
   }, [history]);
 
+  // Отдельный порядок ТОЛЬКО для графиков блока «Аналитика прибыли»:
+  // хронологический — старый месяц слева → новый справа (Май → Июнь → Июль).
+  // Список «Последние расчёты» (visibleHistory, новые сверху) и статистика
+  // (filteredHistory) НЕ затрагиваются. Записи без понятного месяца считаем
+  // «самыми ранними» (слева). Внутри месяца — старее создан левее.
+  const chartHistory = useMemo(() => {
+    return filteredHistory.slice().sort((a, b) => {
+      const ma = histReportMonthKey(a); // 'YYYY-MM' | null
+      const mb = histReportMonthKey(b);
+      if (ma !== mb) {
+        if (ma === null) return -1;
+        if (mb === null) return 1;
+        return ma < mb ? -1 : 1;
+      }
+      const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return ta - tb;
+    });
+  }, [filteredHistory]);
+
   const totalRevenue = filteredHistory.reduce((sum, h) => sum + h.revenue, 0);
   const totalProfit = filteredHistory.reduce((sum, h) => sum + h.profit, 0);
   const avgMargin =
@@ -6575,6 +6595,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
         <AnalyticsBlock
           realHistory={filteredHistory}
+          chartHistory={chartHistory}
           hasAnyData={history.length > 0}
           hasPremium={hasPremium}
           onOpenPremium={openPremium}

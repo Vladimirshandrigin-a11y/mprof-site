@@ -28,6 +28,11 @@ interface AnalyticsCalc {
 
 interface Props {
   realHistory?: AnalyticsCalc[];
+  /** Отдельный порядок ТОЛЬКО для линейных графиков (выручка/прибыль):
+   *  хронологический, старый месяц слева → новый справа. Считается на странице
+   *  (там есть разбор report_period). Если не передан — берём realHistory в
+   *  обратном порядке (как раньше). На статистику/историю не влияет. */
+  chartHistory?: AnalyticsCalc[];
   hasAnyData?: boolean;
   hasPremium?: boolean;
   onOpenPremium?: () => void;
@@ -974,6 +979,7 @@ const EMPTY_RECO: ProfitRecommendationsProps = {
 
 export function AnalyticsBlock({
   realHistory,
+  chartHistory,
   hasAnyData = false,
   hasPremium = false,
   onOpenPremium,
@@ -1090,8 +1096,14 @@ export function AnalyticsBlock({
     };
   }, [hasPremium, aiPayloadSig]);
 
-  /* charts series */
-  const realSlice = history.slice(0, 14).reverse(); // oldest → newest
+  /* charts series — строго хронологический порядок: старый месяц слева →
+     новый справа. chartHistory уже отсортирован по report_period на странице
+     (возрастание), берём последние 14 (самые свежие) в том же порядке.
+     Фолбэк (prop не передан) — прежнее поведение: 14 новых по дате создания,
+     развёрнутые в oldest → newest. */
+  const realSlice = chartHistory
+    ? chartHistory.slice(-14)
+    : history.slice(0, 14).reverse();
   const revenueSeries = isDemo
     ? DEMO_REVENUE_14D
     : realSlice.map((h) => h.revenue);
