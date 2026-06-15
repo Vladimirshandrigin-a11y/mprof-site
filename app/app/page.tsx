@@ -12,6 +12,7 @@ import {
   type CostCoverageSnapshot,
 } from "./components/OzonProductBreakdown"
 import { MonthlyAnalytics } from "./components/MonthlyAnalytics"
+import { ProfitRecommendations } from "./components/ProfitRecommendations"
 import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
@@ -8086,6 +8087,31 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </div>
             )}
           </div>
+        )}
+
+        {/* AI-анализ прибыли — rule-based рекомендации поверх уже посчитанных
+            данных отчёта (combinedResult + profitCalc + покрытие/ключевые
+            товары). Без внешнего AI/API; формулы, парсеры и загрузка не
+            затрагиваются — только интерпретация готовых значений. */}
+        {combinedStatus === "success" && combinedResult && (
+          <ProfitRecommendations
+            ready={netProfitReady}
+            revenue={combinedResult.revenue}
+            profitBeforeCost={combinedResult.profitBeforeCost}
+            updServicesTotal={combinedResult.updServicesTotal}
+            updCommissionTotal={combinedResult.updCommissionTotal}
+            netProfit={profitCalc?.netProfit ?? 0}
+            margin={profitCalc?.margin ?? 0}
+            roi={profitCalc?.roi ?? 0}
+            costPrice={profitCalc?.costPrice ?? 0}
+            tax={profitCalc?.tax ?? 0}
+            taxPercent={profitCalc?.taxPercent ?? 0}
+            ads={profitCalc?.ads ?? 0}
+            otherExpenses={profitCalc?.otherExpensesGroup ?? 0}
+            coverage={reportCostCoverage}
+            best={reportKeyProducts?.best ?? null}
+            worst={reportKeyProducts?.worst ?? null}
+          />
         )}
 
         {/* Чистая прибыль по товарам — себестоимость из каталога по sku +
