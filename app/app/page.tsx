@@ -5818,7 +5818,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .hist-search-input{font-size:16px}
   .hist-month,.hist-month-trigger{width:100%}
   .hist-month-menu{left:0;right:0}
-  .hist-clear{width:100%}
 }
 
 /* ====== HISTORY MONTH DROPDOWN ====== */
@@ -8484,6 +8483,22 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           <div className="card hist-card">
             <div className="card-head">
               <div className="card-title">Последние расчёты</div>
+              <button
+                type="button"
+                className="hist-clear"
+                onClick={clearHistory}
+              >
+                <svg
+                  className="hist-clear-ic"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path d="M3 6h18" />
+                  <path d="M8 6V4h8v2" />
+                  <path d="M19 6l-1 14H6L5 6" />
+                </svg>
+                Очистить историю
+              </button>
             </div>
 
             <div className="hist-tools">
@@ -8610,22 +8625,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   )}
                 </div>
               )}
-              <button
-                type="button"
-                className="hist-clear"
-                onClick={clearHistory}
-              >
-                <svg
-                  className="hist-clear-ic"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                >
-                  <path d="M3 6h18" />
-                  <path d="M8 6V4h8v2" />
-                  <path d="M19 6l-1 14H6L5 6" />
-                </svg>
-                Очистить историю
-              </button>
             </div>
 
             {visibleHistory.length === 0 ? (
