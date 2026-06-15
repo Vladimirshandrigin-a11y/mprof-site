@@ -2616,6 +2616,9 @@ export default function AppPage() {
     useState<HistProfitFilter>("all");
   // Фильтр по месяцу отчёта в «Последние расчёты»: 'all' | 'YYYY-MM'. Только UI.
   const [filterMonth, setFilterMonth] = useState<string>("all");
+  // Компактный дропдаун выбора месяца (в панели фильтров истории). Только UI.
+  const [monthMenuOpen, setMonthMenuOpen] = useState(false);
+  const monthMenuRef = useRef<HTMLDivElement | null>(null);
   // Раскрытые строки «Последних расчётов» (мини-разбивка). Множественное
   // раскрытие — каждая строка независима. Только UI, данные не пересчитываются.
   const [expandedHist, setExpandedHist] = useState<Set<string>>(
@@ -2629,6 +2632,25 @@ export default function AppPage() {
       return next;
     });
   };
+
+  // Закрытие дропдауна месяца по клику вне и по Escape. Только UI.
+  useEffect(() => {
+    if (!monthMenuOpen) return;
+    const onPointer = (e: MouseEvent) => {
+      if (monthMenuRef.current && !monthMenuRef.current.contains(e.target as Node)) {
+        setMonthMenuOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMonthMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [monthMenuOpen]);
 
   const filterPeriodLabel =
     filterPeriod === "all" ? "всё время" : `${filterPeriod} дней`;
@@ -2680,7 +2702,7 @@ export default function AppPage() {
   // иначе (ручной/с себестоимостью) → net.
   const visibleHistory = useMemo(() => {
     const q = histSearch.trim().toLowerCase();
-    return filteredHistory.filter((h) => {
+    const arr = filteredHistory.filter((h) => {
       if (filterMonth !== "all" && histReportMonthKey(h) !== filterMonth) {
         return false;
       }
@@ -2702,6 +2724,22 @@ export default function AppPage() {
         if (!hay.includes(q)) return false;
       }
       return true;
+    });
+    // Порядок: по месяцу отчёта от нового к старому ('YYYY-MM' убыв.); записи
+    // без понятного месяца — ниже всех; внутри месяца новее создан → выше.
+    // Чисто UI-сортировка (.filter уже вернул новый массив), на статистику,
+    // формулы и Supabase не влияет.
+    return arr.sort((a, b) => {
+      const ma = histReportMonthKey(a); // 'YYYY-MM' | null
+      const mb = histReportMonthKey(b);
+      if (ma !== mb) {
+        if (ma === null) return 1;
+        if (mb === null) return -1;
+        return ma < mb ? 1 : -1;
+      }
+      const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return tb - ta;
     });
   }, [filteredHistory, histSearch, histProfitFilter, filterMonth]);
 
@@ -5778,6 +5816,76 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .hist-tools{flex-direction:column;align-items:stretch}
   .hist-search{flex-basis:auto;width:100%}
   .hist-search-input{font-size:16px}
+  .hist-month,.hist-month-trigger{width:100%}
+  .hist-month-menu{left:0;right:0}
+  .hist-clear{width:100%}
+}
+
+/* ====== HISTORY MONTH DROPDOWN ====== */
+.hist-month{position:relative;flex-shrink:0}
+.hist-month-trigger{
+  display:inline-flex;align-items:center;justify-content:space-between;gap:.5rem;
+  min-width:132px;font-family:var(--sans);font-size:.78rem;font-weight:500;
+  padding:7px 13px;border-radius:9px;cursor:pointer;
+  background:transparent;border:1px solid var(--edge2);
+  color:var(--txt2);transition:all .2s ease;
+  -webkit-appearance:none;appearance:none
+}
+.hist-month-trigger:hover{
+  border-color:var(--smoke);color:var(--txt);
+  background:rgba(255,255,255,.03)
+}
+.hist-month-trigger.active{
+  border-color:var(--gold);color:var(--gold2);
+  background:rgba(201,168,76,.10);font-weight:600;
+  box-shadow:inset 0 0 0 1px rgba(201,168,76,.18)
+}
+.hist-month-chev{
+  width:13px;height:13px;flex-shrink:0;
+  stroke:currentColor;stroke-width:2;fill:none;
+  stroke-linecap:round;stroke-linejoin:round;
+  transition:transform .2s ease
+}
+.hist-month-trigger[aria-expanded="true"] .hist-month-chev{transform:rotate(180deg)}
+.hist-month-menu{
+  position:absolute;top:calc(100% + 6px);right:0;z-index:40;
+  min-width:180px;max-height:300px;overflow-y:auto;
+  display:flex;flex-direction:column;gap:2px;
+  padding:6px;border-radius:12px;
+  background:var(--panel);border:1px solid var(--edge);
+  box-shadow:0 18px 44px rgba(0,0,0,.55)
+}
+.hist-month-opt{
+  text-align:left;white-space:nowrap;
+  font-family:var(--sans);font-size:.8rem;font-weight:500;
+  padding:8px 12px;border-radius:8px;cursor:pointer;
+  background:transparent;border:1px solid transparent;
+  color:var(--txt2);transition:background .15s ease,color .15s ease
+}
+.hist-month-opt:hover{background:rgba(255,255,255,.05);color:var(--txt)}
+.hist-month-opt.active{
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  color:var(--void);font-weight:600
+}
+
+/* ====== HISTORY CLEAR BUTTON (спокойный danger-outline) ====== */
+.hist-clear{
+  margin-left:auto;flex-shrink:0;
+  display:inline-flex;align-items:center;justify-content:center;gap:.4rem;
+  font-family:var(--sans);font-size:.78rem;font-weight:500;
+  padding:7px 13px;border-radius:9px;cursor:pointer;
+  background:transparent;border:1px solid var(--edge2);
+  color:var(--txt3);transition:all .2s ease;
+  -webkit-appearance:none;appearance:none
+}
+.hist-clear:hover{
+  border-color:rgba(224,85,102,.45);color:var(--red);
+  background:rgba(224,85,102,.08)
+}
+.hist-clear-ic{
+  width:14px;height:14px;flex-shrink:0;
+  stroke:currentColor;stroke-width:2;fill:none;
+  stroke-linecap:round;stroke-linejoin:round
 }
 
 .hist-filter-empty{
@@ -8376,30 +8484,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           <div className="card hist-card">
             <div className="card-head">
               <div className="card-title">Последние расчёты</div>
-              <button
-                onClick={clearHistory}
-                style={{
-                  boxShadow: "0 0 22px rgba(246,200,107,.22), inset 0 1px 0 rgba(255,255,255,.12)",
-                  backdropFilter: "blur(10px)",
-                  all: "unset",
-                  height: "42px",
-                  padding: "0 18px",
-                  borderRadius: "14px",
-                  border: "1px solid rgba(255,255,255,.10)",
-                  background: "linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,.035))",
-                  color: "#f6c86b",
-                  textShadow: "0 0 10px rgba(246,200,107,.25)",
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: "pointer",
-                  fontSize: "14px",
-                  fontWeight: 700,
-                  transition: "all .2s ease",
-                }}
-              >
-                Очистить историю
-              </button>
             </div>
 
             <div className="hist-tools">
@@ -8458,36 +8542,90 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 ))}
               </div>
               {monthOptions.length >= 2 && (
-                <div
-                  className="filter-pills"
-                  role="group"
-                  aria-label="Фильтр по месяцу отчёта"
-                >
+                <div className="hist-month" ref={monthMenuRef}>
                   <button
                     type="button"
                     className={
-                      "filter-pill" + (filterMonth === "all" ? " active" : "")
+                      "hist-month-trigger" +
+                      (filterMonth !== "all" ? " active" : "")
                     }
-                    aria-pressed={filterMonth === "all"}
-                    onClick={() => setFilterMonth("all")}
+                    aria-haspopup="listbox"
+                    aria-expanded={monthMenuOpen}
+                    aria-label="Фильтр по месяцу отчёта"
+                    onClick={() => setMonthMenuOpen((o) => !o)}
                   >
-                    Все месяцы
-                  </button>
-                  {monthOptions.map((m) => (
-                    <button
-                      key={m.key}
-                      type="button"
-                      className={
-                        "filter-pill" + (filterMonth === m.key ? " active" : "")
-                      }
-                      aria-pressed={filterMonth === m.key}
-                      onClick={() => setFilterMonth(m.key)}
+                    <span>
+                      {filterMonth === "all"
+                        ? "Все месяцы"
+                        : formatMonthLabel(filterMonth)}
+                    </span>
+                    <svg
+                      className="hist-month-chev"
+                      viewBox="0 0 24 24"
+                      aria-hidden="true"
                     >
-                      {m.label}
-                    </button>
-                  ))}
+                      <path d="M6 9l6 6 6-6" />
+                    </svg>
+                  </button>
+                  {monthMenuOpen && (
+                    <div
+                      className="hist-month-menu"
+                      role="listbox"
+                      aria-label="Месяц отчёта"
+                    >
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={filterMonth === "all"}
+                        className={
+                          "hist-month-opt" +
+                          (filterMonth === "all" ? " active" : "")
+                        }
+                        onClick={() => {
+                          setFilterMonth("all");
+                          setMonthMenuOpen(false);
+                        }}
+                      >
+                        Все месяцы
+                      </button>
+                      {monthOptions.map((m) => (
+                        <button
+                          key={m.key}
+                          type="button"
+                          role="option"
+                          aria-selected={filterMonth === m.key}
+                          className={
+                            "hist-month-opt" +
+                            (filterMonth === m.key ? " active" : "")
+                          }
+                          onClick={() => {
+                            setFilterMonth(m.key);
+                            setMonthMenuOpen(false);
+                          }}
+                        >
+                          {m.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
+              <button
+                type="button"
+                className="hist-clear"
+                onClick={clearHistory}
+              >
+                <svg
+                  className="hist-clear-ic"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path d="M3 6h18" />
+                  <path d="M8 6V4h8v2" />
+                  <path d="M19 6l-1 14H6L5 6" />
+                </svg>
+                Очистить историю
+              </button>
             </div>
 
             {visibleHistory.length === 0 ? (
