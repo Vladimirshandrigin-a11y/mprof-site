@@ -775,59 +775,6 @@ function aiQuickFromActions(items: RecommendedAction[]): QuickAction[] {
   }));
 }
 
-/* Score ring — анимированное кольцо вокруг числа */
-function ScoreRing({
-  score,
-  tier,
-}: {
-  score: number;
-  tier: Tier["kind"];
-}) {
-  const r = 24;
-  const circ = 2 * Math.PI * r;
-  const safe = Math.max(0, Math.min(100, score));
-  const offset = circ * (1 - safe / 100);
-  const gradId = `aiRing-${tier}`;
-  const colors: Record<Tier["kind"], [string, string]> = {
-    weak: ["#FF8A98", "#E05566"],
-    stable: ["#FFD37D", "#E0A050"],
-    strong: ["#E8C97A", "#C9A84C"],
-    excellent: ["#7DEAB2", "#2ECC8A"],
-  };
-  const [c1, c2] = colors[tier];
-
-  return (
-    <svg viewBox="0 0 60 60" className="ai-ring-svg" aria-hidden="true">
-      <defs>
-        <linearGradient id={gradId} x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor={c1} />
-          <stop offset="100%" stopColor={c2} />
-        </linearGradient>
-      </defs>
-      <circle
-        cx="30" cy="30" r={r}
-        stroke="rgba(255,255,255,.07)"
-        strokeWidth="3"
-        fill="none"
-      />
-      <circle
-        cx="30" cy="30" r={r}
-        stroke={`url(#${gradId})`}
-        strokeWidth="3"
-        fill="none"
-        strokeLinecap="round"
-        strokeDasharray={circ}
-        strokeDashoffset={offset}
-        transform="rotate(-90 30 30)"
-        style={{
-          transition: "stroke-dashoffset .95s cubic-bezier(.22,1,.36,1)",
-          filter: `drop-shadow(0 0 4px ${c2}55)`,
-        }}
-      />
-    </svg>
-  );
-}
-
 /* AnimatedScore — RAF-counter, уважает prefers-reduced-motion */
 function AnimatedScore({
   value,
@@ -1389,31 +1336,32 @@ export function AnalyticsBlock({
     if (!useAi) {
       const ovw = (
         <>
-          <div className={"ai-top score-" + aiTier.kind}>
-            <div className="ai-score-block">
-              <ScoreRing score={aiScore} tier={aiTier.kind} />
-              <div className="ai-ring-text" aria-label={`AI оценка ${aiScore} из 100`}>
-                <AnimatedScore value={aiScore} />
-              </div>
-            </div>
-            <div className="ai-top-meta">
-              <div className="ai-top-row">
-                <span className="ai-score-label">AI score</span>
+          <div className="ai-compact-top">
+            <div className="ai-compact-metric">
+              <span className="ai-compact-label">AI score</span>
+              <div className="ai-compact-score-row">
+                <span className={"ai-compact-score tier-" + aiTier.kind}>
+                  <AnimatedScore value={aiScore} />
+                </span>
                 <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
               </div>
-              <div className="ai-top-row">
-                <span className={"ai-trend dir-" + aiTrend.dir}>
-                  {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
-                  <span className="ai-trend-val">
-                    {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
-                  </span>
+            </div>
+            <div className="ai-compact-metric">
+              <span className="ai-compact-label">Динамика</span>
+              <span className={"ai-trend dir-" + aiTrend.dir}>
+                {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
+                <span className="ai-trend-val">
+                  {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
                 </span>
-                <span className={"ai-conf conf-" + aiConfidence}>
-                  <span className="ai-conf-dot" />
-                  {CONFIDENCE_LABEL[aiConfidence]}
-                  <span className="ai-conf-pct">· {aiConfidencePct}%</span>
-                </span>
-              </div>
+              </span>
+            </div>
+            <div className="ai-compact-metric ai-compact-metric-end">
+              <span className="ai-compact-label">Точность</span>
+              <span className={"ai-conf conf-" + aiConfidence}>
+                <span className="ai-conf-dot" />
+                {CONFIDENCE_LABEL[aiConfidence]}
+                <span className="ai-conf-pct">· {aiConfidencePct}%</span>
+              </span>
             </div>
           </div>
           <div className="ai-indicators">
@@ -1475,21 +1423,29 @@ export function AnalyticsBlock({
       <>
         {d.source === "fallback" && (
           <p className="ai-fallback-note">
-            AI временно недоступен. Ниже показана базовая аналитика по данным отчёта.
+            AI-анализ временно недоступен. Показана базовая аналитика по данным отчёта.
           </p>
         )}
-        {/* Компактный inline-заголовок без SVG-кольца */}
+        {/* Компактный заголовок с подписями — без слипшихся показателей */}
         <div className="ai-compact-top">
-          <span className={"ai-compact-score tier-" + aiTier.kind}>
-            <AnimatedScore value={aiScore} />
-          </span>
-          <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
-          <span className={"ai-trend dir-" + aiTrend.dir} style={{marginLeft:"auto"}}>
-            {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
-            <span className="ai-trend-val">
-              {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
+          <div className="ai-compact-metric">
+            <span className="ai-compact-label">AI score</span>
+            <div className="ai-compact-score-row">
+              <span className={"ai-compact-score tier-" + aiTier.kind}>
+                <AnimatedScore value={aiScore} />
+              </span>
+              <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
+            </div>
+          </div>
+          <div className="ai-compact-metric ai-compact-metric-end">
+            <span className="ai-compact-label">Динамика</span>
+            <span className={"ai-trend dir-" + aiTrend.dir}>
+              {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
+              <span className="ai-trend-val">
+                {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
+              </span>
             </span>
-          </span>
+          </div>
         </div>
         {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
         {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
@@ -1738,7 +1694,7 @@ export function AnalyticsBlock({
         }
         .an-ai-card > *{position:relative}
         .ai-title-row{display:flex;align-items:center;gap:.6rem;
-          font-family:'Playfair Display',Georgia,serif;font-size:1.05rem;font-weight:700;color:#E8EEF8}
+          font-family:'Playfair Display',Georgia,serif;font-size:.95rem;font-weight:700;color:#E8EEF8}
         .ai-spark{display:inline-flex;width:26px;height:26px;border-radius:9px;
           background:linear-gradient(135deg,#C9A84C 0%,#E8C97A 100%);
           color:#05070f;align-items:center;justify-content:center;
@@ -1792,16 +1748,27 @@ export function AnalyticsBlock({
         }
         .ai-score-block{position:relative;width:78px;height:78px;flex-shrink:0}
 
-        /* ===== AI-data overview: компактная строка без кольца ===== */
+        /* ===== AI-data overview: компактные показатели с подписями ===== */
         .ai-compact-top{
-          display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;
-          padding:.2rem 0 .6rem;
+          display:flex;align-items:flex-end;gap:1.1rem;flex-wrap:wrap;
+          padding:.2rem 0 .65rem;
           border-bottom:1px solid rgba(255,255,255,.06);
-          margin-bottom:.5rem
+          margin-bottom:.55rem
+        }
+        .ai-compact-metric{
+          display:flex;flex-direction:column;gap:.32rem;min-width:0
+        }
+        .ai-compact-metric-end{margin-left:auto;align-items:flex-end;text-align:right}
+        .ai-compact-label{
+          font-family:'DM Mono',monospace;font-size:.56rem;font-weight:700;
+          letter-spacing:.16em;text-transform:uppercase;color:#7A8FA8
+        }
+        .ai-compact-score-row{
+          display:flex;align-items:center;gap:.5rem;flex-wrap:wrap
         }
         .ai-compact-score{
           font-family:'Playfair Display',Georgia,serif;
-          font-size:1.55rem;font-weight:700;letter-spacing:-.025em;
+          font-size:1.35rem;font-weight:700;letter-spacing:-.025em;
           line-height:1
         }
         .ai-compact-score.tier-weak{color:#FF8A98}
@@ -1906,7 +1873,7 @@ export function AnalyticsBlock({
         .ai-insight{
           display:flex;align-items:flex-start;gap:.7rem;
           padding:.7rem .85rem;border-radius:10px;
-          font-size:.88rem;line-height:1.45;font-weight:400;color:#E8EEF8;
+          font-size:.78rem;line-height:1.5;font-weight:400;color:#E8EEF8;
           background:rgba(255,255,255,.025);
           border:1px solid rgba(255,255,255,.07);
           transition:all .22s ease;
@@ -2203,11 +2170,11 @@ export function AnalyticsBlock({
 
         /* Тексты страниц */
         .ai-pg-problem{
-          font-size:.82rem;color:#E8EEF8;font-weight:500;
-          margin:.55rem 0 .3rem;line-height:1.45
+          font-size:.72rem;color:#E8EEF8;font-weight:500;
+          margin:.55rem 0 .3rem;line-height:1.5
         }
         .ai-pg-summary{
-          font-size:.76rem;color:#8A9FBB;line-height:1.5;
+          font-size:.68rem;color:#8A9FBB;line-height:1.55;
           margin:.2rem 0 0
         }
         .ai-pg-loading{
@@ -2630,9 +2597,9 @@ export function AnalyticsBlock({
 
           {/* AI — full right column (spans both rows) */}
           {/* RELEASE v1.0: при AI_COMING_SOON показываем компактную карточку
-              «Скоро» вместо полного AI-кокпита. Весь функционал AI (ScoreRing,
-              health-бары, инсайты, рекомендации) сохранён в ветке else ниже —
-              ничего не удалено, вернётся при AI_COMING_SOON=false. */}
+              «Скоро» вместо полного AI-кокпита. Весь функционал AI (компактный
+              обзор, health-бары, инсайты, рекомендации) сохранён в ветке else
+              ниже — вернётся при AI_COMING_SOON=false. */}
           {AI_COMING_SOON ? (
             <div
               className="an-card an-ai-card an-area-ai an-ai-reco"
