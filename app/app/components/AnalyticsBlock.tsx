@@ -5,6 +5,7 @@ import {
   ProfitRecommendations,
   type ProfitRecommendationsProps,
 } from "./ProfitRecommendations";
+import { supabase } from "../lib/supabase-cloud";
 
 interface AnalyticsCalc {
   id: string;
@@ -692,41 +693,70 @@ function buildQuickActions(
 }
 
 /* ===== Реальная AI-аналитика (ответ серверного /api/ai/analyze) ===== */
-type AiAnalysis = {
-  aiScore: number;
-  healthLabel: string;
-  summary: string;
-  risks: string[];
-  recommendations: string[];
-  quickActions: string[];
+
+type KeyInsight = {
+  title: string;
+  description: string;
+  severity: "low" | "medium" | "high";
 };
 
-/** quickActions от AI — строки вида «Действие — эффект». Разбиваем на 2 части
- *  под существующий дизайн карточки (action + impact). Нет разделителя —
- *  всё уходит в action, impact пустой. Дизайн не меняется. */
-function aiQuickFromStrings(items: string[]): QuickAction[] {
-  return items.slice(0, 4).map((raw) => {
-    const s = String(raw).trim();
-    const parts = s.split(/\s*[—–:→]\s*/);
-    const impact = parts.slice(1).join(" ").trim();
-    if (parts.length >= 2 && parts[0].trim() && impact) {
-      return { action: parts[0].trim(), impact };
-    }
-    return { action: s, impact: "" };
+type ProfitLeak = {
+  area: string;
+  amount: number | null;
+  comment: string;
+};
+
+type ProductRisk = {
+  name: string;
+  sku?: string;
+  reason: string;
+  action: string;
+};
+
+type RecommendedAction = {
+  priority: number;
+  action: string;
+  why: string;
+  expectedEffect: string;
+};
+
+type AiAnalysis = {
+  source: "openai" | "fallback";
+  summary: string;
+  healthScore: number;
+  mainProblem: string;
+  keyInsights: KeyInsight[];
+  profitLeaks: ProfitLeak[];
+  productRisks: ProductRisk[];
+  recommendedActions: RecommendedAction[];
+  missingData: string[];
+};
+
+/** keyInsights от AI → слоты инсайтов (severity → kind). */
+function aiSlotsFromAnalysis(a: AiAnalysis): Insight[] {
+  return a.keyInsights.slice(0, 4).map((ins) => {
+    const kind: Insight["kind"] =
+      ins.severity === "high"
+        ? "danger"
+        : ins.severity === "medium"
+        ? "warning"
+        : "positive";
+    const ico =
+      ins.severity === "high"
+        ? ICONS.alert
+        : ins.severity === "medium"
+        ? ICONS.target
+        : ICONS.trendUp;
+    return { kind, ico, text: ins.title + (ins.description ? ": " + ins.description : "") };
   });
 }
 
-/** risks/recommendations от AI → слоты инсайтов под существующий дизайн
- *  (цветной бордер + иконка): риск → warning, рекомендация → optimization. */
-function aiSlotsFromAnalysis(a: AiAnalysis): Insight[] {
-  const out: Insight[] = [];
-  if (a.risks[0]) out.push({ kind: "warning", ico: ICONS.alert, text: a.risks[0] });
-  if (a.recommendations[0])
-    out.push({ kind: "optimization", ico: ICONS.zap, text: a.recommendations[0] });
-  if (a.risks[1]) out.push({ kind: "warning", ico: ICONS.target, text: a.risks[1] });
-  if (out.length === 0 && a.summary)
-    out.push({ kind: "positive", ico: ICONS.trendUp, text: a.summary });
-  return out.slice(0, 4);
+/** recommendedActions → QuickAction chips для блока «Что улучшить». */
+function aiQuickFromActions(items: RecommendedAction[]): QuickAction[] {
+  return items.slice(0, 4).map((a) => ({
+    action: a.action,
+    impact: a.expectedEffect,
+  }));
 }
 
 /* Score ring — анимированное кольцо вокруг числа */
@@ -953,7 +983,7 @@ function DonutChart({
 // Прежний премиальный AI-кокпит (запрос /api/ai/analyze, score/инсайты)
 // ПОЛНОСТЬЮ сохранён в ветке else ниже и вернётся при AI_COMING_SOON=false —
 // ничего не удалено.
-const AI_COMING_SOON: boolean = true;
+const AI_COMING_SOON: boolean = false;
 
 // Безопасный фолбэк, когда данные для рекомендаций ещё не переданы со страницы
 // (нет расчёта) — карточка покажет аккуратное пустое состояние.
@@ -1001,9 +1031,10 @@ export function AnalyticsBlock({
   const [aiLoading, setAiLoading] = useState(false);
   const [aiFailed, setAiFailed] = useState(false);
 
-  // Числовые агрегаты по истории — ЕДИНСТВЕННОЕ, что уходит в AI.
-  // Никаких файлов/сырых отчётов: только суммы и проценты. Строка-подпись
-  // служит и телом запроса, и стабильным ключом зависимости эффекта.
+  // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
+  // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
+  // Никаких XLSX/PDF/сырых отчётов в LLM не уходит.
+  // Строка-подпись служит и телом запроса, и стабильным ключом эффекта.
   const aiPayloadSig = (() => {
     if (history.length === 0) return "";
     const sum = (sel: (h: AnalyticsCalc) => number) =>
@@ -1014,6 +1045,67 @@ export function AnalyticsBlock({
       revenue > 0
         ? (profit / revenue) * 100
         : history.reduce((a, h) => a + h.margin, 0) / history.length;
+
+    // Расширенные поля — берём из aiInsights самого свежего расчёта,
+    // у которого есть NetProfitBreakdown (kind: "net-profit-3file").
+    let extra: Record<string, number | unknown[]> = {};
+    for (const h of history) {
+      const ins = h.aiInsights as Record<string, unknown> | null | undefined;
+      if (!ins || ins.kind !== "net-profit-3file") continue;
+      const n = (k: string) => {
+        const v = ins[k];
+        return typeof v === "number" && Number.isFinite(v) ? Math.round(v) : 0;
+      };
+      extra = {
+        loyaltyPayouts: n("loyaltyPayouts"),
+        updServicesTotal: n("updServicesTotal"),
+        updCommissionTotal: n("updCommissionTotal"),
+        packaging: n("packaging"),
+        delivery: n("deliveryToWarehouse"),
+        salary: n("salary"),
+        netProfit: n("profitBeforeCost"),
+      };
+      // Топ-15 товаров: только имя, sku, profit, margin — никаких файлов.
+      const rawProducts = ins.products;
+      if (Array.isArray(rawProducts)) {
+        extra.products = rawProducts
+          .slice(0, 15)
+          .map((p: unknown) => {
+            if (!p || typeof p !== "object") return null;
+            const o = p as Record<string, unknown>;
+            const pProfit =
+              typeof o.profit === "number" && Number.isFinite(o.profit)
+                ? Math.round(o.profit)
+                : undefined;
+            const pMargin =
+              typeof o.margin === "number" && Number.isFinite(o.margin)
+                ? Math.round(o.margin * 10) / 10
+                : undefined;
+            return {
+              name:
+                typeof o.name === "string"
+                  ? o.name.trim().slice(0, 80)
+                  : typeof o.article === "string"
+                  ? o.article.trim().slice(0, 80)
+                  : undefined,
+              sku:
+                typeof o.vendorCode === "string"
+                  ? o.vendorCode.trim().slice(0, 40)
+                  : undefined,
+              profit: pProfit,
+              margin: pMargin,
+            };
+          })
+          .filter(Boolean);
+        // productsWithoutCost — товары, у которых нет себестоимости
+        const withoutCost = (rawProducts as Record<string, unknown>[]).filter(
+          (p) => !p.costPrice && !p.cost && p.profit !== undefined
+        ).length;
+        if (withoutCost > 0) extra.productsWithoutCost = withoutCost;
+      }
+      break; // берём только первый подходящий
+    }
+
     return JSON.stringify({
       revenue: Math.round(revenue),
       profit: Math.round(profit),
@@ -1027,10 +1119,12 @@ export function AnalyticsBlock({
       other_expenses: Math.round(sum((h) => h.other)),
       marketplace: history[0].marketplace,
       mode: "history",
+      ...extra,
     });
   })();
 
   // Запрос только когда есть premium И реальные данные (нет данных → нет вызова).
+  // Bearer token берём из сессии Supabase — сервер верифицирует его сам.
   // Любой сбой → aiFailed=true: остаёмся на rule-based, сайт не падает.
   useEffect(() => {
     if (AI_COMING_SOON || !hasPremium || !aiPayloadSig) {
@@ -1045,9 +1139,19 @@ export function AnalyticsBlock({
     setAiFailed(false);
     (async () => {
       try {
+        // Берём токен непосредственно перед запросом — он может обновиться.
+        const { data: sessionData } = await supabase.auth.getSession();
+        const token = sessionData?.session?.access_token;
+        if (!token) {
+          if (active) setAiFailed(true);
+          return;
+        }
         const res = await fetch("/api/ai/analyze", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
           body: aiPayloadSig,
           signal: controller.signal,
         });
@@ -1056,28 +1160,32 @@ export function AnalyticsBlock({
           ok?: boolean;
         };
         if (!active) return;
+        // Новый формат: source + healthScore + keyInsights + ...
         if (
           json &&
-          typeof json.aiScore === "number" &&
-          (Array.isArray(json.risks) || typeof json.summary === "string")
+          (json.source === "openai" || json.source === "fallback") &&
+          typeof json.healthScore === "number"
         ) {
           setAiData({
-            aiScore: json.aiScore,
-            healthLabel:
-              typeof json.healthLabel === "string" ? json.healthLabel : "",
+            source: json.source,
             summary: typeof json.summary === "string" ? json.summary : "",
-            risks: Array.isArray(json.risks)
-              ? json.risks.filter((x): x is string => typeof x === "string")
+            healthScore: json.healthScore,
+            mainProblem:
+              typeof json.mainProblem === "string" ? json.mainProblem : "",
+            keyInsights: Array.isArray(json.keyInsights)
+              ? (json.keyInsights as KeyInsight[])
               : [],
-            recommendations: Array.isArray(json.recommendations)
-              ? json.recommendations.filter(
-                  (x): x is string => typeof x === "string"
-                )
+            profitLeaks: Array.isArray(json.profitLeaks)
+              ? (json.profitLeaks as ProfitLeak[])
               : [],
-            quickActions: Array.isArray(json.quickActions)
-              ? json.quickActions.filter(
-                  (x): x is string => typeof x === "string"
-                )
+            productRisks: Array.isArray(json.productRisks)
+              ? (json.productRisks as ProductRisk[])
+              : [],
+            recommendedActions: Array.isArray(json.recommendedActions)
+              ? (json.recommendedActions as RecommendedAction[])
+              : [],
+            missingData: Array.isArray(json.missingData)
+              ? (json.missingData as string[])
               : [],
           });
           setAiFailed(false);
@@ -1157,27 +1265,21 @@ export function AnalyticsBlock({
   // --- AI-override: при успешном ответе /api/ai/analyze показываем его,
   //     иначе остаёмся на rule-based. Разметка/дизайн ниже не меняются. ---
   const useAi = !!aiData && !aiFailed;
-  const aiScore = useAi ? clamp(0, 100, Math.round(aiData!.aiScore)) : rbScore;
-  const aiTier: Tier = useAi
-    ? {
-        kind: getTier(aiScore).kind,
-        label: aiData!.healthLabel || getTier(aiScore).label,
-      }
-    : getTier(rbScore);
-  const aiSummary = useAi ? aiData!.summary || rbSummary : rbSummary;
-  const aiRecs =
-    useAi && aiData!.recommendations.length
-      ? aiData!.recommendations.slice(0, 4)
-      : rbRecs;
-  const aiQuick =
-    useAi && aiData!.quickActions.length
-      ? aiQuickFromStrings(aiData!.quickActions)
-      : rbQuick;
+  const aiScore = useAi
+    ? clamp(0, 100, Math.round(aiData!.healthScore))
+    : rbScore;
+  const aiTier: Tier = getTier(aiScore);
+  const aiSummary = useAi
+    ? aiData!.mainProblem || aiData!.summary || rbSummary
+    : rbSummary;
+  const aiRecs = useAi && aiData!.recommendedActions.length
+    ? aiData!.recommendedActions.slice(0, 4).map((a) => a.action)
+    : rbRecs;
+  const aiQuick = useAi && aiData!.recommendedActions.length
+    ? aiQuickFromActions(aiData!.recommendedActions)
+    : rbQuick;
   const aiSlots: Insight[] =
-    useAi &&
-    (aiData!.risks.length ||
-      aiData!.recommendations.length ||
-      aiData!.summary)
+    useAi && aiData!.keyInsights.length
       ? aiSlotsFromAnalysis(aiData!)
       : rbSlots;
 
@@ -1730,6 +1832,40 @@ export function AnalyticsBlock({
         .filter-empty-sub{font-size:.88rem;color:#8A9FBB;font-weight:300;
           line-height:1.55;max-width:400px;margin:0}
 
+        /* === PROFIT LEAKS === */
+        .ai-leaks{display:flex;flex-direction:column;gap:.28rem;padding:.1rem 0 .1rem}
+        .ai-leak-row{display:flex;align-items:center;gap:.45rem;font-size:.76rem;
+          padding:.22rem .5rem;border-radius:7px;background:rgba(255,255,255,.025);
+          border:1px solid rgba(255,255,255,.06)}
+        .ai-leak-area{font-family:'DM Mono',monospace;font-size:.62rem;font-weight:600;
+          letter-spacing:.06em;color:#C9A84C;min-width:90px;flex-shrink:0}
+        .ai-leak-comment{flex:1;color:#8A9FBB;font-size:.73rem}
+        .ai-leak-amount{font-family:'DM Mono',monospace;font-size:.68rem;
+          color:#E05566;font-weight:600;white-space:nowrap;flex-shrink:0}
+
+        /* === PRODUCT RISKS === */
+        .ai-risks-list{list-style:none;margin:0;padding:.1rem 0 .1rem;
+          display:flex;flex-direction:column;gap:.3rem}
+        .ai-risk-item{display:grid;grid-template-columns:1fr auto;
+          grid-template-areas:"name sku" "reason action";
+          gap:.12rem .5rem;padding:.3rem .5rem;border-radius:7px;
+          background:rgba(224,85,102,.06);border:1px solid rgba(224,85,102,.18)}
+        .ai-risk-name{grid-area:name;font-size:.76rem;color:#E8EEF8;font-weight:500;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .ai-risk-sku{grid-area:sku;font-family:'DM Mono',monospace;font-size:.58rem;
+          color:#7C8DB5;letter-spacing:.05em;white-space:nowrap}
+        .ai-risk-reason{grid-area:reason;font-size:.71rem;color:#E05566}
+        .ai-risk-action{grid-area:action;font-size:.68rem;color:#8A9FBB;
+          text-align:right;font-style:italic}
+
+        /* === FALLBACK NOTICE + MISSING DATA === */
+        .ai-fallback-notice{margin:.4rem 0 0;font-size:.72rem;color:#7C8DB5;
+          font-style:italic;padding:.25rem .55rem;
+          background:rgba(255,255,255,.025);border-radius:6px;
+          border-left:2px solid rgba(201,168,76,.4)}
+        .ai-missing-data{margin:.25rem 0 0;font-size:.70rem;color:#566070;line-height:1.4}
+        .ai-missing-label{color:#7C8DB5;font-weight:500}
+
         /* === AI PRO LOCK ===  */
         .an-ai-card.ai-locked .ai-list{
           filter:blur(6px) saturate(.55);opacity:.55;
@@ -2131,10 +2267,12 @@ export function AnalyticsBlock({
                   {insightsAreDemo
                     ? "Пример аналитики"
                     : aiLoading
-                    ? "AI анализирует расчёт…"
-                    : useAi
+                    ? "AI анализирует прибыль…"
+                    : useAi && aiData!.source === "openai"
                     ? "AI-анализ"
-                    : "Rule-based"}
+                    : useAi && aiData!.source === "fallback"
+                    ? "Базовая аналитика"
+                    : "Базовая аналитика"}
                 </div>
               )}
             </div>
@@ -2259,7 +2397,46 @@ export function AnalyticsBlock({
                 </div>
               </div>
 
-              {/* === BOTTOM: recs + summary === */}
+              {/* === PROFIT LEAKS (только при AI-ответе) === */}
+              {useAi && aiData!.profitLeaks.length > 0 && (
+                <div className="ai-section">
+                  <div className="ai-section-label">Потери прибыли</div>
+                  <div className="ai-leaks">
+                    {aiData!.profitLeaks.map((leak, i) => (
+                      <div className="ai-leak-row" key={i}>
+                        <span className="ai-leak-area">{leak.area}</span>
+                        <span className="ai-leak-comment">{leak.comment}</span>
+                        {leak.amount != null && (
+                          <span className="ai-leak-amount">
+                            {leak.amount.toLocaleString("ru-RU")} ₽
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* === PRODUCT RISKS (только при AI-ответе) === */}
+              {useAi && aiData!.productRisks.length > 0 && (
+                <div className="ai-section">
+                  <div className="ai-section-label">Риски по товарам</div>
+                  <ul className="ai-risks-list">
+                    {aiData!.productRisks.map((risk, i) => (
+                      <li className="ai-risk-item" key={i}>
+                        <span className="ai-risk-name">{risk.name}</span>
+                        {risk.sku && (
+                          <span className="ai-risk-sku">{risk.sku}</span>
+                        )}
+                        <span className="ai-risk-reason">{risk.reason}</span>
+                        <span className="ai-risk-action">{risk.action}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* === BOTTOM: recs + summary + fallback notice === */}
               <div className="ai-bottom">
                 <div className="ai-recs">
                   {aiRecs.map((r, i) => (
@@ -2269,9 +2446,24 @@ export function AnalyticsBlock({
                   ))}
                 </div>
                 <p className="ai-summary">
-                  <span className="ai-summary-tag">AI</span>
+                  <span className="ai-summary-tag">
+                    {useAi && aiData!.source === "openai" ? "AI" : "~"}
+                  </span>
                   <span>{aiSummary}</span>
                 </p>
+                {/* Fallback-предупреждение: показываем если source=fallback */}
+                {useAi && aiData!.source === "fallback" && (
+                  <p className="ai-fallback-notice">
+                    Показана базовая аналитика — AI временно недоступен
+                  </p>
+                )}
+                {/* missingData: чего не хватает для полного анализа */}
+                {useAi && aiData!.missingData.length > 0 && (
+                  <p className="ai-missing-data">
+                    <span className="ai-missing-label">Для полного анализа нужно: </span>
+                    {aiData!.missingData.join("; ")}
+                  </p>
+                )}
               </div>
             </div>
 
