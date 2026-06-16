@@ -1490,25 +1490,6 @@ export function AnalyticsBlock({
         </div>
         {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
         {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
-        {d.source === "fallback" && (
-          <div className="ai-fallback-diag">
-            <p className="ai-fallback-notice">
-              {"AI временно недоступен. Причина: "}
-              {d.fallbackReason === "missing_api_key" && "ключ OpenAI не настроен"}
-              {d.fallbackReason === "timeout" && "OpenAI не ответил за 25с"}
-              {d.fallbackReason === "openai_error" && "ошибка OpenAI API"}
-              {d.fallbackReason === "invalid_json" && "некорректный ответ OpenAI"}
-              {(!d.fallbackReason || d.fallbackReason === "unknown") && "неизвестно"}
-            </p>
-            {d.debug && (
-              <p className="ai-fallback-debug">
-                hasKey: {d.debug.hasOpenAIKey ? "✓" : "✗"}
-                {" · "}model: {d.debug.openAIModel ?? "—"}
-                {" · "}runtime: {d.debug.runtime ?? "—"}
-              </p>
-            )}
-          </div>
-        )}
       </>
     );
 
@@ -1752,8 +1733,6 @@ export function AnalyticsBlock({
           border-color:rgba(201,168,76,.28);
           min-height:390px;
         }
-        .an-ai-card::before{content:"";position:absolute;inset:0;pointer-events:none;
-          background:radial-gradient(420px 240px at 100% 0%, rgba(201,168,76,.14), transparent 60%)}
         .an-ai-card > *{position:relative}
         .ai-title-row{display:flex;align-items:center;gap:.6rem;
           font-family:'Playfair Display',Georgia,serif;font-size:1.05rem;font-weight:700;color:#E8EEF8}
@@ -2254,6 +2233,28 @@ export function AnalyticsBlock({
         .ai-risk-action{grid-area:action;font-size:.68rem;color:#8A9FBB;
           text-align:right;font-style:italic}
 
+        /* === FALLBACK ДИАГНОСТИКА (в шапке, всегда видна) === */
+        .ai-diag-block{
+          margin:.3rem .85rem .1rem;
+          padding:.5rem .7rem;
+          border-radius:8px;
+          background:rgba(201,168,76,.07);
+          border:1px solid rgba(201,168,76,.25);
+          display:flex;flex-direction:column;gap:.22rem
+        }
+        .ai-diag-title{
+          font-family:'DM Mono',monospace;font-size:.6rem;font-weight:700;
+          letter-spacing:.16em;text-transform:uppercase;color:#E0A050
+        }
+        .ai-diag-row{
+          font-family:'DM Mono',monospace;font-size:.68rem;color:#9FB1CB;
+          display:flex;gap:.5rem;flex-wrap:wrap
+        }
+        .ai-diag-key{color:#7A8FA8}
+        .ai-diag-val{color:#E8EEF8;font-weight:600}
+        .ai-diag-val.ok{color:#7DEAB2}
+        .ai-diag-val.err{color:#FF8A98}
+
         /* === FALLBACK NOTICE + MISSING DATA === */
         .ai-fallback-diag{margin:.4rem 0 0;display:flex;flex-direction:column;gap:.2rem}
         .ai-fallback-notice{font-size:.72rem;color:#E0A050;
@@ -2675,6 +2676,46 @@ export function AnalyticsBlock({
                 </div>
               )}
             </div>
+            {/* ═══ ДИАГНОСТИКА (показывается только при fallback, над каруселью) ══ */}
+            {hasPremium && useAi && aiData && aiData.source === "fallback" && (
+              <div className="ai-diag-block">
+                <div className="ai-diag-title">Диагностика</div>
+                <div className="ai-diag-row">
+                  <span className="ai-diag-key">source:</span>
+                  <span className="ai-diag-val err">fallback</span>
+                </div>
+                <div className="ai-diag-row">
+                  <span className="ai-diag-key">fallbackReason:</span>
+                  <span className="ai-diag-val">{aiData.fallbackReason ?? "unknown"}</span>
+                </div>
+                {aiData.debug ? (
+                  <>
+                    <div className="ai-diag-row">
+                      <span className="ai-diag-key">hasOpenAIKey:</span>
+                      <span className={"ai-diag-val " + (aiData.debug.hasOpenAIKey ? "ok" : "err")}>
+                        {String(aiData.debug.hasOpenAIKey)}
+                      </span>
+                    </div>
+                    <div className="ai-diag-row">
+                      <span className="ai-diag-key">hasOpenAIModel:</span>
+                      <span className={"ai-diag-val " + (aiData.debug.hasOpenAIModel ? "ok" : "err")}>
+                        {String(aiData.debug.hasOpenAIModel)}
+                      </span>
+                    </div>
+                    <div className="ai-diag-row">
+                      <span className="ai-diag-key">openAIModel:</span>
+                      <span className="ai-diag-val">{aiData.debug.openAIModel ?? "—"}</span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="ai-diag-row">
+                    <span className="ai-diag-key">debug:</span>
+                    <span className="ai-diag-val err">не получен от сервера</span>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* ═══ КАРУСЕЛЬ AI-СТРАНИЦ ═══════════════════════════════════ */}
             <div
               className="ai-body"
