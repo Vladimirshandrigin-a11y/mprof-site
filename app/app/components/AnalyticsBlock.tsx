@@ -720,9 +720,17 @@ type RecommendedAction = {
   expectedEffect: string;
 };
 
+type AiDebug = {
+  hasOpenAIKey?: boolean;
+  hasOpenAIModel?: boolean;
+  openAIModel?: string;
+  runtime?: string;
+};
+
 type AiAnalysis = {
   source: "openai" | "fallback";
   fallbackReason?: string;
+  debug?: AiDebug;
   summary: string;
   healthScore: number;
   mainProblem: string;
@@ -1194,6 +1202,8 @@ export function AnalyticsBlock({
             missingData: Array.isArray(json.missingData)
               ? (json.missingData as string[])
               : [],
+            fallbackReason: typeof json.fallbackReason === "string" ? json.fallbackReason : undefined,
+            debug: json.debug && typeof json.debug === "object" ? (json.debug as AiDebug) : undefined,
           });
           setAiFailed(false);
         } else {
@@ -1481,14 +1491,23 @@ export function AnalyticsBlock({
         {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
         {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
         {d.source === "fallback" && (
-          <p className="ai-fallback-notice">
-            Базовая аналитика
-            {d.fallbackReason === "missing_api_key" && " — ключ OpenAI не настроен"}
-            {d.fallbackReason === "timeout" && " — OpenAI не ответил за 25с"}
-            {d.fallbackReason === "openai_error" && " — ошибка OpenAI API"}
-            {d.fallbackReason === "invalid_json" && " — некорректный ответ OpenAI"}
-            {(!d.fallbackReason || d.fallbackReason === "unknown") && " — AI временно недоступен"}
-          </p>
+          <div className="ai-fallback-diag">
+            <p className="ai-fallback-notice">
+              {"AI временно недоступен. Причина: "}
+              {d.fallbackReason === "missing_api_key" && "ключ OpenAI не настроен"}
+              {d.fallbackReason === "timeout" && "OpenAI не ответил за 25с"}
+              {d.fallbackReason === "openai_error" && "ошибка OpenAI API"}
+              {d.fallbackReason === "invalid_json" && "некорректный ответ OpenAI"}
+              {(!d.fallbackReason || d.fallbackReason === "unknown") && "неизвестно"}
+            </p>
+            {d.debug && (
+              <p className="ai-fallback-debug">
+                hasKey: {d.debug.hasOpenAIKey ? "✓" : "✗"}
+                {" · "}model: {d.debug.openAIModel ?? "—"}
+                {" · "}runtime: {d.debug.runtime ?? "—"}
+              </p>
+            )}
+          </div>
         )}
       </>
     );
@@ -1640,7 +1659,7 @@ export function AnalyticsBlock({
             "recent ai"
         }
         .an-area-donut{grid-area:donut}
-        .an-area-ai{grid-area:ai;align-self:start}
+        .an-area-ai{grid-area:ai;align-self:start;min-height:390px;display:flex;flex-direction:column}
         .an-area-recent{grid-area:recent;margin-top:0 !important}
 
         @media(max-width:900px){
@@ -1731,6 +1750,7 @@ export function AnalyticsBlock({
         .an-ai-card{
           background:linear-gradient(150deg, rgba(201,168,76,.10) 0%, rgba(255,255,255,.025) 60%);
           border-color:rgba(201,168,76,.28);
+          min-height:390px;
         }
         .an-ai-card::before{content:"";position:absolute;inset:0;pointer-events:none;
           background:radial-gradient(420px 240px at 100% 0%, rgba(201,168,76,.14), transparent 60%)}
@@ -2121,13 +2141,13 @@ export function AnalyticsBlock({
           line-height:1.55;max-width:400px;margin:0}
 
         /* === КАРУСЕЛЬ === */
-        /* ai-body теперь — контейнер карусели, фиксированной высоты */
-        .ai-body{padding:.35rem .85rem .55rem;display:flex;flex-direction:column;gap:0}
+        /* ai-body — растягивается на всё свободное место внутри карточки */
+        .ai-body{padding:.35rem .85rem .55rem;display:flex;flex-direction:column;gap:0;flex:1}
 
-        /* Область контента страницы — высота по содержимому, без растяжки */
+        /* Viewport — растягивается внутри ai-body, с ограничением сверху */
         .ai-page-viewport{
-          overflow-y:auto;
-          max-height:320px;
+          flex:1;overflow-y:auto;
+          min-height:180px;max-height:300px;
           /* плавный внутренний scroll на iOS */
           -webkit-overflow-scrolling:touch;
           scrollbar-width:thin;
@@ -2235,10 +2255,13 @@ export function AnalyticsBlock({
           text-align:right;font-style:italic}
 
         /* === FALLBACK NOTICE + MISSING DATA === */
-        .ai-fallback-notice{margin:.4rem 0 0;font-size:.72rem;color:#7C8DB5;
+        .ai-fallback-diag{margin:.4rem 0 0;display:flex;flex-direction:column;gap:.2rem}
+        .ai-fallback-notice{font-size:.72rem;color:#E0A050;
           font-style:italic;padding:.25rem .55rem;
-          background:rgba(255,255,255,.025);border-radius:6px;
-          border-left:2px solid rgba(201,168,76,.4)}
+          background:rgba(201,168,76,.07);border-radius:6px;
+          border-left:2px solid rgba(201,168,76,.4);margin:0}
+        .ai-fallback-debug{font-family:'DM Mono',monospace;font-size:.63rem;color:#566070;
+          padding:.2rem .55rem;margin:0;letter-spacing:.03em}
         .ai-missing-data{margin:.25rem 0 0;font-size:.70rem;color:#566070;line-height:1.4}
         .ai-missing-label{color:#7C8DB5;font-weight:500}
 

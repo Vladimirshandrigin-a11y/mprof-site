@@ -91,9 +91,18 @@ export type FallbackReason =
   | "timeout"
   | "unknown";
 
+export type AiDebugInfo = {
+  hasOpenAIKey: boolean;
+  hasOpenAIModel: boolean;
+  openAIModel: string;
+  runtime: "server";
+};
+
 export type AiResult = {
   source: "openai" | "fallback";
   fallbackReason?: FallbackReason;
+  /** Диагностика: только в source=fallback, НЕ раскрывает секреты. */
+  debug?: AiDebugInfo;
   summary: string;
   healthScore: number;
   mainProblem: string;
@@ -186,7 +195,11 @@ async function checkUnlimitedPlan(
 
 // ---------- rule-based fallback ----------
 
-function buildFallback(d: SanitizedData, reason: FallbackReason = "unknown"): AiResult {
+function buildFallback(
+  d: SanitizedData,
+  reason: FallbackReason = "unknown",
+  debug?: AiDebugInfo
+): AiResult {
   const r = d.revenue;
   const pct = (v: number) =>
     r > 0 ? Math.round((v / r) * 1000) / 10 : 0; // 1 знак после точки
@@ -490,6 +503,7 @@ function buildFallback(d: SanitizedData, reason: FallbackReason = "unknown"): Ai
   return {
     source: "fallback" as const,
     fallbackReason: reason,
+    debug,
     summary,
     healthScore,
     mainProblem,
@@ -727,10 +741,23 @@ export async function POST(req: NextRequest) {
 
   // ── 4. Если OPENAI_API_KEY не задан — rule-based fallback (200, не 503) ──
   const apiKey = process.env.OPENAI_API_KEY;
+  const debugInfo: AiDebugInfo = {
+    hasOpenAIKey: !!apiKey,
+    hasOpenAIModel: !!process.env.OPENAI_MODEL,
+    openAIModel: MODEL,
+    runtime: "server",
+  };
+  // eslint-disable-next-line no-console
+  console.log("[ai/analyze] env check:", {
+    hasKey: debugInfo.hasOpenAIKey,
+    model: debugInfo.openAIModel,
+    hasModelEnv: debugInfo.hasOpenAIModel,
+  });
+
   if (!apiKey) {
     // eslint-disable-next-line no-console
-    console.warn("[ai/analyze] OPENAI_API_KEY не задан — возвращаем fallback (missing_api_key)");
-    return NextResponse.json({ ok: true, ...buildFallback(data, "missing_api_key") });
+    console.warn("[ai/analyze] OPENAI_API_KEY не задан — fallback (missing_api_key)");
+    return NextResponse.json({ ok: true, ...buildFallback(data, "missing_api_key", debugInfo) });
   }
 
   // ── 5. Вызываем OpenAI ───────────────────────────────────────────────────
@@ -766,7 +793,7 @@ export async function POST(req: NextRequest) {
     console.error("[ai/analyze] OpenAI недоступен:", msg);
     return NextResponse.json({
       ok: true,
-      ...buildFallback(data, isTimeout ? "timeout" : "openai_error"),
+      ...buildFallback(data, isTimeout ? "timeout" : "openai_error", debugInfo),
     });
   } finally {
     clearTimeout(timeout);
@@ -778,7 +805,7 @@ export async function POST(req: NextRequest) {
   if (!upstream.ok) {
     // eslint-disable-next-line no-console
     console.error("[ai/analyze] upstream error", upstream.status, rawText.slice(0, 300));
-    return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error") });
+    return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error", debugInfo) });
   }
 
   let parsed: unknown = null;
@@ -796,7 +823,7 @@ export async function POST(req: NextRequest) {
   if (!result) {
     // eslint-disable-next-line no-console
     console.error("[ai/analyze] LLM вернул некорректный формат");
-    return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json") });
+    return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json", debugInfo) });
   }
 
   return NextResponse.json({ ok: true, ...result });
