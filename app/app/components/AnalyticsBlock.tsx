@@ -1740,15 +1740,7 @@ export function AnalyticsBlock({
           color:#7A8FA8;margin:0 0 .15rem
         }
 
-        /* ===== TOP: ring + tier/trend/confidence (rule-based branch) ===== */
-        .ai-top{
-          display:flex;align-items:center;gap:1.1rem;
-          padding:.4rem 0 .8rem;
-          border-bottom:1px solid rgba(255,255,255,.06)
-        }
-        .ai-score-block{position:relative;width:78px;height:78px;flex-shrink:0}
-
-        /* ===== AI-data overview: компактные показатели с подписями ===== */
+        /* ===== AI overview: компактные показатели с подписями ===== */
         .ai-compact-top{
           display:flex;align-items:flex-end;gap:1.1rem;flex-wrap:wrap;
           padding:.2rem 0 .65rem;
@@ -1775,45 +1767,6 @@ export function AnalyticsBlock({
         .ai-compact-score.tier-stable{color:#FFD37D}
         .ai-compact-score.tier-strong{color:#E8C97A}
         .ai-compact-score.tier-excellent{color:#7DEAB2}
-        .ai-ring-svg{width:100%;height:100%;display:block;
-          animation:aiRingIn .55s cubic-bezier(.22,1,.36,1) both}
-        @keyframes aiRingIn{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:scale(1)}}
-        .ai-ring-text{
-          position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
-          font-family:'Playfair Display',Georgia,serif;
-          font-size:1.65rem;font-weight:700;letter-spacing:-.025em;
-          background:linear-gradient(135deg,#E8C97A 0%,#C9A84C 100%);
-          -webkit-background-clip:text;background-clip:text;
-          -webkit-text-fill-color:transparent;
-          filter:drop-shadow(0 0 6px rgba(232,201,122,.18))
-        }
-        .ai-top.score-weak .ai-ring-text{
-          background:linear-gradient(135deg,#FF8A98,#E05566);
-          -webkit-background-clip:text;background-clip:text;
-          -webkit-text-fill-color:transparent;
-          filter:drop-shadow(0 0 6px rgba(224,85,102,.25))
-        }
-        .ai-top.score-stable .ai-ring-text{
-          background:linear-gradient(135deg,#FFD37D,#E0A050);
-          -webkit-background-clip:text;background-clip:text;
-          -webkit-text-fill-color:transparent;
-          filter:drop-shadow(0 0 6px rgba(232,180,80,.2))
-        }
-        .ai-top.score-excellent .ai-ring-text{
-          background:linear-gradient(135deg,#7DEAB2,#2ECC8A);
-          -webkit-background-clip:text;background-clip:text;
-          -webkit-text-fill-color:transparent;
-          filter:drop-shadow(0 0 6px rgba(46,204,138,.25))
-        }
-
-        .ai-top-meta{flex:1;display:flex;flex-direction:column;gap:.45rem;min-width:0}
-        .ai-top-row{
-          display:flex;align-items:center;justify-content:space-between;gap:.55rem;flex-wrap:wrap
-        }
-        .ai-score-label{
-          font-family:'DM Mono',monospace;font-size:.62rem;
-          letter-spacing:.18em;text-transform:uppercase;color:#7A8FA8;font-weight:700
-        }
         .ai-trend{
           display:inline-flex;align-items:center;gap:6px;
           font-family:'DM Mono',monospace;font-size:.72rem;font-weight:700;
@@ -2230,17 +2183,6 @@ export function AnalyticsBlock({
           color:#D8C089;font-size:.74rem;line-height:1.45
         }
 
-        /* === FALLBACK NOTICE + MISSING DATA === */
-        .ai-fallback-diag{margin:.4rem 0 0;display:flex;flex-direction:column;gap:.2rem}
-        .ai-fallback-notice{font-size:.72rem;color:#E0A050;
-          font-style:italic;padding:.25rem .55rem;
-          background:rgba(201,168,76,.07);border-radius:6px;
-          border-left:2px solid rgba(201,168,76,.4);margin:0}
-        .ai-fallback-debug{font-family:'DM Mono',monospace;font-size:.63rem;color:#566070;
-          padding:.2rem .55rem;margin:0;letter-spacing:.03em}
-        .ai-missing-data{margin:.25rem 0 0;font-size:.70rem;color:#566070;line-height:1.4}
-        .ai-missing-label{color:#7C8DB5;font-weight:500}
-
         /* === AI PRO LOCK ===  */
         .an-ai-card.ai-locked .ai-list{
           filter:blur(6px) saturate(.55);opacity:.55;
@@ -2418,8 +2360,6 @@ export function AnalyticsBlock({
           .ai-lock-overlay,
           .ai-insight,
           .ai-rec-chip,
-          .ai-ring-svg,
-          .ai-ring-text,
           .ai-health-row,
           .ai-health-fill,
           .ai-quick-card,
