@@ -993,6 +993,8 @@ export function AnalyticsBlock({
   const [aiData, setAiData] = useState<AiAnalysis | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiFailed, setAiFailed] = useState(false);
+  // Текущая страница «книжки» AI Аналитики (0…aiPages.length-1)
+  const [aiPage, setAiPage] = useState(0);
 
   // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
   // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
@@ -1373,6 +1375,45 @@ export function AnalyticsBlock({
     ) : (
       <p className="ai-sec-text ai-sec-muted">{empty}</p>
     );
+
+  // ── Страницы «книжки» AI Аналитики (показываем по одной за раз) ──
+  const aiPages: { title: string; body: ReactNode }[] = [
+    {
+      title: "Главный вывод",
+      body: (
+        <>
+          {aiUnavailable && (
+            <p className="ai-book-note">
+              AI-анализ временно недоступен. Ниже — базовые рекомендации по расчёту.
+            </p>
+          )}
+          <p className="ai-sec-text">
+            {aiVerdict || "Недостаточно данных для вывода."}
+          </p>
+        </>
+      ),
+    },
+    {
+      title: "Что снижает прибыль",
+      body: renderAiList(aiLeaks, "Существенных утечек не обнаружено."),
+    },
+    {
+      title: "Что сделать в первую очередь",
+      body: renderAiList(aiActions, "Показатели в норме — резких действий не требуется."),
+    },
+    {
+      title: "Что проверить дополнительно",
+      body: renderAiList(aiChecks, "Дополнительных проверок не требуется."),
+    },
+    {
+      title: "Риски / внимание",
+      body: renderAiList(aiRisks, "Критичных рисков не обнаружено."),
+    },
+  ];
+  const aiTotal = aiPages.length;
+  const aiCur = Math.min(Math.max(aiPage, 0), aiTotal - 1);
+  const aiGoPrev = () => setAiPage((p) => Math.max(0, p - 1));
+  const aiGoNext = () => setAiPage((p) => Math.min(aiTotal - 1, p + 1));
 
   return (
     <>
@@ -1922,51 +1963,91 @@ export function AnalyticsBlock({
         .filter-empty-sub{font-size:.88rem;color:#8A9FBB;font-weight:300;
           line-height:1.55;max-width:400px;margin:0}
 
-        /* === AI MVP: простой вертикальный вид (без карусели) === */
-        /* ai-body — контейнер секций внутри карточки */
-        .ai-body{padding:.5rem .95rem .95rem;display:flex;flex-direction:column;flex:1;min-width:0}
+        /* === AI «книжка»: одна страница за раз, компактно === */
+        /* ai-body — контейнер книжки внутри карточки */
+        .ai-body{padding:.45rem .9rem .75rem;display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
 
-        /* секции растягиваются по контенту — без внутреннего скролла */
-        .ai-sections{
-          display:flex;flex-direction:column;gap:.65rem;
-          min-width:0;overflow-x:hidden
-        }
+        .ai-book{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
 
-        /* сетка вторичных секций: 2 колонки (desktop) / 1 (mobile) */
-        .ai-grid{
-          display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
-          gap:.65rem;min-width:0;align-items:stretch
-        }
-
-        /* секция-плашка — просторная, тянется по высоте под текст */
-        .ai-sec{
+        /* страница-плашка: тянется по доступной высоте, контент скроллится внутри */
+        .ai-book-page{
+          flex:1;min-height:0;min-width:0;
+          display:flex;flex-direction:column;
           background:rgba(255,255,255,.025);
           border:1px solid rgba(255,255,255,.07);
-          border-radius:14px;padding:.95rem 1.05rem;
-          min-width:0;height:100%;
-          display:flex;flex-direction:column;
-          overflow-wrap:break-word;word-break:break-word
+          border-radius:14px;padding:.85rem .95rem;
+          animation:aiBookFade .28s ease both
         }
-        /* «Главный вывод» — на всю ширину и чуть заметнее */
-        .ai-sec-lead{
-          background:rgba(201,168,76,.05);
-          border-color:rgba(201,168,76,.18);
-          padding:1.05rem 1.15rem
+        @keyframes aiBookFade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+        /* шапка страницы: заголовок + счётчик «1 / 5» */
+        .ai-book-head{
+          display:flex;align-items:center;justify-content:space-between;gap:.5rem;
+          margin-bottom:.5rem;flex-shrink:0
         }
+        .ai-book-counter{
+          font-family:'DM Mono',monospace;font-size:.6rem;letter-spacing:.1em;
+          color:#8A9FBB;flex-shrink:0
+        }
+
+        /* контент страницы: ограничен по высоте, аккуратный внутренний скролл */
+        .ai-book-content{
+          flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;
+          padding-right:.25rem;
+          -webkit-overflow-scrolling:touch;
+          scrollbar-width:thin;scrollbar-color:rgba(201,168,76,.28) transparent
+        }
+        .ai-book-content::-webkit-scrollbar{width:3px}
+        .ai-book-content::-webkit-scrollbar-track{background:transparent}
+        .ai-book-content::-webkit-scrollbar-thumb{background:rgba(201,168,76,.28);border-radius:3px}
+
+        /* плашка «AI недоступен» — только на стр. «Главный вывод» */
+        .ai-book-note{
+          margin:0 0 .55rem;font-size:.72rem;line-height:1.45;color:#C9A84C;
+          padding:.4rem .55rem;border-radius:8px;
+          background:rgba(201,168,76,.07);border:1px solid rgba(201,168,76,.18)
+        }
+
+        /* навигация: стрелки + точки */
+        .ai-book-nav{
+          display:flex;align-items:center;justify-content:center;gap:.7rem;
+          margin-top:.6rem;flex-shrink:0
+        }
+        .ai-book-arrow{
+          width:30px;height:30px;border-radius:50%;flex-shrink:0;padding:0;
+          display:inline-flex;align-items:center;justify-content:center;
+          background:rgba(201,168,76,.08);border:1px solid rgba(201,168,76,.30);
+          color:#E8C97A;cursor:pointer;
+          transition:background .15s,border-color .15s,opacity .15s
+        }
+        .ai-book-arrow:hover:not(:disabled){background:rgba(201,168,76,.18);border-color:rgba(201,168,76,.5)}
+        .ai-book-arrow:disabled{opacity:.28;cursor:default}
+        .ai-book-arrow svg{width:15px;height:15px}
+        .ai-book-dots{display:flex;align-items:center;gap:.4rem}
+        .ai-book-dot{
+          width:7px;height:7px;border-radius:50%;padding:0;cursor:pointer;
+          background:rgba(255,255,255,.18);border:none;
+          transition:background .15s,transform .15s
+        }
+        .ai-book-dot:hover{background:rgba(201,168,76,.5)}
+        .ai-book-dot.is-active{
+          background:#C9A84C;transform:scale(1.25);
+          box-shadow:0 0 8px rgba(201,168,76,.55)
+        }
+
+        /* типографика внутри страницы */
         .ai-sec-title{
-          margin:0 0 .5rem;
-          font-family:'DM Mono',monospace;font-size:.62rem;font-weight:700;
+          margin:0;font-family:'DM Mono',monospace;font-size:.62rem;font-weight:700;
           letter-spacing:.14em;text-transform:uppercase;color:#E8C97A
         }
         .ai-sec-text{
           margin:0;font-size:.84rem;line-height:1.6;color:#D7E0EE;font-weight:400;
           white-space:pre-line;overflow-wrap:break-word;word-break:break-word
         }
-        .ai-sec-lead .ai-sec-text{font-size:.9rem;line-height:1.62;color:#E6EDF7}
         .ai-sec-muted{color:#8A9FBB}
         .ai-sec-list{
           list-style:none;margin:0;padding:0;
-          display:flex;flex-direction:column;gap:.46rem
+          display:flex;flex-direction:column;gap:.5rem
         }
         .ai-sec-list li{
           position:relative;padding-left:1rem;
@@ -1978,8 +2059,8 @@ export function AnalyticsBlock({
           width:5px;height:5px;border-radius:50%;
           background:#C9A84C;box-shadow:0 0 6px rgba(201,168,76,.5)
         }
-        @media (max-width:640px){
-          .ai-grid{grid-template-columns:1fr}
+        @media (prefers-reduced-motion:reduce){
+          .ai-book-page{animation:none}
         }
 
         /* loader на время ожидания ответа AI */
@@ -2442,7 +2523,7 @@ export function AnalyticsBlock({
                 <div className="ai-sub">Персональные рекомендации по вашему отчёту</div>
               )}
             </div>
-            {/* ═══ AI-СЕКЦИИ — простой вертикальный вид (без карусели) ═══ */}
+            {/* ═══ AI-«КНИЖКА» — одна страница за раз: стрелки + точки + счётчик ═══ */}
             <div className="ai-body" aria-hidden={!hasPremium}>
               {aiLoading ? (
                 <div className="ai-loading" role="status" aria-live="polite">
@@ -2450,42 +2531,67 @@ export function AnalyticsBlock({
                   <span>AI анализирует прибыль…</span>
                 </div>
               ) : (
-                <div className="ai-sections">
-                  {aiUnavailable && (
-                    <p className="ai-fallback-note">
-                      AI-анализ временно недоступен. Ниже показаны базовые рекомендации по расчёту.
-                    </p>
-                  )}
+                <div className="ai-book">
+                  <div className="ai-book-page" key={aiCur}>
+                    <div className="ai-book-head">
+                      <h4 className="ai-sec-title">{aiPages[aiCur].title}</h4>
+                      <span className="ai-book-counter">
+                        {aiCur + 1} / {aiTotal}
+                      </span>
+                    </div>
+                    <div className="ai-book-content">{aiPages[aiCur].body}</div>
+                  </div>
 
-                  {/* Главный вывод — отдельная карточка на всю ширину блока */}
-                  <section className="ai-sec ai-sec-lead">
-                    <h4 className="ai-sec-title">Главный вывод</h4>
-                    <p className="ai-sec-text">
-                      {aiVerdict || "Недостаточно данных для вывода."}
-                    </p>
-                  </section>
+                  <div className="ai-book-nav">
+                    <button
+                      type="button"
+                      className="ai-book-arrow"
+                      onClick={aiGoPrev}
+                      disabled={aiCur === 0}
+                      aria-label="Предыдущая страница"
+                    >
+                      <svg
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M15 18l-6-6 6-6" />
+                      </svg>
+                    </button>
 
-                  {/* Остальные секции — сетка: 2 колонки (desktop) / 1 (mobile) */}
-                  <div className="ai-grid">
-                    <section className="ai-sec">
-                      <h4 className="ai-sec-title">Что снижает прибыль</h4>
-                      {renderAiList(aiLeaks, "Существенных утечек не обнаружено.")}
-                    </section>
+                    <div
+                      className="ai-book-dots"
+                      role="tablist"
+                      aria-label="Страницы AI Аналитики"
+                    >
+                      {aiPages.map((p, i) => (
+                        <button
+                          key={i}
+                          type="button"
+                          role="tab"
+                          aria-selected={i === aiCur}
+                          aria-label={p.title}
+                          className={"ai-book-dot" + (i === aiCur ? " is-active" : "")}
+                          onClick={() => setAiPage(i)}
+                        />
+                      ))}
+                    </div>
 
-                    <section className="ai-sec">
-                      <h4 className="ai-sec-title">Что сделать в первую очередь</h4>
-                      {renderAiList(aiActions, "Показатели в норме — резких действий не требуется.")}
-                    </section>
-
-                    <section className="ai-sec">
-                      <h4 className="ai-sec-title">Что проверить дополнительно</h4>
-                      {renderAiList(aiChecks, "Дополнительных проверок не требуется.")}
-                    </section>
-
-                    <section className="ai-sec">
-                      <h4 className="ai-sec-title">Риски / внимание</h4>
-                      {renderAiList(aiRisks, "Критичных рисков не обнаружено.")}
-                    </section>
+                    <button
+                      type="button"
+                      className="ai-book-arrow"
+                      onClick={aiGoNext}
+                      disabled={aiCur === aiTotal - 1}
+                      aria-label="Следующая страница"
+                    >
+                      <svg
+                        viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                        strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M9 6l6 6-6 6" />
+                      </svg>
+                    </button>
                   </div>
                 </div>
               )}
