@@ -1031,6 +1031,12 @@ export function AnalyticsBlock({
   const [aiLoading, setAiLoading] = useState(false);
   const [aiFailed, setAiFailed] = useState(false);
 
+  // ===== Карусель AI-страниц =====
+  const [aiPage, setAiPage] = useState(0);
+  const carouselRef = useRef<HTMLDivElement>(null);
+  const swipeTouchX = useRef(0);
+  const aiPagesTotalRef = useRef(0); // ref для swipe-хендлера (без пересоздания эффекта)
+
   // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
   // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
   // Никаких XLSX/PDF/сырых отчётов в LLM не уходит.
@@ -1204,6 +1210,28 @@ export function AnalyticsBlock({
     };
   }, [hasPremium, aiPayloadSig]);
 
+  // Сброс на первую страницу при смене AI-данных
+  useEffect(() => { setAiPage(0); }, [aiData, aiFailed]);
+
+  // Swipe-навигация на мобильных (mount-only, читает ref для актуального числа страниц)
+  useEffect(() => {
+    const el = carouselRef.current;
+    if (!el) return;
+    const onStart = (e: TouchEvent) => { swipeTouchX.current = e.touches[0].clientX; };
+    const onEnd = (e: TouchEvent) => {
+      const dx = swipeTouchX.current - e.changedTouches[0].clientX;
+      if (Math.abs(dx) < 44) return; // ignore small swipes
+      if (dx > 0) setAiPage(p => Math.min(aiPagesTotalRef.current - 1, p + 1));
+      else setAiPage(p => Math.max(0, p - 1));
+    };
+    el.addEventListener("touchstart", onStart, { passive: true });
+    el.addEventListener("touchend", onEnd, { passive: true });
+    return () => {
+      el.removeEventListener("touchstart", onStart);
+      el.removeEventListener("touchend", onEnd);
+    };
+  }, []); // mount only — ref обновляется синхронно при каждом рендере
+
   /* charts series — строго хронологический порядок: старый месяц слева →
      новый справа. chartHistory уже отсортирован по report_period на странице
      (возрастание), берём последние 14 (самые свежие) в том же порядке.
@@ -1295,6 +1323,259 @@ export function AnalyticsBlock({
           profitLabel: profitLabelFor(h.aiInsights),
         }))
       : DEMO_RECENT;
+
+  // ============================================================
+  // AI-карусель: количество страниц
+  // ============================================================
+  const aiPagesTotal = !hasPremium
+    ? 0
+    : useAi
+    ? 2 +
+      (aiData!.profitLeaks.length > 0 ? 1 : 0) +
+      (aiData!.productRisks.length > 0 ? 1 : 0) +
+      1 +
+      (aiData!.missingData.length > 0 ? 1 : 0)
+    : 4; // rule-based: обзор / инсайты / здоровье / действия
+  aiPagesTotalRef.current = aiPagesTotal;
+  const curAiPage = Math.min(aiPage, Math.max(0, aiPagesTotal - 1));
+
+  // Индексы страниц для AI-данных (dynamic — зависит от наличия опциональных секций)
+  const AI_PG = useAi
+    ? (() => {
+        let i = 0;
+        const overview = i++;
+        const insights = i++;
+        const leaks = aiData!.profitLeaks.length > 0 ? i++ : -1;
+        const risks = aiData!.productRisks.length > 0 ? i++ : -1;
+        const actions = i++;
+        const missing = aiData!.missingData.length > 0 ? i++ : -1;
+        return { overview, insights, leaks, risks, actions, missing };
+      })()
+    : { overview: 0, insights: 1, leaks: -1, risks: -1, actions: 3, missing: -1 };
+
+  // Метка текущей страницы для aria
+  const aiPageLabel = useAi
+    ? ([
+        "Обзор",
+        "Инсайты",
+        ...(aiData?.profitLeaks.length ? ["Расходы"] : []),
+        ...(aiData?.productRisks.length ? ["Риски"] : []),
+        "Действия",
+        ...(aiData?.missingData.length ? ["Данные"] : []),
+      ][curAiPage] ?? "")
+    : (["Обзор", "Инсайты", "Здоровье", "Действия"][curAiPage] ?? "");
+
+  // Рендер содержимого страницы карусели
+  function renderAiCarouselPage(page: number): ReactNode {
+    // ── Rule-based (4 страницы) ──────────────────────────────────────
+    if (!useAi) {
+      const ovw = (
+        <>
+          <div className={"ai-top score-" + aiTier.kind}>
+            <div className="ai-score-block">
+              <ScoreRing score={aiScore} tier={aiTier.kind} />
+              <div className="ai-ring-text" aria-label={`AI оценка ${aiScore} из 100`}>
+                <AnimatedScore value={aiScore} />
+              </div>
+            </div>
+            <div className="ai-top-meta">
+              <div className="ai-top-row">
+                <span className="ai-score-label">AI score</span>
+                <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
+              </div>
+              <div className="ai-top-row">
+                <span className={"ai-trend dir-" + aiTrend.dir}>
+                  {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
+                  <span className="ai-trend-val">
+                    {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
+                  </span>
+                </span>
+                <span className={"ai-conf conf-" + aiConfidence}>
+                  <span className="ai-conf-dot" />
+                  {CONFIDENCE_LABEL[aiConfidence]}
+                  <span className="ai-conf-pct">· {aiConfidencePct}%</span>
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="ai-indicators">
+            <span className="ai-ind"><span className="ai-ind-l">Комм.</span><span className="ai-ind-v">{(aiIndicators.commission * 100).toFixed(0)}%</span></span>
+            <span className="ai-ind"><span className="ai-ind-l">Рек.</span><span className="ai-ind-v">{(aiIndicators.ads * 100).toFixed(0)}%</span></span>
+            <span className="ai-ind"><span className="ai-ind-l">Лог.</span><span className="ai-ind-v">{(aiIndicators.logistics * 100).toFixed(0)}%</span></span>
+            <span className="ai-ind ai-ind-margin"><span className="ai-ind-l">Маржа</span><span className="ai-ind-v">{aiIndicators.margin.toFixed(1)}%</span></span>
+          </div>
+          <p className="ai-pg-summary">{aiSummary}</p>
+        </>
+      );
+      const ins = (
+        <>
+          <div className="ai-section-label">Инсайты</div>
+          <ul className="ai-insights-list" key={history.length + ":" + aiScore}>
+            {aiSlots.map((s, i) => (
+              <li className={"ai-insight " + s.kind} key={i}>
+                <span className="ai-insight-ico" aria-hidden="true">{s.ico}</span>
+                <span className="ai-insight-text">{s.text}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      );
+      const hlth = (
+        <>
+          <div className="ai-section-label">Финансовое здоровье</div>
+          <div className="ai-health" key={"h:" + aiScore}>
+            {aiHealth.map((m, i) => (
+              <div className="ai-health-row" key={i}>
+                <span className="ai-health-label">{m.label}</span>
+                <span className={"ai-health-bar tier-" + m.tier}><span className="ai-health-fill" style={{ width: m.value + "%" }} /></span>
+                <span className={"ai-health-value tier-" + m.tier}>{m.value}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      );
+      const act = (
+        <>
+          <div className="ai-section-label">Что улучшить прямо сейчас</div>
+          <div className="ai-quick" key={"q:" + aiScore}>
+            {aiQuick.map((q, i) => (
+              <div className="ai-quick-card" key={i}>
+                <div className="ai-quick-action">{q.action}</div>
+                <div className="ai-quick-impact">{q.impact}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      );
+      return [ovw, ins, hlth, act][page] ?? null;
+    }
+
+    // ── AI-данные (source: openai | fallback) ─────────────────────────
+    const d = aiData!;
+
+    if (page === AI_PG.overview) return (
+      <>
+        <div className={"ai-top score-" + aiTier.kind}>
+          <div className="ai-score-block">
+            <ScoreRing score={aiScore} tier={aiTier.kind} />
+            <div className="ai-ring-text" aria-label={`AI оценка ${aiScore} из 100`}>
+              <AnimatedScore value={aiScore} />
+            </div>
+          </div>
+          <div className="ai-top-meta">
+            <div className="ai-top-row">
+              <span className="ai-score-label">AI score</span>
+              <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
+            </div>
+            <div className="ai-top-row">
+              <span className={"ai-trend dir-" + aiTrend.dir}>
+                {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
+                <span className="ai-trend-val">
+                  {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
+                </span>
+              </span>
+            </div>
+          </div>
+        </div>
+        {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
+        {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
+        {d.source === "fallback" && (
+          <p className="ai-fallback-notice">Показана базовая аналитика — AI временно недоступен</p>
+        )}
+      </>
+    );
+
+    if (page === AI_PG.insights) return (
+      <>
+        <div className="ai-section-label">Инсайты</div>
+        {d.keyInsights.length > 0 ? (
+          <ul className="ai-insights-list">
+            {d.keyInsights.map((ins, i) => {
+              const kind: InsightKind =
+                ins.severity === "high" ? "danger"
+                : ins.severity === "medium" ? "warning"
+                : "positive";
+              const ico =
+                ins.severity === "high" ? ICONS.alert
+                : ins.severity === "medium" ? ICONS.target
+                : ICONS.trendUp;
+              return (
+                <li className={"ai-insight " + kind} key={i}>
+                  <span className="ai-insight-ico" aria-hidden="true">{ico}</span>
+                  <span className="ai-insight-text">
+                    <strong className="ai-ins-title">{ins.title}</strong>
+                    {ins.description ? <span className="ai-ins-desc">: {ins.description}</span> : null}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p className="ai-pg-summary">Нет значимых инсайтов для этого периода.</p>
+        )}
+      </>
+    );
+
+    if (page === AI_PG.leaks && AI_PG.leaks >= 0) return (
+      <>
+        <div className="ai-section-label">Потери прибыли</div>
+        <div className="ai-leaks">
+          {d.profitLeaks.map((leak, i) => (
+            <div className="ai-leak-row" key={i}>
+              <span className="ai-leak-area">{leak.area}</span>
+              <span className="ai-leak-comment">{leak.comment}</span>
+              {leak.amount != null && (
+                <span className="ai-leak-amount">{leak.amount.toLocaleString("ru-RU")} ₽</span>
+              )}
+            </div>
+          ))}
+        </div>
+      </>
+    );
+
+    if (page === AI_PG.risks && AI_PG.risks >= 0) return (
+      <>
+        <div className="ai-section-label">Риски по товарам</div>
+        <ul className="ai-risks-list">
+          {d.productRisks.map((risk, i) => (
+            <li className="ai-risk-item" key={i}>
+              <span className="ai-risk-name">{risk.name}</span>
+              {risk.sku && <span className="ai-risk-sku">{risk.sku}</span>}
+              <span className="ai-risk-reason">{risk.reason}</span>
+              <span className="ai-risk-action">{risk.action}</span>
+            </li>
+          ))}
+        </ul>
+      </>
+    );
+
+    if (page === AI_PG.actions) return (
+      <>
+        <div className="ai-section-label">Рекомендованные действия</div>
+        <div className="ai-quick" key={"q:" + aiScore}>
+          {d.recommendedActions.slice(0, 4).map((a, i) => (
+            <div className="ai-quick-card" key={i}>
+              <div className="ai-quick-action">{a.priority}. {a.action}</div>
+              <div className="ai-quick-impact">{a.expectedEffect}</div>
+            </div>
+          ))}
+        </div>
+      </>
+    );
+
+    if (page === AI_PG.missing && AI_PG.missing >= 0) return (
+      <>
+        <div className="ai-section-label">Для полного анализа нужно</div>
+        <ul className="ai-missing-list">
+          {d.missingData.map((m, i) => (
+            <li key={i} className="ai-missing-item">{m}</li>
+          ))}
+        </ul>
+      </>
+    );
+
+    return null;
+  }
 
   return (
     <>
@@ -1486,7 +1767,6 @@ export function AnalyticsBlock({
           from{background-position:0% 0}
           to{background-position:280% 0}
         }
-        .ai-body{padding:.4rem 1.2rem 1rem;flex:1;display:flex;flex-direction:column;gap:.85rem}
         .ai-section{display:flex;flex-direction:column;gap:.4rem}
         .ai-section-label{
           font-family:'DM Mono',monospace;font-size:.6rem;font-weight:700;
@@ -1831,6 +2111,94 @@ export function AnalyticsBlock({
           font-size:1.18rem;font-weight:700;color:#E8EEF8;letter-spacing:-.005em;margin:0}
         .filter-empty-sub{font-size:.88rem;color:#8A9FBB;font-weight:300;
           line-height:1.55;max-width:400px;margin:0}
+
+        /* === КАРУСЕЛЬ === */
+        /* ai-body теперь — контейнер карусели, фиксированной высоты */
+        .ai-body{padding:.35rem .85rem .55rem;display:flex;flex-direction:column;gap:0}
+
+        /* Область контента страницы — фиксированная высота, внутренний scroll */
+        .ai-page-viewport{
+          flex:1;overflow-y:auto;
+          min-height:230px;max-height:270px;
+          /* плавный внутренний scroll на iOS */
+          -webkit-overflow-scrolling:touch;
+          scrollbar-width:thin;
+          scrollbar-color:rgba(201,168,76,.25) transparent
+        }
+        .ai-page-viewport::-webkit-scrollbar{width:3px}
+        .ai-page-viewport::-webkit-scrollbar-track{background:transparent}
+        .ai-page-viewport::-webkit-scrollbar-thumb{background:rgba(201,168,76,.25);border-radius:3px}
+
+        /* Страница — анимированный вход */
+        .ai-page-inner{
+          padding:.15rem 0 .4rem;
+          animation:aiPageIn .22s cubic-bezier(.22,1,.36,1) both
+        }
+        @keyframes aiPageIn{
+          from{opacity:0;transform:translateX(10px)}
+          to{opacity:1;transform:translateX(0)}
+        }
+
+        /* Навигация (стрелки + точки) */
+        .ai-pager-nav{
+          display:flex;align-items:center;justify-content:center;
+          gap:.55rem;padding:.4rem 0 .1rem;flex-shrink:0
+        }
+        .ai-nav-btn{
+          display:flex;align-items:center;justify-content:center;
+          width:28px;height:28px;border-radius:8px;
+          background:rgba(255,255,255,.06);
+          border:1px solid rgba(255,255,255,.10);
+          color:#8A9FBB;font-size:1.15rem;line-height:1;
+          cursor:pointer;transition:all .18s ease;
+          -webkit-appearance:none;appearance:none;flex-shrink:0
+        }
+        .ai-nav-btn:hover:not(:disabled){
+          background:rgba(201,168,76,.14);
+          border-color:rgba(201,168,76,.38);
+          color:#E8C97A
+        }
+        .ai-nav-btn:disabled{opacity:.25;cursor:default}
+        .ai-pager-dots{display:flex;align-items:center;gap:.38rem}
+        .ai-dot{
+          width:6px;height:6px;border-radius:50%;
+          background:rgba(255,255,255,.18);
+          border:none;padding:0;cursor:pointer;
+          transition:all .22s ease;flex-shrink:0;
+          -webkit-appearance:none;appearance:none
+        }
+        .ai-dot.active{
+          width:18px;border-radius:3px;
+          background:linear-gradient(90deg,#C9A84C,#E8C97A);
+          box-shadow:0 0 8px rgba(201,168,76,.5)
+        }
+        .ai-dot:not(.active):hover{background:rgba(201,168,76,.45)}
+
+        /* Тексты страниц */
+        .ai-pg-problem{
+          font-size:.82rem;color:#E8EEF8;font-weight:500;
+          margin:.55rem 0 .3rem;line-height:1.45
+        }
+        .ai-pg-summary{
+          font-size:.76rem;color:#8A9FBB;line-height:1.5;
+          margin:.2rem 0 0
+        }
+        .ai-pg-loading{
+          display:flex;align-items:center;gap:.6rem;
+          font-size:.8rem;color:#8A9FBB;padding:.8rem 0
+        }
+        .ai-ins-title{color:#E8EEF8;font-weight:600}
+        .ai-ins-desc{color:#8A9FBB;font-weight:400}
+
+        /* missing data list */
+        .ai-missing-list{
+          list-style:none;margin:.35rem 0 0;padding:0;
+          display:flex;flex-direction:column;gap:.3rem
+        }
+        .ai-missing-item{
+          font-size:.76rem;color:#7C8DB5;padding:.25rem .5rem .25rem .8rem;
+          border-left:2px solid rgba(201,168,76,.3);line-height:1.4
+        }
 
         /* === PROFIT LEAKS === */
         .ai-leaks{display:flex;flex-direction:column;gap:.28rem;padding:.1rem 0 .1rem}
@@ -2276,195 +2644,73 @@ export function AnalyticsBlock({
                 </div>
               )}
             </div>
-            <div className="ai-body" aria-hidden={!hasPremium}>
-              {/* === TOP: score ring + tier + trend + confidence === */}
-              <div className={"ai-top score-" + aiTier.kind}>
-                <div className="ai-score-block">
-                  <ScoreRing score={aiScore} tier={aiTier.kind} />
-                  <div
-                    className="ai-ring-text"
-                    aria-label={`AI оценка ${aiScore} из 100`}
-                  >
-                    <AnimatedScore value={aiScore} />
-                  </div>
-                </div>
-                <div className="ai-top-meta">
-                  <div className="ai-top-row">
-                    <span className="ai-score-label">AI score</span>
-                    <span className={"ai-score-tier-pill " + aiTier.kind}>
-                      {aiTier.label}
-                    </span>
-                  </div>
-                  <div className="ai-top-row">
-                    <span className={"ai-trend dir-" + aiTrend.dir}>
-                      {aiTrend.dir === "up"
-                        ? "↑"
-                        : aiTrend.dir === "down"
-                        ? "↓"
-                        : "→"}
-                      <span className="ai-trend-val">
-                        {aiTrend.dir === "flat"
-                          ? "стабильно"
-                          : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
-                      </span>
-                    </span>
-                    <span className={"ai-conf conf-" + aiConfidence}>
-                      <span className="ai-conf-dot" />
-                      {CONFIDENCE_LABEL[aiConfidence]}
-                      <span className="ai-conf-pct">· {aiConfidencePct}%</span>
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* === INDICATORS row === */}
-              <div className="ai-indicators">
-                <span className="ai-ind">
-                  <span className="ai-ind-l">Комм.</span>
-                  <span className="ai-ind-v">
-                    {(aiIndicators.commission * 100).toFixed(0)}%
-                  </span>
-                </span>
-                <span className="ai-ind">
-                  <span className="ai-ind-l">Рек.</span>
-                  <span className="ai-ind-v">
-                    {(aiIndicators.ads * 100).toFixed(0)}%
-                  </span>
-                </span>
-                <span className="ai-ind">
-                  <span className="ai-ind-l">Лог.</span>
-                  <span className="ai-ind-v">
-                    {(aiIndicators.logistics * 100).toFixed(0)}%
-                  </span>
-                </span>
-                <span className="ai-ind ai-ind-margin">
-                  <span className="ai-ind-l">Маржа</span>
-                  <span className="ai-ind-v">
-                    {aiIndicators.margin.toFixed(1)}%
-                  </span>
-                </span>
-              </div>
-
-              {/* === HEALTH BARS === */}
-              <div className="ai-section">
-                <div className="ai-section-label">Финансовое здоровье</div>
-                <div className="ai-health" key={"h:" + aiScore}>
-                  {aiHealth.map((m, i) => (
-                    <div className="ai-health-row" key={i}>
-                      <span className="ai-health-label">{m.label}</span>
-                      <span className={"ai-health-bar tier-" + m.tier}>
-                        <span
-                          className="ai-health-fill"
-                          style={{ width: m.value + "%" }}
-                        />
-                      </span>
-                      <span className={"ai-health-value tier-" + m.tier}>
-                        {m.value}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              {/* === INSIGHTS (3 slots) === */}
-              <div className="ai-section">
-                <div className="ai-section-label">Инсайты</div>
-                <ul
-                  className="ai-insights-list"
-                  key={history.length + ":" + aiScore}
+            {/* ═══ КАРУСЕЛЬ AI-СТРАНИЦ ═══════════════════════════════════ */}
+            <div
+              className="ai-body"
+              aria-hidden={!hasPremium}
+              ref={carouselRef}
+            >
+              {/* Область контента страницы */}
+              <div
+                className="ai-page-viewport"
+                role="region"
+                aria-label={`AI Аналитика — ${aiPageLabel}`}
+              >
+                <div
+                  className="ai-page-inner"
+                  key={curAiPage + ":" + aiScore + ":" + (useAi ? "ai" : "rb")}
                 >
-                  {aiSlots.map((ins, i) => (
-                    <li className={"ai-insight " + ins.kind} key={i}>
-                      <span className="ai-insight-ico" aria-hidden="true">
-                        {ins.ico}
+                  {aiLoading ? (
+                    <div className="ai-pg-loading">
+                      <span className="ai-spark" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                          <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
+                        </svg>
                       </span>
-                      <span className="ai-insight-text">{ins.text}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-
-              {/* === QUICK ACTIONS === */}
-              <div className="ai-section">
-                <div className="ai-section-label">Что улучшить прямо сейчас</div>
-                <div className="ai-quick" key={"q:" + aiScore}>
-                  {aiQuick.map((q, i) => (
-                    <div className="ai-quick-card" key={i}>
-                      <div className="ai-quick-action">{q.action}</div>
-                      <div className="ai-quick-impact">{q.impact}</div>
+                      <span>AI анализирует прибыль…</span>
                     </div>
-                  ))}
+                  ) : (
+                    renderAiCarouselPage(curAiPage)
+                  )}
                 </div>
               </div>
 
-              {/* === PROFIT LEAKS (только при AI-ответе) === */}
-              {useAi && aiData!.profitLeaks.length > 0 && (
-                <div className="ai-section">
-                  <div className="ai-section-label">Потери прибыли</div>
-                  <div className="ai-leaks">
-                    {aiData!.profitLeaks.map((leak, i) => (
-                      <div className="ai-leak-row" key={i}>
-                        <span className="ai-leak-area">{leak.area}</span>
-                        <span className="ai-leak-comment">{leak.comment}</span>
-                        {leak.amount != null && (
-                          <span className="ai-leak-amount">
-                            {leak.amount.toLocaleString("ru-RU")} ₽
-                          </span>
-                        )}
-                      </div>
+              {/* Навигация: стрелки + точки */}
+              {!aiLoading && aiPagesTotal > 1 && (
+                <div className="ai-pager-nav" aria-label="Навигация по страницам">
+                  <button
+                    type="button"
+                    className="ai-nav-btn"
+                    onClick={() => setAiPage(p => Math.max(0, p - 1))}
+                    disabled={curAiPage === 0}
+                    aria-label="Предыдущая страница"
+                  >
+                    ‹
+                  </button>
+                  <div className="ai-pager-dots" role="tablist">
+                    {Array.from({ length: aiPagesTotal }, (_, i) => (
+                      <button
+                        key={i}
+                        type="button"
+                        role="tab"
+                        aria-selected={i === curAiPage}
+                        aria-label={`Страница ${i + 1} из ${aiPagesTotal}`}
+                        className={"ai-dot" + (i === curAiPage ? " active" : "")}
+                        onClick={() => setAiPage(i)}
+                      />
                     ))}
                   </div>
+                  <button
+                    type="button"
+                    className="ai-nav-btn"
+                    onClick={() => setAiPage(p => Math.min(aiPagesTotal - 1, p + 1))}
+                    disabled={curAiPage === aiPagesTotal - 1}
+                    aria-label="Следующая страница"
+                  >
+                    ›
+                  </button>
                 </div>
               )}
-
-              {/* === PRODUCT RISKS (только при AI-ответе) === */}
-              {useAi && aiData!.productRisks.length > 0 && (
-                <div className="ai-section">
-                  <div className="ai-section-label">Риски по товарам</div>
-                  <ul className="ai-risks-list">
-                    {aiData!.productRisks.map((risk, i) => (
-                      <li className="ai-risk-item" key={i}>
-                        <span className="ai-risk-name">{risk.name}</span>
-                        {risk.sku && (
-                          <span className="ai-risk-sku">{risk.sku}</span>
-                        )}
-                        <span className="ai-risk-reason">{risk.reason}</span>
-                        <span className="ai-risk-action">{risk.action}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              {/* === BOTTOM: recs + summary + fallback notice === */}
-              <div className="ai-bottom">
-                <div className="ai-recs">
-                  {aiRecs.map((r, i) => (
-                    <span className="ai-rec-chip" key={i}>
-                      {r}
-                    </span>
-                  ))}
-                </div>
-                <p className="ai-summary">
-                  <span className="ai-summary-tag">
-                    {useAi && aiData!.source === "openai" ? "AI" : "~"}
-                  </span>
-                  <span>{aiSummary}</span>
-                </p>
-                {/* Fallback-предупреждение: показываем если source=fallback */}
-                {useAi && aiData!.source === "fallback" && (
-                  <p className="ai-fallback-notice">
-                    Показана базовая аналитика — AI временно недоступен
-                  </p>
-                )}
-                {/* missingData: чего не хватает для полного анализа */}
-                {useAi && aiData!.missingData.length > 0 && (
-                  <p className="ai-missing-data">
-                    <span className="ai-missing-label">Для полного анализа нужно: </span>
-                    {aiData!.missingData.join("; ")}
-                  </p>
-                )}
-              </div>
             </div>
 
             {/* RELEASE v1.0: AI_COMING_SOON-оверлей убран — это теперь отдельная
