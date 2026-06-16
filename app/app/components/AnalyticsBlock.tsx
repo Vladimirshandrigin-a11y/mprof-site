@@ -1305,27 +1305,29 @@ export function AnalyticsBlock({
   const curAiPage = Math.min(aiPage, Math.max(0, aiPagesTotal - 1));
 
   // Индексы страниц для AI-данных (dynamic — зависит от наличия опциональных секций)
+  // Порядок страниц = повествование: Обзор → Что снижает прибыль →
+  // Что сделать → На что обратить внимание → (Риски) → (Данные)
   const AI_PG = useAi
     ? (() => {
         let i = 0;
         const overview = i++;
-        const insights = i++;
         const leaks = aiData!.profitLeaks.length > 0 ? i++ : -1;
-        const risks = aiData!.productRisks.length > 0 ? i++ : -1;
         const actions = i++;
+        const insights = i++;
+        const risks = aiData!.productRisks.length > 0 ? i++ : -1;
         const missing = aiData!.missingData.length > 0 ? i++ : -1;
         return { overview, insights, leaks, risks, actions, missing };
       })()
     : { overview: 0, insights: 1, leaks: -1, risks: -1, actions: 3, missing: -1 };
 
-  // Метка текущей страницы для aria
+  // Метка текущей страницы для aria (тот же порядок, что AI_PG)
   const aiPageLabel = useAi
     ? ([
         "Обзор",
-        "Инсайты",
         ...(aiData?.profitLeaks.length ? ["Расходы"] : []),
-        ...(aiData?.productRisks.length ? ["Риски"] : []),
         "Действия",
+        "Инсайты",
+        ...(aiData?.productRisks.length ? ["Риски"] : []),
         ...(aiData?.missingData.length ? ["Данные"] : []),
       ][curAiPage] ?? "")
     : (["Обзор", "Инсайты", "Здоровье", "Действия"][curAiPage] ?? "");
@@ -1423,41 +1425,40 @@ export function AnalyticsBlock({
       <>
         {d.source === "fallback" && (
           <p className="ai-fallback-note">
-            AI-анализ временно недоступен. Показана базовая аналитика по данным отчёта.
+            AI-анализ временно недоступен. Базовая аналитика рассчитана по данным отчёта.
           </p>
         )}
-        {/* Компактный заголовок с подписями — без слипшихся показателей */}
-        <div className="ai-compact-top">
-          <div className="ai-compact-metric">
-            <span className="ai-compact-label">AI score</span>
-            <div className="ai-compact-score-row">
-              <span className={"ai-compact-score tier-" + aiTier.kind}>
-                <AnimatedScore value={aiScore} />
-              </span>
-              <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
-            </div>
-          </div>
-          <div className="ai-compact-metric ai-compact-metric-end">
-            <span className="ai-compact-label">Динамика</span>
-            <span className={"ai-trend dir-" + aiTrend.dir}>
-              {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
-              <span className="ai-trend-val">
-                {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
-              </span>
+        {/* Короткий статус одной строкой: «AI Score: 55 — Стабильный» */}
+        <div className="ai-status-line">
+          <span className="ai-status-key">AI Score:</span>
+          <span className={"ai-status-score tier-" + aiTier.kind}>
+            <AnimatedScore value={aiScore} />
+          </span>
+          <span className="ai-status-dash" aria-hidden="true">—</span>
+          <span className={"ai-status-tier tier-" + aiTier.kind}>{aiTier.label}</span>
+          <span className={"ai-trend dir-" + aiTrend.dir}>
+            {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
+            <span className="ai-trend-val">
+              {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
             </span>
-          </div>
+          </span>
         </div>
-        {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
-        {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
+        {(d.mainProblem || d.summary) && (
+          <div className="ai-pg-block">
+            <div className="ai-section-label">Главный вывод</div>
+            {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
+            {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
+          </div>
+        )}
       </>
     );
 
     if (page === AI_PG.insights) return (
       <>
-        <div className="ai-section-label">Инсайты</div>
+        <div className="ai-section-label">На что обратить внимание</div>
         {d.keyInsights.length > 0 ? (
           <ul className="ai-insights-list">
-            {d.keyInsights.map((ins, i) => {
+            {d.keyInsights.slice(0, 5).map((ins, i) => {
               const kind: InsightKind =
                 ins.severity === "high" ? "danger"
                 : ins.severity === "medium" ? "warning"
@@ -1485,9 +1486,9 @@ export function AnalyticsBlock({
 
     if (page === AI_PG.leaks && AI_PG.leaks >= 0) return (
       <>
-        <div className="ai-section-label">Потери прибыли</div>
+        <div className="ai-section-label">Что снижает прибыль</div>
         <div className="ai-leaks">
-          {d.profitLeaks.map((leak, i) => (
+          {d.profitLeaks.slice(0, 5).map((leak, i) => (
             <div className="ai-leak-row" key={i}>
               <span className="ai-leak-area">{leak.area}</span>
               <span className="ai-leak-comment">{leak.comment}</span>
@@ -1504,7 +1505,7 @@ export function AnalyticsBlock({
       <>
         <div className="ai-section-label">Риски по товарам</div>
         <ul className="ai-risks-list">
-          {d.productRisks.map((risk, i) => (
+          {d.productRisks.slice(0, 5).map((risk, i) => (
             <li className="ai-risk-item" key={i}>
               <span className="ai-risk-name">{risk.name}</span>
               {risk.sku && <span className="ai-risk-sku">{risk.sku}</span>}
@@ -1518,7 +1519,7 @@ export function AnalyticsBlock({
 
     if (page === AI_PG.actions) return (
       <>
-        <div className="ai-section-label">Рекомендованные действия</div>
+        <div className="ai-section-label">Что сделать в первую очередь</div>
         <div className="ai-quick" key={"q:" + aiScore}>
           {d.recommendedActions.slice(0, 4).map((a, i) => (
             <div className="ai-quick-card" key={i}>
@@ -1534,7 +1535,7 @@ export function AnalyticsBlock({
       <>
         <div className="ai-section-label">Для полного анализа нужно</div>
         <ul className="ai-missing-list">
-          {d.missingData.map((m, i) => (
+          {d.missingData.slice(0, 5).map((m, i) => (
             <li key={i} className="ai-missing-item">{m}</li>
           ))}
         </ul>
@@ -1818,6 +1819,38 @@ export function AnalyticsBlock({
           background:rgba(46,204,138,.10)
         }
 
+        /* ===== AI overview: статус-строка «AI Score: 55 — Стабильный» ===== */
+        .ai-status-line{
+          display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap;
+          padding:.1rem 0 .6rem;
+          border-bottom:1px solid rgba(255,255,255,.06);
+          margin-bottom:.6rem
+        }
+        .ai-status-key{
+          font-family:'DM Mono',monospace;font-size:.62rem;font-weight:700;
+          letter-spacing:.14em;text-transform:uppercase;color:#7A8FA8;
+          align-self:center
+        }
+        .ai-status-score{
+          font-family:'Playfair Display',Georgia,serif;
+          font-size:1.4rem;font-weight:700;letter-spacing:-.025em;line-height:1
+        }
+        .ai-status-score.tier-weak{color:#FF8A98}
+        .ai-status-score.tier-stable{color:#FFD37D}
+        .ai-status-score.tier-strong{color:#E8C97A}
+        .ai-status-score.tier-excellent{color:#7DEAB2}
+        .ai-status-dash{color:#5A6B82;font-size:.95rem;align-self:center}
+        .ai-status-tier{
+          font-family:'DM Mono',monospace;font-size:.74rem;font-weight:700;
+          letter-spacing:.04em;align-self:center
+        }
+        .ai-status-tier.tier-weak{color:#FF8A98}
+        .ai-status-tier.tier-stable{color:#FFD37D}
+        .ai-status-tier.tier-strong{color:#E8C97A}
+        .ai-status-tier.tier-excellent{color:#7DEAB2}
+        .ai-status-line .ai-trend{margin-left:auto;align-self:center}
+        .ai-pg-block{display:flex;flex-direction:column;gap:.05rem;min-width:0}
+
         /* insights list */
         .ai-insights-list{
           list-style:none;padding:0;margin:0;
@@ -1827,6 +1860,7 @@ export function AnalyticsBlock({
           display:flex;align-items:flex-start;gap:.7rem;
           padding:.7rem .85rem;border-radius:10px;
           font-size:.78rem;line-height:1.5;font-weight:400;color:#E8EEF8;
+          overflow-wrap:break-word;
           background:rgba(255,255,255,.025);
           border:1px solid rgba(255,255,255,.07);
           transition:all .22s ease;
@@ -2065,7 +2099,7 @@ export function AnalyticsBlock({
 
         /* Viewport — растягивается внутри ai-body, с ограничением сверху */
         .ai-page-viewport{
-          flex:1;overflow-y:auto;
+          flex:1;overflow-y:auto;overflow-x:hidden;
           min-height:180px;max-height:300px;
           /* плавный внутренний scroll на iOS */
           -webkit-overflow-scrolling:touch;
@@ -2079,6 +2113,7 @@ export function AnalyticsBlock({
         /* Страница — анимированный вход */
         .ai-page-inner{
           padding:.15rem 0 .4rem;
+          min-width:0;overflow-wrap:break-word;word-break:break-word;
           animation:aiPageIn .22s cubic-bezier(.22,1,.36,1) both
         }
         @keyframes aiPageIn{
@@ -2124,11 +2159,12 @@ export function AnalyticsBlock({
         /* Тексты страниц */
         .ai-pg-problem{
           font-size:.72rem;color:#E8EEF8;font-weight:500;
-          margin:.55rem 0 .3rem;line-height:1.5
+          margin:.55rem 0 .3rem;line-height:1.5;
+          overflow-wrap:break-word
         }
         .ai-pg-summary{
           font-size:.68rem;color:#8A9FBB;line-height:1.55;
-          margin:.2rem 0 0
+          margin:.2rem 0 0;overflow-wrap:break-word
         }
         .ai-pg-loading{
           display:flex;align-items:center;gap:.6rem;
@@ -2144,7 +2180,8 @@ export function AnalyticsBlock({
         }
         .ai-missing-item{
           font-size:.76rem;color:#7C8DB5;padding:.25rem .5rem .25rem .8rem;
-          border-left:2px solid rgba(201,168,76,.3);line-height:1.4
+          border-left:2px solid rgba(201,168,76,.3);line-height:1.4;
+          overflow-wrap:break-word
         }
 
         /* === PROFIT LEAKS === */
@@ -2154,7 +2191,7 @@ export function AnalyticsBlock({
           border:1px solid rgba(255,255,255,.06)}
         .ai-leak-area{font-family:'DM Mono',monospace;font-size:.62rem;font-weight:600;
           letter-spacing:.06em;color:#C9A84C;min-width:90px;flex-shrink:0}
-        .ai-leak-comment{flex:1;color:#8A9FBB;font-size:.73rem}
+        .ai-leak-comment{flex:1;min-width:0;color:#8A9FBB;font-size:.73rem;overflow-wrap:break-word}
         .ai-leak-amount{font-family:'DM Mono',monospace;font-size:.68rem;
           color:#E05566;font-weight:600;white-space:nowrap;flex-shrink:0}
 
@@ -2169,9 +2206,10 @@ export function AnalyticsBlock({
           overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .ai-risk-sku{grid-area:sku;font-family:'DM Mono',monospace;font-size:.58rem;
           color:#7C8DB5;letter-spacing:.05em;white-space:nowrap}
-        .ai-risk-reason{grid-area:reason;font-size:.71rem;color:#E05566}
+        .ai-risk-reason{grid-area:reason;font-size:.71rem;color:#E05566;
+          min-width:0;overflow-wrap:break-word}
         .ai-risk-action{grid-area:action;font-size:.68rem;color:#8A9FBB;
-          text-align:right;font-style:italic}
+          text-align:right;font-style:italic;min-width:0;overflow-wrap:break-word}
 
         /* === FALLBACK NOTE (дружелюбное сообщение, без техданных) === */
         .ai-fallback-note{
