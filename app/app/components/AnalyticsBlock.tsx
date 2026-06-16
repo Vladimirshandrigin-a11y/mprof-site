@@ -1282,13 +1282,13 @@ export function AnalyticsBlock({
   const rbLeaks: string[] = (() => {
     const out: string[] = [];
     const ind = aiIndicators;
-    if (ind.ads > 0.20) out.push("Реклама забирает заметную долю выручки");
-    if (ind.logistics > 0.12) out.push("Логистика выше комфортной нормы");
+    if (ind.ads > 0.20) out.push("Реклама забирает большую долю выручки");
+    if (ind.logistics > 0.12) out.push("Логистика выше нормы");
     if (ind.commission > 0.20) out.push("Высокая комиссия маркетплейса");
     if (ind.margin > 0 && ind.margin < 12) out.push("Низкая маржа по товарам");
     if (history.some((h) => h.profit < 0)) out.push("Есть убыточные расчёты");
     if (out.length === 0) out.push("Явных утечек прибыли не видно");
-    return out.slice(0, 4);
+    return out.slice(0, 3);
   })();
 
   // rule-based «что проверить дополнительно»
@@ -1296,46 +1296,71 @@ export function AnalyticsBlock({
     "Себестоимость и закупочные цены",
     "Расходы на рекламу и ДРР",
     "Логистику и хранение",
-    "Возвраты и невыкупы",
   ];
 
-  // 1) Главный вывод — одна короткая мысль
+  // rule-based «риски / внимание»
+  const rbRisks: string[] = (() => {
+    const out: string[] = [];
+    const ind = aiIndicators;
+    if (history.some((h) => h.profit < 0)) out.push("Часть товаров уходит в минус");
+    if (ind.margin > 0 && ind.margin < 12) out.push("Тонкая маржа — риск убытка");
+    if (ind.ads > 0.20) out.push("Высокая зависимость от рекламы");
+    if (out.length === 0) out.push("Критичных рисков не видно");
+    return out.slice(0, 3);
+  })();
+
+  // 1) Главный вывод — одна короткая мысль (карточка на всю ширину)
   const aiVerdict = clip(
     useAi ? aiData!.mainProblem || aiData!.summary || rbSummary : rbSummary,
-    220
+    180
   );
 
-  // 2) Что снижает прибыль — до 4 строк
+  // 2) Что снижает прибыль — максимум 3 коротких пункта
   const aiLeaks: string[] = (
     useAi && aiData!.profitLeaks.length
-      ? aiData!.profitLeaks.slice(0, 4).map((l) =>
+      ? aiData!.profitLeaks.slice(0, 3).map((l) =>
           clip(
             l.amount != null
               ? `${l.area}: ${l.comment} (${fmt(l.amount)} ₽)`
               : `${l.area}: ${l.comment}`,
-            120
+            90
           )
         )
       : rbLeaks
-  ).filter(Boolean);
+  )
+    .filter(Boolean)
+    .slice(0, 3);
 
-  // 3) Что сделать в первую очередь — до 4 строк
+  // 3) Что сделать в первую очередь — максимум 3 коротких пункта
   const aiActions: string[] = (
     useAi && aiData!.recommendedActions.length
-      ? aiData!.recommendedActions.slice(0, 4).map((a) =>
-          clip(a.expectedEffect ? `${a.action} — ${a.expectedEffect}` : a.action, 120)
+      ? aiData!.recommendedActions.slice(0, 3).map((a) =>
+          clip(a.expectedEffect ? `${a.action} — ${a.expectedEffect}` : a.action, 90)
         )
-      : aiQuick.map((q) => clip(q.impact ? `${q.action} — ${q.impact}` : q.action, 120))
-  ).filter(Boolean);
+      : aiQuick.map((q) => clip(q.impact ? `${q.action} — ${q.impact}` : q.action, 90))
+  )
+    .filter(Boolean)
+    .slice(0, 3);
 
-  // 4) Что проверить дополнительно — до 4 строк
+  // 4) Что проверить дополнительно — максимум 3 коротких пункта
   const aiChecks: string[] = (
     useAi && aiData!.missingData.length
-      ? aiData!.missingData.slice(0, 4).map((m) => clip(m, 120))
-      : useAi && aiData!.productRisks.length
-      ? aiData!.productRisks.slice(0, 4).map((r) => clip(`${r.name}: ${r.action}`, 120))
+      ? aiData!.missingData.slice(0, 3).map((m) => clip(m, 90))
       : rbChecks
-  ).filter(Boolean);
+  )
+    .filter(Boolean)
+    .slice(0, 3);
+
+  // 5) Риски / внимание — максимум 3 коротких пункта
+  const aiRisks: string[] = (
+    useAi && aiData!.productRisks.length
+      ? aiData!.productRisks.slice(0, 3).map((r) =>
+          clip(r.reason ? `${r.name}: ${r.reason}` : `${r.name}: ${r.action}`, 90)
+        )
+      : rbRisks
+  )
+    .filter(Boolean)
+    .slice(0, 3);
 
   // Рендер одной секции-списка (с аккуратным пустым состоянием)
   const renderAiList = (items: string[], empty: string): ReactNode =>
@@ -1899,50 +1924,62 @@ export function AnalyticsBlock({
 
         /* === AI MVP: простой вертикальный вид (без карусели) === */
         /* ai-body — контейнер секций внутри карточки */
-        .ai-body{padding:.35rem .85rem .7rem;display:flex;flex-direction:column;flex:1;min-width:0}
+        .ai-body{padding:.5rem .95rem .95rem;display:flex;flex-direction:column;flex:1;min-width:0}
 
+        /* секции растягиваются по контенту — без внутреннего скролла */
         .ai-sections{
-          display:flex;flex-direction:column;gap:.5rem;
-          max-height:520px;overflow-y:auto;overflow-x:hidden;
-          padding-right:.15rem;
-          -webkit-overflow-scrolling:touch;
-          scrollbar-width:thin;
-          scrollbar-color:rgba(201,168,76,.25) transparent
+          display:flex;flex-direction:column;gap:.65rem;
+          min-width:0;overflow-x:hidden
         }
-        .ai-sections::-webkit-scrollbar{width:3px}
-        .ai-sections::-webkit-scrollbar-track{background:transparent}
-        .ai-sections::-webkit-scrollbar-thumb{background:rgba(201,168,76,.25);border-radius:3px}
 
-        /* секция-плашка */
+        /* сетка вторичных секций: 2 колонки (desktop) / 1 (mobile) */
+        .ai-grid{
+          display:grid;grid-template-columns:repeat(2,minmax(0,1fr));
+          gap:.65rem;min-width:0;align-items:stretch
+        }
+
+        /* секция-плашка — просторная, тянется по высоте под текст */
         .ai-sec{
           background:rgba(255,255,255,.025);
           border:1px solid rgba(255,255,255,.07);
-          border-radius:11px;padding:.62rem .75rem;
-          min-width:0;overflow-wrap:break-word;word-break:break-word
+          border-radius:14px;padding:.95rem 1.05rem;
+          min-width:0;height:100%;
+          display:flex;flex-direction:column;
+          overflow-wrap:break-word;word-break:break-word
+        }
+        /* «Главный вывод» — на всю ширину и чуть заметнее */
+        .ai-sec-lead{
+          background:rgba(201,168,76,.05);
+          border-color:rgba(201,168,76,.18);
+          padding:1.05rem 1.15rem
         }
         .ai-sec-title{
-          margin:0 0 .32rem;
-          font-family:'DM Mono',monospace;font-size:.6rem;font-weight:700;
+          margin:0 0 .5rem;
+          font-family:'DM Mono',monospace;font-size:.62rem;font-weight:700;
           letter-spacing:.14em;text-transform:uppercase;color:#E8C97A
         }
         .ai-sec-text{
-          margin:0;font-size:.78rem;line-height:1.5;color:#D7E0EE;font-weight:400;
+          margin:0;font-size:.84rem;line-height:1.6;color:#D7E0EE;font-weight:400;
           white-space:pre-line;overflow-wrap:break-word;word-break:break-word
         }
+        .ai-sec-lead .ai-sec-text{font-size:.9rem;line-height:1.62;color:#E6EDF7}
         .ai-sec-muted{color:#8A9FBB}
         .ai-sec-list{
           list-style:none;margin:0;padding:0;
-          display:flex;flex-direction:column;gap:.32rem
+          display:flex;flex-direction:column;gap:.46rem
         }
         .ai-sec-list li{
-          position:relative;padding-left:.95rem;
-          font-size:.76rem;line-height:1.45;color:#D7E0EE;
+          position:relative;padding-left:1rem;
+          font-size:.82rem;line-height:1.55;color:#D7E0EE;
           overflow-wrap:break-word;word-break:break-word
         }
         .ai-sec-list li::before{
-          content:"";position:absolute;left:.12rem;top:.55em;
+          content:"";position:absolute;left:.12rem;top:.62em;
           width:5px;height:5px;border-radius:50%;
           background:#C9A84C;box-shadow:0 0 6px rgba(201,168,76,.5)
+        }
+        @media (max-width:640px){
+          .ai-grid{grid-template-columns:1fr}
         }
 
         /* loader на время ожидания ответа AI */
@@ -2420,27 +2457,36 @@ export function AnalyticsBlock({
                     </p>
                   )}
 
-                  <section className="ai-sec">
+                  {/* Главный вывод — отдельная карточка на всю ширину блока */}
+                  <section className="ai-sec ai-sec-lead">
                     <h4 className="ai-sec-title">Главный вывод</h4>
                     <p className="ai-sec-text">
                       {aiVerdict || "Недостаточно данных для вывода."}
                     </p>
                   </section>
 
-                  <section className="ai-sec">
-                    <h4 className="ai-sec-title">Что снижает прибыль</h4>
-                    {renderAiList(aiLeaks, "Существенных утечек не обнаружено.")}
-                  </section>
+                  {/* Остальные секции — сетка: 2 колонки (desktop) / 1 (mobile) */}
+                  <div className="ai-grid">
+                    <section className="ai-sec">
+                      <h4 className="ai-sec-title">Что снижает прибыль</h4>
+                      {renderAiList(aiLeaks, "Существенных утечек не обнаружено.")}
+                    </section>
 
-                  <section className="ai-sec">
-                    <h4 className="ai-sec-title">Что сделать в первую очередь</h4>
-                    {renderAiList(aiActions, "Показатели в норме — резких действий не требуется.")}
-                  </section>
+                    <section className="ai-sec">
+                      <h4 className="ai-sec-title">Что сделать в первую очередь</h4>
+                      {renderAiList(aiActions, "Показатели в норме — резких действий не требуется.")}
+                    </section>
 
-                  <section className="ai-sec">
-                    <h4 className="ai-sec-title">Что проверить дополнительно</h4>
-                    {renderAiList(aiChecks, "Дополнительных проверок не требуется.")}
-                  </section>
+                    <section className="ai-sec">
+                      <h4 className="ai-sec-title">Что проверить дополнительно</h4>
+                      {renderAiList(aiChecks, "Дополнительных проверок не требуется.")}
+                    </section>
+
+                    <section className="ai-sec">
+                      <h4 className="ai-sec-title">Риски / внимание</h4>
+                      {renderAiList(aiRisks, "Критичных рисков не обнаружено.")}
+                    </section>
+                  </div>
                 </div>
               )}
             </div>
