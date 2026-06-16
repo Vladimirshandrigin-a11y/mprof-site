@@ -722,6 +722,7 @@ type RecommendedAction = {
 
 type AiAnalysis = {
   source: "openai" | "fallback";
+  fallbackReason?: string;
   summary: string;
   healthScore: number;
   mainProblem: string;
@@ -1480,7 +1481,14 @@ export function AnalyticsBlock({
         {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
         {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
         {d.source === "fallback" && (
-          <p className="ai-fallback-notice">Показана базовая аналитика — AI временно недоступен</p>
+          <p className="ai-fallback-notice">
+            Базовая аналитика
+            {d.fallbackReason === "missing_api_key" && " — ключ OpenAI не настроен"}
+            {d.fallbackReason === "timeout" && " — OpenAI не ответил за 25с"}
+            {d.fallbackReason === "openai_error" && " — ошибка OpenAI API"}
+            {d.fallbackReason === "invalid_json" && " — некорректный ответ OpenAI"}
+            {(!d.fallbackReason || d.fallbackReason === "unknown") && " — AI временно недоступен"}
+          </p>
         )}
       </>
     );
@@ -1632,7 +1640,7 @@ export function AnalyticsBlock({
             "recent ai"
         }
         .an-area-donut{grid-area:donut}
-        .an-area-ai{grid-area:ai}
+        .an-area-ai{grid-area:ai;align-self:start}
         .an-area-recent{grid-area:recent;margin-top:0 !important}
 
         @media(max-width:900px){
@@ -2116,10 +2124,10 @@ export function AnalyticsBlock({
         /* ai-body теперь — контейнер карусели, фиксированной высоты */
         .ai-body{padding:.35rem .85rem .55rem;display:flex;flex-direction:column;gap:0}
 
-        /* Область контента страницы — фиксированная высота, внутренний scroll */
+        /* Область контента страницы — высота по содержимому, без растяжки */
         .ai-page-viewport{
-          flex:1;overflow-y:auto;
-          min-height:230px;max-height:270px;
+          overflow-y:auto;
+          max-height:320px;
           /* плавный внутренний scroll на iOS */
           -webkit-overflow-scrolling:touch;
           scrollbar-width:thin;

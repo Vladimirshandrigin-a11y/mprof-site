@@ -84,8 +84,16 @@ type RecommendedAction = {
   expectedEffect: string;
 };
 
+export type FallbackReason =
+  | "missing_api_key"
+  | "openai_error"
+  | "invalid_json"
+  | "timeout"
+  | "unknown";
+
 export type AiResult = {
   source: "openai" | "fallback";
+  fallbackReason?: FallbackReason;
   summary: string;
   healthScore: number;
   mainProblem: string;
@@ -178,7 +186,7 @@ async function checkUnlimitedPlan(
 
 // ---------- rule-based fallback ----------
 
-function buildFallback(d: SanitizedData): AiResult {
+function buildFallback(d: SanitizedData, reason: FallbackReason = "unknown"): AiResult {
   const r = d.revenue;
   const pct = (v: number) =>
     r > 0 ? Math.round((v / r) * 1000) / 10 : 0; // 1 знак после точки
@@ -229,52 +237,102 @@ function buildFallback(d: SanitizedData): AiResult {
       ? `Маржа ${margin.toFixed(1)}%, чистая прибыль ${fmtRub(d.profit)} при выручке ${fmtRub(r)}. ${mainProblem}.`
       : "Недостаточно данных для формирования вывода.";
 
-  // keyInsights
+  // keyInsights — минимум 3, всегда с конкретными цифрами
   const keyInsights: KeyInsight[] = [];
+
+  // 1. Маржа (всегда)
   if (margin <= 0) {
     keyInsights.push({
-      title: "Убыток",
-      description: `Чистая прибыль отрицательная: ${fmtRub(d.profit)}. Расходы превышают выручку.`,
+      title: "Убыток по расчёту",
+      description: `Чистая прибыль: ${fmtRub(d.profit)}. Суммарные расходы превышают выручку — продажи убыточны.`,
       severity: "high",
     });
   } else if (margin <= 8) {
     keyInsights.push({
       title: "Критически низкая маржа",
-      description: `Маржа ${margin.toFixed(1)}% — минимальный запас прочности. Любое повышение расходов даст убыток.`,
+      description: `Маржа ${margin.toFixed(1)}% — минимальный запас прочности. Рост комиссии или логистики на 2–3% даст убыток.`,
       severity: "high",
     });
-  } else if (margin > 20) {
+  } else if (margin <= 15) {
+    keyInsights.push({
+      title: "Маржа ниже среднего",
+      description: `Маржа ${margin.toFixed(1)}% — ниже комфортного уровня (15–25%) для маркетплейсов. Чистая прибыль ${fmtRub(d.profit)}.`,
+      severity: "medium",
+    });
+  } else {
     keyInsights.push({
       title: "Хорошая маржа",
-      description: `Маржа ${margin.toFixed(1)}% выше среднего по маркетплейсам.`,
+      description: `Маржа ${margin.toFixed(1)}% — выше среднего по маркетплейсам. Чистая прибыль ${fmtRub(d.profit)} при выручке ${fmtRub(r)}.`,
       severity: "low",
     });
   }
+
+  // 2. Реклама
   if (adsPct > 15) {
     keyInsights.push({
       title: "Высокие расходы на рекламу",
-      description: `Реклама занимает ${adsPct}% выручки. Норма для маркетплейсов — до 10–15%.`,
+      description: `Реклама ${fmtRub(d.ads)} — это ${adsPct}% выручки. Норма для маркетплейсов — до 10–15%. Превышение на ${(adsPct - 12).toFixed(1)}%.`,
       severity: adsPct > 20 ? "high" : "medium",
     });
+  } else if (d.ads > 0) {
+    keyInsights.push({
+      title: "Реклама в норме",
+      description: `Расходы на рекламу ${fmtRub(d.ads)} (${adsPct}%) — в пределах нормы для маркетплейсов.`,
+      severity: "low",
+    });
   }
+
+  // 3. Комиссия
   if (commPct > 22) {
     keyInsights.push({
       title: "Высокая комиссия маркетплейса",
-      description: `Комиссия ${commPct}% от выручки. Проверьте правильность категории товара.`,
+      description: `Комиссия ${fmtRub(d.commission)} (${commPct}% выручки). Проверьте, правильно ли выбрана категория товара.`,
       severity: "medium",
     });
+  } else if (d.commission > 0 && keyInsights.length < 3) {
+    keyInsights.push({
+      title: "Комиссия маркетплейса",
+      description: `Комиссия составила ${fmtRub(d.commission)} — ${commPct}% от выручки. Это основная статья расходов.`,
+      severity: commPct > 18 ? "medium" : "low",
+    });
   }
+
+  // 4. Логистика
   if (logPct > 18) {
     keyInsights.push({
       title: "Высокая логистика",
-      description: `Логистика ${logPct}% — возможен высокий процент возвратов или крупногабаритный товар.`,
+      description: `Логистика ${fmtRub(d.logistics)} (${logPct}%) — выше нормы. Возможен высокий % возвратов или крупногабаритный товар.`,
       severity: "medium",
     });
+  } else if (d.logistics > 0 && keyInsights.length < 3) {
+    keyInsights.push({
+      title: "Логистика",
+      description: `Расходы на логистику: ${fmtRub(d.logistics)} (${logPct}% выручки).`,
+      severity: logPct > 12 ? "medium" : "low",
+    });
   }
+
+  // 5. УПД-услуги Ozon
   if (d.updServicesTotal > 0 && d.updServicesTotal > d.commission * 0.3) {
     keyInsights.push({
       title: "Значительные услуги по УПД",
-      description: `Услуги Ozon по УПД составили ${fmtRub(d.updServicesTotal)} — проверьте состав.`,
+      description: `Услуги Ozon по УПД: ${fmtRub(d.updServicesTotal)} — проверьте состав и корректность списаний.`,
+      severity: "medium",
+    });
+  }
+
+  // Гарантируем минимум 3 инсайта: добавляем универсальный, если мало
+  if (keyInsights.length < 3 && r > 0) {
+    keyInsights.push({
+      title: "Структура расходов",
+      description: `Из ${fmtRub(r)} выручки: комиссия ${fmtRub(d.commission)}, логистика ${fmtRub(d.logistics)}, реклама ${fmtRub(d.ads)}.`,
+      severity: "low",
+    });
+  }
+  if (keyInsights.length < 3 && d.productsWithoutCost > 0) {
+    keyInsights.push({
+      title: "Неполные данные о себестоимости",
+      description: `${d.productsWithoutCost} товаров без себестоимости — реальная прибыль может быть ниже расчётной.`,
       severity: "medium",
     });
   }
@@ -312,43 +370,113 @@ function buildFallback(d: SanitizedData): AiResult {
     });
   }
 
-  // recommendedActions
+  // recommendedActions — всегда 3-5 конкретных пунктов
   const recommendedActions: RecommendedAction[] = [];
   let p = 1;
+
+  // Реклама
   if (adsPct > 15) {
     recommendedActions.push({
       priority: p++,
-      action: "Оптимизировать рекламные кампании",
-      why: `Реклама занимает ${adsPct}% выручки при норме 10–15%`,
-      expectedEffect:
-        "Снижение рекламных расходов без потери позиций при правильной оптимизации ставок",
+      action: "Снизить расходы на рекламу",
+      why: `Реклама ${fmtRub(d.ads)} — это ${adsPct}% выручки при норме 10–15%`,
+      expectedEffect: `Экономия до ${fmtRub(d.ads * 0.2)} в месяц при сокращении ставок на неэффективных кампаниях`,
+    });
+  } else if (d.ads > 0 && adsPct < 5) {
+    recommendedActions.push({
+      priority: p++,
+      action: "Рассмотреть увеличение рекламного бюджета",
+      why: `Реклама ${adsPct}% — возможно, низкая видимость товаров на площадке`,
+      expectedEffect: "Рост выручки может перекрыть рекламные расходы при правильном таргетинге",
     });
   }
-  if (margin < 10 && margin > 0) {
+
+  // Маржа / цена
+  if (margin <= 0) {
+    recommendedActions.push({
+      priority: p++,
+      action: "Срочно пересмотреть ценообразование",
+      why: `Расчёт убыточен: ${fmtRub(d.profit)}. Каждая продажа приносит убыток`,
+      expectedEffect: "Выход в безубыток при повышении цены или снижении себестоимости",
+    });
+  } else if (margin < 10) {
     recommendedActions.push({
       priority: p++,
       action: "Пересмотреть цену или пересчитать себестоимость",
-      why: `Маржа ${margin.toFixed(1)}% — критически низкий запас`,
-      expectedEffect:
-        "Повышение устойчивости к изменениям комиссий и логистики",
+      why: `Маржа ${margin.toFixed(1)}% — критически низкий запас. Любой рост расходов даст убыток`,
+      expectedEffect: "Повышение маржи до 15% увеличит прибыль с ${fmtRub(d.profit)} примерно на ${fmtRub(r * 0.05)}",
     });
   }
+
+  // Комиссия
   if (commPct > 22) {
     recommendedActions.push({
       priority: p++,
       action: "Проверить категорию размещения товара",
-      why: `Комиссия ${commPct}% выглядит высокой для данной категории`,
-      expectedEffect:
-        "Возможное снижение комиссии при переводе в более выгодную категорию",
+      why: `Комиссия ${fmtRub(d.commission)} (${commPct}%) — выглядит высокой для данной категории`,
+      expectedEffect: "Снижение комиссии на 5% сэкономит " + fmtRub(r * 0.05) + " при той же выручке",
     });
   }
+
+  // Себестоимость
   if (d.productsWithoutCost > 0) {
     recommendedActions.push({
       priority: p++,
       action: "Заполнить себестоимость для всех товаров",
-      why: `${d.productsWithoutCost} товаров считаются без учёта себестоимости`,
-      expectedEffect: "Точный расчёт чистой прибыли по каждой позиции",
+      why: `${d.productsWithoutCost} товаров считаются без себестоимости — прибыль завышена`,
+      expectedEffect: "Точный расчёт чистой прибыли по каждой позиции после заполнения справочника",
     });
+  }
+
+  // Логистика
+  if (logPct > 18) {
+    recommendedActions.push({
+      priority: p++,
+      action: "Проверить причины высокой логистики",
+      why: `Логистика ${fmtRub(d.logistics)} (${logPct}%) — выше нормы. Возможны возвраты или нерациональная упаковка`,
+      expectedEffect: "Сокращение логистики на 3-5% даст экономию " + fmtRub(d.logistics * 0.04),
+    });
+  }
+
+  // Убыточные товары
+  const lossProducts = (d.products ?? []).filter(
+    (pr) => isFinNum(pr.profit) && (pr.profit as number) < 0
+  );
+  if (lossProducts.length > 0) {
+    recommendedActions.push({
+      priority: p++,
+      action: `Разобраться с убыточными товарами (${lossProducts.length} шт.)`,
+      why: `${lossProducts.length} товаров приносят убыток — они тянут общую прибыль вниз`,
+      expectedEffect: "Снятие убыточных позиций или пересмотр цен улучшит общий результат",
+    });
+  }
+
+  // Гарантируем минимум 3 рекомендации — добавляем универсальные
+  if (recommendedActions.length < 3) {
+    if (!d.cost) {
+      recommendedActions.push({
+        priority: p++,
+        action: "Внести себестоимость товаров в систему",
+        why: "Без себестоимости расчёт показывает валовую прибыль, а не чистую",
+        expectedEffect: "Полная картина рентабельности каждой позиции",
+      });
+    }
+    if (recommendedActions.length < 3) {
+      recommendedActions.push({
+        priority: p++,
+        action: "Провести ABC-анализ товарного портфеля",
+        why: "Выявить 20% товаров, которые дают 80% прибыли",
+        expectedEffect: "Концентрация бюджета на прибыльных позициях повышает общую маржу",
+      });
+    }
+    if (recommendedActions.length < 3 && r > 0) {
+      recommendedActions.push({
+        priority: p++,
+        action: "Сравнить показатели с прошлым периодом",
+        why: "Динамика маржи и выручки покажет тренд — рост или падение",
+        expectedEffect: "Своевременное выявление ухудшения позволит принять меры раньше",
+      });
+    }
   }
 
   // missingData
@@ -360,14 +488,15 @@ function buildFallback(d: SanitizedData): AiResult {
     missingData.push("Детализация по товарам (для выявления убыточных позиций)");
 
   return {
-    source: "fallback",
+    source: "fallback" as const,
+    fallbackReason: reason,
     summary,
     healthScore,
     mainProblem,
-    keyInsights: keyInsights.slice(0, 4),
+    keyInsights: keyInsights.slice(0, 5),
     profitLeaks,
     productRisks,
-    recommendedActions: recommendedActions.slice(0, 4),
+    recommendedActions: recommendedActions.slice(0, 5),
     missingData,
   };
 }
@@ -600,8 +729,8 @@ export async function POST(req: NextRequest) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) {
     // eslint-disable-next-line no-console
-    console.warn("[ai/analyze] OPENAI_API_KEY не задан — возвращаем fallback");
-    return NextResponse.json({ ok: true, ...buildFallback(data) });
+    console.warn("[ai/analyze] OPENAI_API_KEY не задан — возвращаем fallback (missing_api_key)");
+    return NextResponse.json({ ok: true, ...buildFallback(data, "missing_api_key") });
   }
 
   // ── 5. Вызываем OpenAI ───────────────────────────────────────────────────
@@ -631,10 +760,14 @@ export async function POST(req: NextRequest) {
       signal: controller.signal,
     });
   } catch (e) {
+    const isTimeout = e instanceof Error && e.name === "AbortError";
     const msg = e instanceof Error ? e.message : "сеть недоступна";
     // eslint-disable-next-line no-console
     console.error("[ai/analyze] OpenAI недоступен:", msg);
-    return NextResponse.json({ ok: true, ...buildFallback(data) });
+    return NextResponse.json({
+      ok: true,
+      ...buildFallback(data, isTimeout ? "timeout" : "openai_error"),
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -645,7 +778,7 @@ export async function POST(req: NextRequest) {
   if (!upstream.ok) {
     // eslint-disable-next-line no-console
     console.error("[ai/analyze] upstream error", upstream.status, rawText.slice(0, 300));
-    return NextResponse.json({ ok: true, ...buildFallback(data) });
+    return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error") });
   }
 
   let parsed: unknown = null;
@@ -663,7 +796,7 @@ export async function POST(req: NextRequest) {
   if (!result) {
     // eslint-disable-next-line no-console
     console.error("[ai/analyze] LLM вернул некорректный формат");
-    return NextResponse.json({ ok: true, ...buildFallback(data) });
+    return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json") });
   }
 
   return NextResponse.json({ ok: true, ...result });
