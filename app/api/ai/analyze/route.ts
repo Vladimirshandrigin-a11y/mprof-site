@@ -23,6 +23,13 @@ export const dynamic = "force-dynamic";
 // OpenAI-совместимый endpoint Timeweb AI Gateway.
 const GATEWAY_URL = "https://api.timeweb.ai/v1/chat/completions";
 const MODEL = process.env.TIMEWEB_AI_MODEL?.trim() || "openai/gpt-5-mini";
+// gpt-5-* — reasoning-модели: бюджет токенов уходит и на рассуждение, и на вывод.
+// При маленьком лимите модель «думает», упирается в потолок и возвращает пустой
+// content → невалидный JSON → fallback. Поэтому даём запас; настраивается env.
+const MAX_TOKENS = (() => {
+  const n = Number(process.env.TIMEWEB_AI_MAX_TOKENS);
+  return Number.isFinite(n) && n >= 500 ? Math.floor(n) : 4000;
+})();
 
 // ---------- входные типы ----------
 
@@ -847,7 +854,8 @@ export async function POST(req: NextRequest) {
 
   let upstream: Response;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+  // reasoning-моделям нужно время на «рассуждение» — даём запас по таймауту.
+  const timeout = setTimeout(() => controller.abort(), 45000);
   try {
     upstream = await fetch(GATEWAY_URL, {
       method: "POST",
@@ -859,7 +867,7 @@ export async function POST(req: NextRequest) {
         model: MODEL,
         // gpt-5-* — reasoning-модели: temperature только дефолтная (не задаём),
         // лимит вывода — через max_completion_tokens (max_tokens они отвергают).
-        max_completion_tokens: 2000,
+        max_completion_tokens: MAX_TOKENS,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },
@@ -913,13 +921,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error", errDebug) });
   }
 
-  // Достаём текст ответа модели из OpenAI-совместимого конверта.
+  // Достаём текст ответа и служебные поля из OpenAI-совместимого конверта.
   let content = "";
+  let finishReason: string | null = null;
+  let usage: unknown = null;
   try {
     const envelope = JSON.parse(rawText) as {
-      choices?: { message?: { content?: string } }[];
+      choices?: { message?: { content?: string }; finish_reason?: string }[];
+      usage?: unknown;
     };
     content = (envelope?.choices?.[0]?.message?.content ?? "").trim();
+    finishReason = envelope?.choices?.[0]?.finish_reason ?? null;
+    usage = envelope?.usage ?? null;
   } catch {
     content = "";
   }
@@ -946,8 +959,21 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, ...buildFromText(data, freeText) });
   }
 
-  // 3) Пусто/мусор — аккуратный fallback (технические данные только в логах).
+  // 3) Пусто/мусор — аккуратный fallback. Подробная диагностика — ТОЛЬКО в логах
+  //    сервера (никаких секретов: ключ не логируем). finish_reason="length"
+  //    означает, что лимит токенов мал — модель не успела отдать ответ.
   // eslint-disable-next-line no-console
-  console.error("[ai/analyze] LLM вернул некорректный формат");
+  console.error("[ai/analyze] невалидный ответ модели", {
+    model: MODEL,
+    maxTokens: MAX_TOKENS,
+    finishReason,
+    contentLength: content.length,
+    usage,
+    rawSnippet: rawText.slice(0, 500),
+    hint:
+      finishReason === "length"
+        ? "Увеличьте TIMEWEB_AI_MAX_TOKENS — лимит токенов исчерпан на reasoning."
+        : "Модель вернула пустой/нечитаемый content.",
+  });
   return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json", debugInfo) });
 }
