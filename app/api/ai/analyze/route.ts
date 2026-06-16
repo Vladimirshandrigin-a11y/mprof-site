@@ -644,6 +644,41 @@ function normalizeAiResult(raw: unknown): AiResult | null {
   };
 }
 
+// ---------- свободный текст как запасной формат ----------
+
+/** Снимаем markdown-обёртку ```json … ``` / ``` … ```, если она есть. */
+function stripCodeFences(s: string): string {
+  const m = s.trim().match(/^```[a-zA-Z]*\s*([\s\S]*?)\s*```$/);
+  return (m ? m[1] : s).trim();
+}
+
+/**
+ * Если модель ответила не JSON-ом, а осмысленным текстом — возвращаем
+ * почищенный текст; для мусора/слишком короткого ответа возвращаем "".
+ */
+function sanitizeFreeText(s: string): string {
+  const t = stripCodeFences(s).replace(/\s+/g, " ").trim().slice(0, 1200);
+  const letters = (t.match(/[A-Za-zА-Яа-яЁё]/g) || []).length;
+  return letters >= 20 ? t : "";
+}
+
+/**
+ * Показываем свободный текст модели как AI-аналитику (source: "openai"):
+ * числовую структуру берём из локального расчёта, а сам текст — в summary.
+ * Технические поля (debug/fallbackReason) клиенту НЕ уходят.
+ */
+function buildFromText(d: SanitizedData, text: string): AiResult {
+  const base = buildFallback(d);
+  return {
+    ...base,
+    source: "openai",
+    fallbackReason: undefined,
+    debug: undefined,
+    mainProblem: "",
+    summary: text,
+  };
+}
+
 // ---------- строим промпт ----------
 
 function buildPrompt(d: SanitizedData): { system: string; user: string } {
@@ -878,23 +913,41 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error", errDebug) });
   }
 
-  let parsed: unknown = null;
+  // Достаём текст ответа модели из OpenAI-совместимого конверта.
+  let content = "";
   try {
     const envelope = JSON.parse(rawText) as {
       choices?: { message?: { content?: string } }[];
     };
-    const content = envelope?.choices?.[0]?.message?.content ?? "";
-    parsed = content ? JSON.parse(content) : null;
+    content = (envelope?.choices?.[0]?.message?.content ?? "").trim();
   } catch {
-    parsed = null;
+    content = "";
   }
 
+  // 1) Строгий JSON (в т.ч. в markdown-обёртке) → структурированная аналитика.
+  let parsed: unknown = null;
+  if (content) {
+    try {
+      parsed = JSON.parse(stripCodeFences(content));
+    } catch {
+      parsed = null;
+    }
+  }
   const result = normalizeAiResult(parsed);
-  if (!result) {
-    // eslint-disable-next-line no-console
-    console.error("[ai/analyze] LLM вернул некорректный формат");
-    return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json", debugInfo) });
+  if (result) {
+    return NextResponse.json({ ok: true, ...result });
   }
 
-  return NextResponse.json({ ok: true, ...result });
+  // 2) Не JSON, но осмысленный текст — это НЕ ошибка: показываем как AI-аналитику.
+  const freeText = sanitizeFreeText(content);
+  if (freeText) {
+    // eslint-disable-next-line no-console
+    console.warn("[ai/analyze] модель вернула текст вместо JSON — показываем как AI-аналитику");
+    return NextResponse.json({ ok: true, ...buildFromText(data, freeText) });
+  }
+
+  // 3) Пусто/мусор — аккуратный fallback (технические данные только в логах).
+  // eslint-disable-next-line no-console
+  console.error("[ai/analyze] LLM вернул некорректный формат");
+  return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json", debugInfo) });
 }

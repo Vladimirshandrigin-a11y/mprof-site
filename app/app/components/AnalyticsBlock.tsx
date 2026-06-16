@@ -1473,6 +1473,11 @@ export function AnalyticsBlock({
 
     if (page === AI_PG.overview) return (
       <>
+        {d.source === "fallback" && (
+          <p className="ai-fallback-note">
+            AI временно недоступен, показаны расчёты по данным отчёта.
+          </p>
+        )}
         {/* Компактный inline-заголовок без SVG-кольца */}
         <div className="ai-compact-top">
           <span className={"ai-compact-score tier-" + aiTier.kind}>
@@ -2248,27 +2253,15 @@ export function AnalyticsBlock({
         .ai-risk-action{grid-area:action;font-size:.68rem;color:#8A9FBB;
           text-align:right;font-style:italic}
 
-        /* === FALLBACK ДИАГНОСТИКА (в шапке, всегда видна) === */
-        .ai-diag-block{
-          margin:.3rem .85rem .1rem;
+        /* === FALLBACK NOTE (дружелюбное сообщение, без техданных) === */
+        .ai-fallback-note{
+          margin:0 0 .1rem;
           padding:.5rem .7rem;
           border-radius:8px;
-          background:rgba(201,168,76,.07);
-          border:1px solid rgba(201,168,76,.25);
-          display:flex;flex-direction:column;gap:.22rem
+          background:rgba(201,168,76,.08);
+          border:1px solid rgba(201,168,76,.22);
+          color:#D8C089;font-size:.74rem;line-height:1.45
         }
-        .ai-diag-title{
-          font-family:'DM Mono',monospace;font-size:.6rem;font-weight:700;
-          letter-spacing:.16em;text-transform:uppercase;color:#E0A050
-        }
-        .ai-diag-row{
-          font-family:'DM Mono',monospace;font-size:.68rem;color:#9FB1CB;
-          display:flex;gap:.5rem;flex-wrap:wrap
-        }
-        .ai-diag-key{color:#7A8FA8}
-        .ai-diag-val{color:#E8EEF8;font-weight:600}
-        .ai-diag-val.ok{color:#7DEAB2}
-        .ai-diag-val.err{color:#FF8A98}
 
         /* === FALLBACK NOTICE + MISSING DATA === */
         .ai-fallback-diag{margin:.4rem 0 0;display:flex;flex-direction:column;gap:.2rem}
@@ -2691,96 +2684,6 @@ export function AnalyticsBlock({
                 </div>
               )}
             </div>
-            {/* ═══ ДИАГНОСТИКА (показывается только при fallback, над каруселью) ══ */}
-            {hasPremium && useAi && aiData && aiData.source === "fallback" && (
-              <div className="ai-diag-block">
-                <div className="ai-diag-title">Диагностика</div>
-                <div className="ai-diag-row">
-                  <span className="ai-diag-key">source:</span>
-                  <span className="ai-diag-val err">fallback</span>
-                </div>
-                <div className="ai-diag-row">
-                  <span className="ai-diag-key">fallbackReason:</span>
-                  <span className="ai-diag-val">{aiData.fallbackReason ?? "unknown"}</span>
-                </div>
-                {aiData.debug ? (
-                  <>
-                    <div className="ai-diag-row">
-                      <span className="ai-diag-key">hasGatewayKey:</span>
-                      <span className={"ai-diag-val " + (aiData.debug.hasGatewayKey ? "ok" : "err")}>
-                        {String(aiData.debug.hasGatewayKey)}
-                      </span>
-                    </div>
-                    <div className="ai-diag-row">
-                      <span className="ai-diag-key">hasGatewayModel:</span>
-                      <span className={"ai-diag-val " + (aiData.debug.hasGatewayModel ? "ok" : "err")}>
-                        {String(aiData.debug.hasGatewayModel)}
-                      </span>
-                    </div>
-                    <div className="ai-diag-row">
-                      <span className="ai-diag-key">gatewayModel:</span>
-                      <span className="ai-diag-val">{aiData.debug.gatewayModel ?? "—"}</span>
-                    </div>
-                    {typeof aiData.debug.keyContainsEquals === "boolean" && (
-                      <div className="ai-diag-row">
-                        <span className="ai-diag-key">keyContainsEquals:</span>
-                        <span className={"ai-diag-val " + (aiData.debug.keyContainsEquals ? "err" : "ok")}>
-                          {String(aiData.debug.keyContainsEquals)}
-                        </span>
-                      </div>
-                    )}
-                    {typeof aiData.debug.keyContainsWhitespace === "boolean" && (
-                      <div className="ai-diag-row">
-                        <span className="ai-diag-key">keyContainsWhitespace:</span>
-                        <span className={"ai-diag-val " + (aiData.debug.keyContainsWhitespace ? "err" : "ok")}>
-                          {String(aiData.debug.keyContainsWhitespace)}
-                        </span>
-                      </div>
-                    )}
-                    {typeof aiData.debug.keyLength === "number" && (
-                      <div className="ai-diag-row">
-                        <span className="ai-diag-key">keyLength:</span>
-                        <span className="ai-diag-val">{aiData.debug.keyLength}</span>
-                      </div>
-                    )}
-                    {aiData.debug.gatewayStatus != null && (
-                      <div className="ai-diag-row">
-                        <span className="ai-diag-key">gatewayStatus:</span>
-                        <span className={"ai-diag-val " + (aiData.debug.gatewayStatus === 200 ? "ok" : "err")}>
-                          {aiData.debug.gatewayStatus}
-                        </span>
-                      </div>
-                    )}
-                    {aiData.debug.gatewayErrorType && (
-                      <div className="ai-diag-row">
-                        <span className="ai-diag-key">gatewayErrorType:</span>
-                        <span className="ai-diag-val err">{aiData.debug.gatewayErrorType}</span>
-                      </div>
-                    )}
-                    {aiData.debug.gatewayErrorCode && (
-                      <div className="ai-diag-row">
-                        <span className="ai-diag-key">gatewayErrorCode:</span>
-                        <span className="ai-diag-val err">{aiData.debug.gatewayErrorCode}</span>
-                      </div>
-                    )}
-                    {aiData.debug.gatewayErrorMessage && (
-                      <div className="ai-diag-row" style={{flexDirection:"column",gap:".1rem"}}>
-                        <span className="ai-diag-key">gatewayErrorMessage:</span>
-                        <span className="ai-diag-val" style={{color:"#FFB3B3",fontSize:".64rem",fontWeight:400,wordBreak:"break-word"}}>
-                          {aiData.debug.gatewayErrorMessage}
-                        </span>
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <div className="ai-diag-row">
-                    <span className="ai-diag-key">debug:</span>
-                    <span className="ai-diag-val err">не получен от сервера</span>
-                  </div>
-                )}
-              </div>
-            )}
-
             {/* ═══ КАРУСЕЛЬ AI-СТРАНИЦ ═══════════════════════════════════ */}
             <div
               className="ai-body"
