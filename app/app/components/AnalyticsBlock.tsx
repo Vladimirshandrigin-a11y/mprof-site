@@ -994,12 +994,6 @@ export function AnalyticsBlock({
   const [aiLoading, setAiLoading] = useState(false);
   const [aiFailed, setAiFailed] = useState(false);
 
-  // ===== Карусель AI-страниц =====
-  const [aiPage, setAiPage] = useState(0);
-  const carouselRef = useRef<HTMLDivElement>(null);
-  const swipeTouchX = useRef(0);
-  const aiPagesTotalRef = useRef(0); // ref для swipe-хендлера (без пересоздания эффекта)
-
   // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
   // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
   // Никаких XLSX/PDF/сырых отчётов в LLM не уходит.
@@ -1175,28 +1169,6 @@ export function AnalyticsBlock({
     };
   }, [hasPremium, aiPayloadSig]);
 
-  // Сброс на первую страницу при смене AI-данных
-  useEffect(() => { setAiPage(0); }, [aiData, aiFailed]);
-
-  // Swipe-навигация на мобильных (mount-only, читает ref для актуального числа страниц)
-  useEffect(() => {
-    const el = carouselRef.current;
-    if (!el) return;
-    const onStart = (e: TouchEvent) => { swipeTouchX.current = e.touches[0].clientX; };
-    const onEnd = (e: TouchEvent) => {
-      const dx = swipeTouchX.current - e.changedTouches[0].clientX;
-      if (Math.abs(dx) < 44) return; // ignore small swipes
-      if (dx > 0) setAiPage(p => Math.min(aiPagesTotalRef.current - 1, p + 1));
-      else setAiPage(p => Math.max(0, p - 1));
-    };
-    el.addEventListener("touchstart", onStart, { passive: true });
-    el.addEventListener("touchend", onEnd, { passive: true });
-    return () => {
-      el.removeEventListener("touchstart", onStart);
-      el.removeEventListener("touchend", onEnd);
-    };
-  }, []); // mount only — ref обновляется синхронно при каждом рендере
-
   /* charts series — строго хронологический порядок: старый месяц слева →
      новый справа. chartHistory уже отсортирован по report_period на странице
      (возрастание), берём последние 14 (самые свежие) в том же порядке.
@@ -1290,260 +1262,92 @@ export function AnalyticsBlock({
       : DEMO_RECENT;
 
   // ============================================================
-  // AI-карусель: количество страниц
+  // MVP-вид AI-блока: 4 короткие секции (источник — AI или rule-based).
+  // Без карусели, без сырого ответа модели, без техполей.
   // ============================================================
-  const aiPagesTotal = !hasPremium
-    ? 0
-    : useAi
-    ? 2 +
-      (aiData!.profitLeaks.length > 0 ? 1 : 0) +
-      (aiData!.productRisks.length > 0 ? 1 : 0) +
-      1 +
-      (aiData!.missingData.length > 0 ? 1 : 0)
-    : 4; // rule-based: обзор / инсайты / здоровье / действия
-  aiPagesTotalRef.current = aiPagesTotal;
-  const curAiPage = Math.min(aiPage, Math.max(0, aiPagesTotal - 1));
 
-  // Индексы страниц для AI-данных (dynamic — зависит от наличия опциональных секций)
-  // Порядок страниц = повествование: Обзор → Что снижает прибыль →
-  // Что сделать → На что обратить внимание → (Риски) → (Данные)
-  const AI_PG = useAi
-    ? (() => {
-        let i = 0;
-        const overview = i++;
-        const leaks = aiData!.profitLeaks.length > 0 ? i++ : -1;
-        const actions = i++;
-        const insights = i++;
-        const risks = aiData!.productRisks.length > 0 ? i++ : -1;
-        const missing = aiData!.missingData.length > 0 ? i++ : -1;
-        return { overview, insights, leaks, risks, actions, missing };
-      })()
-    : { overview: 0, insights: 1, leaks: -1, risks: -1, actions: 3, missing: -1 };
+  // Аккуратная обрезка: схлопывает пробелы и режет до n символов с «…».
+  const clip = (s: string, n: number): string => {
+    const t = String(s ?? "").replace(/\s+/g, " ").trim();
+    return t.length > n ? t.slice(0, n - 1).trimEnd() + "…" : t;
+  };
 
-  // Метка текущей страницы для aria (тот же порядок, что AI_PG)
-  const aiPageLabel = useAi
-    ? ([
-        "Обзор",
-        ...(aiData?.profitLeaks.length ? ["Расходы"] : []),
-        "Действия",
-        "Инсайты",
-        ...(aiData?.productRisks.length ? ["Риски"] : []),
-        ...(aiData?.missingData.length ? ["Данные"] : []),
-      ][curAiPage] ?? "")
-    : (["Обзор", "Инсайты", "Здоровье", "Действия"][curAiPage] ?? "");
+  // Дружелюбная плашка «AI недоступен» — только при реальной ошибке/фолбэке,
+  // не в demo-режиме. Технические поля (source/debug) пользователю не видны.
+  const aiUnavailable =
+    !insightsAreDemo &&
+    (aiFailed || (!!aiData && aiData.source === "fallback"));
 
-  // Рендер содержимого страницы карусели
-  function renderAiCarouselPage(page: number): ReactNode {
-    // ── Rule-based (4 страницы) ──────────────────────────────────────
-    if (!useAi) {
-      const ovw = (
-        <>
-          <div className="ai-compact-top">
-            <div className="ai-compact-metric">
-              <span className="ai-compact-label">AI score</span>
-              <div className="ai-compact-score-row">
-                <span className={"ai-compact-score tier-" + aiTier.kind}>
-                  <AnimatedScore value={aiScore} />
-                </span>
-                <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
-              </div>
-            </div>
-            <div className="ai-compact-metric">
-              <span className="ai-compact-label">Динамика</span>
-              <span className={"ai-trend dir-" + aiTrend.dir}>
-                {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
-                <span className="ai-trend-val">
-                  {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
-                </span>
-              </span>
-            </div>
-            <div className="ai-compact-metric ai-compact-metric-end">
-              <span className="ai-compact-label">Точность</span>
-              <span className={"ai-conf conf-" + aiConfidence}>
-                <span className="ai-conf-dot" />
-                {CONFIDENCE_LABEL[aiConfidence]}
-                <span className="ai-conf-pct">· {aiConfidencePct}%</span>
-              </span>
-            </div>
-          </div>
-          <div className="ai-indicators">
-            <span className="ai-ind"><span className="ai-ind-l">Комм.</span><span className="ai-ind-v">{(aiIndicators.commission * 100).toFixed(0)}%</span></span>
-            <span className="ai-ind"><span className="ai-ind-l">Рек.</span><span className="ai-ind-v">{(aiIndicators.ads * 100).toFixed(0)}%</span></span>
-            <span className="ai-ind"><span className="ai-ind-l">Лог.</span><span className="ai-ind-v">{(aiIndicators.logistics * 100).toFixed(0)}%</span></span>
-            <span className="ai-ind ai-ind-margin"><span className="ai-ind-l">Маржа</span><span className="ai-ind-v">{aiIndicators.margin.toFixed(1)}%</span></span>
-          </div>
-          <p className="ai-pg-summary">{aiSummary}</p>
-        </>
-      );
-      const ins = (
-        <>
-          <div className="ai-section-label">Инсайты</div>
-          <ul className="ai-insights-list" key={history.length + ":" + aiScore}>
-            {aiSlots.map((s, i) => (
-              <li className={"ai-insight " + s.kind} key={i}>
-                <span className="ai-insight-ico" aria-hidden="true">{s.ico}</span>
-                <span className="ai-insight-text">{s.text}</span>
-              </li>
-            ))}
-          </ul>
-        </>
-      );
-      const hlth = (
-        <>
-          <div className="ai-section-label">Финансовое здоровье</div>
-          <div className="ai-health" key={"h:" + aiScore}>
-            {aiHealth.map((m, i) => (
-              <div className="ai-health-row" key={i}>
-                <span className="ai-health-label">{m.label}</span>
-                <span className={"ai-health-bar tier-" + m.tier}><span className="ai-health-fill" style={{ width: m.value + "%" }} /></span>
-                <span className={"ai-health-value tier-" + m.tier}>{m.value}</span>
-              </div>
-            ))}
-          </div>
-        </>
-      );
-      const act = (
-        <>
-          <div className="ai-section-label">Что улучшить прямо сейчас</div>
-          <div className="ai-quick" key={"q:" + aiScore}>
-            {aiQuick.map((q, i) => (
-              <div className="ai-quick-card" key={i}>
-                <div className="ai-quick-action">{q.action}</div>
-                <div className="ai-quick-impact">{q.impact}</div>
-              </div>
-            ))}
-          </div>
-        </>
-      );
-      return [ovw, ins, hlth, act][page] ?? null;
-    }
+  // rule-based «что снижает прибыль» — из индикаторов расчёта
+  const rbLeaks: string[] = (() => {
+    const out: string[] = [];
+    const ind = aiIndicators;
+    if (ind.ads > 0.20) out.push("Реклама забирает заметную долю выручки");
+    if (ind.logistics > 0.12) out.push("Логистика выше комфортной нормы");
+    if (ind.commission > 0.20) out.push("Высокая комиссия маркетплейса");
+    if (ind.margin > 0 && ind.margin < 12) out.push("Низкая маржа по товарам");
+    if (history.some((h) => h.profit < 0)) out.push("Есть убыточные расчёты");
+    if (out.length === 0) out.push("Явных утечек прибыли не видно");
+    return out.slice(0, 4);
+  })();
 
-    // ── AI-данные (source: openai | fallback) ─────────────────────────
-    const d = aiData!;
+  // rule-based «что проверить дополнительно»
+  const rbChecks: string[] = [
+    "Себестоимость и закупочные цены",
+    "Расходы на рекламу и ДРР",
+    "Логистику и хранение",
+    "Возвраты и невыкупы",
+  ];
 
-    if (page === AI_PG.overview) return (
-      <>
-        {d.source === "fallback" && (
-          <p className="ai-fallback-note">
-            AI-анализ временно недоступен. Базовая аналитика рассчитана по данным отчёта.
-          </p>
-        )}
-        {/* Короткий статус одной строкой: «AI Score: 55 — Стабильный» */}
-        <div className="ai-status-line">
-          <span className="ai-status-key">AI Score:</span>
-          <span className={"ai-status-score tier-" + aiTier.kind}>
-            <AnimatedScore value={aiScore} />
-          </span>
-          <span className="ai-status-dash" aria-hidden="true">—</span>
-          <span className={"ai-status-tier tier-" + aiTier.kind}>{aiTier.label}</span>
-          <span className={"ai-trend dir-" + aiTrend.dir}>
-            {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
-            <span className="ai-trend-val">
-              {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
-            </span>
-          </span>
-        </div>
-        {(d.mainProblem || d.summary) && (
-          <div className="ai-pg-block">
-            <div className="ai-section-label">Главный вывод</div>
-            {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
-            {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
-          </div>
-        )}
-      </>
+  // 1) Главный вывод — одна короткая мысль
+  const aiVerdict = clip(
+    useAi ? aiData!.mainProblem || aiData!.summary || rbSummary : rbSummary,
+    220
+  );
+
+  // 2) Что снижает прибыль — до 4 строк
+  const aiLeaks: string[] = (
+    useAi && aiData!.profitLeaks.length
+      ? aiData!.profitLeaks.slice(0, 4).map((l) =>
+          clip(
+            l.amount != null
+              ? `${l.area}: ${l.comment} (${fmt(l.amount)} ₽)`
+              : `${l.area}: ${l.comment}`,
+            120
+          )
+        )
+      : rbLeaks
+  ).filter(Boolean);
+
+  // 3) Что сделать в первую очередь — до 4 строк
+  const aiActions: string[] = (
+    useAi && aiData!.recommendedActions.length
+      ? aiData!.recommendedActions.slice(0, 4).map((a) =>
+          clip(a.expectedEffect ? `${a.action} — ${a.expectedEffect}` : a.action, 120)
+        )
+      : aiQuick.map((q) => clip(q.impact ? `${q.action} — ${q.impact}` : q.action, 120))
+  ).filter(Boolean);
+
+  // 4) Что проверить дополнительно — до 4 строк
+  const aiChecks: string[] = (
+    useAi && aiData!.missingData.length
+      ? aiData!.missingData.slice(0, 4).map((m) => clip(m, 120))
+      : useAi && aiData!.productRisks.length
+      ? aiData!.productRisks.slice(0, 4).map((r) => clip(`${r.name}: ${r.action}`, 120))
+      : rbChecks
+  ).filter(Boolean);
+
+  // Рендер одной секции-списка (с аккуратным пустым состоянием)
+  const renderAiList = (items: string[], empty: string): ReactNode =>
+    items.length > 0 ? (
+      <ul className="ai-sec-list">
+        {items.map((t, i) => (
+          <li key={i}>{t}</li>
+        ))}
+      </ul>
+    ) : (
+      <p className="ai-sec-text ai-sec-muted">{empty}</p>
     );
-
-    if (page === AI_PG.insights) return (
-      <>
-        <div className="ai-section-label">На что обратить внимание</div>
-        {d.keyInsights.length > 0 ? (
-          <ul className="ai-insights-list">
-            {d.keyInsights.slice(0, 5).map((ins, i) => {
-              const kind: InsightKind =
-                ins.severity === "high" ? "danger"
-                : ins.severity === "medium" ? "warning"
-                : "positive";
-              const ico =
-                ins.severity === "high" ? ICONS.alert
-                : ins.severity === "medium" ? ICONS.target
-                : ICONS.trendUp;
-              return (
-                <li className={"ai-insight " + kind} key={i}>
-                  <span className="ai-insight-ico" aria-hidden="true">{ico}</span>
-                  <span className="ai-insight-text">
-                    <strong className="ai-ins-title">{ins.title}</strong>
-                    {ins.description ? <span className="ai-ins-desc">: {ins.description}</span> : null}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-        ) : (
-          <p className="ai-pg-summary">Нет значимых инсайтов для этого периода.</p>
-        )}
-      </>
-    );
-
-    if (page === AI_PG.leaks && AI_PG.leaks >= 0) return (
-      <>
-        <div className="ai-section-label">Что снижает прибыль</div>
-        <div className="ai-leaks">
-          {d.profitLeaks.slice(0, 5).map((leak, i) => (
-            <div className="ai-leak-row" key={i}>
-              <span className="ai-leak-area">{leak.area}</span>
-              <span className="ai-leak-comment">{leak.comment}</span>
-              {leak.amount != null && (
-                <span className="ai-leak-amount">{leak.amount.toLocaleString("ru-RU")} ₽</span>
-              )}
-            </div>
-          ))}
-        </div>
-      </>
-    );
-
-    if (page === AI_PG.risks && AI_PG.risks >= 0) return (
-      <>
-        <div className="ai-section-label">Риски по товарам</div>
-        <ul className="ai-risks-list">
-          {d.productRisks.slice(0, 5).map((risk, i) => (
-            <li className="ai-risk-item" key={i}>
-              <span className="ai-risk-name">{risk.name}</span>
-              {risk.sku && <span className="ai-risk-sku">{risk.sku}</span>}
-              <span className="ai-risk-reason">{risk.reason}</span>
-              <span className="ai-risk-action">{risk.action}</span>
-            </li>
-          ))}
-        </ul>
-      </>
-    );
-
-    if (page === AI_PG.actions) return (
-      <>
-        <div className="ai-section-label">Что сделать в первую очередь</div>
-        <div className="ai-quick" key={"q:" + aiScore}>
-          {d.recommendedActions.slice(0, 4).map((a, i) => (
-            <div className="ai-quick-card" key={i}>
-              <div className="ai-quick-action">{a.priority}. {a.action}</div>
-              <div className="ai-quick-impact">{a.expectedEffect}</div>
-            </div>
-          ))}
-        </div>
-      </>
-    );
-
-    if (page === AI_PG.missing && AI_PG.missing >= 0) return (
-      <>
-        <div className="ai-section-label">Для полного анализа нужно</div>
-        <ul className="ai-missing-list">
-          {d.missingData.slice(0, 5).map((m, i) => (
-            <li key={i} className="ai-missing-item">{m}</li>
-          ))}
-        </ul>
-      </>
-    );
-
-    return null;
-  }
 
   return (
     <>
@@ -2093,83 +1897,65 @@ export function AnalyticsBlock({
         .filter-empty-sub{font-size:.88rem;color:#8A9FBB;font-weight:300;
           line-height:1.55;max-width:400px;margin:0}
 
-        /* === КАРУСЕЛЬ === */
-        /* ai-body — растягивается на всё свободное место внутри карточки */
-        .ai-body{padding:.35rem .85rem .55rem;display:flex;flex-direction:column;gap:0;flex:1}
+        /* === AI MVP: простой вертикальный вид (без карусели) === */
+        /* ai-body — контейнер секций внутри карточки */
+        .ai-body{padding:.35rem .85rem .7rem;display:flex;flex-direction:column;flex:1;min-width:0}
 
-        /* Viewport — растягивается внутри ai-body, с ограничением сверху */
-        .ai-page-viewport{
-          flex:1;overflow-y:auto;overflow-x:hidden;
-          min-height:180px;max-height:300px;
-          /* плавный внутренний scroll на iOS */
+        .ai-sections{
+          display:flex;flex-direction:column;gap:.5rem;
+          max-height:520px;overflow-y:auto;overflow-x:hidden;
+          padding-right:.15rem;
           -webkit-overflow-scrolling:touch;
           scrollbar-width:thin;
           scrollbar-color:rgba(201,168,76,.25) transparent
         }
-        .ai-page-viewport::-webkit-scrollbar{width:3px}
-        .ai-page-viewport::-webkit-scrollbar-track{background:transparent}
-        .ai-page-viewport::-webkit-scrollbar-thumb{background:rgba(201,168,76,.25);border-radius:3px}
+        .ai-sections::-webkit-scrollbar{width:3px}
+        .ai-sections::-webkit-scrollbar-track{background:transparent}
+        .ai-sections::-webkit-scrollbar-thumb{background:rgba(201,168,76,.25);border-radius:3px}
 
-        /* Страница — анимированный вход */
-        .ai-page-inner{
-          padding:.15rem 0 .4rem;
-          min-width:0;overflow-wrap:break-word;word-break:break-word;
-          animation:aiPageIn .22s cubic-bezier(.22,1,.36,1) both
+        /* секция-плашка */
+        .ai-sec{
+          background:rgba(255,255,255,.025);
+          border:1px solid rgba(255,255,255,.07);
+          border-radius:11px;padding:.62rem .75rem;
+          min-width:0;overflow-wrap:break-word;word-break:break-word
         }
-        @keyframes aiPageIn{
-          from{opacity:0;transform:translateX(10px)}
-          to{opacity:1;transform:translateX(0)}
+        .ai-sec-title{
+          margin:0 0 .32rem;
+          font-family:'DM Mono',monospace;font-size:.6rem;font-weight:700;
+          letter-spacing:.14em;text-transform:uppercase;color:#E8C97A
+        }
+        .ai-sec-text{
+          margin:0;font-size:.78rem;line-height:1.5;color:#D7E0EE;font-weight:400;
+          white-space:pre-line;overflow-wrap:break-word;word-break:break-word
+        }
+        .ai-sec-muted{color:#8A9FBB}
+        .ai-sec-list{
+          list-style:none;margin:0;padding:0;
+          display:flex;flex-direction:column;gap:.32rem
+        }
+        .ai-sec-list li{
+          position:relative;padding-left:.95rem;
+          font-size:.76rem;line-height:1.45;color:#D7E0EE;
+          overflow-wrap:break-word;word-break:break-word
+        }
+        .ai-sec-list li::before{
+          content:"";position:absolute;left:.12rem;top:.55em;
+          width:5px;height:5px;border-radius:50%;
+          background:#C9A84C;box-shadow:0 0 6px rgba(201,168,76,.5)
         }
 
-        /* Навигация (стрелки + точки) */
-        .ai-pager-nav{
-          display:flex;align-items:center;justify-content:center;
-          gap:.55rem;padding:.4rem 0 .1rem;flex-shrink:0
+        /* loader на время ожидания ответа AI */
+        .ai-loading{
+          display:flex;align-items:center;justify-content:center;gap:.6rem;
+          min-height:160px;font-size:.82rem;color:#9FB1CB
         }
-        .ai-nav-btn{
-          display:flex;align-items:center;justify-content:center;
-          width:28px;height:28px;border-radius:8px;
-          background:rgba(255,255,255,.06);
-          border:1px solid rgba(255,255,255,.10);
-          color:#8A9FBB;font-size:1.15rem;line-height:1;
-          cursor:pointer;transition:all .18s ease;
-          -webkit-appearance:none;appearance:none;flex-shrink:0
+        .ai-spinner{
+          width:16px;height:16px;border-radius:50%;
+          border:2px solid rgba(201,168,76,.25);border-top-color:#C9A84C;
+          animation:aiSpin .8s linear infinite;flex-shrink:0
         }
-        .ai-nav-btn:hover:not(:disabled){
-          background:rgba(201,168,76,.14);
-          border-color:rgba(201,168,76,.38);
-          color:#E8C97A
-        }
-        .ai-nav-btn:disabled{opacity:.25;cursor:default}
-        .ai-pager-dots{display:flex;align-items:center;gap:.38rem}
-        .ai-dot{
-          width:6px;height:6px;border-radius:50%;
-          background:rgba(255,255,255,.18);
-          border:none;padding:0;cursor:pointer;
-          transition:all .22s ease;flex-shrink:0;
-          -webkit-appearance:none;appearance:none
-        }
-        .ai-dot.active{
-          width:18px;border-radius:3px;
-          background:linear-gradient(90deg,#C9A84C,#E8C97A);
-          box-shadow:0 0 8px rgba(201,168,76,.5)
-        }
-        .ai-dot:not(.active):hover{background:rgba(201,168,76,.45)}
-
-        /* Тексты страниц */
-        .ai-pg-problem{
-          font-size:.72rem;color:#E8EEF8;font-weight:500;
-          margin:.55rem 0 .3rem;line-height:1.5;
-          overflow-wrap:break-word
-        }
-        .ai-pg-summary{
-          font-size:.68rem;color:#8A9FBB;line-height:1.55;
-          margin:.2rem 0 0;overflow-wrap:break-word
-        }
-        .ai-pg-loading{
-          display:flex;align-items:center;gap:.6rem;
-          font-size:.8rem;color:#8A9FBB;padding:.8rem 0
-        }
+        @keyframes aiSpin{to{transform:rotate(360deg)}}
         .ai-ins-title{color:#E8EEF8;font-weight:600}
         .ai-ins-desc{color:#8A9FBB;font-weight:400}
 
@@ -2616,84 +2402,45 @@ export function AnalyticsBlock({
                 AI Аналитика
               </div>
               {hasPremium && (
-                <div className="ai-sub">
-                  {insightsAreDemo
-                    ? "Пример аналитики"
-                    : aiLoading
-                    ? "AI анализирует прибыль…"
-                    : useAi && aiData!.source === "openai"
-                    ? "AI-анализ"
-                    : useAi && aiData!.source === "fallback"
-                    ? "Базовая аналитика"
-                    : "Базовая аналитика"}
-                </div>
+                <div className="ai-sub">Персональные рекомендации по вашему отчёту</div>
               )}
             </div>
-            {/* ═══ КАРУСЕЛЬ AI-СТРАНИЦ ═══════════════════════════════════ */}
-            <div
-              className="ai-body"
-              aria-hidden={!hasPremium}
-              ref={carouselRef}
-            >
-              {/* Область контента страницы */}
-              <div
-                className="ai-page-viewport"
-                role="region"
-                aria-label={`AI Аналитика — ${aiPageLabel}`}
-              >
-                <div
-                  className="ai-page-inner"
-                  key={curAiPage + ":" + aiScore + ":" + (useAi ? "ai" : "rb")}
-                >
-                  {aiLoading ? (
-                    <div className="ai-pg-loading">
-                      <span className="ai-spark" aria-hidden="true">
-                        <svg viewBox="0 0 24 24" fill="currentColor">
-                          <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
-                        </svg>
-                      </span>
-                      <span>AI анализирует прибыль…</span>
-                    </div>
-                  ) : (
-                    renderAiCarouselPage(curAiPage)
-                  )}
+            {/* ═══ AI-СЕКЦИИ — простой вертикальный вид (без карусели) ═══ */}
+            <div className="ai-body" aria-hidden={!hasPremium}>
+              {aiLoading ? (
+                <div className="ai-loading" role="status" aria-live="polite">
+                  <span className="ai-spinner" aria-hidden="true" />
+                  <span>AI анализирует прибыль…</span>
                 </div>
-              </div>
+              ) : (
+                <div className="ai-sections">
+                  {aiUnavailable && (
+                    <p className="ai-fallback-note">
+                      AI-анализ временно недоступен. Ниже показаны базовые рекомендации по расчёту.
+                    </p>
+                  )}
 
-              {/* Навигация: стрелки + точки */}
-              {!aiLoading && aiPagesTotal > 1 && (
-                <div className="ai-pager-nav" aria-label="Навигация по страницам">
-                  <button
-                    type="button"
-                    className="ai-nav-btn"
-                    onClick={() => setAiPage(p => Math.max(0, p - 1))}
-                    disabled={curAiPage === 0}
-                    aria-label="Предыдущая страница"
-                  >
-                    ‹
-                  </button>
-                  <div className="ai-pager-dots" role="tablist">
-                    {Array.from({ length: aiPagesTotal }, (_, i) => (
-                      <button
-                        key={i}
-                        type="button"
-                        role="tab"
-                        aria-selected={i === curAiPage}
-                        aria-label={`Страница ${i + 1} из ${aiPagesTotal}`}
-                        className={"ai-dot" + (i === curAiPage ? " active" : "")}
-                        onClick={() => setAiPage(i)}
-                      />
-                    ))}
-                  </div>
-                  <button
-                    type="button"
-                    className="ai-nav-btn"
-                    onClick={() => setAiPage(p => Math.min(aiPagesTotal - 1, p + 1))}
-                    disabled={curAiPage === aiPagesTotal - 1}
-                    aria-label="Следующая страница"
-                  >
-                    ›
-                  </button>
+                  <section className="ai-sec">
+                    <h4 className="ai-sec-title">Главный вывод</h4>
+                    <p className="ai-sec-text">
+                      {aiVerdict || "Недостаточно данных для вывода."}
+                    </p>
+                  </section>
+
+                  <section className="ai-sec">
+                    <h4 className="ai-sec-title">Что снижает прибыль</h4>
+                    {renderAiList(aiLeaks, "Существенных утечек не обнаружено.")}
+                  </section>
+
+                  <section className="ai-sec">
+                    <h4 className="ai-sec-title">Что сделать в первую очередь</h4>
+                    {renderAiList(aiActions, "Показатели в норме — резких действий не требуется.")}
+                  </section>
+
+                  <section className="ai-sec">
+                    <h4 className="ai-sec-title">Что проверить дополнительно</h4>
+                    {renderAiList(aiChecks, "Дополнительных проверок не требуется.")}
+                  </section>
                 </div>
               )}
             </div>
