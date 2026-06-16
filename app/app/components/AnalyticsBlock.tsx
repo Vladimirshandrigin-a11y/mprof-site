@@ -721,10 +721,17 @@ type RecommendedAction = {
 };
 
 type AiDebug = {
-  hasOpenAIKey?: boolean;
-  hasOpenAIModel?: boolean;
-  openAIModel?: string;
+  hasGatewayKey?: boolean;
+  hasGatewayModel?: boolean;
+  gatewayModel?: string;
   runtime?: string;
+  keyContainsEquals?: boolean;
+  keyContainsWhitespace?: boolean;
+  keyLength?: number;
+  gatewayStatus?: number | null;
+  gatewayErrorType?: string | null;
+  gatewayErrorCode?: string | null;
+  gatewayErrorMessage?: string | null;
 };
 
 type AiAnalysis = {
@@ -1466,27 +1473,18 @@ export function AnalyticsBlock({
 
     if (page === AI_PG.overview) return (
       <>
-        <div className={"ai-top score-" + aiTier.kind}>
-          <div className="ai-score-block">
-            <ScoreRing score={aiScore} tier={aiTier.kind} />
-            <div className="ai-ring-text" aria-label={`AI оценка ${aiScore} из 100`}>
-              <AnimatedScore value={aiScore} />
-            </div>
-          </div>
-          <div className="ai-top-meta">
-            <div className="ai-top-row">
-              <span className="ai-score-label">AI score</span>
-              <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
-            </div>
-            <div className="ai-top-row">
-              <span className={"ai-trend dir-" + aiTrend.dir}>
-                {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
-                <span className="ai-trend-val">
-                  {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
-                </span>
-              </span>
-            </div>
-          </div>
+        {/* Компактный inline-заголовок без SVG-кольца */}
+        <div className="ai-compact-top">
+          <span className={"ai-compact-score tier-" + aiTier.kind}>
+            <AnimatedScore value={aiScore} />
+          </span>
+          <span className={"ai-score-tier-pill " + aiTier.kind}>{aiTier.label}</span>
+          <span className={"ai-trend dir-" + aiTrend.dir} style={{marginLeft:"auto"}}>
+            {aiTrend.dir === "up" ? "↑" : aiTrend.dir === "down" ? "↓" : "→"}
+            <span className="ai-trend-val">
+              {aiTrend.dir === "flat" ? "стабильно" : `${aiTrend.delta > 0 ? "+" : ""}${aiTrend.delta.toFixed(1)}%`}
+            </span>
+          </span>
         </div>
         {d.mainProblem && <p className="ai-pg-problem">{d.mainProblem}</p>}
         {d.summary && <p className="ai-pg-summary">{d.summary}</p>}
@@ -1781,13 +1779,30 @@ export function AnalyticsBlock({
           color:#7A8FA8;margin:0 0 .15rem
         }
 
-        /* ===== TOP: ring + tier/trend/confidence ===== */
+        /* ===== TOP: ring + tier/trend/confidence (rule-based branch) ===== */
         .ai-top{
           display:flex;align-items:center;gap:1.1rem;
           padding:.4rem 0 .8rem;
           border-bottom:1px solid rgba(255,255,255,.06)
         }
         .ai-score-block{position:relative;width:78px;height:78px;flex-shrink:0}
+
+        /* ===== AI-data overview: компактная строка без кольца ===== */
+        .ai-compact-top{
+          display:flex;align-items:center;gap:.55rem;flex-wrap:wrap;
+          padding:.2rem 0 .6rem;
+          border-bottom:1px solid rgba(255,255,255,.06);
+          margin-bottom:.5rem
+        }
+        .ai-compact-score{
+          font-family:'Playfair Display',Georgia,serif;
+          font-size:1.55rem;font-weight:700;letter-spacing:-.025em;
+          line-height:1
+        }
+        .ai-compact-score.tier-weak{color:#FF8A98}
+        .ai-compact-score.tier-stable{color:#FFD37D}
+        .ai-compact-score.tier-strong{color:#E8C97A}
+        .ai-compact-score.tier-excellent{color:#7DEAB2}
         .ai-ring-svg{width:100%;height:100%;display:block;
           animation:aiRingIn .55s cubic-bezier(.22,1,.36,1) both}
         @keyframes aiRingIn{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:scale(1)}}
@@ -2691,21 +2706,71 @@ export function AnalyticsBlock({
                 {aiData.debug ? (
                   <>
                     <div className="ai-diag-row">
-                      <span className="ai-diag-key">hasOpenAIKey:</span>
-                      <span className={"ai-diag-val " + (aiData.debug.hasOpenAIKey ? "ok" : "err")}>
-                        {String(aiData.debug.hasOpenAIKey)}
+                      <span className="ai-diag-key">hasGatewayKey:</span>
+                      <span className={"ai-diag-val " + (aiData.debug.hasGatewayKey ? "ok" : "err")}>
+                        {String(aiData.debug.hasGatewayKey)}
                       </span>
                     </div>
                     <div className="ai-diag-row">
-                      <span className="ai-diag-key">hasOpenAIModel:</span>
-                      <span className={"ai-diag-val " + (aiData.debug.hasOpenAIModel ? "ok" : "err")}>
-                        {String(aiData.debug.hasOpenAIModel)}
+                      <span className="ai-diag-key">hasGatewayModel:</span>
+                      <span className={"ai-diag-val " + (aiData.debug.hasGatewayModel ? "ok" : "err")}>
+                        {String(aiData.debug.hasGatewayModel)}
                       </span>
                     </div>
                     <div className="ai-diag-row">
-                      <span className="ai-diag-key">openAIModel:</span>
-                      <span className="ai-diag-val">{aiData.debug.openAIModel ?? "—"}</span>
+                      <span className="ai-diag-key">gatewayModel:</span>
+                      <span className="ai-diag-val">{aiData.debug.gatewayModel ?? "—"}</span>
                     </div>
+                    {typeof aiData.debug.keyContainsEquals === "boolean" && (
+                      <div className="ai-diag-row">
+                        <span className="ai-diag-key">keyContainsEquals:</span>
+                        <span className={"ai-diag-val " + (aiData.debug.keyContainsEquals ? "err" : "ok")}>
+                          {String(aiData.debug.keyContainsEquals)}
+                        </span>
+                      </div>
+                    )}
+                    {typeof aiData.debug.keyContainsWhitespace === "boolean" && (
+                      <div className="ai-diag-row">
+                        <span className="ai-diag-key">keyContainsWhitespace:</span>
+                        <span className={"ai-diag-val " + (aiData.debug.keyContainsWhitespace ? "err" : "ok")}>
+                          {String(aiData.debug.keyContainsWhitespace)}
+                        </span>
+                      </div>
+                    )}
+                    {typeof aiData.debug.keyLength === "number" && (
+                      <div className="ai-diag-row">
+                        <span className="ai-diag-key">keyLength:</span>
+                        <span className="ai-diag-val">{aiData.debug.keyLength}</span>
+                      </div>
+                    )}
+                    {aiData.debug.gatewayStatus != null && (
+                      <div className="ai-diag-row">
+                        <span className="ai-diag-key">gatewayStatus:</span>
+                        <span className={"ai-diag-val " + (aiData.debug.gatewayStatus === 200 ? "ok" : "err")}>
+                          {aiData.debug.gatewayStatus}
+                        </span>
+                      </div>
+                    )}
+                    {aiData.debug.gatewayErrorType && (
+                      <div className="ai-diag-row">
+                        <span className="ai-diag-key">gatewayErrorType:</span>
+                        <span className="ai-diag-val err">{aiData.debug.gatewayErrorType}</span>
+                      </div>
+                    )}
+                    {aiData.debug.gatewayErrorCode && (
+                      <div className="ai-diag-row">
+                        <span className="ai-diag-key">gatewayErrorCode:</span>
+                        <span className="ai-diag-val err">{aiData.debug.gatewayErrorCode}</span>
+                      </div>
+                    )}
+                    {aiData.debug.gatewayErrorMessage && (
+                      <div className="ai-diag-row" style={{flexDirection:"column",gap:".1rem"}}>
+                        <span className="ai-diag-key">gatewayErrorMessage:</span>
+                        <span className="ai-diag-val" style={{color:"#FFB3B3",fontSize:".64rem",fontWeight:400,wordBreak:"break-word"}}>
+                          {aiData.debug.gatewayErrorMessage}
+                        </span>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div className="ai-diag-row">

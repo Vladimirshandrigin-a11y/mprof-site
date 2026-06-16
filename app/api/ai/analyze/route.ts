@@ -7,20 +7,22 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 // ============================================================================
-// /api/ai/analyze — реальная AI-аналитика расчёта через OpenAI.
+// /api/ai/analyze — реальная AI-аналитика расчёта через Timeweb AI Gateway
+// (OpenAI-совместимый API; НЕ чат-бот, НЕ AI Agent — прямой вызов /chat/completions).
 //
 // БЕЗОПАСНОСТЬ:
-//   • OPENAI_API_KEY — серверный секрет, без NEXT_PUBLIC.
-//   • auth + план проверяются ДО любого вызова OpenAI — токены не тратятся
+//   • TIMEWEB_AI_GATEWAY_KEY — серверный секрет, без NEXT_PUBLIC.
+//   • auth + план проверяются ДО любого вызова Gateway — токены не тратятся
 //     на free/single пользователей.
 //   • на вход принимаем ТОЛЬКО числовые агрегаты + короткие строки товаров;
 //     никаких XLSX/PDF/сырых отчётов в LLM не уходит.
-//   • любой сбой OpenAI → rule-based fallback с source:"fallback";
+//   • любой сбой Gateway → rule-based fallback с source:"fallback";
 //     сайт не падает.
 // ============================================================================
 
-const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
-const MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// OpenAI-совместимый endpoint Timeweb AI Gateway.
+const GATEWAY_URL = "https://api.timeweb.ai/v1/chat/completions";
+const MODEL = process.env.TIMEWEB_AI_MODEL?.trim() || "openai/gpt-5-mini";
 
 // ---------- входные типы ----------
 
@@ -86,16 +88,27 @@ type RecommendedAction = {
 
 export type FallbackReason =
   | "missing_api_key"
+  | "invalid_key_format"
   | "openai_error"
   | "invalid_json"
   | "timeout"
   | "unknown";
 
 export type AiDebugInfo = {
-  hasOpenAIKey: boolean;
-  hasOpenAIModel: boolean;
-  openAIModel: string;
+  hasGatewayKey: boolean;
+  hasGatewayModel: boolean;
+  gatewayModel: string;
   runtime: "server";
+  // Безопасная диагностика ФОРМАТА ключа — сам ключ НЕ раскрываем,
+  // только boolean-проверки и длину.
+  keyContainsEquals?: boolean;
+  keyContainsWhitespace?: boolean;
+  keyLength?: number;
+  // Заполняется при ошибке Gateway (upstream.ok === false)
+  gatewayStatus?: number | null;
+  gatewayErrorType?: string | null;
+  gatewayErrorCode?: string | null;
+  gatewayErrorMessage?: string | null;
 };
 
 export type AiResult = {
@@ -739,35 +752,69 @@ export async function POST(req: NextRequest) {
   }
   const data = sanitizeInput(rawBody);
 
-  // ── 4. Если OPENAI_API_KEY не задан — rule-based fallback (200, не 503) ──
-  const apiKey = process.env.OPENAI_API_KEY;
+  // ── 4. Читаем ключ строго из env и ОБЯЗАТЕЛЬНО trim ──────────────────────
+  // Частая причина 401: в env попал лишний мусор
+  // (целиком "TIMEWEB_AI_GATEWAY_KEY=...", кавычки, пробелы, перенос строки).
+  const rawApiKey = process.env.TIMEWEB_AI_GATEWAY_KEY;
+  const apiKey = rawApiKey?.trim();
+
+  // Безопасная диагностика ФОРМАТА (никаких символов ключа наружу).
+  // sk-проверки НЕТ: ключи Timeweb Gateway не обязаны начинаться с "sk-".
+  const keyContainsEquals = !!apiKey && apiKey.includes("=");
+  const keyContainsWhitespace = !!apiKey && /\s/.test(apiKey);
+  const keyLength = apiKey ? apiKey.length : 0;
+
   const debugInfo: AiDebugInfo = {
-    hasOpenAIKey: !!apiKey,
-    hasOpenAIModel: !!process.env.OPENAI_MODEL,
-    openAIModel: MODEL,
+    hasGatewayKey: !!apiKey,
+    hasGatewayModel: !!process.env.TIMEWEB_AI_MODEL,
+    gatewayModel: MODEL,
     runtime: "server",
+    keyContainsEquals,
+    keyContainsWhitespace,
+    keyLength,
   };
   // eslint-disable-next-line no-console
   console.log("[ai/analyze] env check:", {
-    hasKey: debugInfo.hasOpenAIKey,
-    model: debugInfo.openAIModel,
-    hasModelEnv: debugInfo.hasOpenAIModel,
+    hasKey: debugInfo.hasGatewayKey,
+    model: debugInfo.gatewayModel,
+    hasModelEnv: debugInfo.hasGatewayModel,
+    keyContainsEquals,
+    keyContainsWhitespace,
+    keyLength,
   });
 
   if (!apiKey) {
     // eslint-disable-next-line no-console
-    console.warn("[ai/analyze] OPENAI_API_KEY не задан — fallback (missing_api_key)");
+    console.warn("[ai/analyze] TIMEWEB_AI_GATEWAY_KEY не задан — fallback (missing_api_key)");
     return NextResponse.json({ ok: true, ...buildFallback(data, "missing_api_key", debugInfo) });
   }
 
-  // ── 5. Вызываем OpenAI ───────────────────────────────────────────────────
+  // ── 4b. Явно битый формат ключа — НЕ дёргаем Gateway впустую ─────────────
+  if (keyContainsEquals) {
+    // eslint-disable-next-line no-console
+    console.warn("[ai/analyze] неверный формат ключа — fallback (invalid_key_format)", {
+      keyContainsEquals,
+      keyContainsWhitespace,
+      keyLength,
+    });
+    return NextResponse.json({
+      ok: true,
+      ...buildFallback(data, "invalid_key_format", {
+        ...debugInfo,
+        gatewayErrorMessage:
+          "TIMEWEB_AI_GATEWAY_KEY в env должен содержать только сам ключ, без TIMEWEB_AI_GATEWAY_KEY=, кавычек и пробелов.",
+      }),
+    });
+  }
+
+  // ── 5. Вызываем Timeweb AI Gateway (OpenAI-совместимый /chat/completions) ──
   const { system, user } = buildPrompt(data);
 
   let upstream: Response;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25000);
   try {
-    upstream = await fetch(OPENAI_URL, {
+    upstream = await fetch(GATEWAY_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -775,8 +822,9 @@ export async function POST(req: NextRequest) {
       },
       body: JSON.stringify({
         model: MODEL,
-        temperature: 0.35,
-        max_tokens: 1200,
+        // gpt-5-* — reasoning-модели: temperature только дефолтная (не задаём),
+        // лимит вывода — через max_completion_tokens (max_tokens они отвергают).
+        max_completion_tokens: 2000,
         response_format: { type: "json_object" },
         messages: [
           { role: "system", content: system },
@@ -790,7 +838,7 @@ export async function POST(req: NextRequest) {
     const isTimeout = e instanceof Error && e.name === "AbortError";
     const msg = e instanceof Error ? e.message : "сеть недоступна";
     // eslint-disable-next-line no-console
-    console.error("[ai/analyze] OpenAI недоступен:", msg);
+    console.error("[ai/analyze] Gateway недоступен:", msg);
     return NextResponse.json({
       ok: true,
       ...buildFallback(data, isTimeout ? "timeout" : "openai_error", debugInfo),
@@ -803,9 +851,31 @@ export async function POST(req: NextRequest) {
   const rawText = await upstream.text();
 
   if (!upstream.ok) {
+    // Безопасно парсим тело ошибки Gateway — извлекаем status/type/code/message,
+    // ключ НЕ логируем и НЕ возвращаем.
+    let gwType: string | null = null;
+    let gwCode: string | null = null;
+    let gwMsg: string | null = null;
+    try {
+      const errBody = JSON.parse(rawText) as {
+        error?: { type?: string; code?: string; message?: string };
+      };
+      gwType = errBody?.error?.type?.slice(0, 80) ?? null;
+      gwCode = errBody?.error?.code?.slice(0, 80) ?? null;
+      gwMsg = errBody?.error?.message?.slice(0, 280) ?? null;
+    } catch { /* не валидный JSON — оставляем null */ }
     // eslint-disable-next-line no-console
-    console.error("[ai/analyze] upstream error", upstream.status, rawText.slice(0, 300));
-    return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error", debugInfo) });
+    console.error("[ai/analyze] gateway error", upstream.status, {
+      type: gwType, code: gwCode, message: gwMsg,
+    });
+    const errDebug: AiDebugInfo = {
+      ...debugInfo,
+      gatewayStatus: upstream.status,
+      gatewayErrorType: gwType,
+      gatewayErrorCode: gwCode,
+      gatewayErrorMessage: gwMsg,
+    };
+    return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error", errDebug) });
   }
 
   let parsed: unknown = null;
