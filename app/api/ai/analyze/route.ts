@@ -817,9 +817,11 @@ export async function POST(req: NextRequest) {
   };
   // eslint-disable-next-line no-console
   console.log("[ai/analyze] env check:", {
+    endpoint: GATEWAY_URL,
     hasKey: debugInfo.hasGatewayKey,
     model: debugInfo.gatewayModel,
     hasModelEnv: debugInfo.hasGatewayModel,
+    maxTokens: MAX_TOKENS,
     keyContainsEquals,
     keyContainsWhitespace,
     keyLength,
@@ -890,8 +892,20 @@ export async function POST(req: NextRequest) {
     clearTimeout(timeout);
   }
 
-  // ── 6. Разбираем ответ OpenAI ────────────────────────────────────────────
+  // ── 6. Разбираем ответ Gateway ───────────────────────────────────────────
   const rawText = await upstream.text();
+
+  // Всегда логируем статус ответа Gateway (без секретов) — чтобы причина ухода
+  // в fallback была видна в server logs Timeweb при ЛЮБОМ исходе:
+  //   401/403 → ключ · 404 → endpoint/model · 429/402 → баланс/лимиты Timeweb.
+  // eslint-disable-next-line no-console
+  console.log("[ai/analyze] ответ Gateway:", {
+    endpoint: GATEWAY_URL,
+    model: MODEL,
+    status: upstream.status,
+    ok: upstream.ok,
+    bodyLength: rawText.length,
+  });
 
   if (!upstream.ok) {
     // Безопасно парсим тело ошибки Gateway — извлекаем status/type/code/message,
