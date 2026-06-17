@@ -63,6 +63,9 @@ type AnalyzeInput = {
   marketplace?: string;
   mode?: string;
   products?: unknown[];
+  // последние расчёты (агрегаты по каждому) + период отчёта, если доступны
+  recentCalcs?: unknown[];
+  period?: string;
 };
 
 // ---------- выходной тип (новый формат) ----------
@@ -118,6 +121,47 @@ export type AiDebugInfo = {
   gatewayErrorMessage?: string | null;
 };
 
+// ---------- новый структурированный формат «книжки» ----------
+// Модель возвращает готовые страницы: заголовок, тип, строки-выводы, метрики
+// (для шкал), действия и риски. Числа остаются детерминированными (считаем
+// локально), AI отвечает за текстовый разбор — никаких выдуманных сумм.
+export type ProfitStatus = "good" | "warning" | "bad";
+
+export type AiPageType =
+  | "summary"
+  | "expense_structure"
+  | "profit_leaks"
+  | "sku"
+  | "actions"
+  | "risks"
+  | "plan";
+
+export type AiMetric = {
+  label: string;
+  value: string; // готовая строка для показа, напр. "98 180 ₽"
+  share: number | null; // доля в % от выручки (ширина шкалы) или null
+  tone: "good" | "warning" | "bad" | "neutral";
+};
+
+export type AiBookPageDoc = {
+  title: string;
+  type: AiPageType;
+  lines: string[]; // 4–6 коротких смысловых строк
+  metrics: AiMetric[]; // опц. (для «структуры расходов»)
+  actions: string[]; // опц.: проблема → почему → что сделать
+  risks: string[]; // опц.: строки рисков
+};
+
+export type AiAnalysisDoc = {
+  summary: {
+    mainConclusion: string;
+    profitStatus: ProfitStatus;
+    mainProblem: string;
+    mainAction: string;
+  };
+  pages: AiBookPageDoc[];
+};
+
 export type AiResult = {
   source: "openai" | "fallback";
   fallbackReason?: FallbackReason;
@@ -131,6 +175,8 @@ export type AiResult = {
   productRisks: ProductRisk[];
   recommendedActions: RecommendedAction[];
   missingData: string[];
+  /** Новый структурированный разбор для книжки (заполнен при source=openai). */
+  analysis?: AiAnalysisDoc;
 };
 
 // ---------- хелперы ----------
@@ -162,6 +208,25 @@ function sanitizeInput(p: AnalyzeInput) {
       });
     }
   }
+  // последние расчёты: только агрегаты по каждому (числа + тип площадки)
+  const recentCalcs: {
+    revenue: number;
+    profit: number;
+    margin: number;
+    marketplace: string;
+  }[] = [];
+  if (Array.isArray(p.recentCalcs)) {
+    for (const item of p.recentCalcs.slice(0, 12)) {
+      if (!item || typeof item !== "object") continue;
+      const o = item as Record<string, unknown>;
+      recentCalcs.push({
+        revenue: num(o.revenue),
+        profit: num(o.profit),
+        margin: num(o.margin),
+        marketplace: o.marketplace === "wb" ? "wb" : "ozon",
+      });
+    }
+  }
   return {
     revenue: num(p.revenue),
     profit: num(p.profit),
@@ -186,7 +251,10 @@ function sanitizeInput(p: AnalyzeInput) {
       typeof p.mode === "string" && p.mode.trim()
         ? p.mode.trim().slice(0, 16)
         : "manual",
+    period:
+      typeof p.period === "string" ? p.period.trim().slice(0, 40) : "",
     products,
+    recentCalcs,
   };
 }
 
@@ -651,6 +719,124 @@ function normalizeAiResult(raw: unknown): AiResult | null {
   };
 }
 
+// ---------- нормализация нового формата { summary, pages } ----------
+
+const PAGE_TYPES: AiPageType[] = [
+  "summary",
+  "expense_structure",
+  "profit_leaks",
+  "sku",
+  "actions",
+  "risks",
+  "plan",
+];
+
+/** Терпимо приводим к массиву коротких строк: принимаем массив ИЛИ строку
+ *  (с переносами/точками) — модель иногда отдаёт text вместо lines. */
+function toStrArr(raw: unknown, maxItems: number, maxLen: number): string[] {
+  let parts: string[];
+  if (typeof raw === "string") {
+    parts = raw.split(/\r?\n|(?<=[.!?])\s+(?=[А-ЯA-ZЁ0-9])/);
+  } else if (Array.isArray(raw)) {
+    parts = raw.map((x) => (typeof x === "string" ? x : ""));
+  } else {
+    return [];
+  }
+  return parts
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter((s) => s.length > 0)
+    .slice(0, maxItems)
+    .map((s) => s.slice(0, maxLen));
+}
+
+function normalizeMetrics(raw: unknown): AiMetric[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AiMetric[] = [];
+  for (const item of raw.slice(0, 8)) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const label = toStr(o.label, 48);
+    if (!label) continue;
+    const shareRaw = isFinNum(o.share)
+      ? (o.share as number)
+      : isFinNum(o.pct)
+      ? (o.pct as number)
+      : null;
+    const tone = o.tone;
+    out.push({
+      label,
+      value: toStr(o.value, 40),
+      share: shareRaw === null ? null : Math.round(shareRaw * 10) / 10,
+      tone:
+        tone === "good" || tone === "warning" || tone === "bad"
+          ? tone
+          : "neutral",
+    });
+  }
+  return out;
+}
+
+/** Строгий, но терпимый парсер { summary, pages }. Пустые страницы выкидываем,
+ *  чтобы во фронте не было пустых слайдов. null → уходим в fallback. */
+function normalizeAnalysisDoc(raw: unknown): AiAnalysisDoc | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  const s = (
+    o.summary && typeof o.summary === "object" ? o.summary : {}
+  ) as Record<string, unknown>;
+  const ps = s.profitStatus;
+  const summary = {
+    mainConclusion: toStr(s.mainConclusion, 300),
+    profitStatus: (ps === "good" || ps === "warning" || ps === "bad"
+      ? ps
+      : "warning") as ProfitStatus,
+    mainProblem: toStr(s.mainProblem, 300),
+    mainAction: toStr(s.mainAction, 300),
+  };
+
+  const rawPages = Array.isArray(o.pages) ? o.pages : [];
+  const pages: AiBookPageDoc[] = [];
+  rawPages.slice(0, 9).forEach((item, idx) => {
+    if (!item || typeof item !== "object") return;
+    const p = item as Record<string, unknown>;
+    const typ = PAGE_TYPES.includes(p.type as AiPageType)
+      ? (p.type as AiPageType)
+      : PAGE_TYPES[Math.min(idx, PAGE_TYPES.length - 1)];
+    const lines = toStrArr(p.lines ?? p.text, 8, 220);
+    const metrics = normalizeMetrics(p.metrics);
+    const actions = toStrArr(p.actions, 6, 240);
+    const risks = toStrArr(p.risks, 6, 240);
+    // Пустую страницу не добавляем (не показываем пустых слайдов).
+    if (lines.length + metrics.length + actions.length + risks.length === 0) {
+      return;
+    }
+    pages.push({
+      title: toStr(p.title, 60) || typ,
+      type: typ,
+      lines,
+      metrics,
+      actions,
+      risks,
+    });
+  });
+
+  // Считаем валидным, если есть главный вывод и достаточно наполненных страниц.
+  if (pages.length === 0) return null;
+  if (!summary.mainConclusion && pages.length < 3) return null;
+  return { summary, pages };
+}
+
+// ---------- dev-only диагностика (в production не логируем) ----------
+
+const AI_DEV = process.env.NODE_ENV !== "production";
+function devLog(msg: string, extra?: unknown): void {
+  if (!AI_DEV) return;
+  // eslint-disable-next-line no-console
+  if (extra !== undefined) console.log("[ai/analyze][dev] " + msg, extra);
+  // eslint-disable-next-line no-console
+  else console.log("[ai/analyze][dev] " + msg);
+}
+
 // ---------- свободный текст как запасной формат ----------
 
 /** Снимаем markdown-обёртку ```json … ``` / ``` … ```, если она есть. */
@@ -689,65 +875,107 @@ function buildFromText(d: SanitizedData, text: string): AiResult {
 // ---------- строим промпт ----------
 
 function buildPrompt(d: SanitizedData): { system: string; user: string } {
+  // Точная схема ответа: книга из 7 страниц + краткое резюме.
+  const schema = {
+    summary: {
+      mainConclusion: "1–2 предложения: главный вывод по прибыли с цифрами",
+      profitStatus: "good | warning | bad",
+      mainProblem: "главная проблема чистой прибыли с конкретной цифрой",
+      mainAction: "одно самое важное действие",
+    },
+    pages: [
+      {
+        title: "Главный вывод",
+        type: "summary",
+        lines: ["4–6 коротких строк с конкретными цифрами"],
+        metrics: [],
+        actions: [],
+        risks: [],
+      },
+      {
+        title: "Структура расходов",
+        type: "expense_structure",
+        lines: ["4–6 строк: на что уходит выручка"],
+        metrics: [
+          { label: "Комиссия", value: "98 180 ₽", share: 21.4, tone: "warning" },
+        ],
+        actions: [],
+        risks: [],
+      },
+      {
+        title: "Что съедает прибыль",
+        type: "profit_leaks",
+        lines: ["4–6 строк: проблема → почему опасно → что проверить"],
+        metrics: [],
+        actions: [],
+        risks: [],
+      },
+      {
+        title: "SKU / товары",
+        type: "sku",
+        lines: ["разбор товаров ИЛИ честный список недостающих данных"],
+        metrics: [],
+        actions: [],
+        risks: [],
+      },
+      {
+        title: "Конкретные действия",
+        type: "actions",
+        lines: ["вводная строка"],
+        metrics: [],
+        actions: ["проблема → почему важно → что сделать"],
+        risks: [],
+      },
+      {
+        title: "Риски",
+        type: "risks",
+        lines: ["вводная строка"],
+        metrics: [],
+        actions: [],
+        risks: ["конкретный риск с цифрой"],
+      },
+      {
+        title: "План на 7 дней",
+        type: "plan",
+        lines: ["вводная строка"],
+        metrics: [],
+        actions: ["День 1: …", "День 2: …"],
+        risks: [],
+      },
+    ],
+  };
+
   const system = [
     "Ты — опытный финансовый аналитик для продавца Ozon/WB.",
-    "Анализируй переданные цифры и найди 2–4 ГЛАВНЫЕ проблемы чистой прибыли, а не очевидные общие места.",
-    "К каждой проблеме давай конкретное решение: что именно проверить, сверить или пересчитать.",
-    "В описаниях опирайся на числа — указывай долю в % от выручки и сумму в рублях.",
-    "Пиши короткими строками для книжки-слайдера в интерфейсе: одна мысль — одна строка, без длинных абзацев.",
+    "Готовишь ПЛАТНЫЙ разбор расчёта в виде книги из 7 страниц.",
+    "Пиши по-русски, коротко и по делу, строками для книжки-слайдера.",
     "",
-    "Запрещены слабые и пустые формулировки:",
-    "— «проверьте товары», «проанализируйте продажи», «улучшите показатели», «оптимизируйте расходы»;",
-    "— «увеличьте цену» без указания, каким именно SKU и почему;",
-    "— «себестоимость высокая» / «логистика высокая» без цифры и без вывода;",
-    "— «проверьте данные» без указания, что именно сверить;",
-    "— markdown, таблицы и разметка внутри строк;",
-    "— технические слова: fallback, debug, json, source, model, endpoint, API.",
+    "ЖЁСТКИЕ ПРАВИЛА:",
+    "1) Каждый вывод привязан к конкретной цифре — сумма в ₽ и/или доля в % от выручки.",
+    "2) Каждый совет отвечает на 3 вопроса: какая проблема найдена; почему это влияет на прибыль; что конкретно сделать продавцу.",
+    "3) Запрещены очевидные советы без причины («проверьте себестоимость», «оптимизируйте расходы», «улучшите показатели» — без цифры и вывода).",
+    "4) Не слишком коротко и не слишком длинно: на каждую страницу 4–6 смысловых строк.",
+    "5) Если данных по SKU/товарам нет — честно укажи, каких данных не хватает, и дай чек-лист, что загрузить и проверить.",
+    "6) Не выдумывай данные, которых нет. Не обещай точный/гарантированный рост прибыли, если данных недостаточно.",
+    "7) Никакого markdown, таблиц и ссылок. Запрещены технические слова: fallback, debug, json, source, model, endpoint, API.",
     "",
-    "Вместо общих фраз пиши конкретно, например:",
-    "— «Проверьте 10 SKU с максимальной выручкой: если у них себестоимость выше 55%, именно они съедают маржу»;",
-    "— «Не повышайте цену всем: найдите SKU с маржой ниже 10% и проверьте, выдержат ли они рост цены без потери заказов»;",
-    "— «Если логистика выше 7–8% выручки, проверьте габариты карточек, схему FBO/FBS и упаковку».",
+    "Хорошие формулировки (пример стиля, а не готовый ответ):",
+    "— «Комиссия 98 180 ₽ — это 21% выручки. Для этой категории норма ниже: проверьте, верно ли выбрана категория карточки».",
+    "— «Логистика выше 8% выручки: проверьте габариты карточек, схему FBO/FBS и процент возвратов».",
+    "— «Не повышайте цену всем: найдите SKU с маржой ниже 10% и проверьте, выдержат ли они рост цены без потери заказов».",
     "",
-    "В productRisks бери реальные товары из переданного списка (название/sku) — не выдумывай новых.",
-    "Опирайся ТОЛЬКО на переданные цифры. Не выдумывай цифры и товары.",
-    "Если данных не хватает — честно укажи, чего именно, в поле missingData.",
-    "Не обещай гарантированный рост прибыли и не давай налоговых или юридических гарантий.",
+    "Страницы строго в этом порядке и с этими type: summary, expense_structure, profit_leaks, sku, actions, risks, plan.",
+    "На странице expense_structure заполни metrics по основным статьям: label, value (сумма с ₽), share (доля % от выручки), tone (good|warning|bad|neutral).",
+    "На странице sku бери ТОЛЬКО реальные товары из переданного списка (название/sku) — не выдумывай новых.",
     "",
-    "Ответь ТОЛЬКО валидным JSON по точной схеме (без markdown, без комментариев):",
-    JSON.stringify({
-      summary: "строка 1-2 предложения",
-      healthScore: "число 0-100",
-      mainProblem: "главная проблема чистой прибыли",
-      keyInsights: [
-        {
-          title: "короткий заголовок",
-          description: "конкретное объяснение с цифрами",
-          severity: "low|medium|high",
-        },
-      ],
-      profitLeaks: [
-        { area: "статья расходов", amount: "число или null", comment: "что проверить" },
-      ],
-      productRisks: [
-        { name: "товар", sku: "sku или null", reason: "почему риск", action: "что сделать" },
-      ],
-      recommendedActions: [
-        {
-          priority: 1,
-          action: "конкретное действие",
-          why: "почему важно",
-          expectedEffect: "ожидаемый эффект без гарантий",
-        },
-      ],
-      missingData: ["каких данных не хватает"],
-    }),
+    "Ответь ТОЛЬКО валидным JSON по схеме (без markdown и комментариев):",
+    JSON.stringify(schema),
   ].join("\n");
 
   const userData: Record<string, unknown> = {
     маркетплейс: d.marketplace,
     выручка: d.revenue,
-    чистая_прибыль: d.profit || d.netProfit,
+    чистая_прибыль: d.netProfit || d.profit,
     маржа_процент: d.margin,
     комиссия: d.commission,
     логистика: d.logistics,
@@ -757,20 +985,23 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
     налог: d.tax,
     прочие_расходы: d.other_expenses,
   };
+  if (d.period) userData.период_отчёта = d.period;
   if (d.loyaltyPayouts > 0) userData.выплаты_партнёрам = d.loyaltyPayouts;
   if (d.updServicesTotal > 0) userData.услуги_озон_упд = d.updServicesTotal;
-  if (d.updCommissionTotal > 0) userData.агентское_вознаграждение_упд = d.updCommissionTotal;
+  if (d.updCommissionTotal > 0)
+    userData.агентское_вознаграждение_упд = d.updCommissionTotal;
   if (d.packaging > 0) userData.упаковка = d.packaging;
   if (d.delivery > 0) userData.доставка_до_склада = d.delivery;
   if (d.salary > 0) userData.зарплата = d.salary;
   if (d.productsWithoutCost > 0)
     userData.товаров_без_себестоимости = d.productsWithoutCost;
   if (d.products.length > 0) userData.товары_топ15 = d.products;
+  if (d.recentCalcs.length > 0) userData.последние_расчёты = d.recentCalcs;
 
   const user =
     "Данные расчёта (суммы в ₽, маржа в %):\n" +
     JSON.stringify(userData, null, 2) +
-    "\n\nОцени финансовое здоровье продавца и верни строго JSON по схеме.";
+    "\n\nСделай разбор и верни строго JSON по схеме (summary + 7 страниц pages).";
 
   return { system, user };
 }
@@ -868,6 +1099,11 @@ export async function POST(req: NextRequest) {
 
   // ── 5. Вызываем Timeweb AI Gateway (OpenAI-совместимый /chat/completions) ──
   const { system, user } = buildPrompt(data);
+  devLog("endpoint called → Gateway", {
+    products: data.products.length,
+    recentCalcs: data.recentCalcs.length,
+    hasPeriod: !!data.period,
+  });
 
   let upstream: Response;
   const controller = new AbortController();
@@ -965,6 +1201,11 @@ export async function POST(req: NextRequest) {
   } catch {
     content = "";
   }
+  devLog("response received", {
+    status: upstream.status,
+    contentLength: content.length,
+    finishReason,
+  });
 
   // 1) Строгий JSON (в т.ч. в markdown-обёртке) → структурированная аналитика.
   let parsed: unknown = null;
@@ -975,8 +1216,32 @@ export async function POST(req: NextRequest) {
       parsed = null;
     }
   }
+  // НОВЫЙ формат { summary, pages } → структурированная книжка.
+  // Числа берём из детерминированного rule-based расчёта (модель не придумывает
+  // суммы), а текстовый разбор книжки — из ответа AI.
+  const analysis = normalizeAnalysisDoc(parsed);
+  if (analysis) {
+    devLog("parse success: analysis", {
+      pages: analysis.pages.length,
+      finishReason,
+    });
+    const base = buildFallback(data);
+    return NextResponse.json({
+      ok: true,
+      ...base,
+      source: "openai" as const,
+      fallbackReason: undefined,
+      debug: undefined,
+      summary: analysis.summary.mainConclusion || base.summary,
+      mainProblem: analysis.summary.mainProblem || base.mainProblem,
+      analysis,
+    });
+  }
+
+  // Старый строгий формат (на случай, если модель вернула прежнюю схему).
   const result = normalizeAiResult(parsed);
   if (result) {
+    devLog("parse success: legacy schema");
     return NextResponse.json({ ok: true, ...result });
   }
 
@@ -1004,5 +1269,6 @@ export async function POST(req: NextRequest) {
         ? "Увеличьте TIMEWEB_AI_MAX_TOKENS — лимит токенов исчерпан на reasoning."
         : "Модель вернула пустой/нечитаемый content.",
   });
+  devLog("fallback used: invalid_json");
   return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json", debugInfo) });
 }

@@ -919,7 +919,16 @@ function buildWeekPlan(f: AiFinancials): string[] {
 type AiItemTone = "exp" | "good" | "bad";
 type AiItem =
   | { kind: "text"; text: string }
-  | { kind: "bar"; label: string; pct: number; amount: number; tone: AiItemTone };
+  | {
+      kind: "bar";
+      label: string;
+      pct: number;
+      amount: number;
+      tone: AiItemTone;
+      // если задано — показываем эту строку вместо «{amount} ₽ · {pct}%»
+      // (метрики из ответа AI приходят уже отформатированными).
+      valueText?: string;
+    };
 // Логическая секция = одна тема. На сколько физических страниц «книжки» она ляжет,
 // решает автопагинация по реальной высоте — текст не обрезаем и «…» не ставим.
 interface AiBookPage {
@@ -1184,6 +1193,31 @@ type AiDebug = {
   gatewayErrorMessage?: string | null;
 };
 
+// Новый структурированный разбор «книжки» (ответ /api/ai/analyze, source=openai).
+type AiMetricDoc = {
+  label: string;
+  value: string;
+  share: number | null;
+  tone: "good" | "warning" | "bad" | "neutral";
+};
+type AiPageDoc = {
+  title: string;
+  type: string;
+  lines: string[];
+  metrics: AiMetricDoc[];
+  actions: string[];
+  risks: string[];
+};
+type AiAnalysisDoc = {
+  summary: {
+    mainConclusion: string;
+    profitStatus: "good" | "warning" | "bad";
+    mainProblem: string;
+    mainAction: string;
+  };
+  pages: AiPageDoc[];
+};
+
 type AiAnalysis = {
   source: "openai" | "fallback";
   fallbackReason?: string;
@@ -1196,6 +1230,7 @@ type AiAnalysis = {
   productRisks: ProductRisk[];
   recommendedActions: RecommendedAction[];
   missingData: string[];
+  analysis?: AiAnalysisDoc;
 };
 
 /** keyInsights от AI → слоты инсайтов (severity → kind). */
@@ -1527,6 +1562,14 @@ export function AnalyticsBlock({
       break; // берём только первый подходящий
     }
 
+    // Последние расчёты — только агрегаты по каждому (числа + площадка).
+    const recentCalcs = history.slice(0, 6).map((h) => ({
+      revenue: Math.round(h.revenue),
+      profit: Math.round(h.profit),
+      margin: Number((Number(h.margin) || 0).toFixed(1)),
+      marketplace: h.marketplace,
+    }));
+
     return JSON.stringify({
       revenue: Math.round(revenue),
       profit: Math.round(profit),
@@ -1540,6 +1583,7 @@ export function AnalyticsBlock({
       other_expenses: Math.round(sum((h) => h.other)),
       marketplace: history[0].marketplace,
       mode: "history",
+      recentCalcs,
       ...extra,
     });
   })();
@@ -1567,6 +1611,16 @@ export function AnalyticsBlock({
           if (active) setAiFailed(true);
           return;
         }
+        if (process.env.NODE_ENV !== "production") {
+          let keys: string[] = [];
+          try {
+            keys = Object.keys(JSON.parse(aiPayloadSig || "{}"));
+          } catch {}
+          // eslint-disable-next-line no-console
+          console.log("[AI] endpoint called → /api/ai/analyze", {
+            payloadKeys: keys,
+          });
+        }
         const res = await fetch("/api/ai/analyze", {
           method: "POST",
           headers: {
@@ -1581,6 +1635,16 @@ export function AnalyticsBlock({
           ok?: boolean;
         };
         if (!active) return;
+        if (process.env.NODE_ENV !== "production") {
+          // eslint-disable-next-line no-console
+          console.log("[AI] response received", {
+            source: json.source,
+            hasAnalysis: !!json.analysis,
+            pages: Array.isArray(json.analysis?.pages)
+              ? json.analysis!.pages.length
+              : 0,
+          });
+        }
         // Новый формат: source + healthScore + keyInsights + ...
         if (
           json &&
@@ -1610,8 +1674,24 @@ export function AnalyticsBlock({
               : [],
             fallbackReason: typeof json.fallbackReason === "string" ? json.fallbackReason : undefined,
             debug: json.debug && typeof json.debug === "object" ? (json.debug as AiDebug) : undefined,
+            analysis:
+              json.analysis &&
+              typeof json.analysis === "object" &&
+              Array.isArray((json.analysis as AiAnalysisDoc).pages)
+                ? (json.analysis as AiAnalysisDoc)
+                : undefined,
           });
           setAiFailed(false);
+          if (process.env.NODE_ENV !== "production") {
+            const smart = json.source === "openai" && !!json.analysis;
+            // eslint-disable-next-line no-console
+            console.log(
+              "[AI] parse:",
+              smart ? "structured success" : "no structured analysis",
+              "| fallback used:",
+              json.source === "fallback"
+            );
+          }
         } else {
           setAiFailed(true);
         }
@@ -1755,8 +1835,8 @@ export function AnalyticsBlock({
   const toText = (arr: string[]): AiItem[] =>
     arr.map((t) => ({ kind: "text" as const, text: tidy(t) }));
 
-  // 7 секций. Каждая может занять 1+ страниц книжки — это решает автопагинация.
-  const aiSections: AiBookPage[] = [
+  // Базовые (rule-based) 7 секций — используются, когда реального AI-разбора нет.
+  const aiLocalSections: AiBookPage[] = [
     { title: "Главный вывод", items: toText(aiVerdictLines), empty: "Недостаточно данных для вывода — нужен хотя бы один расчёт." },
     { title: "Структура расходов", items: aiExpenseBars, empty: "Расходы в расчёте не детализированы — проверьте отчёт." },
     { title: "Что съедает прибыль", items: toText(aiLeaks), empty: "Серьёзных перекосов по расходам не видно — структура сбалансирована." },
@@ -1765,6 +1845,56 @@ export function AnalyticsBlock({
     { title: "Риски", items: toText(aiRisksList), empty: "Критичных рисков по текущим данным не обнаружено." },
     { title: "План на 7 дней", items: toText(aiPlan), empty: "План появится после первого расчёта." },
   ];
+
+  // Реальный структурированный разбор от AI → секции книжки. Строки-выводы +
+  // метрики (как шкалы) + действия + риски. Пустые страницы отбрасываем.
+  const aiDocToSections = (doc: AiAnalysisDoc): AiBookPage[] =>
+    doc.pages
+      .map((p): AiBookPage => {
+        const items: AiItem[] = [];
+        p.lines.forEach((t) => {
+          const s = tidy(t);
+          if (s) items.push({ kind: "text", text: s });
+        });
+        p.metrics.forEach((m) => {
+          const label = tidy(m.label);
+          if (!label) return;
+          const pct = typeof m.share === "number" ? m.share : 0;
+          const tone: AiItemTone =
+            m.tone === "good" ? "good" : m.tone === "bad" ? "bad" : "exp";
+          const valueText = tidy(
+            m.value +
+              (typeof m.share === "number" ? ` · ${m.share.toFixed(1)}%` : "")
+          );
+          items.push({ kind: "bar", label, pct, amount: 0, tone, valueText });
+        });
+        p.actions.forEach((t) => {
+          const s = tidy(t);
+          if (s) items.push({ kind: "text", text: s });
+        });
+        p.risks.forEach((t) => {
+          const s = tidy(t);
+          if (s) items.push({ kind: "text", text: s });
+        });
+        // Если на странице расходов AI не дал шкал — дополняем локальными барами
+        // (детерминированные доли из расчёта, не выдуманные числа).
+        if (
+          p.type === "expense_structure" &&
+          !items.some((it) => it.kind === "bar")
+        ) {
+          aiExpenseBars.forEach((b) => items.push(b));
+        }
+        return { title: tidy(p.title), items, empty: "Недостаточно данных для этой страницы." };
+      })
+      .filter((s) => s.items.length > 0);
+
+  // Если AI вернул содержательный разбор (≥3 наполненных страниц) — показываем его.
+  // Иначе остаёмся на базовой (rule-based) аналитике, честно подписав её.
+  const aiDoc: AiAnalysisDoc | undefined = useAi ? aiData!.analysis : undefined;
+  const aiDocSections =
+    aiDoc && aiDoc.pages.length ? aiDocToSections(aiDoc) : null;
+  const aiIsSmart = !!(aiDocSections && aiDocSections.length >= 3);
+  const aiSections: AiBookPage[] = aiIsSmart ? aiDocSections! : aiLocalSections;
 
   // Рендер одного пункта: строка-вывод либо мини-бар структуры расходов.
   const renderAiItem = (item: AiItem, i: number): ReactNode => {
@@ -1775,7 +1905,9 @@ export function AnalyticsBlock({
           <div className="ai-bar-head">
             <span className="ai-bar-name">{item.label}</span>
             <span className="ai-bar-val">
-              {fmt(item.amount)} ₽ · {item.pct.toFixed(1)}%
+              {item.valueText
+                ? item.valueText
+                : `${fmt(item.amount)} ₽ · ${item.pct.toFixed(1)}%`}
             </span>
           </div>
           <div className="ai-bar-track">
@@ -3018,7 +3150,11 @@ export function AnalyticsBlock({
                 AI Аналитика
               </div>
               {hasPremium && (
-                <div className="ai-sub">Персональные рекомендации по вашему отчёту</div>
+                <div className="ai-sub">
+                  {aiIsSmart
+                    ? "Персональные рекомендации по вашему отчёту"
+                    : "Базовая аналитика по вашим цифрам"}
+                </div>
               )}
             </div>
             {/* ═══ AI-«КНИЖКА» — одна страница за раз: стрелки + точки + счётчик ═══ */}
