@@ -915,43 +915,85 @@ function buildWeekPlan(f: AiFinancials): string[] {
     "День 7: повторить расчёт в M-PROF и сравнить маржу с сегодняшней.",
   ];
 }
-// Слайд 5 — «Сценарии улучшения»: простые «что если» на реальных суммах.
-// Считаем прямой эффект на прибыль (это оценка-ориентир, формулы расчёта не трогаем).
-function buildScenarios(f: AiFinancials): string[] {
+// Один пункт страницы «книжки»: либо строка-вывод, либо мини-бар структуры расходов.
+type AiItemTone = "exp" | "good" | "bad";
+type AiItem =
+  | { kind: "text"; text: string }
+  | { kind: "bar"; label: string; pct: number; amount: number; tone: AiItemTone };
+// Логическая секция = одна тема. На сколько физических страниц «книжки» она ляжет,
+// решает автопагинация по реальной высоте — текст не обрезаем и «…» не ставим.
+interface AiBookPage {
+  title: string;
+  items: AiItem[];
+  empty: string;
+}
+// Страница 2 — «Структура расходов»: доли статей компактными прогресс-барами
+// (без библиотек, чистый CSS). Последний бар — что осталось как прибыль/убыток.
+function buildExpenseBars(f: AiFinancials): AiItem[] {
+  if (f.revenue <= 0) return [];
+  const rows = topFactors(f); // ненулевые статьи, по убыванию доли
+  const MAX = 5;
+  const bars: AiItem[] = rows.slice(0, MAX).map((r) => ({
+    kind: "bar" as const,
+    label: capFirst(r.name),
+    pct: r.share * 100,
+    amount: r.amount,
+    tone: "exp" as const,
+  }));
+  const restAmt = rows.slice(MAX).reduce((s, r) => s + r.amount, 0);
+  if (restAmt > 0)
+    bars.push({
+      kind: "bar",
+      label: "Прочие расходы",
+      pct: pctRev(restAmt, f.revenue),
+      amount: restAmt,
+      tone: "exp",
+    });
+  bars.push({
+    kind: "bar",
+    label: f.profit >= 0 ? "Чистая прибыль" : "Убыток",
+    pct: f.marginPct,
+    amount: f.profit,
+    tone: f.profit >= 0 ? "good" : "bad",
+  });
+  return bars;
+}
+// Страница 3 — «Что съедает прибыль»: 2–4 главных давящих фактора в формате
+// проблема → почему опасно → что проверить. Только то, что видно из расчёта.
+function buildLeaks(f: AiFinancials): string[] {
+  const s = scoreProblems(f);
   const out: string[] = [];
-  const saveCost = f.cost * 0.05;
-  const saveComm = f.commission * 0.1;
-  const saveLog = f.logistics * 0.1;
-  if (f.cost > 0)
+  if (s.costHigh || s.costElevated)
     out.push(
-      `Снизить себестоимость на 5% (${fmt(f.cost)} ₽ → ${fmt(f.cost - saveCost)} ₽) — прибыль вырастет примерно на ${fmt(saveCost)} ₽.`
+      `Себестоимость ${s.costPct.toFixed(1)}% выручки (${fmt(f.cost)} ₽). Почему опасно: при такой доле закупки маржа почти не растёт, а подорожание у поставщика сразу уводит в минус. Что проверить: закупочные цены и unit-экономику топ-SKU.`
     );
-  if (f.commission > 0)
+  if (s.commissionElevated)
     out.push(
-      `Снизить комиссию на 10% (${fmt(f.commission)} ₽ → ${fmt(f.commission - saveComm)} ₽) — прибыль вырастет примерно на ${fmt(saveComm)} ₽.`
+      `Комиссия маркетплейса ${s.commissionPct.toFixed(1)}% (${fmt(f.commission)} ₽). Почему опасно: завышенная ставка и невыгодные акции тихо забирают наценку. Что проверить: ставку по категориям и участие в акциях.`
     );
-  if (f.logistics > 0)
+  if (s.logisticsElevated)
     out.push(
-      `Снизить логистику и УПД на 10% (${fmt(f.logistics)} ₽ → ${fmt(f.logistics - saveLog)} ₽) — прибыль вырастет примерно на ${fmt(saveLog)} ₽.`
+      `Логистика и УПД ${s.logisticsPct.toFixed(1)}% (${fmt(f.logistics)} ₽). Почему опасно: крупные габариты и возвраты превращают прибыльные позиции в убыточные. Что проверить: габариты карточек, схему FBO/FBS и процент возвратов.`
     );
-  const total =
-    (f.cost > 0 ? saveCost : 0) +
-    (f.commission > 0 ? saveComm : 0) +
-    (f.logistics > 0 ? saveLog : 0);
-  if (total > 0 && f.revenue > 0) {
-    const newProfit = f.profit + total;
-    const newMargin = (newProfit / f.revenue) * 100;
+  if (s.adsPct > 8)
     out.push(
-      `Вместе это около +${fmt(total)} ₽ к прибыли: ${fmt(f.profit)} ₽ → примерно ${fmt(newProfit)} ₽, маржа ${f.marginPct.toFixed(1)}% → около ${newMargin.toFixed(1)}%.`
+      `Реклама ${s.adsPct.toFixed(1)}% (${fmt(f.ads)} ₽). Почему опасно: при высокой ДРР часть бюджета уходит в неокупаемые показы. Что проверить: ДРР и ставки по кампаниям, отключите убыточные.`
     );
+  if (s.taxHigh)
+    out.push(
+      `Налог ${s.taxPct.toFixed(1)}% (${fmt(f.tax)} ₽). Почему опасно: неоптимальный режим съедает прибыль на ровном месте. Что проверить: налоговую модель и учёт расходов.`
+    );
+  if (!out.length) {
+    const top = topFactors(f);
+    if (top[0])
+      out.push(
+        `Крупнейшая статья — ${top[0].name}: ${shareStr(top[0].amount, f.revenue)} выручки (${fmt(top[0].amount)} ₽). Грубых перекосов нет, но именно здесь спрятан главный резерв: даже −5% по ней заметно поднимут прибыль.`
+      );
   }
-  out.push(
-    "Это ориентир по текущим суммам, а не гарантия: проверьте, какие из расходов реально можно снизить без падения продаж."
-  );
   return pad3(out, [
-    "Считайте сценарии от реальных цифр отчёта — так видно, какая статья расходов даёт наибольший прирост прибыли.",
-    "Начинать выгоднее с самой крупной статьи: даже небольшое снижение в ₽ по ней заметнее, чем большое снижение мелкой статьи.",
-  ]).slice(0, 5);
+    "Сравните доли расходов с прошлым периодом: резкий рост любой статьи — первый признак утечки прибыли.",
+    "Держите под контролем себестоимость, комиссию и логистику — вместе они решают итоговую маржу.",
+  ]).slice(0, 4);
 }
 function buildRecommendations(
   ind: FinancialIndicators,
@@ -1401,8 +1443,14 @@ export function AnalyticsBlock({
   const [aiData, setAiData] = useState<AiAnalysis | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiFailed, setAiFailed] = useState(false);
-  // Текущая страница «книжки» AI Аналитики (0…aiPages.length-1)
+  // Текущая страница «книжки» AI Аналитики (0…aiBookPages.length-1)
   const [aiPage, setAiPage] = useState(0);
+  // Автопагинация: измеряем доступную высоту карточки и реальные высоты пунктов,
+  // затем раскладываем секции по страницам так, чтобы текст не обрезался и не
+  // оставлял пустоту. Никакой обрезки строк и «…» — лишнее уходит на след. страницу.
+  const aiContentRef = useRef<HTMLDivElement | null>(null);
+  const aiMeasureRef = useRef<HTMLDivElement | null>(null);
+  const [aiPages, setAiPages] = useState<AiBookPage[]>([]);
 
   // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
   // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
@@ -1676,96 +1724,164 @@ export function AnalyticsBlock({
   // Без карусели, без сырого ответа модели, без техполей.
   // ============================================================
 
-  // Аккуратная обрезка: схлопывает пробелы и режет до n символов с «…».
-  const clip = (s: string, n: number): string => {
-    const t = String(s ?? "").replace(/\s+/g, " ").trim();
-    return t.length > n ? t.slice(0, n - 1).trimEnd() + "…" : t;
-  };
+  // Текст пунктов: только схлопываем пробелы — без обрезки и «…».
+  // Если пунктов много, лишнее уходит на следующую страницу (автопагинация ниже).
+  const tidy = (s: string): string => String(s ?? "").replace(/\s+/g, " ").trim();
 
   // Числа расчёта для слайдов «книжки». В режиме AI и в фолбэке одинаково —
-  // текст строится из реальных агрегатов, поэтому выглядит как нормальная
-  // аналитика без техдиагностики. Саму математику расчёта не трогаем.
+  // текст строится из реальных агрегатов. Саму математику расчёта не трогаем.
   const aiFin = buildFinancials(history);
 
-  // 1) Главный диагноз — прибыль, маржа, главный фактор
-  const aiVerdictLines = buildVerdictLines(aiFin);
-
-  // 2) Денежные утечки — крупнейшие статьи расходов с % выручки и суммой в ₽
-  const aiEaters = buildEaters(aiFin);
-
-  // 3) Проблема по товарам / SKU — реальные позиции из отчёта (AI), а если их
-  //    нет — честный разбор того, какой детализации не хватает
+  // Контент 7 логических секций (порядок = порядок страниц книжки).
+  const aiVerdictLines = buildVerdictLines(aiFin); // 1) главный вывод
+  const aiExpenseBars = buildExpenseBars(aiFin); // 2) структура расходов (бары)
+  const aiLeaks = buildLeaks(aiFin); // 3) что съедает прибыль
+  // 4) проверка SKU — реальные товары из отчёта (AI) либо честный разбор пробелов
   const aiSkuItems: string[] =
     useAi && aiData!.productRisks.length
       ? aiData!.productRisks
-          .slice(0, 5)
+          .slice(0, 8)
           .map((r) => {
             const core = r.reason || r.action;
             const tail = r.reason && r.action ? ` → ${r.action}` : "";
-            return clip(`${r.name} — ${core}${tail}`, 160);
+            return tidy(`${r.name} — ${core}${tail}`);
           })
           .filter(Boolean)
       : buildSkuProblems(aiFin);
+  const aiFirstActions = buildFirstActions(aiFin); // 5) практические действия
+  const aiRisksList = buildRisks(aiFin); // 6) риски
+  const aiPlan = buildWeekPlan(aiFin); // 7) план на 7 дней
 
-  // 4) Что сделать в первую очередь — конкретные действия (где и почему)
-  const aiFirstActions = buildFirstActions(aiFin);
+  const toText = (arr: string[]): AiItem[] =>
+    arr.map((t) => ({ kind: "text" as const, text: tidy(t) }));
 
-  // 5) Сценарии улучшения — простые «что если» на реальных суммах
-  const aiScenarios = buildScenarios(aiFin);
+  // 7 секций. Каждая может занять 1+ страниц книжки — это решает автопагинация.
+  const aiSections: AiBookPage[] = [
+    { title: "Главный вывод", items: toText(aiVerdictLines), empty: "Недостаточно данных для вывода — нужен хотя бы один расчёт." },
+    { title: "Структура расходов", items: aiExpenseBars, empty: "Расходы в расчёте не детализированы — проверьте отчёт." },
+    { title: "Что съедает прибыль", items: toText(aiLeaks), empty: "Серьёзных перекосов по расходам не видно — структура сбалансирована." },
+    { title: "Проверка SKU", items: toText(aiSkuItems), empty: "Недостаточно данных по товарам — выгрузите отчёт с SKU." },
+    { title: "Практические действия", items: toText(aiFirstActions), empty: "Показатели в норме — резких действий не требуется." },
+    { title: "Риски", items: toText(aiRisksList), empty: "Критичных рисков по текущим данным не обнаружено." },
+    { title: "План на 7 дней", items: toText(aiPlan), empty: "План появится после первого расчёта." },
+  ];
 
-  // 6) Риски
-  const aiRisksList = buildRisks(aiFin);
-
-  // 7) План на 7 дней
-  const aiPlan = buildWeekPlan(aiFin);
-
-  // Рендер одной секции-списка (с аккуратным пустым состоянием)
-  const renderAiList = (items: string[], empty: string): ReactNode =>
-    items.length > 0 ? (
-      <ul className="ai-sec-list">
-        {items.map((t, i) => (
-          <li key={i}>{t}</li>
-        ))}
-      </ul>
+  // Рендер одного пункта: строка-вывод либо мини-бар структуры расходов.
+  const renderAiItem = (item: AiItem, i: number): ReactNode => {
+    if (item.kind === "bar") {
+      const w = Math.max(0, Math.min(100, item.pct));
+      return (
+        <li key={i} className={"ai-bar-li ai-bar-" + item.tone}>
+          <div className="ai-bar-head">
+            <span className="ai-bar-name">{item.label}</span>
+            <span className="ai-bar-val">
+              {fmt(item.amount)} ₽ · {item.pct.toFixed(1)}%
+            </span>
+          </div>
+          <div className="ai-bar-track">
+            <span className="ai-bar-fill" style={{ width: w + "%" }} />
+          </div>
+        </li>
+      );
+    }
+    return <li key={i}>{item.text}</li>;
+  };
+  const renderAiPageBody = (page: AiBookPage): ReactNode =>
+    page.items.length > 0 ? (
+      <ul className="ai-sec-list">{page.items.map(renderAiItem)}</ul>
     ) : (
-      <p className="ai-sec-text ai-sec-muted">{empty}</p>
+      <p className="ai-sec-text ai-sec-muted">{page.empty}</p>
     );
 
-  // ── Страницы «книжки» AI Аналитики (показываем по одной за раз) ──
-  const aiPages: { title: string; body: ReactNode }[] = [
-    {
-      title: "Главный диагноз",
-      body: renderAiList(aiVerdictLines, "Недостаточно данных для вывода — нужен хотя бы один расчёт."),
-    },
-    {
-      title: "Денежные утечки",
-      body: renderAiList(aiEaters, "Расходы в расчёте не детализированы — проверьте отчёт."),
-    },
-    {
-      title: "Проблемы по SKU",
-      body: renderAiList(aiSkuItems, "Недостаточно данных по товарам — выгрузите отчёт с SKU."),
-    },
-    {
-      title: "Что сделать",
-      body: renderAiList(aiFirstActions, "Показатели в норме — резких действий не требуется."),
-    },
-    {
-      title: "Сценарии улучшения",
-      body: renderAiList(aiScenarios, "Сценарии появятся после расчёта с расходами."),
-    },
-    {
-      title: "Риски",
-      body: renderAiList(aiRisksList, "Критичных рисков по текущим данным не обнаружено."),
-    },
-    {
-      title: "План на 7 дней",
-      body: renderAiList(aiPlan, "План появится после первого расчёта."),
-    },
-  ];
-  const aiTotal = aiPages.length;
+  // До измерения (SSR/первый кадр) — по одной секции на страницу; затем эффект
+  // ниже измеряет реальные высоты и раскладывает плотно, без обрезки текста.
+  const aiBookPages: AiBookPage[] = aiPages.length ? aiPages : aiSections;
+  const aiTotal = aiBookPages.length;
   const aiCur = Math.min(Math.max(aiPage, 0), aiTotal - 1);
   const aiGoPrev = () => setAiPage((p) => Math.max(0, p - 1));
   const aiGoNext = () => setAiPage((p) => Math.min(aiTotal - 1, p + 1));
+
+  // Автопагинация: измеряем доступную высоту контента и реальные высоты пунктов,
+  // раскладываем секции по страницам так, чтобы ничего не обрезалось и низ не пустовал.
+  const aiSectionsKey = JSON.stringify(aiSections);
+  useEffect(() => {
+    const measureEl = aiMeasureRef.current;
+    const contentEl = aiContentRef.current;
+    if (!measureEl || !contentEl || typeof ResizeObserver === "undefined") {
+      setAiPages(aiSections.map((s) => ({ ...s })));
+      return;
+    }
+    const GAP = 0.42 * 16; // зазор между пунктами (.ai-sec-list gap)
+    const SAFETY = 6; // небольшой запас, чтобы не упереться в край
+    const paginate = () => {
+      const avail = contentEl.clientHeight;
+      const width = contentEl.clientWidth;
+      if (avail <= 0 || width <= 0) {
+        setAiPages(aiSections.map((s) => ({ ...s })));
+        return;
+      }
+      measureEl.style.width = width + "px";
+      const limit = Math.max(80, avail - SAFETY);
+      const uls = Array.from(measureEl.children) as HTMLElement[];
+      const pages: AiBookPage[] = [];
+      aiSections.forEach((section, si) => {
+        if (!section.items.length) {
+          pages.push({ title: section.title, items: [], empty: section.empty });
+          return;
+        }
+        const lis = uls[si] ? (Array.from(uls[si].children) as HTMLElement[]) : [];
+        const heights = section.items.map((_, i) => lis[i]?.offsetHeight ?? 0);
+        // упаковка по строкам: tooTall — жёсткий предел высоты; target — мягкая
+        // балансировка, чтобы при разбиении не оставалось пустого низа.
+        const pack = (target: number): number[][] => {
+          const res: number[][] = [];
+          let cur: number[] = [];
+          let h = 0;
+          section.items.forEach((_, i) => {
+            const add = heights[i] + (cur.length ? GAP : 0);
+            const tooTall = cur.length > 0 && h + add > limit;
+            const balanced = target > 0 && cur.length > 0 && h >= target;
+            if (tooTall || balanced) {
+              res.push(cur);
+              cur = [i];
+              h = heights[i];
+            } else {
+              cur.push(i);
+              h += add;
+            }
+          });
+          if (cur.length) res.push(cur);
+          return res;
+        };
+        let groups = pack(0); // минимальное число страниц
+        if (groups.length > 1) {
+          const totalH =
+            heights.reduce((a, b) => a + b, 0) + GAP * (heights.length - 1);
+          groups = pack(totalH / groups.length); // ровнее, без пустых низов
+        }
+        groups.forEach((g) =>
+          pages.push({
+            title: section.title,
+            items: g.map((i) => section.items[i]),
+            empty: section.empty,
+          })
+        );
+      });
+      setAiPages(pages.length ? pages : aiSections.map((s) => ({ ...s })));
+    };
+    paginate();
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(paginate);
+    });
+    ro.observe(contentEl);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aiSectionsKey, aiLoading]);
 
   return (
     <>
@@ -2319,7 +2435,13 @@ export function AnalyticsBlock({
         /* ai-body — контейнер книжки внутри карточки */
         .ai-body{padding:.45rem .9rem .75rem;display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
 
-        .ai-book{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
+        .ai-book{position:relative;display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
+        /* скрытый измеритель высот для автопагинации: вне потока, не виден, не кликается,
+           height:0+overflow:hidden — чтобы не создавать прокрутку (дети измеряются по offsetHeight) */
+        .ai-book-measure{
+          position:absolute;left:0;top:0;z-index:-1;height:0;overflow:hidden;
+          visibility:hidden;pointer-events:none
+        }
 
         /* страница-плашка: тянется по доступной высоте, контент скроллится внутри */
         .ai-book-page{
@@ -2411,6 +2533,30 @@ export function AnalyticsBlock({
           width:5px;height:5px;border-radius:50%;
           background:#C9A84C;box-shadow:0 0 6px rgba(201,168,76,.5)
         }
+        /* мини-бары структуры расходов (стр. 2) — чистый CSS, без библиотек */
+        .ai-sec-list li.ai-bar-li{padding-left:0}
+        .ai-sec-list li.ai-bar-li::before{display:none}
+        .ai-bar-head{
+          display:flex;align-items:baseline;justify-content:space-between;gap:.5rem;
+          margin-bottom:.3rem;font-size:.78rem;line-height:1.3;color:#D7E0EE
+        }
+        .ai-bar-name{overflow-wrap:break-word;word-break:break-word}
+        .ai-bar-val{
+          font-family:'DM Mono',monospace;font-size:.72rem;color:#9FB1CB;
+          flex-shrink:0;white-space:nowrap
+        }
+        .ai-bar-track{
+          height:7px;border-radius:6px;overflow:hidden;
+          background:rgba(255,255,255,.06)
+        }
+        .ai-bar-fill{
+          display:block;height:100%;border-radius:6px;
+          background:linear-gradient(90deg,#C9A84C,#E8C97A)
+        }
+        .ai-bar-good .ai-bar-fill{background:linear-gradient(90deg,#3FB984,#6FE0AE)}
+        .ai-bar-good .ai-bar-val{color:#7FE3B4}
+        .ai-bar-bad .ai-bar-fill{background:linear-gradient(90deg,#E0604C,#F0897A)}
+        .ai-bar-bad .ai-bar-val{color:#F0897A}
         @media (prefers-reduced-motion:reduce){
           .ai-book-page{animation:none}
         }
@@ -2886,12 +3032,23 @@ export function AnalyticsBlock({
                 <div className="ai-book">
                   <div className="ai-book-page" key={aiCur}>
                     <div className="ai-book-head">
-                      <h4 className="ai-sec-title">{aiPages[aiCur].title}</h4>
+                      <h4 className="ai-sec-title">{aiBookPages[aiCur].title}</h4>
                       <span className="ai-book-counter">
                         {aiCur + 1} / {aiTotal}
                       </span>
                     </div>
-                    <div className="ai-book-content">{aiPages[aiCur].body}</div>
+                    <div className="ai-book-content" ref={aiContentRef}>
+                      {renderAiPageBody(aiBookPages[aiCur])}
+                    </div>
+                  </div>
+
+                  {/* скрытый измеритель: реальные высоты пунктов для автопагинации */}
+                  <div className="ai-book-measure" ref={aiMeasureRef} aria-hidden="true">
+                    {aiSections.map((s, si) => (
+                      <ul className="ai-sec-list" key={si}>
+                        {s.items.map(renderAiItem)}
+                      </ul>
+                    ))}
                   </div>
 
                   <div className="ai-book-nav">
@@ -2916,7 +3073,7 @@ export function AnalyticsBlock({
                       role="tablist"
                       aria-label="Страницы AI Аналитики"
                     >
-                      {aiPages.map((p, i) => (
+                      {aiBookPages.map((p, i) => (
                         <button
                           key={i}
                           type="button"
