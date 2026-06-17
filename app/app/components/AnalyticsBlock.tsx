@@ -554,6 +554,7 @@ interface AiFinancials {
   isDemo: boolean;
   count: number;
   lossCount: number;
+  noCostCount: number;
   revenue: number;
   profit: number;
   cost: number;
@@ -566,160 +567,234 @@ interface AiFinancials {
   expenses: number;
   marginPct: number;
   hasCost: boolean;
+  // revenue − expenses − profit. Для корректных расчётов ≈ 0 (модель хранит
+  // тождество profit = revenue − total_expenses), поэтому показываем «расхождение»
+  // только при реально большом отклонении — не выдумываем его на ровном месте.
+  discrepancy: number;
 }
 function buildFinancials(history: AnalyticsCalc[]): AiFinancials {
   if (history.length === 0) {
-    // demo-числа для пустого состояния (до первого расчёта / за замком)
-    const revenue = 560000;
-    const expenses = 442500;
+    // demo-числа для пустого состояния (до первого расчёта / за замком).
+    // Внутренне согласованы: profit = revenue − сумма всех статей расходов.
+    const revenue = 755260;
+    const cost = 475060, commission = 98180, logistics = 52870,
+      ads = 41540, storage = 13600, tax = 22650, other = 12400;
+    const expenses = cost + commission + logistics + ads + storage + tax + other;
+    const profit = revenue - expenses;
     return {
-      isDemo: true, count: 0, lossCount: 0,
-      revenue, expenses, profit: revenue - expenses,
-      cost: 145000, commission: 96500, logistics: 48200,
-      storage: 33000, ads: 69800, tax: 28000, other: 22000,
-      marginPct: ((revenue - expenses) / revenue) * 100,
-      hasCost: true,
+      isDemo: true, count: 0, lossCount: 0, noCostCount: 0,
+      revenue, profit, cost, commission, logistics, storage, ads, tax, other,
+      expenses, marginPct: (profit / revenue) * 100, hasCost: true,
+      discrepancy: 0,
     };
   }
   const sum = (f: (h: AnalyticsCalc) => number) =>
     history.reduce((s, h) => s + f(h), 0);
+  const revenue = sum((h) => h.revenue);
+  const profit = sum((h) => h.profit);
+  const expenses = sum((h) => h.expenses);
   const cost = sum((h) => h.cost);
   return {
     isDemo: false,
     count: history.length,
     lossCount: history.filter((h) => h.profit < 0).length,
-    revenue: sum((h) => h.revenue),
-    profit: sum((h) => h.profit),
-    cost,
+    noCostCount: history.filter((h) => h.cost <= 0 && h.revenue > 0).length,
+    revenue, profit, expenses, cost,
     commission: sum((h) => h.commission),
     logistics: sum((h) => h.logistics),
     storage: sum((h) => h.storage),
     ads: sum((h) => h.ads),
     tax: sum((h) => h.tax),
     other: sum((h) => h.other),
-    expenses: sum((h) => h.expenses),
-    marginPct: history.reduce((s, h) => s + h.margin, 0) / history.length,
+    // маржа по агрегату (profit/revenue) — точнее простого среднего по расчётам
+    marginPct: revenue > 0
+      ? (profit / revenue) * 100
+      : history.reduce((s, h) => s + h.margin, 0) / history.length,
     hasCost: cost > 0,
+    discrepancy: revenue - expenses - profit,
   };
 }
-// доля от выручки в виде «62.9%»
-function shareStr(value: number, revenue: number): string {
-  if (revenue <= 0) return "0%";
-  return ((value / revenue) * 100).toFixed(1) + "%";
+// доля от выручки числом (%) и строкой («62.9%»)
+function pctRev(value: number, revenue: number): number {
+  return revenue > 0 ? (value / revenue) * 100 : 0;
 }
-interface FactorRow { name: string; share: number; pct: string }
-function topFactors(f: AiFinancials): FactorRow[] {
-  const rev = f.revenue > 0 ? f.revenue : 1;
-  return [
-    { name: "себестоимость", v: f.cost },
-    { name: "комиссия маркетплейса", v: f.commission },
-    { name: "логистика и УПД", v: f.logistics },
-    { name: "реклама", v: f.ads },
-    { name: "налог", v: f.tax },
-    { name: "хранение", v: f.storage },
-  ]
-    .filter((x) => x.v > 0)
-    .map((x) => ({ name: x.name, share: x.v / rev, pct: shareStr(x.v, f.revenue) }))
-    .sort((a, b) => b.share - a.share);
+function shareStr(value: number, revenue: number): string {
+  return pctRev(value, revenue).toFixed(1) + "%";
 }
 function capFirst(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
-// Слайд 1 — Главный вывод: 1–3 коротких предложения с числами расчёта
-function buildVerdict(f: AiFinancials): string {
-  const profitWord = f.hasCost ? "Чистая прибыль" : "Прибыль до себестоимости";
-  const parts: string[] = [
-    `${profitWord} за период — ${fmt(f.profit)} ₽ при средней марже ${f.marginPct.toFixed(1)}%.`,
-  ];
+// гарантируем минимум 3 содержательных строки — добиваем нейтральными, но
+// конкретными пунктами (без пустых фраз), чтобы слайд не схлопывался в одну мысль
+function pad3(items: string[], fillers: string[]): string[] {
+  const out = items.filter(Boolean);
+  for (const f of fillers) {
+    if (out.length >= 3) break;
+    if (!out.includes(f)) out.push(f);
+  }
+  return out;
+}
+interface FactorRow { name: string; amount: number; share: number }
+function topFactors(f: AiFinancials): FactorRow[] {
+  const rev = f.revenue > 0 ? f.revenue : 1;
+  return [
+    { name: "себестоимость", amount: f.cost },
+    { name: "комиссия маркетплейса", amount: f.commission },
+    { name: "логистика и УПД", amount: f.logistics },
+    { name: "реклама", amount: f.ads },
+    { name: "налог", amount: f.tax },
+    { name: "хранение", amount: f.storage },
+    { name: "прочие расходы", amount: f.other },
+  ]
+    .filter((x) => x.amount > 0)
+    .map((x) => ({ name: x.name, amount: x.amount, share: x.amount / rev }))
+    .sort((a, b) => b.share - a.share);
+}
+// строка фактора: «Себестоимость — 62.9% выручки (475 060 ₽), главная статья»
+function factorLine(x: FactorRow, revenue: number, suffix = ""): string {
+  return `${capFirst(x.name)} — ${shareStr(x.amount, revenue)} выручки (${fmt(x.amount)} ₽)${suffix}`;
+}
+// Слайд 1 — «Главный вывод»: главная проблема, крупнейшая статья, влияние на
+// прибыль и (если есть) подозрение на расхождение в данных. 3–4 строки.
+function buildVerdictLines(f: AiFinancials): string[] {
+  const out: string[] = [];
   const top = topFactors(f);
   if (top.length) {
-    parts.push(`Сильнее всего давит ${top[0].name} — ${top[0].pct} выручки.`);
+    out.push(
+      `Главное ограничение прибыли — ${top[0].name}: ${shareStr(top[0].amount, f.revenue)} выручки (${fmt(top[0].amount)} ₽).`
+    );
   }
-  if (!f.hasCost) {
-    parts.push("Себестоимость не внесена — добавьте её по SKU для точной чистой прибыли.");
-  } else if (f.lossCount > 0) {
-    parts.push(`${f.lossCount} из ${f.count} расчётов убыточны — проверьте эти позиции.`);
-  }
-  return parts.join(" ");
-}
-// Слайд 2 — Что съедает прибыль: 2–4 фактора с долей выручки
-function buildEaters(f: AiFinancials): string[] {
-  const top = topFactors(f).slice(0, 4);
-  if (!top.length) {
-    return ["Расходы в расчёте не детализированы — добавьте комиссию, логистику и себестоимость."];
-  }
-  return top.map((x, i) =>
-    i === 0
-      ? `${capFirst(x.name)} — ${x.pct} выручки, главный фактор давления на маржу.`
-      : `${capFirst(x.name)} — ${x.pct} выручки.`
+  const profitWord = f.hasCost ? "Чистая прибыль" : "Прибыль до себестоимости";
+  out.push(
+    `${profitWord} ${fmt(f.profit)} ₽ при выручке ${fmt(f.revenue)} ₽ и марже ${f.marginPct.toFixed(1)}%.`
   );
+  if (f.profit < 0) {
+    out.push("Расчёт убыточен — расходы превышают выручку, нужен быстрый пересмотр цены и закупки.");
+  } else if (pctRev(f.cost, f.revenue) > 55) {
+    out.push("Высокая доля закупки держит маржу низкой — её пересчёт даст самый быстрый эффект.");
+  } else if (f.marginPct < 10) {
+    out.push("Маржа ниже 10% — запас прочности тонкий, расходы стоит ужимать точечно.");
+  } else {
+    out.push("Структура расходов умеренная — основной резерв в 1–2 крупных статьях.");
+  }
+  if (Math.abs(f.discrepancy) > Math.max(f.revenue * 0.01, 1500)) {
+    out.push(
+      `Суммы выручки, расходов и прибыли расходятся примерно на ${fmt(Math.abs(f.discrepancy))} ₽ — сверьте отчёт до решений.`
+    );
+  } else if (!f.hasCost || f.noCostCount > 0) {
+    out.push("Часть позиций без себестоимости — реальная чистая прибыль может быть ниже.");
+  }
+  return pad3(out, [
+    "Сравните показатели с прошлым периодом, чтобы увидеть тренд маржи.",
+    "Зафиксируйте текущие цифры как точку отсчёта для решений.",
+  ]).slice(0, 4);
 }
-// Слайд 3 — Что сделать в первую очередь: 3 конкретных действия (не «поднять цену»)
+// Слайд 2 — «Куда уходит прибыль»: статьи расходов с долей выручки И суммой в ₽.
+function buildEaters(f: AiFinancials): string[] {
+  const top = topFactors(f).slice(0, 5);
+  if (!top.length) {
+    return pad3([], [
+      "Расходы в расчёте не детализированы — добавьте комиссию, логистику и себестоимость.",
+      "Без разбивки расходов точную утечку прибыли показать нельзя.",
+      "Загрузите полный отчёт, чтобы увидеть структуру затрат.",
+    ]);
+  }
+  const out = top.map((x, i) =>
+    factorLine(x, f.revenue, i === 0 ? ", главная статья расходов" : "")
+  );
+  if (out.length < 5 && f.expenses > 0) {
+    out.push(`Все расходы вместе — ${shareStr(f.expenses, f.revenue)} выручки (${fmt(f.expenses)} ₽).`);
+  }
+  return out.slice(0, 5);
+}
+// Слайд 3 (fallback) — «Что проверить по SKU»: конкретные точки ошибок по товарам.
+function buildSkuChecks(f: AiFinancials): string[] {
+  const out: string[] = [];
+  if (f.lossCount > 0)
+    out.push(`Сначала разберите убыточные расчёты (${f.lossCount}) — они тянут общий результат вниз.`);
+  if (!f.hasCost || f.noCostCount > 0)
+    out.push("Сверьте себестоимость по топ-SKU — без неё прибыль по товару считается неточно.");
+  out.push("Проверьте упаковку и вложения по ключевым позициям — частая скрытая статья.");
+  out.push("Сверьте возвраты и невыкупы по товарам — они тихо съедают маржу.");
+  out.push("Исключите пересорт и неверные артикулы при загрузке отчёта.");
+  out.push("Проверьте скидки и акции — не уводят ли отдельные SKU в минус.");
+  return out.slice(0, 5);
+}
+// Слайд 4 — «Что сделать в первую очередь»: ровно 3 конкретных действия.
 function buildFirstActions(f: AiFinancials): string[] {
   const out: string[] = [];
-  const rev = f.revenue > 0 ? f.revenue : 1;
-  if (!f.hasCost) out.push("Внесите себестоимость по SKU — без неё чистая прибыль считается неточно.");
-  if (f.cost / rev > 0.5) out.push(`Проверьте unit-cost по топ-SKU: себестоимость ${shareStr(f.cost, f.revenue)} выручки.`);
-  if (f.commission / rev > 0.15) out.push(`Сверьте комиссии по категориям Ozon/WB — сейчас ${shareStr(f.commission, f.revenue)} выручки.`);
-  if (f.logistics / rev > 0.1) out.push(`Разберите логистику и УПД, сравните FBO/FBS — ${shareStr(f.logistics, f.revenue)} выручки.`);
-  if (f.lossCount > 0) out.push(`Найдите товары с отрицательной маржой — убыточных расчётов: ${f.lossCount}.`);
-  if (f.ads / rev > 0.1) out.push(`Пересчитайте ДРР по SKU и отключите неокупаемую рекламу (${shareStr(f.ads, f.revenue)} выручки).`);
-  for (const p of [
-    "Сверьте возвраты и невыкупы — они скрыто снижают маржу.",
-    "Пересчитайте упаковку и вложения по ключевым позициям.",
+  if (!f.hasCost)
+    out.push("Внесите себестоимость по топ-SKU — без неё чистая прибыль считается неверно.");
+  else
+    out.push(`Сверьте себестоимость по топ-SKU — ${shareStr(f.cost, f.revenue)} выручки, главный рычаг прибыли.`);
+  out.push(
+    `Проверьте комиссии, логистику и УПД (${shareStr(f.commission, f.revenue)} + ${shareStr(f.logistics, f.revenue)} выручки) на лишние списания.`
+  );
+  if (f.lossCount > 0)
+    out.push(`Найдите товары с отрицательной маржой (${f.lossCount}) и решите по каждому: цена, упаковка или вывод.`);
+  else
+    out.push("Пересчитайте unit-экономику топ-SKU — цену меняйте только после проверки, а не «на глаз».");
+  return pad3(out, [
+    "Сверьте возвраты и невыкупы — они скрыто снижают прибыль.",
     "Проверьте актуальность категорий и тарифов маркетплейса.",
-  ]) {
-    if (out.length >= 3) break;
-    out.push(p);
-  }
-  return out.slice(0, 3);
+  ]).slice(0, 3);
 }
-// Слайд 4 (fallback) — какие данные нужны для анализа по SKU
-function buildSkuNeeds(f: AiFinancials): string[] {
-  const out: string[] = [];
-  if (!f.hasCost) out.push("Себестоимость по товарам не внесена — анализ по SKU пока ограничен.");
-  out.push("Загрузите продажи в разрезе SKU — увидим точки убытка.");
-  out.push("Добавьте себестоимость и комиссии по каждому SKU.");
-  out.push("Подключите возвраты и невыкупы по товарам.");
-  return out.slice(0, 3);
-}
-// Слайд 5 — Риски
+// Слайд 5 — «Риски»: подозрительные места отчёта человеческим языком.
 function buildRisks(f: AiFinancials): string[] {
   const out: string[] = [];
-  const rev = f.revenue > 0 ? f.revenue : 1;
-  if (f.cost / rev > 0.6) out.push(`Высокая доля себестоимости (${shareStr(f.cost, f.revenue)}) — маржа уязвима к росту закупки.`);
-  if (f.marginPct < 10) out.push(`Низкая маржа (${f.marginPct.toFixed(1)}%) — риск ухода в минус при росте расходов.`);
-  if (!f.hasCost) out.push("Часть товаров без себестоимости — чистая прибыль может быть завышена.");
-  if (f.commission / rev > 0.2) out.push(`Высокая комиссия (${shareStr(f.commission, f.revenue)}) — проверьте категории и тарифы.`);
-  if (f.tax <= 0) out.push("Налог не отражён в расчёте — реальная прибыль может быть ниже.");
-  if (f.lossCount > 0) out.push(`${f.lossCount} убыточных расчётов тянут общий результат вниз.`);
-  if (!out.length) out.push("Критичных рисков по текущим данным нет — держите маржу под контролем.");
-  return out.slice(0, 4);
+  if (pctRev(f.cost, f.revenue) > 55)
+    out.push(`Высокая себестоимость (${shareStr(f.cost, f.revenue)}) — прибыль уязвима к подорожанию закупки.`);
+  if (f.profit < 0)
+    out.push("Расчёт убыточен — суммарные расходы превышают выручку.");
+  else if (f.marginPct < 10)
+    out.push(`Низкая маржа (${f.marginPct.toFixed(1)}%) — небольшой рост расходов уводит в минус.`);
+  if (pctRev(f.logistics, f.revenue) > 10)
+    out.push(`Логистика ${shareStr(f.logistics, f.revenue)} выручки — проверьте FBO/FBS, габариты и возвраты.`);
+  if (pctRev(f.commission, f.revenue) > 15)
+    out.push(`Комиссия ${shareStr(f.commission, f.revenue)} выручки — выше нормы, проверьте категории и акции.`);
+  if (f.lossCount > 0)
+    out.push(`Есть убыточные расчёты (${f.lossCount}) — они снижают общий результат.`);
+  if (!f.hasCost || f.noCostCount > 0)
+    out.push("Часть товаров без себестоимости — прибыль может быть завышена.");
+  if (f.tax <= 0)
+    out.push("Налог не учтён в расчёте — реальная прибыль может оказаться ниже.");
+  if (Math.abs(f.discrepancy) > Math.max(f.revenue * 0.01, 1500))
+    out.push(`Выручка, расходы и прибыль не сходятся (~${fmt(Math.abs(f.discrepancy))} ₽) — сверьте отчёты.`);
+  return pad3(out, [
+    "Критичных рисков по текущим данным нет — держите маржу под контролем.",
+    "Следите, чтобы реклама и логистика не росли быстрее выручки.",
+    "Перепроверяйте себестоимость при смене поставщика или закупочных цен.",
+  ]).slice(0, 5);
 }
-// Слайд 6 — Резерв роста (с примерным ₽-эффектом)
+// Слайд 6 — «План на 7 дней»: пошаговый разбор по дням.
+function buildWeekPlan(f: AiFinancials): string[] {
+  return [
+    "День 1–2: сверить себестоимость и закупочные цены по топ-SKU.",
+    "День 3–4: проверить комиссии, логистику и УПД на ошибки и лишние списания.",
+    f.lossCount > 0
+      ? `День 5–6: разобрать убыточные позиции (${f.lossCount}) и слабую маржу.`
+      : "День 5–6: пересчитать unit-экономику и упаковку по ключевым товарам.",
+    "День 7: принять решение по цене, поставкам и остаткам.",
+  ];
+}
+// Слайд 7 — «Что даст эффект»: действия с примерным ₽-эффектом из чисел отчёта.
 function buildGrowth(f: AiFinancials): string[] {
   const out: string[] = [];
-  const rev = f.revenue > 0 ? f.revenue : 1;
-  if (f.ads > 0 && f.ads / rev > 0.08) out.push(`Снижение ДРР на 15% освободит около ${fmt(f.ads * 0.15)} ₽.`);
-  if (f.storage > 0 && f.expenses > 0 && f.storage / f.expenses > 0.06) out.push(`Оптимизация хранения вернёт примерно ${fmt(f.storage * 0.3)} ₽.`);
-  if (f.logistics / rev > 0.1) out.push(`Пересмотр логистики и упаковки сэкономит часть из ${fmt(f.logistics)} ₽ затрат.`);
-  out.push(`Рост среднего чека на 5% добавит около ${fmt(rev * 0.05)} ₽ к выручке.`);
-  if (f.marginPct < 15) out.push("Вывод низкомаржинальных SKU поднимет среднюю маржу без потери оборота.");
-  out.push("Усиление карточек топ-товаров повышает конверсию без роста расходов.");
-  return out.slice(0, 3);
-}
-// Слайд 7 — Короткий план на 1–2 дня: 3 пронумерованных шага
-function buildShortPlan(f: AiFinancials): string[] {
-  const steps: string[] = [
-    f.hasCost
-      ? "Проверить unit-cost по топ-SKU."
-      : "Внести себестоимость по топ-SKU и пересчитать прибыль.",
-    "Сверить комиссии, логистику и УПД с тарифами маркетплейса.",
-    f.lossCount > 0
-      ? "Разобрать убыточные позиции: цена, упаковка или вывод из ассортимента."
-      : "Пересчитать ДРР и упаковку по ключевым товарам.",
-  ];
-  return steps.slice(0, 3).map((s, i) => `${i + 1}. ${s}`);
+  if (f.hasCost && f.cost > 0)
+    out.push(`Снижение себестоимости на 5% — примерно +${fmt(f.cost * 0.05)} ₽ к прибыли.`);
+  if (f.ads > 0)
+    out.push(`Сокращение неэффективной рекламы на 10% — около +${fmt(f.ads * 0.1)} ₽.`);
+  if (f.logistics > 0 && pctRev(f.logistics, f.revenue) > 8)
+    out.push(`Оптимизация логистики и упаковки на 10% — порядка +${fmt(f.logistics * 0.1)} ₽.`);
+  if (pctRev(f.commission, f.revenue) > 15)
+    out.push(`Возврат комиссии к норме (−2% выручки) — около +${fmt(f.revenue * 0.02)} ₽.`);
+  out.push(`Рост среднего чека на 5% — примерно +${fmt(f.revenue * 0.05)} ₽ выручки.`);
+  if (f.marginPct < 15)
+    out.push("Вывод низкомаржинальных SKU поднимет среднюю маржу без потери оборота.");
+  return pad3(out, [
+    "Усиление карточек топ-товаров повышает конверсию без роста расходов.",
+    "Перераспределение бюджета на прибыльные SKU поднимает общую маржу.",
+  ]).slice(0, 4);
 }
 
 function buildRecommendations(
@@ -1456,36 +1531,37 @@ export function AnalyticsBlock({
   // аналитика без техдиагностики. Саму математику расчёта не трогаем.
   const aiFin = buildFinancials(history);
 
-  // 1) Главный вывод — 1–3 предложения с числами
-  const aiLead = buildVerdict(aiFin);
+  // 1) Главный вывод — главная проблема + крупнейшая статья + влияние + данные
+  const aiVerdictLines = buildVerdictLines(aiFin);
 
-  // 2) Что съедает прибыль — факторы с долей выручки
+  // 2) Куда уходит прибыль — статьи расходов с % выручки и суммой в ₽
   const aiEaters = buildEaters(aiFin);
 
-  // 3) Что сделать в первую очередь — 3 конкретных действия
-  const aiFirstActions = buildFirstActions(aiFin);
-
-  // 4) SKU / товары — реальные позиции из отчёта (AI) или какие данные нужны
+  // 3) Что проверить по SKU — реальные позиции из отчёта (AI) + конкретные проверки
   const aiSkuItems: string[] = (
     useAi && aiData!.productRisks.length
       ? aiData!.productRisks
-          .slice(0, 3)
+          .slice(0, 2)
           .map((r) =>
-            clip(r.reason ? `${r.name}: ${r.reason}` : `${r.name}: ${r.action}`, 110)
+            clip(r.reason ? `${r.name}: ${r.reason}` : `${r.name}: ${r.action}`, 120)
           )
-      : buildSkuNeeds(aiFin)
+      : []
   )
+    .concat(buildSkuChecks(aiFin))
     .filter(Boolean)
-    .slice(0, 3);
+    .slice(0, 5);
+
+  // 4) Что сделать в первую очередь — 3 конкретных действия
+  const aiFirstActions = buildFirstActions(aiFin);
 
   // 5) Риски
   const aiRisksList = buildRisks(aiFin);
 
-  // 6) Резерв роста
-  const aiGrowth = buildGrowth(aiFin);
+  // 6) План на 7 дней
+  const aiPlan = buildWeekPlan(aiFin);
 
-  // 7) Короткий план на 1–2 дня
-  const aiPlan = buildShortPlan(aiFin);
+  // 7) Что даст эффект — ₽-эффект из чисел отчёта
+  const aiGrowth = buildGrowth(aiFin);
 
   // Рендер одной секции-списка (с аккуратным пустым состоянием)
   const renderAiList = (items: string[], empty: string): ReactNode =>
@@ -1503,35 +1579,31 @@ export function AnalyticsBlock({
   const aiPages: { title: string; body: ReactNode }[] = [
     {
       title: "Главный вывод",
-      body: (
-        <p className="ai-sec-text">
-          {aiLead || "Недостаточно данных для вывода."}
-        </p>
-      ),
+      body: renderAiList(aiVerdictLines, "Недостаточно данных для вывода."),
     },
     {
-      title: "Что съедает прибыль",
+      title: "Куда уходит прибыль",
       body: renderAiList(aiEaters, "Расходы в расчёте не детализированы."),
+    },
+    {
+      title: "Что проверить по SKU",
+      body: renderAiList(aiSkuItems, "Недостаточно данных по товарам."),
     },
     {
       title: "Что сделать в первую очередь",
       body: renderAiList(aiFirstActions, "Показатели в норме — резких действий не требуется."),
     },
     {
-      title: "SKU / товары",
-      body: renderAiList(aiSkuItems, "Недостаточно данных для вывода по товарам."),
-    },
-    {
       title: "Риски",
       body: renderAiList(aiRisksList, "Критичных рисков не обнаружено."),
     },
     {
-      title: "Резерв роста",
-      body: renderAiList(aiGrowth, "Резервы роста не определены."),
+      title: "План на 7 дней",
+      body: renderAiList(aiPlan, "План появится после первого расчёта."),
     },
     {
-      title: "Короткий план",
-      body: renderAiList(aiPlan, "План появится после первого расчёта."),
+      title: "Что даст эффект",
+      body: renderAiList(aiGrowth, "Резервы роста не определены."),
     },
   ];
   const aiTotal = aiPages.length;
@@ -2171,15 +2243,15 @@ export function AnalyticsBlock({
         .ai-sec-muted{color:#8A9FBB}
         .ai-sec-list{
           list-style:none;margin:0;padding:0;
-          display:flex;flex-direction:column;gap:.5rem
+          display:flex;flex-direction:column;gap:.42rem
         }
         .ai-sec-list li{
-          position:relative;padding-left:1rem;
-          font-size:.82rem;line-height:1.55;color:#D7E0EE;
+          position:relative;padding-left:.95rem;
+          font-size:.8rem;line-height:1.46;color:#D7E0EE;
           overflow-wrap:break-word;word-break:break-word
         }
         .ai-sec-list li::before{
-          content:"";position:absolute;left:.12rem;top:.62em;
+          content:"";position:absolute;left:.1rem;top:.56em;
           width:5px;height:5px;border-radius:50%;
           background:#C9A84C;box-shadow:0 0 6px rgba(201,168,76,.5)
         }
