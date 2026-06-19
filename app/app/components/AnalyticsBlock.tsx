@@ -935,6 +935,8 @@ type AiItem =
       valueText?: string;
       // нет суммы по статье → бар рендерится приглушённым с «нет данных»
       missing?: boolean;
+      // короткий комментарий AI к статье (под шкалой), если есть
+      comment?: string;
     }
   // сильный вывод (стр. «Главный вывод» / «Итог»)
   | { kind: "verdict"; text: string; tone: AiTone }
@@ -1237,6 +1239,42 @@ type AiAnalysisDoc = {
   pages: AiPageDoc[];
 };
 
+// Готовые данные 7 страниц от модели (ответ /api/ai/analyze, source=openai,
+// поле aiDoc). Это и есть «настоящая» AI-аналитика, которую рендерит книжка.
+type AiDocRiskLevel = "low" | "medium" | "high";
+type AiDoc = {
+  diagnosis: { mainConclusion: string; mainRisk: string; profitSafety: string };
+  moneyBreakdown: {
+    label: string;
+    amount: number;
+    percent: number;
+    comment: string;
+  }[];
+  profitLeaks: {
+    title: string;
+    amount: number;
+    whyItMatters: string;
+    action: string;
+    expectedEffect: string;
+  }[];
+  skuAudit: {
+    sku: string;
+    name: string;
+    problem: string;
+    profit: number;
+    margin: number;
+    action: string;
+  }[];
+  risks: {
+    level: AiDocRiskLevel;
+    title: string;
+    reason: string;
+    action: string;
+  }[];
+  sevenDayPlan: { day: number; task: string; expectedResult: string }[];
+  finalActions: { title: string; action: string; expectedEffect: string }[];
+};
+
 type AiAnalysis = {
   source: "openai" | "fallback";
   fallbackReason?: string;
@@ -1250,6 +1288,8 @@ type AiAnalysis = {
   recommendedActions: RecommendedAction[];
   missingData: string[];
   analysis?: AiAnalysisDoc;
+  /** Готовые данные 7 страниц от модели (заполнены при source=openai). */
+  aiDoc?: AiDoc;
 };
 
 /** keyInsights от AI → слоты инсайтов (severity → kind). */
@@ -2215,6 +2255,204 @@ function buildBookPages(
   ];
 }
 
+// Защитное приведение ответа сервера (aiDoc) к типу: гарантируем массивы и
+// строки, чтобы рендер книжки не падал на неожиданном теле. Сервер уже
+// валидирует, это второй контур безопасности на клиенте.
+function aiStr(v: unknown): string {
+  return typeof v === "string" ? v : "";
+}
+function aiNum(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : 0;
+}
+function coerceAiDoc(raw: unknown): AiDoc | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const o = raw as Record<string, unknown>;
+  const dg = (
+    o.diagnosis && typeof o.diagnosis === "object" ? o.diagnosis : {}
+  ) as Record<string, unknown>;
+  const arr = (v: unknown): Record<string, unknown>[] =>
+    Array.isArray(v)
+      ? v
+          .filter((x) => x && typeof x === "object")
+          .map((x) => x as Record<string, unknown>)
+      : [];
+  return {
+    diagnosis: {
+      mainConclusion: aiStr(dg.mainConclusion),
+      mainRisk: aiStr(dg.mainRisk),
+      profitSafety: aiStr(dg.profitSafety),
+    },
+    moneyBreakdown: arr(o.moneyBreakdown).map((m) => ({
+      label: aiStr(m.label),
+      amount: aiNum(m.amount),
+      percent: aiNum(m.percent),
+      comment: aiStr(m.comment),
+    })),
+    profitLeaks: arr(o.profitLeaks).map((l) => ({
+      title: aiStr(l.title),
+      amount: aiNum(l.amount),
+      whyItMatters: aiStr(l.whyItMatters),
+      action: aiStr(l.action),
+      expectedEffect: aiStr(l.expectedEffect),
+    })),
+    skuAudit: arr(o.skuAudit).map((s) => ({
+      sku: aiStr(s.sku),
+      name: aiStr(s.name),
+      problem: aiStr(s.problem),
+      profit: aiNum(s.profit),
+      margin: aiNum(s.margin),
+      action: aiStr(s.action),
+    })),
+    risks: arr(o.risks).map((r) => ({
+      level: (r.level === "low" || r.level === "medium" || r.level === "high"
+        ? r.level
+        : "medium") as AiDocRiskLevel,
+      title: aiStr(r.title),
+      reason: aiStr(r.reason),
+      action: aiStr(r.action),
+    })),
+    sevenDayPlan: arr(o.sevenDayPlan).map((p, i) => ({
+      day: aiNum(p.day) || i + 1,
+      task: aiStr(p.task),
+      expectedResult: aiStr(p.expectedResult),
+    })),
+    finalActions: arr(o.finalActions).map((a) => ({
+      title: aiStr(a.title),
+      action: aiStr(a.action),
+      expectedEffect: aiStr(a.expectedEffect),
+    })),
+  };
+}
+
+/** Есть ли в ответе модели хоть какое-то содержимое для книжки. */
+function aiDocHasContent(doc: AiDoc): boolean {
+  const filled =
+    doc.moneyBreakdown.length +
+    doc.profitLeaks.length +
+    doc.skuAudit.length +
+    doc.risks.length +
+    doc.sevenDayPlan.length +
+    doc.finalActions.length;
+  return !!doc.diagnosis.mainConclusion && filled > 0;
+}
+
+// Конвертируем ГОТОВЫЙ ответ модели (aiDoc) в те же AiBookPage[], что и
+// rule-based книжка, — рендер и стили остаются прежними. Числа и тексты берём
+// из ответа AI. Пустую секцию подменяем детерминированной rule-based страницей
+// (числа реальны), чтобы не было пустых слайдов — но техполей не добавляем.
+function buildBookPagesFromAiDoc(
+  doc: AiDoc,
+  fallback: AiBookPage[]
+): AiBookPage[] {
+  const fbItems = (i: number): AiItem[] => (fallback[i] ? fallback[i].items : []);
+  const fbVerdictTone = (i: number): AiTone => {
+    const v = fbItems(i).find((it) => it.kind === "verdict");
+    return v && v.kind === "verdict" ? v.tone : "neutral";
+  };
+
+  // 1) Главный вывод: вывод + (реальные KPI из расчёта) + риск + запас прочности
+  const p1: AiItem[] = [];
+  if (doc.diagnosis.mainConclusion)
+    p1.push({
+      kind: "verdict",
+      text: doc.diagnosis.mainConclusion,
+      tone: fbVerdictTone(0),
+    });
+  const kpis = fbItems(0).find((it) => it.kind === "kpis");
+  if (kpis) p1.push(kpis);
+  if (doc.diagnosis.mainRisk)
+    p1.push({
+      kind: "note",
+      text: `Главный риск: ${doc.diagnosis.mainRisk}`,
+      tone: "accent",
+    });
+  if (doc.diagnosis.profitSafety)
+    p1.push({
+      kind: "note",
+      text: `Запас прочности: ${doc.diagnosis.profitSafety}`,
+      tone: "muted",
+    });
+
+  // 2) Структура расходов: шкалы статей + короткий комментарий AI
+  const p2: AiItem[] = doc.moneyBreakdown.map((m) => ({
+    kind: "bar" as const,
+    label: m.label,
+    pct: m.percent,
+    amount: m.amount,
+    tone: "exp" as AiItemTone,
+    valueText: `${fmt(m.amount)} ₽ · ${m.percent.toFixed(1)}%`,
+    comment: m.comment || undefined,
+  }));
+
+  // 3) Что съедает прибыль: карточки проблема → почему → что сделать
+  const p3: AiItem[] = doc.profitLeaks.map((l) => ({
+    kind: "card" as const,
+    problem: l.amount ? `${l.title} — ${fmt(l.amount)} ₽` : l.title,
+    why: l.whyItMatters,
+    action: l.expectedEffect
+      ? `${l.action} Ожидаемый эффект: ${l.expectedEffect}`
+      : l.action,
+    tone: "bad" as AiTone,
+  }));
+
+  // 4) Товары и SKU: карточки по реальным товарам из ответа
+  const p4: AiItem[] = doc.skuAudit.map((s) => {
+    const head = [s.name, s.sku].filter(Boolean).join(" · ");
+    return {
+      kind: "card" as const,
+      problem: s.problem ? `${head} — ${s.problem}` : head,
+      why: `Прибыль ${fmt(s.profit)} ₽ · маржа ${s.margin.toFixed(1)}%`,
+      action: s.action,
+      tone: (s.profit < 0 ? "bad" : "warn") as AiTone,
+    };
+  });
+
+  // 5) Риски и учёт: бейдж уровня + причина → действие
+  const p5: AiItem[] = doc.risks.map((r) => {
+    const tail = [r.reason, r.action].filter(Boolean).join(" → ");
+    return {
+      kind: "risk" as const,
+      level: r.level,
+      text: tail ? `${r.title}: ${tail}` : r.title,
+    };
+  });
+
+  // 6) План на 7 дней: чек-лист по дням
+  const p6: AiItem[] = doc.sevenDayPlan.map((p) => ({
+    kind: "check" as const,
+    day: `День ${p.day}`,
+    text: p.expectedResult ? `${p.task} → ${p.expectedResult}` : p.task,
+  }));
+
+  // 7) Итог и эффект: ровно 3 приоритетных действия
+  const p7: AiItem[] = doc.finalActions.slice(0, 3).map((a) => ({
+    kind: "card" as const,
+    problem: a.title,
+    why: a.action,
+    action: a.expectedEffect
+      ? `Ожидаемый эффект: ${a.expectedEffect}`
+      : "Ожидаемый эффект: рост чистой прибыли",
+    tone: "good" as AiTone,
+  }));
+
+  const sections: { title: string; items: AiItem[]; empty: string; fb: number }[] =
+    [
+      { title: "Главный вывод", items: p1, empty: "Недостаточно данных для вывода.", fb: 0 },
+      { title: "Структура расходов", items: p2, empty: "Расходы не детализированы.", fb: 1 },
+      { title: "Что съедает прибыль", items: p3, empty: "Серьёзных перекосов не видно.", fb: 2 },
+      { title: "Товары и SKU", items: p4, empty: "Недостаточно данных по товарам.", fb: 3 },
+      { title: "Риски и учёт", items: p5, empty: "Критичных рисков не обнаружено.", fb: 4 },
+      { title: "План на 7 дней", items: p6, empty: "План появится после расчёта.", fb: 5 },
+      { title: "Итог и эффект", items: p7, empty: "Итог появится после расчёта.", fb: 6 },
+    ];
+
+  return sections.map((s) => ({
+    title: s.title,
+    items: s.items.length > 0 ? s.items : fbItems(s.fb),
+    empty: s.empty,
+  }));
+}
+
 export function AnalyticsBlock({
   realHistory,
   chartHistory,
@@ -2324,6 +2562,11 @@ export function AnalyticsBlock({
       marketplace: h.marketplace,
     }));
 
+    // Месяц/дата отчёта — только если это реально дата (есть цифры), чтобы не
+    // слать в модель ярлыки вроде «сегодня».
+    const latestDate = history[0]?.date || "";
+    const period = /\d/.test(latestDate) ? latestDate.slice(0, 40) : "";
+
     return JSON.stringify({
       revenue: Math.round(revenue),
       profit: Math.round(profit),
@@ -2337,6 +2580,7 @@ export function AnalyticsBlock({
       other_expenses: Math.round(sum((h) => h.other)),
       marketplace: history[0].marketplace,
       mode: "history",
+      ...(period ? { period } : {}),
       recentCalcs,
       ...extra,
     });
@@ -2434,6 +2678,7 @@ export function AnalyticsBlock({
               Array.isArray((json.analysis as AiAnalysisDoc).pages)
                 ? (json.analysis as AiAnalysisDoc)
                 : undefined,
+            aiDoc: coerceAiDoc((json as { aiDoc?: unknown }).aiDoc),
           });
           setAiFailed(false);
           if (process.env.NODE_ENV !== "production") {
@@ -2558,38 +2803,33 @@ export function AnalyticsBlock({
   // Без карусели, без сырого ответа модели, без техполей.
   // ============================================================
 
-  // Текст пунктов: только схлопываем пробелы — без обрезки и «…».
-  // Если пунктов много, лишнее уходит на следующую страницу (автопагинация ниже).
-  const tidy = (s: string): string => String(s ?? "").replace(/\s+/g, " ").trim();
-
-  // Числа расчёта для страниц «книжки». Структуру 7 страниц ВСЕГДА строит сайт
-  // из этих агрегатов (buildBookPages) — AI лишь добавляет комментарий. Саму
-  // математику расчёта не трогаем: только агрегируем уже посчитанные поля.
+  // Числа расчёта для rule-based книжки («Базовая аналитика», когда настоящий
+  // AI-разбор недоступен). Саму математику расчёта не трогаем — только агрегаты.
   const aiFin = buildFinancials(history);
   const aiSkuCtx = extractSkuContext(history);
 
-  // AI-текст — ТОЛЬКО дополнительный человекочитаемый комментарий. Если ответа
-  // нет / он скуден / это фолбэк — честно подписываем «AI-комментарий временно
-  // недоступен», а страницы всё равно строятся из данных. Никаких техошибок в UI.
+  // Настоящая AI-аналитика = успешный ответ модели (source=openai) с готовыми
+  // данными 7 страниц (aiDoc). Тогда книжку рендерим ИЗ ответа AI, а не строим
+  // сами. productRisks от AI нужны только rule-based ветке.
   const aiProductRisks: ProductRisk[] = useAi ? aiData!.productRisks ?? [] : [];
-  const aiComment = useAi
-    ? tidy(
-        aiData!.analysis?.summary.mainConclusion ||
-          aiData!.summary ||
-          aiData!.mainProblem ||
-          ""
-      )
-    : "";
-  // Содержательным считаем комментарий от настоящего AI (не фолбэк) длиной ≥40.
-  const aiHasComment = useAi && aiData!.source === "openai" && aiComment.length >= 40;
-  const aiUnavailableNote =
-    hasPremium && !aiHasComment
-      ? "AI-комментарий временно недоступен, базовая аналитика построена по данным отчёта."
-      : undefined;
+  const realAi =
+    useAi &&
+    aiData!.source === "openai" &&
+    !!aiData!.aiDoc &&
+    aiDocHasContent(aiData!.aiDoc!);
 
-  // 7 фиксированных страниц из чисел расчёта + опциональный AI-комментарий.
-  const aiSections: AiBookPage[] = buildBookPages(aiFin, aiSkuCtx, {
-    comment: aiHasComment ? aiComment : undefined,
+  // Есть доступ (premium), но настоящий AI-разбор не пришёл (ошибка/недоступно/
+  // фолбэк) → честно: «AI-аудит временно недоступен», ниже — базовая аналитика.
+  // Никаких технических ошибок AI в интерфейсе.
+  const aiUnavailable = hasPremium && !aiLoading && !realAi;
+  const aiUnavailableNote = aiUnavailable
+    ? "AI-аудит временно недоступен, попробуйте позже. Ниже — базовая аналитика по вашим цифрам."
+    : undefined;
+
+  // rule-based 7 страниц (детерминированные числа) — запасной вариант и основа
+  // для подмешивания при пустой секции настоящего AI-ответа.
+  const ruleBookPages: AiBookPage[] = buildBookPages(aiFin, aiSkuCtx, {
+    comment: undefined,
     note: aiUnavailableNote,
     productRisks: aiProductRisks,
   });
@@ -2616,6 +2856,9 @@ export function AnalyticsBlock({
           <div className="ai-bar-track">
             <span className="ai-bar-fill" style={{ width: w + "%" }} />
           </div>
+          {item.comment ? (
+            <div className="ai-bar-comment">{item.comment}</div>
+          ) : null}
         </li>
       );
     }
@@ -2693,10 +2936,13 @@ export function AnalyticsBlock({
       <p className="ai-sec-text ai-sec-muted">{page.empty}</p>
     );
 
-  // Фиксированные 7 страниц: структуру задаёт buildBookPages, а не высотный
-  // сплиттер. Карточки, KPI и чек-листы не разбиваются между страницами; редкое
+  // Фиксированные 7 страниц. Если пришёл настоящий AI-разбор (aiDoc) — рендерим
+  // его (тексты и числа от модели); иначе — rule-based «Базовая аналитика».
+  // Карточки, KPI и чек-листы не разбиваются между страницами; редкое
   // переполнение аккуратно скроллится внутри .ai-book-content (без обрезки фраз).
-  const aiBookPages: AiBookPage[] = aiSections;
+  const aiBookPages: AiBookPage[] = realAi
+    ? buildBookPagesFromAiDoc(aiData!.aiDoc!, ruleBookPages)
+    : ruleBookPages;
   const aiTotal = aiBookPages.length;
   const aiCur = Math.min(Math.max(aiPage, 0), aiTotal - 1);
   const aiGoPrev = () => setAiPage((p) => Math.max(0, p - 1));
@@ -3381,6 +3627,8 @@ export function AnalyticsBlock({
         .ai-bar-missing .ai-bar-name{color:#8A9FBB}
         .ai-bar-missing .ai-bar-val{color:#6B7E99;font-style:italic}
         .ai-bar-missing .ai-bar-track{background:rgba(255,255,255,.04)}
+        /* короткий комментарий AI под шкалой статьи */
+        .ai-bar-comment{margin-top:.32rem;font-size:.72rem;line-height:1.4;color:#9FB1CB}
 
         /* === Структурные блоки книжки: KPI, карточки, риски, чек-лист === */
         /* строковый пункт-контейнер без маркера */
@@ -3933,12 +4181,16 @@ export function AnalyticsBlock({
                     <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
                   </svg>
                 </span>
-                AI Аналитика
+                {hasPremium && !aiLoading && !realAi
+                  ? "Базовая аналитика"
+                  : "AI Аналитика"}
               </div>
               {hasPremium && (
                 <div className="ai-sub">
-                  {aiHasComment
+                  {realAi
                     ? "Персональные рекомендации по вашему отчёту"
+                    : aiLoading
+                    ? "AI анализирует ваш отчёт…"
                     : "Базовая аналитика по вашим цифрам"}
                 </div>
               )}

@@ -20,8 +20,12 @@ export const dynamic = "force-dynamic";
 //     сайт не падает.
 // ============================================================================
 
-// OpenAI-совместимый endpoint Timeweb AI Gateway.
-const GATEWAY_URL = "https://api.timeweb.ai/v1/chat/completions";
+// OpenAI-совместимый endpoint Timeweb AI Gateway. Берём из env Timeweb App
+// Platform (process.env.TIMEWEB_AI_GATEWAY_URL); запасной адрес — на случай,
+// если переменная ещё не проброшена, чтобы поведение не ломалось.
+const GATEWAY_URL =
+  process.env.TIMEWEB_AI_GATEWAY_URL?.trim() ||
+  "https://api.timeweb.ai/v1/chat/completions";
 const MODEL = process.env.TIMEWEB_AI_MODEL?.trim() || "openai/gpt-5-mini";
 // gpt-5-* — reasoning-модели: бюджет токенов уходит и на рассуждение, и на вывод.
 // При маленьком лимите модель «думает», упирается в потолок и возвращает пустой
@@ -162,6 +166,58 @@ export type AiAnalysisDoc = {
   pages: AiBookPageDoc[];
 };
 
+// ---------- готовые данные 7 страниц AI Аналитики (контракт с фронтом) ----------
+// Это структура, которую модель Timeweb GPT-5 mini возвращает строгим JSON, а
+// фронт рендерит как «книжку». Числа берёт модель из переданных агрегатов —
+// новых сумм не выдумывает (см. промпт). Лежит в ответе под ключом aiDoc,
+// чтобы не конфликтовать с legacy-полем profitLeaks (другой формы).
+export type AiRiskLevel = "low" | "medium" | "high";
+
+export type AiDoc = {
+  diagnosis: {
+    mainConclusion: string;
+    mainRisk: string;
+    profitSafety: string;
+  };
+  moneyBreakdown: {
+    label: string;
+    amount: number;
+    percent: number;
+    comment: string;
+  }[];
+  profitLeaks: {
+    title: string;
+    amount: number;
+    whyItMatters: string;
+    action: string;
+    expectedEffect: string;
+  }[];
+  skuAudit: {
+    sku: string;
+    name: string;
+    problem: string;
+    profit: number;
+    margin: number;
+    action: string;
+  }[];
+  risks: {
+    level: AiRiskLevel;
+    title: string;
+    reason: string;
+    action: string;
+  }[];
+  sevenDayPlan: {
+    day: number;
+    task: string;
+    expectedResult: string;
+  }[];
+  finalActions: {
+    title: string;
+    action: string;
+    expectedEffect: string;
+  }[];
+};
+
 export type AiResult = {
   source: "openai" | "fallback";
   fallbackReason?: FallbackReason;
@@ -175,8 +231,10 @@ export type AiResult = {
   productRisks: ProductRisk[];
   recommendedActions: RecommendedAction[];
   missingData: string[];
-  /** Новый структурированный разбор для книжки (заполнен при source=openai). */
+  /** Прежний структурированный разбор книжки (legacy-формат summary+pages). */
   analysis?: AiAnalysisDoc;
+  /** Готовые данные 7 страниц от модели (заполнены ТОЛЬКО при source=openai). */
+  aiDoc?: AiDoc;
 };
 
 // ---------- хелперы ----------
@@ -826,6 +884,118 @@ function normalizeAnalysisDoc(raw: unknown): AiAnalysisDoc | null {
   return { summary, pages };
 }
 
+/** Строгий, но терпимый парсер нового контракта 7 страниц (aiDoc).
+ *  Пустые секции выкидываем; слишком скудный ответ → null (уходим в fallback,
+ *  чтобы НЕ показывать rule-based под видом AI). */
+function normalizeAiDoc(raw: unknown): AiDoc | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+
+  const dg = (
+    o.diagnosis && typeof o.diagnosis === "object" ? o.diagnosis : {}
+  ) as Record<string, unknown>;
+  const diagnosis = {
+    mainConclusion: toStr(dg.mainConclusion, 400),
+    mainRisk: toStr(dg.mainRisk, 400),
+    profitSafety: toStr(dg.profitSafety, 400),
+  };
+
+  const arr = (v: unknown): Record<string, unknown>[] =>
+    Array.isArray(v)
+      ? v
+          .filter((x) => x && typeof x === "object")
+          .map((x) => x as Record<string, unknown>)
+      : [];
+
+  const moneyBreakdown = arr(o.moneyBreakdown)
+    .slice(0, 10)
+    .map((m) => ({
+      label: toStr(m.label, 60),
+      amount: toNum(m.amount),
+      percent: toNum(m.percent),
+      comment: toStr(m.comment, 240),
+    }))
+    .filter((m) => m.label);
+
+  const profitLeaks = arr(o.profitLeaks)
+    .slice(0, 8)
+    .map((l) => ({
+      title: toStr(l.title, 120),
+      amount: toNum(l.amount),
+      whyItMatters: toStr(l.whyItMatters, 280),
+      action: toStr(l.action, 280),
+      expectedEffect: toStr(l.expectedEffect, 200),
+    }))
+    .filter((l) => l.title || l.action);
+
+  const skuAudit = arr(o.skuAudit)
+    .slice(0, 12)
+    .map((s) => ({
+      sku: toStr(s.sku, 40),
+      name: toStr(s.name, 80),
+      problem: toStr(s.problem, 240),
+      profit: toNum(s.profit),
+      margin: toNum(s.margin),
+      action: toStr(s.action, 240),
+    }))
+    .filter((s) => s.name || s.sku);
+
+  const risks = arr(o.risks)
+    .slice(0, 8)
+    .map((r) => {
+      const lvl = r.level;
+      return {
+        level: (lvl === "low" || lvl === "medium" || lvl === "high"
+          ? lvl
+          : "medium") as AiRiskLevel,
+        title: toStr(r.title, 120),
+        reason: toStr(r.reason, 240),
+        action: toStr(r.action, 240),
+      };
+    })
+    .filter((r) => r.title || r.reason);
+
+  const sevenDayPlan = arr(o.sevenDayPlan)
+    .slice(0, 7)
+    .map((p, i) => ({
+      day: isFinNum(p.day)
+        ? clamp(1, 7, Math.round(p.day as number))
+        : i + 1,
+      task: toStr(p.task, 200),
+      expectedResult: toStr(p.expectedResult, 200),
+    }))
+    .filter((p) => p.task);
+
+  const finalActions = arr(o.finalActions)
+    .slice(0, 3)
+    .map((a) => ({
+      title: toStr(a.title, 120),
+      action: toStr(a.action, 240),
+      expectedEffect: toStr(a.expectedEffect, 200),
+    }))
+    .filter((a) => a.title || a.action);
+
+  const filled =
+    moneyBreakdown.length +
+    profitLeaks.length +
+    skuAudit.length +
+    risks.length +
+    sevenDayPlan.length +
+    finalActions.length;
+  // Нужен главный вывод и хотя бы несколько наполненных секций.
+  if (!diagnosis.mainConclusion || filled < 3) return null;
+
+  return {
+    diagnosis,
+    moneyBreakdown,
+    profitLeaks,
+    skuAudit,
+    risks,
+    sevenDayPlan,
+    finalActions,
+  };
+}
+
 // ---------- dev-only диагностика (в production не логируем) ----------
 
 const AI_DEV = process.env.NODE_ENV !== "production";
@@ -835,6 +1005,20 @@ function devLog(msg: string, extra?: unknown): void {
   if (extra !== undefined) console.log("[ai/analyze][dev] " + msg, extra);
   // eslint-disable-next-line no-console
   else console.log("[ai/analyze][dev] " + msg);
+}
+function devWarn(msg: string, extra?: unknown): void {
+  if (!AI_DEV) return;
+  // eslint-disable-next-line no-console
+  if (extra !== undefined) console.warn("[ai/analyze][dev] " + msg, extra);
+  // eslint-disable-next-line no-console
+  else console.warn("[ai/analyze][dev] " + msg);
+}
+function devError(msg: string, extra?: unknown): void {
+  if (!AI_DEV) return;
+  // eslint-disable-next-line no-console
+  if (extra !== undefined) console.error("[ai/analyze][dev] " + msg, extra);
+  // eslint-disable-next-line no-console
+  else console.error("[ai/analyze][dev] " + msg);
 }
 
 // ---------- свободный текст как запасной формат ----------
@@ -875,100 +1059,78 @@ function buildFromText(d: SanitizedData, text: string): AiResult {
 // ---------- строим промпт ----------
 
 function buildPrompt(d: SanitizedData): { system: string; user: string } {
-  // Точная схема ответа: книга из 7 страниц + краткое резюме.
+  // Точная схема ответа = контракт aiDoc (готовые данные 7 страниц).
   const schema = {
-    summary: {
-      mainConclusion: "1–2 предложения: главный вывод по прибыли с цифрами",
-      profitStatus: "good | warning | bad",
-      mainProblem: "главная проблема чистой прибыли с конкретной цифрой",
-      mainAction: "одно самое важное действие",
+    diagnosis: {
+      mainConclusion:
+        "1–2 предложения: главный вывод по прибыли с конкретными цифрами",
+      mainRisk: "главный риск для прибыли, с конкретной цифрой",
+      profitSafety:
+        "запас прочности прибыли: насколько устойчива, с цифрой или долей",
     },
-    pages: [
+    moneyBreakdown: [
       {
-        title: "Главный вывод",
-        type: "summary",
-        lines: ["4–6 коротких строк с конкретными цифрами"],
-        metrics: [],
-        actions: [],
-        risks: [],
+        label: "Комиссия",
+        amount: 0,
+        percent: 0,
+        comment: "что не так с этой статьёй и что проверить",
       },
+    ],
+    profitLeaks: [
       {
-        title: "Структура расходов",
-        type: "expense_structure",
-        lines: ["4–6 строк: на что уходит выручка"],
-        metrics: [
-          { label: "Комиссия", value: "98 180 ₽", share: 21.4, tone: "warning" },
-        ],
-        actions: [],
-        risks: [],
+        title: "где теряется прибыль",
+        amount: 0,
+        whyItMatters: "почему это бьёт по прибыли",
+        action: "что конкретно сделать",
+        expectedEffect: "ожидаемый эффект",
       },
+    ],
+    skuAudit: [
       {
-        title: "Что съедает прибыль",
-        type: "profit_leaks",
-        lines: ["4–6 строк: проблема → почему опасно → что проверить"],
-        metrics: [],
-        actions: [],
-        risks: [],
+        sku: "артикул из переданных данных",
+        name: "название из переданных данных",
+        problem: "проблема товара",
+        profit: 0,
+        margin: 0,
+        action: "что сделать с этим товаром",
       },
+    ],
+    risks: [
       {
-        title: "SKU / товары",
-        type: "sku",
-        lines: ["разбор товаров ИЛИ честный список недостающих данных"],
-        metrics: [],
-        actions: [],
-        risks: [],
+        level: "low|medium|high",
+        title: "название риска",
+        reason: "почему это риск, с цифрой",
+        action: "что сделать",
       },
+    ],
+    sevenDayPlan: [
+      { day: 1, task: "конкретная задача на день", expectedResult: "ожидаемый результат" },
+    ],
+    finalActions: [
       {
-        title: "Конкретные действия",
-        type: "actions",
-        lines: ["вводная строка"],
-        metrics: [],
-        actions: ["проблема → почему важно → что сделать"],
-        risks: [],
-      },
-      {
-        title: "Риски",
-        type: "risks",
-        lines: ["вводная строка"],
-        metrics: [],
-        actions: [],
-        risks: ["конкретный риск с цифрой"],
-      },
-      {
-        title: "План на 7 дней",
-        type: "plan",
-        lines: ["вводная строка"],
-        metrics: [],
-        actions: ["День 1: …", "День 2: …"],
-        risks: [],
+        title: "приоритетное действие",
+        action: "что именно сделать",
+        expectedEffect: "ожидаемый эффект",
       },
     ],
   };
 
+  // Базовый промпт — дословно по ТЗ; ниже добавлены требования к формату JSON.
   const system = [
-    "Ты — опытный финансовый аналитик для продавца Ozon/WB.",
-    "Готовишь ПЛАТНЫЙ разбор расчёта в виде книги из 7 страниц.",
-    "Пиши по-русски, коротко и по делу, строками для книжки-слайдера.",
+    "Ты финансовый аналитик для продавцов Ozon/WB.",
+    "Анализируй только переданные данные. Не выдумывай цифры.",
+    "Не давай общие советы типа «увеличьте продажи» или «поднимите цену».",
+    "Давай конкретные действия: какие расходы проверить, какие товары требуют внимания, где теряется маржа, что сделать в первую очередь.",
+    "Пиши по-русски. Ответ строго JSON.",
     "",
-    "ЖЁСТКИЕ ПРАВИЛА:",
-    "1) Каждый вывод привязан к конкретной цифре — сумма в ₽ и/или доля в % от выручки.",
-    "2) Каждый совет отвечает на 3 вопроса: какая проблема найдена; почему это влияет на прибыль; что конкретно сделать продавцу.",
-    "3) Запрещены очевидные советы без причины («проверьте себестоимость», «оптимизируйте расходы», «улучшите показатели» — без цифры и вывода).",
-    "4) Не слишком коротко и не слишком длинно: на каждую страницу 4–6 смысловых строк.",
-    "5) Если данных по SKU/товарам нет — честно укажи, каких данных не хватает, и дай чек-лист, что загрузить и проверить.",
-    "6) Не выдумывай данные, которых нет. Не обещай точный/гарантированный рост прибыли, если данных недостаточно.",
-    "7) Никакого markdown, таблиц и ссылок. Запрещены технические слова: fallback, debug, json, source, model, endpoint, API.",
+    "Требования к ответу:",
+    "— Каждый вывод и риск привязывай к конкретной цифре (сумма в ₽ и/или доля % от выручки) из переданных данных.",
+    "— moneyBreakdown: основные статьи расходов с суммой, долей % от выручки и коротким комментарием.",
+    "— skuAudit: бери ТОЛЬКО товары из переданного списка (их название/sku), не выдумывай новых. Если товаров нет — верни пустой массив skuAudit.",
+    "— sevenDayPlan: ровно 7 пунктов (день 1..7). finalActions: ровно 3 приоритетных действия.",
+    "— Никакого markdown, никаких пояснений вне JSON. Верни ровно один JSON-объект по схеме ниже.",
     "",
-    "Хорошие формулировки (пример стиля, а не готовый ответ):",
-    "— «Комиссия 98 180 ₽ — это 21% выручки. Для этой категории норма ниже: проверьте, верно ли выбрана категория карточки».",
-    "— «Логистика выше 8% выручки: проверьте габариты карточек, схему FBO/FBS и процент возвратов».",
-    "— «Не повышайте цену всем: найдите SKU с маржой ниже 10% и проверьте, выдержат ли они рост цены без потери заказов».",
-    "",
-    "Страницы строго в этом порядке и с этими type: summary, expense_structure, profit_leaks, sku, actions, risks, plan.",
-    "На странице expense_structure заполни metrics по основным статьям: label, value (сумма с ₽), share (доля % от выручки), tone (good|warning|bad|neutral).",
-    "На странице sku бери ТОЛЬКО реальные товары из переданного списка (название/sku) — не выдумывай новых.",
-    "",
-    "Ответь ТОЛЬКО валидным JSON по схеме (без markdown и комментариев):",
+    "Схема ответа (строго такой JSON, без markdown):",
     JSON.stringify(schema),
   ].join("\n");
 
@@ -998,10 +1160,22 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
   if (d.products.length > 0) userData.товары_топ15 = d.products;
   if (d.recentCalcs.length > 0) userData.последние_расчёты = d.recentCalcs;
 
+  // Явно выделяем сигналы по товарам из уже переданного списка (не новые данные):
+  // убыточные (profit<0) и низкомаржинальные (0≤margin<10).
+  const lossMaking = d.products.filter(
+    (p) => typeof p.profit === "number" && p.profit < 0
+  );
+  const lowMargin = d.products.filter(
+    (p) => typeof p.margin === "number" && p.margin >= 0 && p.margin < 10
+  );
+  if (lossMaking.length > 0) userData.убыточные_товары = lossMaking;
+  if (lowMargin.length > 0) userData.низкомаржинальные_товары = lowMargin;
+
   const user =
     "Данные расчёта (суммы в ₽, маржа в %):\n" +
     JSON.stringify(userData, null, 2) +
-    "\n\nСделай разбор и верни строго JSON по схеме (summary + 7 страниц pages).";
+    "\n\nСделай разбор и верни строго JSON по схеме " +
+    "(diagnosis, moneyBreakdown, profitLeaks, skuAudit, risks, sevenDayPlan, finalActions).";
 
   return { system, user };
 }
@@ -1061,8 +1235,7 @@ export async function POST(req: NextRequest) {
     keyContainsWhitespace,
     keyLength,
   };
-  // eslint-disable-next-line no-console
-  console.log("[ai/analyze] env check:", {
+  devLog("env check", {
     endpoint: GATEWAY_URL,
     hasKey: debugInfo.hasGatewayKey,
     model: debugInfo.gatewayModel,
@@ -1074,15 +1247,13 @@ export async function POST(req: NextRequest) {
   });
 
   if (!apiKey) {
-    // eslint-disable-next-line no-console
-    console.warn("[ai/analyze] TIMEWEB_AI_GATEWAY_KEY не задан — fallback (missing_api_key)");
+    devWarn("TIMEWEB_AI_GATEWAY_KEY не задан — fallback (missing_api_key)");
     return NextResponse.json({ ok: true, ...buildFallback(data, "missing_api_key", debugInfo) });
   }
 
   // ── 4b. Явно битый формат ключа — НЕ дёргаем Gateway впустую ─────────────
   if (keyContainsEquals) {
-    // eslint-disable-next-line no-console
-    console.warn("[ai/analyze] неверный формат ключа — fallback (invalid_key_format)", {
+    devWarn("неверный формат ключа — fallback (invalid_key_format)", {
       keyContainsEquals,
       keyContainsWhitespace,
       keyLength,
@@ -1133,8 +1304,7 @@ export async function POST(req: NextRequest) {
   } catch (e) {
     const isTimeout = e instanceof Error && e.name === "AbortError";
     const msg = e instanceof Error ? e.message : "сеть недоступна";
-    // eslint-disable-next-line no-console
-    console.error("[ai/analyze] Gateway недоступен:", msg);
+    devError("Gateway недоступен", msg);
     return NextResponse.json({
       ok: true,
       ...buildFallback(data, isTimeout ? "timeout" : "openai_error", debugInfo),
@@ -1149,8 +1319,7 @@ export async function POST(req: NextRequest) {
   // Всегда логируем статус ответа Gateway (без секретов) — чтобы причина ухода
   // в fallback была видна в server logs Timeweb при ЛЮБОМ исходе:
   //   401/403 → ключ · 404 → endpoint/model · 429/402 → баланс/лимиты Timeweb.
-  // eslint-disable-next-line no-console
-  console.log("[ai/analyze] ответ Gateway:", {
+  devLog("ответ Gateway", {
     endpoint: GATEWAY_URL,
     model: MODEL,
     status: upstream.status,
@@ -1172,8 +1341,7 @@ export async function POST(req: NextRequest) {
       gwCode = errBody?.error?.code?.slice(0, 80) ?? null;
       gwMsg = errBody?.error?.message?.slice(0, 280) ?? null;
     } catch { /* не валидный JSON — оставляем null */ }
-    // eslint-disable-next-line no-console
-    console.error("[ai/analyze] gateway error", upstream.status, {
+    devError("gateway error " + upstream.status, {
       type: gwType, code: gwCode, message: gwMsg,
     });
     const errDebug: AiDebugInfo = {
@@ -1216,9 +1384,35 @@ export async function POST(req: NextRequest) {
       parsed = null;
     }
   }
-  // НОВЫЙ формат { summary, pages } → структурированная книжка.
-  // Числа берём из детерминированного rule-based расчёта (модель не придумывает
-  // суммы), а текстовый разбор книжки — из ответа AI.
+  // ПРИОРИТЕТНЫЙ контракт (aiDoc): готовые данные 7 страниц от модели. Разбор и
+  // тексты — от AI; рендерит их фронт как «книжку». healthScore/legacy-поля
+  // остаются от детерминированного расчёта (для совместимости старого кокпита).
+  const aiDoc = normalizeAiDoc(parsed);
+  if (aiDoc) {
+    devLog("parse success: aiDoc", {
+      money: aiDoc.moneyBreakdown.length,
+      leaks: aiDoc.profitLeaks.length,
+      sku: aiDoc.skuAudit.length,
+      risks: aiDoc.risks.length,
+      plan: aiDoc.sevenDayPlan.length,
+      actions: aiDoc.finalActions.length,
+      finishReason,
+    });
+    const base = buildFallback(data);
+    return NextResponse.json({
+      ok: true,
+      ...base,
+      source: "openai" as const,
+      fallbackReason: undefined,
+      debug: undefined,
+      summary: aiDoc.diagnosis.mainConclusion || base.summary,
+      mainProblem: aiDoc.diagnosis.mainRisk || base.mainProblem,
+      aiDoc,
+    });
+  }
+
+  // Прежний формат { summary, pages } → структурированная книжка (на случай,
+  // если модель вернула старую схему). Числа — детерминированные.
   const analysis = normalizeAnalysisDoc(parsed);
   if (analysis) {
     devLog("parse success: analysis", {
@@ -1248,16 +1442,14 @@ export async function POST(req: NextRequest) {
   // 2) Не JSON, но осмысленный текст — это НЕ ошибка: показываем как AI-аналитику.
   const freeText = sanitizeFreeText(content);
   if (freeText) {
-    // eslint-disable-next-line no-console
-    console.warn("[ai/analyze] модель вернула текст вместо JSON — показываем как AI-аналитику");
+    devWarn("модель вернула текст вместо JSON — показываем как AI-аналитику");
     return NextResponse.json({ ok: true, ...buildFromText(data, freeText) });
   }
 
   // 3) Пусто/мусор — аккуратный fallback. Подробная диагностика — ТОЛЬКО в логах
   //    сервера (никаких секретов: ключ не логируем). finish_reason="length"
   //    означает, что лимит токенов мал — модель не успела отдать ответ.
-  // eslint-disable-next-line no-console
-  console.error("[ai/analyze] невалидный ответ модели", {
+  devError("невалидный ответ модели", {
     model: MODEL,
     maxTokens: MAX_TOKENS,
     finishReason,
