@@ -1626,7 +1626,7 @@ function mainProblemText(f: AiFinancials, s: AiScore): string {
 }
 
 // KPI-сетка стр. 1: 5 ключевых цифр с тоном.
-function buildKpiCells(f: AiFinancials, s: AiScore): AiItem {
+function buildKpiCells(f: AiFinancials, s: AiScore, ctx: SkuContext): AiItem {
   return {
     kind: "kpis",
     cells: [
@@ -1653,9 +1653,19 @@ function buildKpiCells(f: AiFinancials, s: AiScore): AiItem {
         tone: s.commissionHigh ? "bad" : s.commissionElevated ? "warn" : "good",
       },
       {
-        label: "Логистика/УПД",
+        label: "Логистика",
         value: `${s.logisticsPct.toFixed(1)}%`,
         tone: s.logisticsHigh ? "bad" : s.logisticsElevated ? "warn" : "good",
+      },
+      {
+        // УПД/доп. услуги детализируются только в расчёте net-profit-3file;
+        // если их нет — «нет данных» (как у себестоимости), а не пустой 0%.
+        label: "УПД / доп. услуги",
+        value:
+          ctx.updServicesTotal > 0
+            ? shareStr(ctx.updServicesTotal, f.revenue)
+            : "нет данных",
+        tone: "neutral",
       },
     ],
   };
@@ -2045,53 +2055,105 @@ function buildWeekChecklist(f: AiFinancials, ctx: SkuContext): AiItem[] {
 // что проверить перед следующим отчётом + блок «ожидаемый эффект» (без обещаний).
 function buildFinalItems(f: AiFinancials, ctx: SkuContext): AiItem[] {
   const s = scoreProblems(f);
-  const items: AiItem[] = [];
   const top = topFactors(f)[0];
   const topName = top ? top.name : "себестоимость";
   const hasLossSku = ctx.products.some(
     (p) => typeof p.profit === "number" && p.profit < 0
   );
 
-  let firstAction: string;
-  if (s.noCost) firstAction = "заполнить себестоимость по топ-SKU и пересчитать прибыль";
-  else if (s.isLoss || f.lossCount > 0 || hasLossSku)
-    firstAction = "разобрать убыточные позиции и пересобрать по ним цену и закупку";
-  else if (s.costHigh || s.costElevated)
-    firstAction = "снизить долю закупки по топ-SKU (поставщик, упаковка, объём)";
-  else if (s.commissionElevated)
-    firstAction = "пересмотреть комиссию и участие в акциях по категориям";
-  else if (s.logisticsElevated)
-    firstAction = "оптимизировать логистику: габариты, схему FBO/FBS и возвраты";
-  else firstAction = `снизить крупнейшую статью расходов — ${topName}`;
+  // Кандидаты действий в порядке приоритета: заголовок / как сделать / эффект.
+  // Берём первые три активных (по флагам score); добиваем универсальными.
+  type Act = { on: boolean; problem: string; why: string; effect: string };
+  const candidates: Act[] = [
+    {
+      on: s.noCost,
+      problem: "Заполнить себестоимость по SKU",
+      why: "Проставьте закупочную цену там, где её нет, и пересчитайте отчёт.",
+      effect: "прибыль и маржа станут реальными, а не завышенными.",
+    },
+    {
+      on: s.isLoss || f.lossCount > 0 || hasLossSku,
+      problem: "Закрыть убыточные позиции",
+      why: "Поднимите цену, снизьте закупку и логистику или выведите их из ассортимента.",
+      effect: "уберёте прямой минус — общая прибыль вырастет.",
+    },
+    {
+      on: s.costHigh || s.costElevated,
+      problem: "Снизить себестоимость топ-SKU",
+      why: "Пересмотрите поставщика, упаковку, объём партии и аналоги по крупным позициям.",
+      effect: "−3–5 п.п. закупки заметно поднимут маржу.",
+    },
+    {
+      on: s.commissionElevated,
+      problem: "Пересмотреть комиссию и акции",
+      why: "Сверьте ставку по категориям и участие в промо-акциях.",
+      effect: "меньше будете отдавать площадке с каждой продажи.",
+    },
+    {
+      on: s.logisticsElevated,
+      problem: "Оптимизировать логистику",
+      why: "Проверьте габариты карточек, схему FBO/FBS и процент возвратов.",
+      effect: "логистика перестанет утягивать прибыльные позиции в минус.",
+    },
+    {
+      on: s.adsPct > 8,
+      problem: "Перебрать рекламные кампании",
+      why: "Сверьте ДРР и ставки по кампаниям, отключите неокупаемые.",
+      effect: "рекламный бюджет уйдёт в окупаемые показы.",
+    },
+  ];
+  const fillers: Act[] = [
+    {
+      on: true,
+      problem: "Сверить отчёт с актом УПД",
+      why: "Проверьте услуги и агентское вознаграждение на расхождения с отчётом.",
+      effect: "найдёте скрытые удержания, которые занижают прибыль.",
+    },
+    {
+      on: true,
+      problem: "Точечно поднять цену",
+      why: "Поднимите цену там, где маржа позволяет, без риска для оборота.",
+      effect: "прибыль вырастет без потери заказов.",
+    },
+    {
+      on: true,
+      problem: "Повторить расчёт в M-PROF",
+      why: "Загрузите следующий отчёт и сравните маржу с текущей.",
+      effect: "увидите эффект изменений сразу в цифрах.",
+    },
+  ];
+  // ровно три карточки-действия
+  const chosen = [...candidates.filter((a) => a.on), ...fillers].slice(0, 3);
 
+  const items: AiItem[] = [];
+  // вводный вердикт — задаёт тон страницы (не карточка)
+  const lead = s.isLoss
+    ? "Сейчас расчёт в минусе. Ниже — три действия в порядке приоритета, чтобы вернуть прибыль."
+    : s.marginCritical || s.marginWeak
+    ? `Маржа ${f.marginPct.toFixed(
+        1
+      )}% — рабочая, но тонкая. Ниже — три действия с наибольшим эффектом на прибыль.`
+    : `Прибыль в норме. Дальше всё упирается в ${topName} — ниже три действия, чтобы закрепить результат.`;
   items.push({
     kind: "verdict",
-    text: `Первым делом — ${firstAction}. Это даст самый быстрый эффект на марже.`,
-    tone: s.severity === "critical" ? "bad" : s.severity === "high" ? "warn" : "good",
+    text: lead,
+    tone: s.isLoss || s.marginCritical ? "bad" : s.marginWeak ? "warn" : "good",
   });
+  for (const a of chosen) {
+    items.push({
+      kind: "card",
+      problem: a.problem,
+      why: a.why,
+      action: `Ожидаемый эффект: ${a.effect}`,
+      tone: "neutral",
+    });
+  }
+  // финальный сжатый вывод (не карточка)
   items.push({
-    kind: "card",
-    problem: "Максимальный эффект",
-    why: "Прибыль чувствительнее всего к крупнейшим статьям расходов и убыточным SKU.",
-    action: `Сфокусируйтесь на ${topName} и позициях с маржой ниже 10%.`,
-    tone: "neutral",
+    kind: "note",
+    text: "Сделайте хотя бы первое действие и пересчитайте отчёт через неделю — эффект будет виден в марже.",
+    tone: "accent",
   });
-  items.push({
-    kind: "card",
-    problem: "Проверить перед следующим отчётом",
-    why: "Чистые входные данные — это точная прибыль.",
-    action: `Себестоимость по всем SKU${
-      ctx.withoutCost > 0 ? ` (сейчас без неё ${ctx.withoutCost})` : ""
-    }, возвраты и сверку с УПД.`,
-    tone: "neutral",
-  });
-  const effect =
-    s.costHigh || s.costElevated
-      ? "Если снизить себестоимость на 3–5 п.п. или убрать убыточные SKU, маржа может заметно вырасти."
-      : f.lossCount > 0 || hasLossSku
-      ? "Если убрать или исправить убыточные позиции, общая прибыль может заметно вырасти."
-      : "Если удержать расходы и точечно поднять цену там, где маржа позволяет, прибыль может вырасти без потери оборота.";
-  items.push({ kind: "note", text: `Ожидаемый эффект: ${effect}`, tone: "accent" });
   return items;
 }
 
@@ -2111,7 +2173,7 @@ function buildBookPages(
     text: mainVerdict(f, s),
     tone: s.isLoss || s.marginCritical ? "bad" : s.marginWeak ? "warn" : "good",
   });
-  p1.push(buildKpiCells(f, s));
+  p1.push(buildKpiCells(f, s, ctx));
   p1.push({
     kind: "note",
     text: `Главная проблема месяца: ${mainProblemText(f, s)}.`,
@@ -3339,7 +3401,7 @@ export function AnalyticsBlock({
         /* KPI-сетка — авто-перенос: на широком 5 в ряд, на узком переносится */
         .ai-kpi-grid{
           display:grid;gap:.4rem;
-          grid-template-columns:repeat(auto-fit,minmax(108px,1fr))
+          grid-template-columns:repeat(3,1fr)
         }
         .ai-kpi{
           display:flex;flex-direction:column;gap:.1rem;min-width:0;
@@ -3643,6 +3705,7 @@ export function AnalyticsBlock({
           .an-chart-body{padding:.2rem .8rem 0}
           .an-chart-foot{padding:.7rem 1.1rem 1rem;gap:1rem}
           .rc-grid{padding:.2rem 1.1rem 1.1rem;gap:.7rem}
+          .ai-kpi-grid{grid-template-columns:repeat(2,1fr)}
         }
 
         @media (prefers-reduced-motion: reduce){
