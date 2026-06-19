@@ -1197,7 +1197,11 @@ export async function POST(req: NextRequest) {
   // ── 2. Авторизация: только active unlimited ───────────────────────────────
   // Клиенту НЕ верим: проверяем plan и premium_until в Supabase.
   const isUnlimited = await checkUnlimitedPlan(auth);
+  // Безопасная диагностика без секретов: результат проверки тарифа (true/false).
+  // eslint-disable-next-line no-console
+  console.log("[ai/analyze] user premium:", isUnlimited);
   if (!isUnlimited) {
+    // Нет активного тарифа 449₽ → 403 и Gateway НЕ вызывается.
     return NextResponse.json(
       {
         ok: false,
