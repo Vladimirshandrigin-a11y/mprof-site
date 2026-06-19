@@ -1214,7 +1214,7 @@ type AiDebug = {
   gatewayErrorMessage?: string | null;
 };
 
-// Новый структурированный разбор «книжки» (ответ /api/ai/analyze, source=openai).
+// Новый структурированный разбор «книжки» (ответ /api/ai/analyze, source=timeweb_gateway).
 type AiMetricDoc = {
   label: string;
   value: string;
@@ -1239,7 +1239,7 @@ type AiAnalysisDoc = {
   pages: AiPageDoc[];
 };
 
-// Готовые данные 7 страниц от модели (ответ /api/ai/analyze, source=openai,
+// Готовые данные 7 страниц от модели (ответ /api/ai/analyze, source=timeweb_gateway,
 // поле aiDoc). Это и есть «настоящая» AI-аналитика, которую рендерит книжка.
 type AiDocRiskLevel = "low" | "medium" | "high";
 type AiDoc = {
@@ -1276,7 +1276,7 @@ type AiDoc = {
 };
 
 type AiAnalysis = {
-  source: "openai" | "fallback";
+  source: "timeweb_gateway" | "fallback";
   fallbackReason?: string;
   debug?: AiDebug;
   summary: string;
@@ -1288,7 +1288,7 @@ type AiAnalysis = {
   recommendedActions: RecommendedAction[];
   missingData: string[];
   analysis?: AiAnalysisDoc;
-  /** Готовые данные 7 страниц от модели (заполнены при source=openai). */
+  /** Готовые данные 7 страниц от модели (заполнены при source=timeweb_gateway). */
   aiDoc?: AiDoc;
 };
 
@@ -2646,7 +2646,7 @@ export function AnalyticsBlock({
         // Новый формат: source + healthScore + keyInsights + ...
         if (
           json &&
-          (json.source === "openai" || json.source === "fallback") &&
+          (json.source === "timeweb_gateway" || json.source === "fallback") &&
           typeof json.healthScore === "number"
         ) {
           setAiData({
@@ -2682,7 +2682,7 @@ export function AnalyticsBlock({
           });
           setAiFailed(false);
           if (process.env.NODE_ENV !== "production") {
-            const smart = json.source === "openai" && !!json.analysis;
+            const smart = json.source === "timeweb_gateway" && !!json.analysis;
             // eslint-disable-next-line no-console
             console.log(
               "[AI] parse:",
@@ -2808,13 +2808,13 @@ export function AnalyticsBlock({
   const aiFin = buildFinancials(history);
   const aiSkuCtx = extractSkuContext(history);
 
-  // Настоящая AI-аналитика = успешный ответ модели (source=openai) с готовыми
+  // Настоящая AI-аналитика = успешный ответ модели (source=timeweb_gateway) с готовыми
   // данными 7 страниц (aiDoc). Тогда книжку рендерим ИЗ ответа AI, а не строим
   // сами. productRisks от AI нужны только rule-based ветке.
   const aiProductRisks: ProductRisk[] = useAi ? aiData!.productRisks ?? [] : [];
   const realAi =
     useAi &&
-    aiData!.source === "openai" &&
+    aiData!.source === "timeweb_gateway" &&
     !!aiData!.aiDoc &&
     aiDocHasContent(aiData!.aiDoc!);
 

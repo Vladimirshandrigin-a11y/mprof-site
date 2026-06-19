@@ -219,7 +219,7 @@ export type AiDoc = {
 };
 
 export type AiResult = {
-  source: "openai" | "fallback";
+  source: "timeweb_gateway" | "fallback";
   fallbackReason?: FallbackReason;
   /** Диагностика: только в source=fallback, НЕ раскрывает секреты. */
   debug?: AiDebugInfo;
@@ -233,7 +233,7 @@ export type AiResult = {
   missingData: string[];
   /** Прежний структурированный разбор книжки (legacy-формат summary+pages). */
   analysis?: AiAnalysisDoc;
-  /** Готовые данные 7 страниц от модели (заполнены ТОЛЬКО при source=openai). */
+  /** Готовые данные 7 страниц от модели (заполнены ТОЛЬКО при source=timeweb_gateway). */
   aiDoc?: AiDoc;
 };
 
@@ -765,7 +765,7 @@ function normalizeAiResult(raw: unknown): AiResult | null {
   }
 
   return {
-    source: "openai",
+    source: "timeweb_gateway",
     summary,
     healthScore,
     mainProblem,
@@ -1040,7 +1040,7 @@ function sanitizeFreeText(s: string): string {
 }
 
 /**
- * Показываем свободный текст модели как AI-аналитику (source: "openai"):
+ * Показываем свободный текст модели как AI-аналитику (source: "timeweb_gateway"):
  * числовую структуру берём из локального расчёта, а сам текст — в summary.
  * Технические поля (debug/fallbackReason) клиенту НЕ уходят.
  */
@@ -1048,7 +1048,7 @@ function buildFromText(d: SanitizedData, text: string): AiResult {
   const base = buildFallback(d);
   return {
     ...base,
-    source: "openai",
+    source: "timeweb_gateway",
     fallbackReason: undefined,
     debug: undefined,
     mainProblem: "",
@@ -1185,6 +1185,11 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
 // ============================================================================
 
 export async function POST(req: NextRequest) {
+  // Безопасная диагностика без секретов: сам факт вызова роута (виден в server
+  // logs Timeweb, в т.ч. в production). Ключи/токены/тело с PII здесь НЕ пишем.
+  // eslint-disable-next-line no-console
+  console.log("[ai/analyze] ai route called");
+
   // ── 1. Аутентификация: Bearer JWT → userId (fail-closed) ──────────────────
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
@@ -1316,6 +1321,16 @@ export async function POST(req: NextRequest) {
   // ── 6. Разбираем ответ Gateway ───────────────────────────────────────────
   const rawText = await upstream.text();
 
+  // Безопасная диагностика без секретов (видна и в production): подтверждаем,
+  // что данные идут из Timeweb Gateway, и его HTTP-статус. Ключ/тело не пишем.
+  // eslint-disable-next-line no-console
+  console.log(
+    "[ai/analyze] source: timeweb_gateway · model:",
+    MODEL,
+    "· gateway status:",
+    upstream.status
+  );
+
   // Всегда логируем статус ответа Gateway (без секретов) — чтобы причина ухода
   // в fallback была видна в server logs Timeweb при ЛЮБОМ исходе:
   //   401/403 → ключ · 404 → endpoint/model · 429/402 → баланс/лимиты Timeweb.
@@ -1402,7 +1417,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       ...base,
-      source: "openai" as const,
+      source: "timeweb_gateway" as const,
       fallbackReason: undefined,
       debug: undefined,
       summary: aiDoc.diagnosis.mainConclusion || base.summary,
@@ -1423,7 +1438,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       ...base,
-      source: "openai" as const,
+      source: "timeweb_gateway" as const,
       fallbackReason: undefined,
       debug: undefined,
       summary: analysis.summary.mainConclusion || base.summary,
