@@ -3277,8 +3277,9 @@ export function AnalyticsBlock({
         }
         .ai-sec-muted{color:#8A9FBB}
         .ai-sec-list{
-          list-style:none;margin:auto 0;padding:0;
-          display:flex;flex-direction:column;gap:.42rem
+          list-style:none;margin:0;padding:0;flex:1 1 auto;
+          display:flex;flex-direction:column;gap:.5rem;
+          justify-content:space-between
         }
         .ai-sec-list li{
           position:relative;padding-left:.95rem;
@@ -3376,9 +3377,11 @@ export function AnalyticsBlock({
         .ai-pcard-action{font-size:.76rem;line-height:1.4;color:#D7E0EE;display:flex;gap:.32rem}
         .ai-pcard-arrow{color:#C9A84C;flex-shrink:0}
 
-        /* риск с бейджем уровня */
-        .ai-risk{display:flex;align-items:flex-start;gap:.45rem;
-          font-size:.78rem;line-height:1.42;color:#D7E0EE}
+        /* риск с бейджем уровня — компактная карточка */
+        .ai-risk{display:flex;align-items:flex-start;gap:.5rem;
+          font-size:.78rem;line-height:1.42;color:#D7E0EE;
+          padding:.46rem .58rem;border-radius:9px;
+          background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.07)}
         .ai-risk-badge{
           flex-shrink:0;font-family:'DM Mono',monospace;font-size:.55rem;font-weight:700;
           letter-spacing:.05em;text-transform:uppercase;
@@ -3389,9 +3392,11 @@ export function AnalyticsBlock({
         .ai-risk-low{background:rgba(120,140,170,.14);color:#9FB1CB;border:1px solid rgba(120,140,170,.28)}
         .ai-risk-text{flex:1;min-width:0;overflow-wrap:break-word;word-break:break-word}
 
-        /* чек-лист «План на 7 дней» */
-        .ai-check{display:flex;align-items:flex-start;gap:.45rem;
-          font-size:.78rem;line-height:1.4;color:#D7E0EE}
+        /* чек-лист «План на 7 дней» — компактная карточка */
+        .ai-check{display:flex;align-items:flex-start;gap:.5rem;
+          font-size:.78rem;line-height:1.4;color:#D7E0EE;
+          padding:.46rem .58rem;border-radius:9px;
+          background:rgba(255,255,255,.025);border:1px solid rgba(255,255,255,.07)}
         .ai-check-box{
           flex-shrink:0;width:13px;height:13px;border-radius:4px;margin-top:.12rem;
           border:1.5px solid rgba(201,168,76,.55);background:rgba(201,168,76,.08)
