@@ -203,7 +203,7 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
     "- Если есть данные по товарам — укажи, какие SKU/группы требуют внимания и что с ними делать.",
     "- Для каждой рекомендации указывай ожидаемый эффект (в рублях или %, если можно оценить по данным).",
     "- Избегай общих советов вроде «поднимите цены» без объяснения где именно, почему и какой риск.",
-    "- Пиши по-русски, кратко и по делу, без воды и маркетингового тона.",
+    "- Пиши по-русски, тезисно и без воды: это компактные карточки в интерфейсе, а не сплошной отчёт — короткие фразы, не абзацы.",
     "",
     "Верни СТРОГО валидный JSON по схеме (без markdown, без текста вне JSON):",
     "{",
@@ -214,8 +214,10 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
     '  "actionPlan": [ { "action": "конкретный шаг", "expectedEffect": "ожидаемый эффект" } ]',
     "}",
     "",
-    "Ограничения: profitLeaks — 2–5 пунктов; actionPlan — 3–7 пунктов (план на ближайшие 7 дней, по приоритету);",
+    "Ограничения по количеству: profitLeaks — 2–5 пунктов; actionPlan — 3–7 пунктов (план на ближайшие 7 дней, по приоритету);",
     "skuInsights — только если есть данные по товарам, иначе пустой массив []. Все строки на русском.",
+    "Ограничения по длине (строго — это компактные карточки в UI): verdict — 1–2 коротких предложения (≤220 символов);",
+    "summary — 1 предложение (≤160); title — ≤70; why/issue — ≤200; action — ≤160; expectedEffect — короткая фраза (≤90).",
   ].join("\n");
 
   const metrics = {
@@ -251,21 +253,21 @@ function coerceAiDoc(raw: unknown): AiDoc | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
 
-  const verdict = str(o.verdict, 600);
-  const summary = str(o.summary, 600);
+  const verdict = str(o.verdict, 280);
+  const summary = str(o.summary, 200);
 
   const profitLeaks: ProfitLeak[] = Array.isArray(o.profitLeaks)
     ? o.profitLeaks
         .map((x): ProfitLeak | null => {
           if (!x || typeof x !== "object") return null;
           const e = x as Record<string, unknown>;
-          const title = str(e.title, 160);
+          const title = str(e.title, 90);
           if (!title) return null;
           return {
             title,
-            why: str(e.why, 600),
-            action: str(e.action, 600),
-            expectedEffect: str(e.expectedEffect, 400),
+            why: str(e.why, 240),
+            action: str(e.action, 200),
+            expectedEffect: str(e.expectedEffect, 120),
           };
         })
         .filter((x): x is ProfitLeak => x !== null)
@@ -277,12 +279,12 @@ function coerceAiDoc(raw: unknown): AiDoc | null {
         .map((x): SkuInsight | null => {
           if (!x || typeof x !== "object") return null;
           const e = x as Record<string, unknown>;
-          const name = str(e.name, 120);
+          const name = str(e.name, 80);
           if (!name) return null;
           return {
             name,
-            issue: str(e.issue, 400),
-            action: str(e.action, 400),
+            issue: str(e.issue, 220),
+            action: str(e.action, 200),
           };
         })
         .filter((x): x is SkuInsight => x !== null)
@@ -294,9 +296,9 @@ function coerceAiDoc(raw: unknown): AiDoc | null {
         .map((x): ActionItem | null => {
           if (!x || typeof x !== "object") return null;
           const e = x as Record<string, unknown>;
-          const action = str(e.action, 400);
+          const action = str(e.action, 220);
           if (!action) return null;
-          return { action, expectedEffect: str(e.expectedEffect, 400) };
+          return { action, expectedEffect: str(e.expectedEffect, 120) };
         })
         .filter((x): x is ActionItem => x !== null)
         .slice(0, 7)
