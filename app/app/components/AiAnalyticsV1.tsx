@@ -312,6 +312,24 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
           overflow: hidden;
           min-width: 0;
         }
+        /* ----- высота блока: компактная, как левая колонка; скролл ВНУТРИ ----- */
+        /* Компаунд .an-ai-card.aiv1-card (специфичность 0,2,0) перекрывает
+           min-height:390px из AnalyticsBlock — сам AnalyticsBlock НЕ трогаем.
+           max-height ломает «растягивание» (AI больше не тянет сетку вниз):
+           длинный ответ скроллится внутри .aiv1-scroll, страница не растёт. */
+        .an-ai-card.aiv1-card {
+          min-height: 240px;
+          max-height: 480px;
+          align-self: stretch;
+        }
+        /* мобайл (сетка уже стекается с 900px): обычный поток страницы, без
+           внутреннего скролла и без горизонтального overflow. */
+        @media (max-width: 900px) {
+          .an-ai-card.aiv1-card {
+            max-height: none;
+            min-height: 0;
+          }
+        }
 
         /* шапка (работает поверх .an-card-head, ничего в нём не ломая) */
         .aiv1-title-row {
