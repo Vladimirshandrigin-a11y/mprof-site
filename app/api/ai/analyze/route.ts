@@ -1021,6 +1021,23 @@ function devError(msg: string, extra?: unknown): void {
   else console.error("[ai/analyze][dev] " + msg);
 }
 
+// ---------- production-safe диагностика (видна в server logs Timeweb) ----------
+/**
+ * Безопасный лог, который ОСТАЁТСЯ в production (в отличие от devLog) — чтобы по
+ * логам Timeweb было видно, почему запрос ушёл в fallback. Пишем ТОЛЬКО безопасные
+ * скаляры: статусы, флаги true/false, имя модели, длины, причины, userId (UUID).
+ * НИКОГДА не пишем: ключ/токен, тело отчёта, текст ответа модели, прочие PII.
+ */
+function aiLog(
+  event: string,
+  fields?: Record<string, string | number | boolean | null>
+): void {
+  // eslint-disable-next-line no-console
+  if (fields) console.log("[ai/analyze]", event, fields);
+  // eslint-disable-next-line no-console
+  else console.log("[ai/analyze]", event);
+}
+
 // ---------- свободный текст как запасной формат ----------
 
 /** Снимаем markdown-обёртку ```json … ``` / ``` … ```, если она есть. */
@@ -1054,6 +1071,67 @@ function buildFromText(d: SanitizedData, text: string): AiResult {
     mainProblem: "",
     summary: text,
   };
+}
+
+// ---------- сборка aiDoc из «нестрогих» успешных ответов Gateway ----------
+
+/** moneyBreakdown из РЕАЛЬНЫХ чисел расчёта (ничего не выдумываем). */
+function moneyBreakdownFromData(d: SanitizedData): AiDoc["moneyBreakdown"] {
+  const r = d.revenue;
+  const pct = (v: number) => (r > 0 ? Math.round((v / r) * 1000) / 10 : 0);
+  return [
+    { label: "Себестоимость", amount: d.cost, percent: pct(d.cost), comment: "" },
+    { label: "Комиссии", amount: d.commission, percent: pct(d.commission), comment: "" },
+    { label: "Логистика", amount: d.logistics, percent: pct(d.logistics), comment: "" },
+    { label: "Реклама", amount: d.ads, percent: pct(d.ads), comment: "" },
+    { label: "Налог", amount: d.tax, percent: pct(d.tax), comment: "" },
+  ].filter((m) => m.amount > 0);
+}
+
+/**
+ * Превращаем ЛЮБОЙ осмысленный успешный ответ Gateway, который не лёг строго в
+ * схему aiDoc (старая схема {summary,pages} / legacy / свободный текст), в валидный
+ * aiDoc — чтобы фронт показал это как настоящий AI-разбор, а не маскировал под
+ * «Базовую аналитику» (фронт рендерит реальный AI только при наличии aiDoc).
+ * Тексты — от модели; числа moneyBreakdown — из реального расчёта. Если контента
+ * собрать не удалось (нет главного вывода или все суммы нулевые) → null.
+ */
+function looseAiDoc(
+  d: SanitizedData,
+  c: {
+    mainConclusion: string;
+    mainRisk?: string;
+    profitSafety?: string;
+    profitLeaks?: AiDoc["profitLeaks"];
+    risks?: AiDoc["risks"];
+    finalActions?: AiDoc["finalActions"];
+    sevenDayPlan?: AiDoc["sevenDayPlan"];
+    skuAudit?: AiDoc["skuAudit"];
+  }
+): AiDoc | null {
+  const mainConclusion = c.mainConclusion.trim().slice(0, 400);
+  if (!mainConclusion) return null;
+  const doc: AiDoc = {
+    diagnosis: {
+      mainConclusion,
+      mainRisk: (c.mainRisk ?? "").trim().slice(0, 400),
+      profitSafety: (c.profitSafety ?? "").trim().slice(0, 400),
+    },
+    moneyBreakdown: moneyBreakdownFromData(d),
+    profitLeaks: (c.profitLeaks ?? []).slice(0, 8),
+    skuAudit: (c.skuAudit ?? []).slice(0, 12),
+    risks: (c.risks ?? []).slice(0, 8),
+    sevenDayPlan: (c.sevenDayPlan ?? []).slice(0, 7),
+    finalActions: (c.finalActions ?? []).slice(0, 3),
+  };
+  const filled =
+    doc.moneyBreakdown.length +
+    doc.profitLeaks.length +
+    doc.skuAudit.length +
+    doc.risks.length +
+    doc.sevenDayPlan.length +
+    doc.finalActions.length;
+  return filled > 0 ? doc : null;
 }
 
 // ---------- строим промпт ----------
@@ -1187,21 +1265,25 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
 export async function POST(req: NextRequest) {
   // Безопасная диагностика без секретов: сам факт вызова роута (виден в server
   // logs Timeweb, в т.ч. в production). Ключи/токены/тело с PII здесь НЕ пишем.
-  // eslint-disable-next-line no-console
-  console.log("[ai/analyze] ai route called");
+  aiLog("ai route called");
 
   // ── 1. Аутентификация: Bearer JWT → userId (fail-closed) ──────────────────
   const auth = await authenticateRequest(req);
-  if (!auth.ok) return auth.response;
+  if (!auth.ok) {
+    aiLog("final source", { source: "none", reason: "unauthorized" });
+    return auth.response;
+  }
+  // Безопасная диагностика: userId (UUID, не PII отчёта) — чтобы соотнести запрос.
+  aiLog("user id", { userId: auth.userId });
 
   // ── 2. Авторизация: только active unlimited ───────────────────────────────
   // Клиенту НЕ верим: проверяем plan и premium_until в Supabase.
   const isUnlimited = await checkUnlimitedPlan(auth);
   // Безопасная диагностика без секретов: результат проверки тарифа (true/false).
-  // eslint-disable-next-line no-console
-  console.log("[ai/analyze] user premium:", isUnlimited);
+  aiLog("user premium", { premium: isUnlimited });
   if (!isUnlimited) {
     // Нет активного тарифа 449₽ → 403 и Gateway НЕ вызывается.
+    aiLog("final source", { source: "none", reason: "no_active_plan_403" });
     return NextResponse.json(
       {
         ok: false,
@@ -1216,6 +1298,7 @@ export async function POST(req: NextRequest) {
   try {
     rawBody = (await req.json()) as AnalyzeInput;
   } catch {
+    aiLog("final source", { source: "none", reason: "bad_request_body_400" });
     return NextResponse.json(
       { ok: false, error: "Некорректный JSON в теле запроса" },
       { status: 400 }
@@ -1257,6 +1340,7 @@ export async function POST(req: NextRequest) {
 
   if (!apiKey) {
     devWarn("TIMEWEB_AI_GATEWAY_KEY не задан — fallback (missing_api_key)");
+    aiLog("final source", { source: "fallback", reason: "missing_api_key" });
     return NextResponse.json({ ok: true, ...buildFallback(data, "missing_api_key", debugInfo) });
   }
 
@@ -1267,6 +1351,7 @@ export async function POST(req: NextRequest) {
       keyContainsWhitespace,
       keyLength,
     });
+    aiLog("final source", { source: "fallback", reason: "invalid_key_format" });
     return NextResponse.json({
       ok: true,
       ...buildFallback(data, "invalid_key_format", {
@@ -1283,6 +1368,15 @@ export async function POST(req: NextRequest) {
     products: data.products.length,
     recentCalcs: data.recentCalcs.length,
     hasPeriod: !!data.period,
+  });
+  // Безопасная диагностика конфигурации Gateway (без значения ключа/URL):
+  // видно, заданы ли env, какая модель и есть ли ключ — частые причины fallback.
+  aiLog("gateway config", {
+    gatewayUrlEnvSet: !!process.env.TIMEWEB_AI_GATEWAY_URL,
+    modelEnvSet: !!process.env.TIMEWEB_AI_MODEL,
+    model: MODEL,
+    hasKey: !!apiKey,
+    maxTokens: MAX_TOKENS,
   });
 
   let upstream: Response;
@@ -1314,6 +1408,11 @@ export async function POST(req: NextRequest) {
     const isTimeout = e instanceof Error && e.name === "AbortError";
     const msg = e instanceof Error ? e.message : "сеть недоступна";
     devError("Gateway недоступен", msg);
+    aiLog("gateway unreachable", { timeout: isTimeout });
+    aiLog("final source", {
+      source: "fallback",
+      reason: isTimeout ? "timeout" : "network_error",
+    });
     return NextResponse.json({
       ok: true,
       ...buildFallback(data, isTimeout ? "timeout" : "openai_error", debugInfo),
@@ -1325,15 +1424,16 @@ export async function POST(req: NextRequest) {
   // ── 6. Разбираем ответ Gateway ───────────────────────────────────────────
   const rawText = await upstream.text();
 
-  // Безопасная диагностика без секретов (видна и в production): подтверждаем,
-  // что данные идут из Timeweb Gateway, и его HTTP-статус. Ключ/тело не пишем.
-  // eslint-disable-next-line no-console
-  console.log(
-    "[ai/analyze] source: timeweb_gateway · model:",
-    MODEL,
-    "· gateway status:",
-    upstream.status
-  );
+  // Безопасная диагностика без секретов (видна и в production): факт ответа
+  // Gateway, его HTTP-статус и ok. ВАЖНО: это НЕ финальный source — реальным
+  // источником "timeweb_gateway" считаем только распознанный контент ниже
+  // (см. aiLog "final source"). Ключ/тело/текст ответа не пишем.
+  aiLog("gateway response", {
+    status: upstream.status,
+    ok: upstream.ok,
+    model: MODEL,
+    bodyLength: rawText.length,
+  });
 
   // Всегда логируем статус ответа Gateway (без секретов) — чтобы причина ухода
   // в fallback была видна в server logs Timeweb при ЛЮБОМ исходе:
@@ -1363,6 +1463,14 @@ export async function POST(req: NextRequest) {
     devError("gateway error " + upstream.status, {
       type: gwType, code: gwCode, message: gwMsg,
     });
+    // Production-safe: сообщение об ошибке Gateway (без ключей/токенов) — чтобы по
+    // логам Timeweb понять причину: 401/403 ключ · 404 endpoint/model · 402/429 баланс.
+    aiLog("gateway error", {
+      status: upstream.status,
+      type: gwType,
+      code: gwCode,
+      message: gwMsg,
+    });
     const errDebug: AiDebugInfo = {
       ...debugInfo,
       gatewayStatus: upstream.status,
@@ -1370,6 +1478,10 @@ export async function POST(req: NextRequest) {
       gatewayErrorCode: gwCode,
       gatewayErrorMessage: gwMsg,
     };
+    aiLog("final source", {
+      source: "fallback",
+      reason: "gateway_http_" + upstream.status,
+    });
     return NextResponse.json({ ok: true, ...buildFallback(data, "openai_error", errDebug) });
   }
 
@@ -1392,6 +1504,13 @@ export async function POST(req: NextRequest) {
     status: upstream.status,
     contentLength: content.length,
     finishReason,
+  });
+  // Production-safe: длина контента и finish_reason. finishReason="length" +
+  // contentLength=0 ⇒ reasoning-модель исчерпала лимит токенов (поднять
+  // TIMEWEB_AI_MAX_TOKENS). Сам текст ответа НЕ пишем.
+  aiLog("gateway content", {
+    contentLength: content.length,
+    finishReason: finishReason ?? "null",
   });
 
   // 1) Строгий JSON (в т.ч. в markdown-обёртке) → структурированная аналитика.
@@ -1418,6 +1537,7 @@ export async function POST(req: NextRequest) {
       finishReason,
     });
     const base = buildFallback(data);
+    aiLog("final source", { source: "timeweb_gateway", reason: "aiDoc" });
     return NextResponse.json({
       ok: true,
       ...base,
@@ -1439,6 +1559,32 @@ export async function POST(req: NextRequest) {
       finishReason,
     });
     const base = buildFallback(data);
+    // Собираем aiDoc из старой схемы — иначе фронт (рендерит реальный AI только
+    // по aiDoc) замаскирует рабочий ответ Gateway под «Базовую аналитику».
+    const aLeaks: AiDoc["profitLeaks"] = [];
+    const aRisks: AiDoc["risks"] = [];
+    analysis.pages.forEach((pg) => {
+      pg.actions.forEach((a) => {
+        if (a) aLeaks.push({ title: a.slice(0, 120), amount: 0, whyItMatters: "", action: a.slice(0, 280), expectedEffect: "" });
+      });
+      pg.risks.forEach((rk) => {
+        if (rk) aRisks.push({ level: "medium", title: rk.slice(0, 120), reason: "", action: "" });
+      });
+    });
+    const aActions: AiDoc["finalActions"] = analysis.summary.mainAction
+      ? [{ title: "Что сделать в первую очередь", action: analysis.summary.mainAction.slice(0, 240), expectedEffect: "" }]
+      : [];
+    const aiDocFromAnalysis = looseAiDoc(data, {
+      mainConclusion: analysis.summary.mainConclusion || analysis.pages[0]?.lines[0] || "",
+      mainRisk: analysis.summary.mainProblem,
+      profitLeaks: aLeaks,
+      risks: aRisks,
+      finalActions: aActions,
+    });
+    aiLog("final source", {
+      source: "timeweb_gateway",
+      reason: aiDocFromAnalysis ? "analysis->aiDoc" : "analysis_no_content",
+    });
     return NextResponse.json({
       ok: true,
       ...base,
@@ -1448,6 +1594,7 @@ export async function POST(req: NextRequest) {
       summary: analysis.summary.mainConclusion || base.summary,
       mainProblem: analysis.summary.mainProblem || base.mainProblem,
       analysis,
+      ...(aiDocFromAnalysis ? { aiDoc: aiDocFromAnalysis } : {}),
     });
   }
 
@@ -1455,14 +1602,39 @@ export async function POST(req: NextRequest) {
   const result = normalizeAiResult(parsed);
   if (result) {
     devLog("parse success: legacy schema");
-    return NextResponse.json({ ok: true, ...result });
+    // Привязываем aiDoc, чтобы фронт показал это как настоящий AI, а не fallback.
+    const aiDocFromLegacy = looseAiDoc(data, {
+      mainConclusion: result.summary || result.mainProblem,
+      mainRisk: result.mainProblem,
+    });
+    aiLog("final source", {
+      source: "timeweb_gateway",
+      reason: aiDocFromLegacy ? "legacy->aiDoc" : "legacy_no_content",
+    });
+    return NextResponse.json({
+      ok: true,
+      ...result,
+      ...(aiDocFromLegacy ? { aiDoc: aiDocFromLegacy } : {}),
+    });
   }
 
   // 2) Не JSON, но осмысленный текст — это НЕ ошибка: показываем как AI-аналитику.
   const freeText = sanitizeFreeText(content);
   if (freeText) {
     devWarn("модель вернула текст вместо JSON — показываем как AI-аналитику");
-    return NextResponse.json({ ok: true, ...buildFromText(data, freeText) });
+    const fromText = buildFromText(data, freeText);
+    // Привязываем aiDoc (текст модели + реальные числа), чтобы фронт показал это
+    // как настоящий AI-разбор, а не «Базовую аналитику».
+    const aiDocFromFree = looseAiDoc(data, { mainConclusion: freeText });
+    aiLog("final source", {
+      source: "timeweb_gateway",
+      reason: aiDocFromFree ? "freeText->aiDoc" : "freeText_no_content",
+    });
+    return NextResponse.json({
+      ok: true,
+      ...fromText,
+      ...(aiDocFromFree ? { aiDoc: aiDocFromFree } : {}),
+    });
   }
 
   // 3) Пусто/мусор — аккуратный fallback. Подробная диагностика — ТОЛЬКО в логах
@@ -1481,5 +1653,10 @@ export async function POST(req: NextRequest) {
         : "Модель вернула пустой/нечитаемый content.",
   });
   devLog("fallback used: invalid_json");
+  aiLog("final source", {
+    source: "fallback",
+    reason: "invalid_json",
+    finishReason: finishReason ?? "null",
+  });
   return NextResponse.json({ ok: true, ...buildFallback(data, "invalid_json", debugInfo) });
 }
