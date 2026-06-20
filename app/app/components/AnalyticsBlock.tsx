@@ -5,7 +5,7 @@ import {
   ProfitRecommendations,
   type ProfitRecommendationsProps,
 } from "./ProfitRecommendations";
-import { supabase } from "../lib/supabase-cloud";
+import { AiAnalyticsV1 } from "./AiAnalyticsV1";
 
 interface AnalyticsCalc {
   id: string;
@@ -1484,14 +1484,13 @@ function DonutChart({
 
 /* ---------- MAIN ---------- */
 
-// === AI ANALYTICS RESET ===
-// Текущая AI-аналитика ОТКЛЮЧЕНА (флаг = true): фронт НЕ вызывает /api/ai/analyze,
-// 7-страничная «книга» и rule-based «Базовая аналитика» НЕ рендерятся. Вместо
-// блока — аккуратная заглушка «AI-аналитика скоро будет обновлена» (без страниц,
-// без фейковых советов, без fallback-аналитики). Весь прежний код сохранён в
-// ветке else ниже (ничего не удалено) и будет переписан заново отдельной задачей.
-// AI вернётся ТОЛЬКО через Timeweb AI Gateway и ТОЛЬКО для тарифа 449₽ unlimited.
-const AI_COMING_SOON: boolean = true;
+// === AI ANALYTICS v1 ===
+// Платный AI-блок ВКЛЮЧЁН и рендерится компонентом <AiAnalyticsV1>, который
+// обращается ТОЛЬКО к /api/ai/profit-advice (Timeweb AI Gateway, GPT-5 mini) и
+// ТОЛЬКО для тарифа 449₽ unlimited. Прежняя 7-страничная «книга» и rule-based
+// «Базовая аналитика» НЕ рендерятся (мёртвая ветка else ниже сохранена и будет
+// удалена отдельной чисткой). Флаг оставлен как явный включатель блока.
+const AI_V1_ENABLED: boolean = true;
 
 // Безопасный фолбэк, когда данные для рекомендаций ещё не переданы со страницы
 // (нет расчёта) — карточка покажет аккуратное пустое состояние.
@@ -2590,122 +2589,10 @@ export function AnalyticsBlock({
   // Запрос только когда есть premium И реальные данные (нет данных → нет вызова).
   // Bearer token берём из сессии Supabase — сервер верифицирует его сам.
   // Любой сбой → aiFailed=true: остаёмся на rule-based, сайт не падает.
-  useEffect(() => {
-    if (AI_COMING_SOON || !hasPremium || !aiPayloadSig) {
-      setAiData(null);
-      setAiFailed(false);
-      setAiLoading(false);
-      return;
-    }
-    let active = true;
-    const controller = new AbortController();
-    setAiLoading(true);
-    setAiFailed(false);
-    (async () => {
-      try {
-        // Берём токен непосредственно перед запросом — он может обновиться.
-        const { data: sessionData } = await supabase.auth.getSession();
-        const token = sessionData?.session?.access_token;
-        if (!token) {
-          if (active) setAiFailed(true);
-          return;
-        }
-        if (process.env.NODE_ENV !== "production") {
-          let keys: string[] = [];
-          try {
-            keys = Object.keys(JSON.parse(aiPayloadSig || "{}"));
-          } catch {}
-          // eslint-disable-next-line no-console
-          console.log("[AI] endpoint called → /api/ai/analyze", {
-            payloadKeys: keys,
-          });
-        }
-        const res = await fetch("/api/ai/analyze", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: aiPayloadSig,
-          signal: controller.signal,
-        });
-        if (!res.ok) throw new Error("status " + res.status);
-        const json = (await res.json()) as Partial<AiAnalysis> & {
-          ok?: boolean;
-        };
-        if (!active) return;
-        if (process.env.NODE_ENV !== "production") {
-          // eslint-disable-next-line no-console
-          console.log("[AI] response received", {
-            source: json.source,
-            hasAnalysis: !!json.analysis,
-            pages: Array.isArray(json.analysis?.pages)
-              ? json.analysis!.pages.length
-              : 0,
-          });
-        }
-        // Новый формат: source + healthScore + keyInsights + ...
-        if (
-          json &&
-          (json.source === "timeweb_gateway" || json.source === "fallback") &&
-          typeof json.healthScore === "number"
-        ) {
-          setAiData({
-            source: json.source,
-            summary: typeof json.summary === "string" ? json.summary : "",
-            healthScore: json.healthScore,
-            mainProblem:
-              typeof json.mainProblem === "string" ? json.mainProblem : "",
-            keyInsights: Array.isArray(json.keyInsights)
-              ? (json.keyInsights as KeyInsight[])
-              : [],
-            profitLeaks: Array.isArray(json.profitLeaks)
-              ? (json.profitLeaks as ProfitLeak[])
-              : [],
-            productRisks: Array.isArray(json.productRisks)
-              ? (json.productRisks as ProductRisk[])
-              : [],
-            recommendedActions: Array.isArray(json.recommendedActions)
-              ? (json.recommendedActions as RecommendedAction[])
-              : [],
-            missingData: Array.isArray(json.missingData)
-              ? (json.missingData as string[])
-              : [],
-            fallbackReason: typeof json.fallbackReason === "string" ? json.fallbackReason : undefined,
-            debug: json.debug && typeof json.debug === "object" ? (json.debug as AiDebug) : undefined,
-            analysis:
-              json.analysis &&
-              typeof json.analysis === "object" &&
-              Array.isArray((json.analysis as AiAnalysisDoc).pages)
-                ? (json.analysis as AiAnalysisDoc)
-                : undefined,
-            aiDoc: coerceAiDoc((json as { aiDoc?: unknown }).aiDoc),
-          });
-          setAiFailed(false);
-          if (process.env.NODE_ENV !== "production") {
-            const smart = json.source === "timeweb_gateway" && !!json.analysis;
-            // eslint-disable-next-line no-console
-            console.log(
-              "[AI] parse:",
-              smart ? "structured success" : "no structured analysis",
-              "| fallback used:",
-              json.source === "fallback"
-            );
-          }
-        } else {
-          setAiFailed(true);
-        }
-      } catch {
-        if (active) setAiFailed(true);
-      } finally {
-        if (active) setAiLoading(false);
-      }
-    })();
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [hasPremium, aiPayloadSig]);
+  // AI Аналитика v1: запрос вынесен в самостоятельный компонент <AiAnalyticsV1>,
+  // который обращается ТОЛЬКО к новому маршруту /api/ai/profit-advice (Timeweb AI
+  // Gateway, GPT-5 mini). Фронт к старому /api/ai/analyze больше не обращается.
+  // aiPayloadSig (безопасные агрегаты) передаётся в компонент как тело запроса.
 
   /* charts series — строго хронологический порядок: старый месяц слева →
      новый справа. chartHistory уже отсортирован по report_period на странице
@@ -3119,10 +3006,6 @@ export function AnalyticsBlock({
         /* ===== AI Аналитика — встроенные умные рекомендации ===== */
         .an-ai-reco{justify-content:flex-start}
         .ai-reco-body{padding:.2rem 1.05rem 1rem;flex:1;min-width:0}
-        /* AI ANALYTICS RESET — заглушка «скоро будет обновлена» */
-        .ai-soon{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.6rem;min-height:160px;height:100%;padding:1.4rem 1rem;text-align:center}
-        .ai-soon-badge{display:inline-block;padding:.22rem .6rem;border-radius:999px;background:rgba(99,102,241,.12);color:#6366f1;font-size:.72rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
-        .ai-soon-note{margin:0;color:#64748b;font-size:.95rem;font-weight:500;line-height:1.4;max-width:280px}
         /* ===== AI cockpit (premium main feature) ===== */
         .an-ai-card{
           /* layered glassmorphism + усиленный gold-glow по углу */
@@ -4147,34 +4030,16 @@ export function AnalyticsBlock({
           </div>
 
           {/* AI — full right column (spans both rows) */}
-          {/* AI ANALYTICS RESET: при AI_COMING_SOON (=true) вместо полного
-              AI-кокпита и rule-based рекомендаций показываем аккуратную заглушку
-              «скоро будет обновлена». Прежний AI-блок целиком сохранён в ветке
-              else ниже (ничего не удалено) — будет переписан отдельной задачей. */}
-          {AI_COMING_SOON ? (
-            <div
-              className="an-card an-ai-card an-area-ai an-ai-reco"
-              role="region"
-              aria-label="AI Аналитика"
-            >
-              <span className="ai-card-shine" aria-hidden="true" />
-              <div className="an-card-head">
-                <div className="ai-title-row">
-                  <span className="ai-spark" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M12 2L13.4 9.2L20 10.6L13.4 12L12 19.2L10.6 12L4 10.6L10.6 9.2L12 2Z" />
-                    </svg>
-                  </span>
-                  AI Аналитика
-                </div>
-              </div>
-              <div className="ai-reco-body">
-                <div className="ai-soon" role="status">
-                  <span className="ai-soon-badge">Скоро</span>
-                  <p className="ai-soon-note">AI-аналитика скоро будет обновлена</p>
-                </div>
-              </div>
-            </div>
+          {/* AI ANALYTICS v1: при AI_V1_ENABLED (=true) рендерим компонент
+              <AiAnalyticsV1> (Timeweb AI Gateway, GPT-5 mini, только тариф 449₽
+              unlimited). Прежний AI-блок сохранён в мёртвой ветке else ниже и
+              будет удалён отдельной чисткой. */}
+          {AI_V1_ENABLED ? (
+            <AiAnalyticsV1
+              payloadSig={aiPayloadSig}
+              hasPremium={hasPremium}
+              onOpenPremium={onOpenPremium}
+            />
           ) : (
           <div
             className={"an-card an-ai-card an-area-ai" + (hasPremium ? "" : " ai-locked")}
