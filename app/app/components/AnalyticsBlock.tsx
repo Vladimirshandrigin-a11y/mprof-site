@@ -1484,13 +1484,14 @@ function DonutChart({
 
 /* ---------- MAIN ---------- */
 
-// === RELEASE ===
-// Карточка «AI Аналитика» показывает rule-based умные рекомендации по чистой
-// прибыли (компонент ProfitRecommendations, данные с расчёта на странице).
-// Прежний премиальный AI-кокпит (запрос /api/ai/analyze, score/инсайты)
-// ПОЛНОСТЬЮ сохранён в ветке else ниже и вернётся при AI_COMING_SOON=false —
-// ничего не удалено.
-const AI_COMING_SOON: boolean = false;
+// === AI ANALYTICS RESET ===
+// Текущая AI-аналитика ОТКЛЮЧЕНА (флаг = true): фронт НЕ вызывает /api/ai/analyze,
+// 7-страничная «книга» и rule-based «Базовая аналитика» НЕ рендерятся. Вместо
+// блока — аккуратная заглушка «AI-аналитика скоро будет обновлена» (без страниц,
+// без фейковых советов, без fallback-аналитики). Весь прежний код сохранён в
+// ветке else ниже (ничего не удалено) и будет переписан заново отдельной задачей.
+// AI вернётся ТОЛЬКО через Timeweb AI Gateway и ТОЛЬКО для тарифа 449₽ unlimited.
+const AI_COMING_SOON: boolean = true;
 
 // Безопасный фолбэк, когда данные для рекомендаций ещё не переданы со страницы
 // (нет расчёта) — карточка покажет аккуратное пустое состояние.
@@ -3118,6 +3119,10 @@ export function AnalyticsBlock({
         /* ===== AI Аналитика — встроенные умные рекомендации ===== */
         .an-ai-reco{justify-content:flex-start}
         .ai-reco-body{padding:.2rem 1.05rem 1rem;flex:1;min-width:0}
+        /* AI ANALYTICS RESET — заглушка «скоро будет обновлена» */
+        .ai-soon{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.6rem;min-height:160px;height:100%;padding:1.4rem 1rem;text-align:center}
+        .ai-soon-badge{display:inline-block;padding:.22rem .6rem;border-radius:999px;background:rgba(99,102,241,.12);color:#6366f1;font-size:.72rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+        .ai-soon-note{margin:0;color:#64748b;font-size:.95rem;font-weight:500;line-height:1.4;max-width:280px}
         /* ===== AI cockpit (premium main feature) ===== */
         .an-ai-card{
           /* layered glassmorphism + усиленный gold-glow по углу */
@@ -4142,10 +4147,10 @@ export function AnalyticsBlock({
           </div>
 
           {/* AI — full right column (spans both rows) */}
-          {/* RELEASE v1.0: при AI_COMING_SOON показываем компактную карточку
-              «Скоро» вместо полного AI-кокпита. Весь функционал AI (компактный
-              обзор, health-бары, инсайты, рекомендации) сохранён в ветке else
-              ниже — вернётся при AI_COMING_SOON=false. */}
+          {/* AI ANALYTICS RESET: при AI_COMING_SOON (=true) вместо полного
+              AI-кокпита и rule-based рекомендаций показываем аккуратную заглушку
+              «скоро будет обновлена». Прежний AI-блок целиком сохранён в ветке
+              else ниже (ничего не удалено) — будет переписан отдельной задачей. */}
           {AI_COMING_SOON ? (
             <div
               className="an-card an-ai-card an-area-ai an-ai-reco"
@@ -4162,10 +4167,12 @@ export function AnalyticsBlock({
                   </span>
                   AI Аналитика
                 </div>
-                <div className="ai-sub">умные рекомендации</div>
               </div>
               <div className="ai-reco-body">
-                <ProfitRecommendations {...(reco ?? EMPTY_RECO)} />
+                <div className="ai-soon" role="status">
+                  <span className="ai-soon-badge">Скоро</span>
+                  <p className="ai-soon-note">AI-аналитика скоро будет обновлена</p>
+                </div>
               </div>
             </div>
           ) : (
