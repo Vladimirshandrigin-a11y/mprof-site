@@ -289,18 +289,22 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
       aria-label="AI Аналитика"
     >
       <span className="ai-card-shine" aria-hidden="true" />
-      <div className="an-card-head aiv1-head">
-        <div className="aiv1-title-row">
-          <SparkIcon />
-          <div className="aiv1-title-col">
-            <div className="aiv1-title">AI Аналитика</div>
-            <div className="aiv1-subtitle">
-              Персональный анализ на основе вашего отчёта
+      {/* .aiv1-fill — абсолютный слой контента (см. CSS ниже): не инфлейтит
+          1fr-строку сетки, поэтому высота карты = высоте левой колонки. */}
+      <div className="aiv1-fill">
+        <div className="an-card-head aiv1-head">
+          <div className="aiv1-title-row">
+            <SparkIcon />
+            <div className="aiv1-title-col">
+              <div className="aiv1-title">AI Аналитика</div>
+              <div className="aiv1-subtitle">
+                Персональный анализ на основе вашего отчёта
+              </div>
             </div>
           </div>
         </div>
+        {body}
       </div>
-      {body}
 
       <style jsx global>{`
         /* ============ AI Аналитика v1 — премиальный тёмный блок ============ */
@@ -312,24 +316,41 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
           overflow: hidden;
           min-width: 0;
         }
-        /* ----- высота блока: компактная, как левая колонка; скролл ВНУТРИ ----- */
-        /* Компаунд .an-ai-card.aiv1-card (специфичность 0,2,0) перекрывает
-           min-height:390px из AnalyticsBlock — сам AnalyticsBlock НЕ трогаем.
-           max-height ломает «растягивание» (AI больше не тянет сетку вниз):
-           длинный ответ скроллится внутри .aiv1-scroll, страница не растёт.
-           Значение подобрано по месту: низ AI-карточки доходит до низа блока
-           «Последние расчёты» слева (левая колонка ≈539px), но НЕ растягивает
-           сетку — recent остаётся в своём размере (порог растяжки выше ~537px). */
+        /* ----- высота блока: ровно по левой колонке; скролл ВНУТРИ ----- */
+        /* Контент карты вынесен в абсолютный слой .aiv1-fill (inset:0).
+           Абсолютно спозиционированный контент НЕ участвует в max-content
+           расчёте высоты карты, поэтому длинный AI-ответ больше НЕ инфлейтит
+           1fr-строку сетки (.an-grid-bottom: rows auto/1fr; AI-карта спанит обе
+           строки правой колонки). Высоту карты задаёт только сетка = высота
+           левой колонки (donut + «Последние расчёты»), а align-self:stretch
+           растягивает карту ровно на эту высоту → низ AI всегда совпадает с
+           низом «Последних расчётов», без подбора max-height «на глаз».
+           Внутренний скролл — в .aiv1-scroll (flex:1; min-height:0).
+           Компаунд .an-ai-card.aiv1-card (0,2,0) перекрывает min-height:390px
+           из AnalyticsBlock — сам AnalyticsBlock НЕ трогаем. У .an-card нет
+           padding, поэтому inset:0 не даёт визуального сдвига контента. */
+        .aiv1-card .aiv1-fill {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          flex-direction: column;
+          min-height: 0;
+        }
+        .aiv1-fill > * {
+          position: relative;
+        }
         .an-ai-card.aiv1-card {
           min-height: 240px;
-          max-height: 535px;
           align-self: stretch;
         }
-        /* мобайл (сетка уже стекается с 900px): обычный поток страницы, без
-           внутреннего скролла и без горизонтального overflow. */
+        /* мобайл (сетка стекается с 900px): убираем абсолютный слой —
+           карта идёт обычным потоком и растёт по контенту, без фикс. высоты,
+           без внутреннего скролла и без горизонтального overflow. */
         @media (max-width: 900px) {
+          .aiv1-card .aiv1-fill {
+            display: contents;
+          }
           .an-ai-card.aiv1-card {
-            max-height: none;
             min-height: 0;
           }
         }
