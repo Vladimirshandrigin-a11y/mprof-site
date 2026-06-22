@@ -323,12 +323,194 @@ function coerceAiDoc(raw: unknown): AiDoc | null {
 
 const noStore = { "Cache-Control": "no-store" } as const;
 
-function gatewayError(reason: string): NextResponse {
-  aiLog("final source", { source: "timeweb_gateway_error", reason });
+// Безопасные коды ошибок Gateway, которые отдаём фронту (без секретов/деталей).
+type GatewayErrorCode =
+  | "gateway_timeout"
+  | "gateway_rate_limited"
+  | "gateway_http_5xx"
+  | "gateway_invalid_json"
+  | "gateway_empty_response"
+  | "gateway_unavailable";
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+// Честное «временно недоступно». errorCode — из белого списка выше; retryable
+// подсказывает фронту, можно ли тихо попробовать ещё раз (временный сбой) или
+// нет (ключ/доступ/постоянная ошибка). Никакого rule-based fallback.
+function gatewayError(
+  errorCode: GatewayErrorCode,
+  reason: string,
+  retryable: boolean
+): NextResponse {
+  aiLog("final source", {
+    source: "timeweb_gateway_error",
+    errorCode,
+    reason,
+    retryable,
+  });
   return NextResponse.json(
-    { source: "timeweb_gateway_error", message: "AI temporarily unavailable" },
+    {
+      source: "timeweb_gateway_error",
+      errorCode,
+      retryable,
+      message: "AI temporarily unavailable",
+    },
     { status: 200, headers: noStore }
   );
+}
+
+// ---------- вызов Gateway: одна попытка + безопасный retry ----------
+
+// Результат одной попытки: либо валидный aiDoc, либо причина + признак
+// «временности» (retryable) для решения о повторе.
+type AttemptResult =
+  | { ok: true; aiDoc: AiDoc }
+  | { ok: false; errorCode: GatewayErrorCode; reason: string; retryable: boolean };
+
+/** Один вызов Timeweb AI Gateway + разбор/валидация ответа модели. */
+async function attemptGateway(
+  key: string,
+  data: SanitizedData
+): Promise<AttemptResult> {
+  const { system, user } = buildPrompt(data);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), GATEWAY_TIMEOUT_MS);
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(GATEWAY_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        // gpt-5-* — reasoning: temperature дефолтная (не задаём),
+        // лимит вывода — через max_completion_tokens (max_tokens модель отвергает).
+        max_completion_tokens: MAX_TOKENS,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
+      }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    // timeout/abort и сетевые сбои — временные, повторяем.
+    const isTimeout = e instanceof Error && e.name === "AbortError";
+    aiLog("gateway unreachable", { timeout: isTimeout });
+    return isTimeout
+      ? { ok: false, errorCode: "gateway_timeout", reason: "gateway_timeout", retryable: true }
+      : { ok: false, errorCode: "gateway_unavailable", reason: "gateway_unreachable", retryable: true };
+  }
+  clearTimeout(timer);
+
+  const rawText = await upstream.text();
+  aiLog("gateway response", {
+    status: upstream.status,
+    ok: upstream.ok,
+    model: MODEL,
+    bodyLength: rawText.length,
+  });
+
+  if (!upstream.ok) {
+    let errType: string | null = null;
+    let errCode: string | null = null;
+    try {
+      const errBody = JSON.parse(rawText) as {
+        error?: { type?: string; code?: string };
+      };
+      errType = errBody?.error?.type ?? null;
+      errCode = errBody?.error?.code ?? null;
+    } catch {
+      /* тело не-JSON — оставляем null */
+    }
+    aiLog("gateway error", {
+      status: upstream.status,
+      type: errType,
+      code: errCode,
+    });
+    const s = upstream.status;
+    // Временные статусы Gateway → повторяем.
+    if (s === 429)
+      return { ok: false, errorCode: "gateway_rate_limited", reason: "gateway_http_429", retryable: true };
+    if (s === 500 || s === 502 || s === 503 || s === 504)
+      return { ok: false, errorCode: "gateway_http_5xx", reason: `gateway_http_${s}`, retryable: true };
+    // 400/401/403 и прочие — постоянные (запрос/ключ/доступ Timeweb). БЕЗ retry.
+    return { ok: false, errorCode: "gateway_unavailable", reason: `gateway_http_${s}`, retryable: false };
+  }
+
+  // Разбор конверта ответа Gateway.
+  let content = "";
+  let finishReason: string | null = null;
+  try {
+    const envelope = JSON.parse(rawText) as {
+      choices?: { message?: { content?: string }; finish_reason?: string }[];
+    };
+    content = envelope?.choices?.[0]?.message?.content ?? "";
+    finishReason = envelope?.choices?.[0]?.finish_reason ?? null;
+  } catch {
+    // 200, но тело не-JSON — считаем временным сбоем, повторяем.
+    return { ok: false, errorCode: "gateway_invalid_json", reason: "envelope_parse_failed", retryable: true };
+  }
+  aiLog("gateway content", { contentLength: content.length, finishReason });
+  if (!content.trim())
+    return { ok: false, errorCode: "gateway_empty_response", reason: "empty_content", retryable: true };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripCodeFences(content));
+  } catch {
+    return { ok: false, errorCode: "gateway_invalid_json", reason: "invalid_json", retryable: true };
+  }
+
+  const aiDoc = coerceAiDoc(parsed);
+  if (!aiDoc)
+    return { ok: false, errorCode: "gateway_invalid_json", reason: "invalid_content", retryable: true };
+
+  return { ok: true, aiDoc };
+}
+
+/**
+ * Максимум 2 попытки: первая обычная, вторая — после паузы 700–1200 мс.
+ * Повтор делаем ТОЛЬКО для временных сбоев (retryable). Ключ/доступ/постоянные
+ * ошибки возвращаем сразу. Логи без секретов: attempt N/2, retry reason.
+ */
+async function callGatewayWithRetry(
+  key: string,
+  data: SanitizedData
+): Promise<AttemptResult> {
+  const MAX_ATTEMPTS = 2;
+  let last: Extract<AttemptResult, { ok: false }> = {
+    ok: false,
+    errorCode: "gateway_unavailable",
+    reason: "no_attempt",
+    retryable: false,
+  };
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    aiLog("attempt", { attempt: `${attempt}/${MAX_ATTEMPTS}` });
+    const res = await attemptGateway(key, data);
+    if (res.ok) {
+      if (attempt > 1) aiLog("retry succeeded", { attempt: `${attempt}/${MAX_ATTEMPTS}` });
+      return res;
+    }
+    last = res;
+    if (!res.retryable) {
+      aiLog("not retryable", { reason: res.reason });
+      break;
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      const delay = 700 + Math.floor(Math.random() * 500); // 700–1200 мс
+      aiLog("retry scheduled", { retryReason: res.errorCode, reason: res.reason, delayMs: delay });
+      await sleep(delay);
+    }
+  }
+  return last;
 }
 
 // ---------- handler ----------
@@ -378,101 +560,23 @@ export async function POST(req: NextRequest) {
     hasKey: !!key,
     maxTokens: MAX_TOKENS,
   });
-  if (!key) return gatewayError("missing_api_key");
-  if (/[=\s]/.test(key)) return gatewayError("invalid_key_format");
+  // Постоянные ошибки конфигурации — без retry, честно «недоступно».
+  if (!key) return gatewayError("gateway_unavailable", "missing_api_key", false);
+  if (/[=\s]/.test(key))
+    return gatewayError("gateway_unavailable", "invalid_key_format", false);
 
-  // 5) Вызов Timeweb AI Gateway.
-  const { system, user } = buildPrompt(data);
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GATEWAY_TIMEOUT_MS);
-  let upstream: Response;
-  try {
-    upstream = await fetch(GATEWAY_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        // gpt-5-* — reasoning: temperature дефолтная (не задаём),
-        // лимит вывода — через max_completion_tokens (max_tokens модель отвергает).
-        max_completion_tokens: MAX_TOKENS,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-      }),
-      signal: controller.signal,
-    });
-  } catch (e) {
-    clearTimeout(timer);
-    const isTimeout = e instanceof Error && e.name === "AbortError";
-    aiLog("gateway unreachable", { timeout: isTimeout });
-    return gatewayError(isTimeout ? "gateway_timeout" : "gateway_unreachable");
+  // 5) Вызов Timeweb AI Gateway с безопасным retry (макс. 2 попытки): первая
+  //    обычная, вторая — после паузы 700–1200 мс и ТОЛЬКО для временных сбоев
+  //    (network/timeout/429/5xx/пустой ответ/невалидный JSON/невалидный aiDoc).
+  //    Постоянные ошибки (400/401/403/ключ) не повторяем. Без rule-based fallback.
+  const result = await callGatewayWithRetry(key, data);
+  if (!result.ok) {
+    return gatewayError(result.errorCode, result.reason, result.retryable);
   }
-  clearTimeout(timer);
-
-  const rawText = await upstream.text();
-  aiLog("gateway response", {
-    status: upstream.status,
-    ok: upstream.ok,
-    model: MODEL,
-    bodyLength: rawText.length,
-  });
-
-  if (!upstream.ok) {
-    let errType: string | null = null;
-    let errCode: string | null = null;
-    try {
-      const errBody = JSON.parse(rawText) as {
-        error?: { type?: string; code?: string };
-      };
-      errType = errBody?.error?.type ?? null;
-      errCode = errBody?.error?.code ?? null;
-    } catch {
-      /* тело не-JSON — оставляем null */
-    }
-    aiLog("gateway error", {
-      status: upstream.status,
-      type: errType,
-      code: errCode,
-    });
-    return gatewayError(`gateway_http_${upstream.status}`);
-  }
-
-  // 6) Разбор ответа.
-  let content = "";
-  let finishReason: string | null = null;
-  try {
-    const envelope = JSON.parse(rawText) as {
-      choices?: { message?: { content?: string }; finish_reason?: string }[];
-    };
-    content = envelope?.choices?.[0]?.message?.content ?? "";
-    finishReason = envelope?.choices?.[0]?.finish_reason ?? null;
-  } catch {
-    return gatewayError("envelope_parse_failed");
-  }
-  aiLog("gateway content", {
-    contentLength: content.length,
-    finishReason,
-  });
-  if (!content.trim()) return gatewayError("empty_content");
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stripCodeFences(content));
-  } catch {
-    return gatewayError("invalid_json");
-  }
-
-  const aiDoc = coerceAiDoc(parsed);
-  if (!aiDoc) return gatewayError("invalid_content");
 
   aiLog("final source", { source: "timeweb_gateway", reason: "aiDoc" });
   return NextResponse.json(
-    { source: "timeweb_gateway", model: MODEL, aiDoc },
+    { source: "timeweb_gateway", model: MODEL, aiDoc: result.aiDoc },
     { status: 200, headers: noStore }
   );
 }

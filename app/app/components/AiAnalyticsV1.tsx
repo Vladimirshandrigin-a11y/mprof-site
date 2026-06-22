@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { supabase } from "../lib/supabase-cloud";
 
 // ============================================================================
@@ -36,7 +42,15 @@ type ApiResponse = {
   source?: string;
   model?: string;
   aiDoc?: Partial<AiDoc>;
+  /** Безопасный код ошибки Gateway (при source: "timeweb_gateway_error"). */
+  errorCode?: string;
+  /** true → временный сбой, можно один раз тихо повторить на клиенте. */
+  retryable?: boolean;
 };
+
+// Один тихий авто-повтор на клиенте — только если backend сам сообщил, что сбой
+// временный (retryable). Основной retry живёт на backend; это лишь подстраховка.
+const AUTO_RETRY_DELAY_MS = 900;
 
 type Props = {
   /** Готовая безопасная подпись агрегатов (тело запроса). "" → данных нет. */
@@ -70,26 +84,47 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
   const [status, setStatus] = useState<Status>("idle");
   const [doc, setDoc] = useState<AiDoc | null>(null);
 
-  useEffect(() => {
-    // Запрос только для премиума и при наличии данных. Иначе — без вызова.
-    if (!hasPremium || !payloadSig) {
-      setStatus("idle");
+  // Управление гонкой запросов и одноразовым авто-повтором на клиенте.
+  const reqIdRef = useRef(0);
+  const controllerRef = useRef<AbortController | null>(null);
+  const autoRetriedRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Единая загрузка AI-анализа: используется и при первом рендере (useEffect),
+  // и по кнопке «Повторить анализ». Зависит только от hasPremium/payloadSig.
+  const loadAiAdvice = useCallback(
+    async (opts?: { isAutoRetry?: boolean }) => {
+      // Без премиума или без данных запрос не уходит (сервер тоже проверяет).
+      if (!hasPremium || !payloadSig) {
+        setStatus("idle");
+        setDoc(null);
+        return;
+      }
+
+      // Новый запрос отменяет предыдущий и таймер авто-повтора; получает свой
+      // id — ответы устаревших запросов игнорируются (защита от гонок/циклов).
+      controllerRef.current?.abort();
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      // Ручной/первичный запуск восстанавливает право на один авто-повтор.
+      if (!opts?.isAutoRetry) autoRetriedRef.current = false;
+
+      const controller = new AbortController();
+      controllerRef.current = controller;
+      const reqId = ++reqIdRef.current;
+      const isCurrent = () => reqId === reqIdRef.current;
+
+      setStatus("loading");
       setDoc(null);
-      return;
-    }
 
-    let active = true;
-    const controller = new AbortController();
-    setStatus("loading");
-    setDoc(null);
-
-    (async () => {
       try {
         // Токен берём прямо перед запросом — сервер верифицирует его сам.
         const { data: sessionData } = await supabase.auth.getSession();
         const token = sessionData?.session?.access_token;
         if (!token) {
-          if (active) setStatus("error");
+          if (isCurrent()) setStatus("error");
           return;
         }
         const res = await fetch("/api/ai/profit-advice", {
@@ -101,13 +136,14 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
           body: payloadSig,
           signal: controller.signal,
         });
-        if (!active) return;
+        if (!isCurrent()) return;
         if (!res.ok) {
           setStatus("error");
           return;
         }
         const json = (await res.json()) as ApiResponse;
-        if (!active) return;
+        if (!isCurrent()) return;
+
         if (json.source === "timeweb_gateway" && isValidDoc(json.aiDoc)) {
           setDoc({
             verdict: json.aiDoc.verdict,
@@ -124,20 +160,47 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
               : [],
           });
           setStatus("ready");
-        } else {
-          // source: "timeweb_gateway_error" или невалидный контент → недоступно.
-          setStatus("error");
+          return;
         }
-      } catch {
-        if (active) setStatus("error");
-      }
-    })();
 
+        // Честное «временно недоступно». Один тихий авто-повтор — ТОЛЬКО если
+        // backend пометил сбой временным (retryable) и мы ещё не повторяли.
+        // Остаёмся в loading, чтобы не показать ошибку раньше времени.
+        const canAutoRetry =
+          json.source === "timeweb_gateway_error" &&
+          json.retryable === true &&
+          !autoRetriedRef.current;
+        if (canAutoRetry) {
+          autoRetriedRef.current = true;
+          retryTimerRef.current = setTimeout(() => {
+            retryTimerRef.current = null;
+            void loadAiAdvice({ isAutoRetry: true });
+          }, AUTO_RETRY_DELAY_MS);
+          return;
+        }
+        setStatus("error");
+      } catch (e) {
+        // Abort из-за нового запроса/размонтирования — это не ошибка для UI.
+        if ((e as Error)?.name === "AbortError") return;
+        if (isCurrent()) setStatus("error");
+      }
+    },
+    [hasPremium, payloadSig]
+  );
+
+  // Первичная загрузка + перезапуск при смене премиума/данных. На размонтирование
+  // или смену входов — отменяем активный запрос и таймер авто-повтора.
+  useEffect(() => {
+    void loadAiAdvice();
     return () => {
-      active = false;
-      controller.abort();
+      reqIdRef.current++; // инвалидируем текущий запрос
+      controllerRef.current?.abort();
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
     };
-  }, [hasPremium, payloadSig]);
+  }, [loadAiAdvice]);
 
   // ── состояния без реального AI ──────────────────────────────────────────────
   let body: ReactNode;
@@ -191,7 +254,17 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
           </svg>
         </span>
         <p className="aiv1-state-title">AI-аналитика временно недоступна</p>
-        <p className="aiv1-state-note">Попробуйте позже.</p>
+        <p className="aiv1-state-note">
+          Попробуйте повторить анализ. Если сервис Timeweb отвечает с задержкой,
+          обычно помогает повторная попытка.
+        </p>
+        <button
+          type="button"
+          className="aiv1-cta"
+          onClick={() => void loadAiAdvice()}
+        >
+          Повторить анализ
+        </button>
       </div>
     );
   } else if (status === "ready" && doc) {
