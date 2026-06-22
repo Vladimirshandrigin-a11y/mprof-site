@@ -316,10 +316,13 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
         /* Компаунд .an-ai-card.aiv1-card (специфичность 0,2,0) перекрывает
            min-height:390px из AnalyticsBlock — сам AnalyticsBlock НЕ трогаем.
            max-height ломает «растягивание» (AI больше не тянет сетку вниз):
-           длинный ответ скроллится внутри .aiv1-scroll, страница не растёт. */
+           длинный ответ скроллится внутри .aiv1-scroll, страница не растёт.
+           Значение подобрано по месту: низ AI-карточки доходит до низа блока
+           «Последние расчёты» слева (левая колонка ≈539px), но НЕ растягивает
+           сетку — recent остаётся в своём размере (порог растяжки выше ~537px). */
         .an-ai-card.aiv1-card {
           min-height: 240px;
-          max-height: 480px;
+          max-height: 535px;
           align-self: stretch;
         }
         /* мобайл (сетка уже стекается с 900px): обычный поток страницы, без
