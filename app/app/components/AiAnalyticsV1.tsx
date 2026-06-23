@@ -48,6 +48,16 @@ type ApiResponse = {
   retryable?: boolean;
 };
 
+/** Схема доставки — приходит готовой из родителя (AnalyticsBlock её определяет).
+ *  Компонент только показывает бейдж; ничего сам не вычисляет. */
+type FulfillmentMode = "fbo" | "fbs" | "mixed" | "unknown";
+const FULFILLMENT_LABEL: Record<FulfillmentMode, string> = {
+  fbo: "Схема доставки: FBO",
+  fbs: "Схема доставки: FBS",
+  mixed: "Схема доставки: смешанная",
+  unknown: "Схема доставки: не определена",
+};
+
 // Один тихий авто-повтор на клиенте — только если backend сам сообщил, что сбой
 // временный (retryable). Основной retry живёт на backend; это лишь подстраховка.
 const AUTO_RETRY_DELAY_MS = 900;
@@ -59,6 +69,10 @@ type Props = {
   hasPremium: boolean;
   /** Открыть окно покупки тарифа (для не-премиум состояния). */
   onOpenPremium?: () => void;
+  /** Схема доставки для бейджа. Не задана → бейдж не показываем. */
+  fulfillmentMode?: FulfillmentMode;
+  /** Короткие причины определения схемы (подсказка при наведении). */
+  fulfillmentEvidence?: string[];
 };
 
 type Status = "idle" | "loading" | "ready" | "error";
@@ -80,7 +94,13 @@ function isValidDoc(doc: Partial<AiDoc> | undefined): doc is AiDoc {
   return leaks > 0 || plan > 0;
 }
 
-export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) {
+export function AiAnalyticsV1({
+  payloadSig,
+  hasPremium,
+  onOpenPremium,
+  fulfillmentMode,
+  fulfillmentEvidence,
+}: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [doc, setDoc] = useState<AiDoc | null>(null);
 
@@ -373,6 +393,18 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
               <div className="aiv1-subtitle">
                 Персональный анализ на основе вашего отчёта
               </div>
+              {payloadSig && fulfillmentMode ? (
+                <span
+                  className="aiv1-fulfillment"
+                  title={
+                    fulfillmentEvidence && fulfillmentEvidence.length > 0
+                      ? fulfillmentEvidence.join("; ")
+                      : undefined
+                  }
+                >
+                  {FULFILLMENT_LABEL[fulfillmentMode]}
+                </span>
+              ) : null}
             </div>
           </div>
         </div>
@@ -455,6 +487,27 @@ export function AiAnalyticsV1({ payloadSig, hasPremium, onOpenPremium }: Props) 
           opacity: 0.72;
           margin-top: 0.22rem;
           overflow-wrap: anywhere;
+        }
+        /* бейдж схемы доставки — тот же тёмно-золотой стиль (gold pill). Не влияет
+           на высоту карты (контент в абсолютном .aiv1-fill), .aiv1-scroll/grid не
+           трогает; на мобайле просто добавляет несколько px в обычном потоке. */
+        .aiv1-fulfillment {
+          display: inline-block;
+          margin-top: 0.34rem;
+          padding: 0.13rem 0.5rem;
+          font-family: "DM Mono", monospace;
+          font-size: 0.55rem;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: #e8c97a;
+          background: rgba(201, 168, 76, 0.1);
+          border: 1px solid rgba(201, 168, 76, 0.32);
+          border-radius: 999px;
+          line-height: 1.3;
+          max-width: 100%;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
         }
 
         /* ---------- состояния: locked / empty / loading / error ---------- */

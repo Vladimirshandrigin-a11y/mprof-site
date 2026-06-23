@@ -87,6 +87,8 @@ type AnalyzeInput = {
   tax?: number;
   other_expenses?: number;
   marketplace?: string;
+  /** Схема доставки, определённая фронтом. Любое иное значение → "unknown". */
+  fulfillmentMode?: string;
   period?: string;
   productsWithoutCost?: number;
   products?: unknown[];
@@ -104,6 +106,7 @@ type SanitizedData = {
   tax: number;
   other: number;
   marketplace: string;
+  fulfillmentMode: FulfillmentMode;
   period: string;
   productsWithoutCost: number;
   products: ProductRow[];
@@ -135,6 +138,24 @@ const num = (v: unknown): number =>
 
 const str = (v: unknown, max: number): string =>
   typeof v === "string" ? v.trim().slice(0, max) : "";
+
+// ---------- схема доставки (fulfillment) ----------
+// Значение приходит готовым с фронта (он определяет его по данным отчёта).
+// Backend НИЧЕГО не вычисляет — только валидирует: разрешены ровно 4 значения,
+// любое странное/отсутствующее приводится к "unknown" (схема не навязывается).
+type FulfillmentMode = "fbo" | "fbs" | "mixed" | "unknown";
+const FULFILLMENT_MODES: readonly FulfillmentMode[] = [
+  "fbo",
+  "fbs",
+  "mixed",
+  "unknown",
+];
+function coerceFulfillment(v: unknown): FulfillmentMode {
+  return typeof v === "string" &&
+    (FULFILLMENT_MODES as readonly string[]).includes(v)
+    ? (v as FulfillmentMode)
+    : "unknown";
+}
 
 /** Снимаем markdown-обёртку ```json … ``` / ``` … ```, если она есть. */
 function stripCodeFences(s: string): string {
@@ -179,6 +200,7 @@ function sanitize(input: AnalyzeInput): SanitizedData {
     tax: Math.round(num(input.tax)),
     other: Math.round(num(input.other_expenses)),
     marketplace: str(input.marketplace, 16) || "—",
+    fulfillmentMode: coerceFulfillment(input.fulfillmentMode),
     period: str(input.period, 40),
     productsWithoutCost: Math.round(num(input.productsWithoutCost)),
     products,
@@ -215,6 +237,12 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
     "- Для каждого совета по возможности укажи ожидаемый эффект в рублях или процентах (прикинь по присланным цифрам).",
     "- Пиши тезисно: это маленькие карточки в интерфейсе, а не длинный отчёт. Короткие фразы, не абзацы.",
     "",
+    "СХЕМА ДОСТАВКИ (FBO / FBS) — в данных есть поле «схемаДоставки». Учитывай его и НЕ выдумывай схему:",
+    "- fbo: товар лежит и отгружается со склада маркетплейса. Советы по логистике — про хранение на складе маркетплейса, стоимость поставки на склад и тарифы склада.",
+    "- fbs: товар лежит и отгружается со склада продавца. Советы — про упаковку, габариты, сборку и обработку заказов и доставку до маркетплейса.",
+    "- mixed: используются обе схемы сразу. Прямо напиши, что схема смешанная, и что советы по логистике надо проверять отдельно для товаров со склада маркетплейса и со склада продавца.",
+    "- unknown: схема НЕ определена по отчёту. НЕ предполагай FBO или FBS. Если речь заходит о доставке — напиши «схема доставки не определена по данным отчёта» и дай нейтральные советы без привязки к FBO или FBS.",
+    "",
     "Верни СТРОГО валидный JSON по схеме (без markdown, без текста вне JSON):",
     "{",
     '  "verdict": "1–3 предложения простыми словами: главный вывод о прибыли",',
@@ -232,6 +260,7 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
 
   const metrics = {
     площадка: d.marketplace,
+    схемаДоставки: d.fulfillmentMode,
     период: d.period || "не указан",
     выручка: d.revenue,
     чистаяПрибыль: d.profit,
