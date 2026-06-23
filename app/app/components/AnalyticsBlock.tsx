@@ -2495,6 +2495,12 @@ export function AnalyticsBlock({
   const [aiFailed, setAiFailed] = useState(false);
   // Текущая страница «книжки» AI Аналитики (0…aiBookPages.length-1)
   const [aiPage, setAiPage] = useState(0);
+  // Ручной выбор схемы доставки — используется ТОЛЬКО когда автоопределение дало
+  // "unknown". Влияет лишь на AI-аналитику (через payload); формулы прибыли,
+  // парсеры и расчёт НЕ затрагивает. default "unknown" («Не знаю»): пока
+  // пользователь ничего не указал, в AI уходит unknown (схему не навязываем).
+  const [manualFulfillment, setManualFulfillment] =
+    useState<FulfillmentMode>("unknown");
 
   // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
   // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
@@ -2540,6 +2546,13 @@ export function AnalyticsBlock({
     }
     return { mode, evidence };
   })();
+
+  // Итоговая схема доставки для AI. Если автоопределение дало fbo/fbs/mixed —
+  // берём его и ручной выбор игнорируем (селектор тогда не показываем). Если
+  // автоопределение = "unknown" — берём ручной выбор пользователя (по умолчанию
+  // тоже "unknown", пока он ничего не указал). Это значение и уходит в payload.
+  const effectiveFulfillment: FulfillmentMode =
+    aiFulfillment.mode === "unknown" ? manualFulfillment : aiFulfillment.mode;
 
   const aiPayloadSig = (() => {
     if (history.length === 0) return "";
@@ -2637,7 +2650,7 @@ export function AnalyticsBlock({
       tax: Math.round(sum((h) => h.tax)),
       other_expenses: Math.round(sum((h) => h.other)),
       marketplace: history[0].marketplace,
-      fulfillmentMode: aiFulfillment.mode,
+      fulfillmentMode: effectiveFulfillment,
       mode: "history",
       ...(period ? { period } : {}),
       recentCalcs,
@@ -4100,6 +4113,8 @@ export function AnalyticsBlock({
               onOpenPremium={onOpenPremium}
               fulfillmentMode={aiFulfillment.mode}
               fulfillmentEvidence={aiFulfillment.evidence}
+              fulfillmentManual={manualFulfillment}
+              onFulfillmentManualChange={setManualFulfillment}
             />
           ) : (
           <div

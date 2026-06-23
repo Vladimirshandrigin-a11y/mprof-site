@@ -49,7 +49,9 @@ type ApiResponse = {
 };
 
 /** Схема доставки — приходит готовой из родителя (AnalyticsBlock её определяет).
- *  Компонент только показывает бейдж; ничего сам не вычисляет. */
+ *  Компонент показывает бейдж; если авто-определение дало "unknown" — даёт
+ *  пользователю вручную выбрать схему (выбор уходит обратно в родителя, влияет
+ *  ТОЛЬКО на AI-аналитику). Сам компонент схему не вычисляет. */
 type FulfillmentMode = "fbo" | "fbs" | "mixed" | "unknown";
 const FULFILLMENT_LABEL: Record<FulfillmentMode, string> = {
   fbo: "Схема доставки: FBO",
@@ -57,6 +59,16 @@ const FULFILLMENT_LABEL: Record<FulfillmentMode, string> = {
   mixed: "Схема доставки: смешанная",
   unknown: "Схема доставки: не определена",
 };
+/** Короткие подписи опций ручного выбора (значение → текст в селекторе). */
+const FULFILLMENT_OPTION: Record<FulfillmentMode, string> = {
+  unknown: "Не знаю",
+  fbo: "FBO",
+  fbs: "FBS",
+  mixed: "Смешанная",
+};
+function isFulfillmentMode(v: string): v is FulfillmentMode {
+  return v === "fbo" || v === "fbs" || v === "mixed" || v === "unknown";
+}
 
 // Один тихий авто-повтор на клиенте — только если backend сам сообщил, что сбой
 // временный (retryable). Основной retry живёт на backend; это лишь подстраховка.
@@ -69,10 +81,15 @@ type Props = {
   hasPremium: boolean;
   /** Открыть окно покупки тарифа (для не-премиум состояния). */
   onOpenPremium?: () => void;
-  /** Схема доставки для бейджа. Не задана → бейдж не показываем. */
+  /** Авто-определённая схема. fbo/fbs/mixed → бейдж; "unknown" → ручной выбор;
+   *  не задана → ничего не показываем. */
   fulfillmentMode?: FulfillmentMode;
-  /** Короткие причины определения схемы (подсказка при наведении). */
+  /** Короткие причины определения схемы (подсказка при наведении на бейдж). */
   fulfillmentEvidence?: string[];
+  /** Текущий ручной выбор схемы (актуален, только когда авто = "unknown"). */
+  fulfillmentManual?: FulfillmentMode;
+  /** Сообщить родителю о ручном выборе схемы — он влияет на payload AI. */
+  onFulfillmentManualChange?: (mode: FulfillmentMode) => void;
 };
 
 type Status = "idle" | "loading" | "ready" | "error";
@@ -100,6 +117,8 @@ export function AiAnalyticsV1({
   onOpenPremium,
   fulfillmentMode,
   fulfillmentEvidence,
+  fulfillmentManual,
+  onFulfillmentManualChange,
 }: Props) {
   const [status, setStatus] = useState<Status>("idle");
   const [doc, setDoc] = useState<AiDoc | null>(null);
@@ -394,16 +413,50 @@ export function AiAnalyticsV1({
                 Персональный анализ на основе вашего отчёта
               </div>
               {payloadSig && fulfillmentMode ? (
-                <span
-                  className="aiv1-fulfillment"
-                  title={
-                    fulfillmentEvidence && fulfillmentEvidence.length > 0
-                      ? fulfillmentEvidence.join("; ")
-                      : undefined
-                  }
-                >
-                  {FULFILLMENT_LABEL[fulfillmentMode]}
-                </span>
+                fulfillmentMode === "unknown" ? (
+                  // Авто-определение не нашло схему → даём выбрать вручную.
+                  // Выбор уходит в родителя → меняет payload → AI перезапросится
+                  // (через тот же loadAiAdvice/AbortController, без цикла).
+                  <div className="aiv1-fulfill-pick">
+                    <span className="aiv1-fulfill-note">
+                      Схема доставки не определена
+                    </span>
+                    <label className="aiv1-fulfill-hint">
+                      Укажите, если знаете
+                      <select
+                        className="aiv1-fulfill-select"
+                        aria-label="Схема доставки"
+                        value={fulfillmentManual ?? "unknown"}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (onFulfillmentManualChange && isFulfillmentMode(v)) {
+                            onFulfillmentManualChange(v);
+                          }
+                        }}
+                      >
+                        <option value="unknown">
+                          {FULFILLMENT_OPTION.unknown}
+                        </option>
+                        <option value="fbo">{FULFILLMENT_OPTION.fbo}</option>
+                        <option value="fbs">{FULFILLMENT_OPTION.fbs}</option>
+                        <option value="mixed">
+                          {FULFILLMENT_OPTION.mixed}
+                        </option>
+                      </select>
+                    </label>
+                  </div>
+                ) : (
+                  <span
+                    className="aiv1-fulfillment"
+                    title={
+                      fulfillmentEvidence && fulfillmentEvidence.length > 0
+                        ? fulfillmentEvidence.join("; ")
+                        : undefined
+                    }
+                  >
+                    {FULFILLMENT_LABEL[fulfillmentMode]}
+                  </span>
+                )
               ) : null}
             </div>
           </div>
@@ -508,6 +561,66 @@ export function AiAnalyticsV1({
           overflow: hidden;
           text-overflow: ellipsis;
           white-space: nowrap;
+        }
+        /* ручной выбор схемы доставки (когда авто = unknown) — тот же тёмно-
+           золотой стиль, спокойно и компактно. Живёт в шапке (.aiv1-title-col),
+           поэтому НЕ влияет на высоту карты (контент в абсолютном .aiv1-fill),
+           .aiv1-scroll/grid не трогает; на мобайле добавляет лишь пару px в
+           обычном потоке. */
+        .aiv1-fulfill-pick {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 0.26rem 0.45rem;
+          margin-top: 0.34rem;
+          min-width: 0;
+        }
+        .aiv1-fulfill-note {
+          font-family: "DM Mono", monospace;
+          font-size: 0.55rem;
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          color: #e8c97a;
+          opacity: 0.9;
+        }
+        .aiv1-fulfill-hint {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.34rem;
+          font-size: 0.7rem;
+          color: #9fb1cb;
+          line-height: 1.3;
+        }
+        .aiv1-fulfill-select {
+          appearance: none;
+          -webkit-appearance: none;
+          cursor: pointer;
+          padding: 0.13rem 1.25rem 0.13rem 0.5rem;
+          font-family: "DM Mono", monospace;
+          font-size: 0.62rem;
+          letter-spacing: 0.04em;
+          color: #e8c97a;
+          background-color: rgba(201, 168, 76, 0.1);
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23e8c97a' stroke-width='2'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E");
+          background-repeat: no-repeat;
+          background-position: right 0.45rem center;
+          background-size: 0.58rem;
+          border: 1px solid rgba(201, 168, 76, 0.32);
+          border-radius: 999px;
+          line-height: 1.3;
+          max-width: 100%;
+        }
+        .aiv1-fulfill-select:hover {
+          background-color: rgba(201, 168, 76, 0.16);
+        }
+        .aiv1-fulfill-select:focus-visible {
+          outline: 2px solid rgba(201, 168, 76, 0.5);
+          outline-offset: 1px;
+        }
+        /* список опций — нативный, делаем читаемым (тёмный текст на светлом). */
+        .aiv1-fulfill-select option {
+          color: #0b1020;
+          background: #e8eef8;
         }
 
         /* ---------- состояния: locked / empty / loading / error ---------- */
