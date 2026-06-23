@@ -27,6 +27,23 @@ interface AnalyticsCalc {
   aiInsights?: unknown;
 }
 
+/** Схема доставки (fulfillment) для AI-контекста. Определяется КОНСЕРВАТИВНО по
+ *  данным отчёта; если надёжных признаков нет — "unknown" (схему не навязываем). */
+type FulfillmentMode = "fbo" | "fbs" | "mixed" | "unknown";
+
+/** Чистая 4-значная классификация по двум флагам признаков. Вынесена отдельно,
+ *  чтобы режимы "fbs"/"mixed" заработали автоматически, если надёжный признак FBS
+ *  появится в данных в будущем. Расчёт прибыли не затрагивает. */
+function classifyFulfillment(
+  fboSignal: boolean,
+  fbsSignal: boolean
+): FulfillmentMode {
+  if (fboSignal && fbsSignal) return "mixed";
+  if (fboSignal) return "fbo";
+  if (fbsSignal) return "fbs";
+  return "unknown";
+}
+
 interface Props {
   realHistory?: AnalyticsCalc[];
   /** Отдельный порядок ТОЛЬКО для линейных графиков (выручка/прибыль):
@@ -2478,11 +2495,65 @@ export function AnalyticsBlock({
   const [aiFailed, setAiFailed] = useState(false);
   // Текущая страница «книжки» AI Аналитики (0…aiBookPages.length-1)
   const [aiPage, setAiPage] = useState(0);
+  // Ручной выбор схемы доставки — используется ТОЛЬКО когда автоопределение дало
+  // "unknown". Влияет лишь на AI-аналитику (через payload); формулы прибыли,
+  // парсеры и расчёт НЕ затрагивает. default "unknown" («Не знаю»): пока
+  // пользователь ничего не указал, в AI уходит unknown (схему не навязываем).
+  const [manualFulfillment, setManualFulfillment] =
+    useState<FulfillmentMode>("unknown");
 
   // Числовые агрегаты по истории + расширенные поля из NetProfitBreakdown.
   // ЕДИНСТВЕННОЕ, что уходит в AI: только числа и короткие строки товаров.
   // Никаких XLSX/PDF/сырых отчётов в LLM не уходит.
   // Строка-подпись служит и телом запроса, и стабильным ключом эффекта.
+  // Схему доставки определяем по тем же данным, что и payload. Консервативно и
+  // ТОЛЬКО по Ozon: в агрегатах надёжны лишь FBO-специфичные расходы Ozon —
+  // хранение на складе маркетплейса и поставка на склад. Сырые признаки FBS
+  // («последняя миля» / «обработка отправления») ещё в парсере сворачиваются в
+  // общую логистику, поэтому надёжного признака FBS в данных нет — НЕ выдумываем.
+  // Нет признаков → "unknown". Результат идёт и в payload (контекст для GPT), и
+  // в проп компонента (бейдж). Формулы прибыли НЕ затрагиваются.
+  const aiFulfillment = ((): { mode: FulfillmentMode; evidence: string[] } => {
+    const ozon = history.filter((h) => h.marketplace === "ozon");
+    if (ozon.length === 0) return { mode: "unknown", evidence: [] };
+    const sumStorage = ozon.reduce((a, h) => a + (Number(h.storage) || 0), 0);
+    let deliveryToWarehouse = 0;
+    for (const h of ozon) {
+      const ins = h.aiInsights as Record<string, unknown> | null | undefined;
+      if (
+        ins &&
+        ins.kind === "net-profit-3file" &&
+        typeof ins.deliveryToWarehouse === "number" &&
+        Number.isFinite(ins.deliveryToWarehouse)
+      ) {
+        deliveryToWarehouse += ins.deliveryToWarehouse;
+      }
+    }
+    const evidence: string[] = [];
+    let fboSignal = false;
+    if (sumStorage > 0) {
+      fboSignal = true;
+      evidence.push("есть расходы на хранение на складе маркетплейса");
+    }
+    if (deliveryToWarehouse > 0) {
+      fboSignal = true;
+      evidence.push("есть поставка на склад маркетплейса");
+    }
+    // Надёжного признака FBS в агрегатах нет → false (схему не выдумываем).
+    const mode = classifyFulfillment(fboSignal, false);
+    if (mode === "unknown" && evidence.length === 0) {
+      evidence.push("в отчёте нет надёжных признаков схемы доставки");
+    }
+    return { mode, evidence };
+  })();
+
+  // Итоговая схема доставки для AI. Если автоопределение дало fbo/fbs/mixed —
+  // берём его и ручной выбор игнорируем (селектор тогда не показываем). Если
+  // автоопределение = "unknown" — берём ручной выбор пользователя (по умолчанию
+  // тоже "unknown", пока он ничего не указал). Это значение и уходит в payload.
+  const effectiveFulfillment: FulfillmentMode =
+    aiFulfillment.mode === "unknown" ? manualFulfillment : aiFulfillment.mode;
+
   const aiPayloadSig = (() => {
     if (history.length === 0) return "";
     const sum = (sel: (h: AnalyticsCalc) => number) =>
@@ -2579,6 +2650,7 @@ export function AnalyticsBlock({
       tax: Math.round(sum((h) => h.tax)),
       other_expenses: Math.round(sum((h) => h.other)),
       marketplace: history[0].marketplace,
+      fulfillmentMode: effectiveFulfillment,
       mode: "history",
       ...(period ? { period } : {}),
       recentCalcs,
@@ -4039,6 +4111,10 @@ export function AnalyticsBlock({
               payloadSig={aiPayloadSig}
               hasPremium={hasPremium}
               onOpenPremium={onOpenPremium}
+              fulfillmentMode={aiFulfillment.mode}
+              fulfillmentEvidence={aiFulfillment.evidence}
+              fulfillmentManual={manualFulfillment}
+              onFulfillmentManualChange={setManualFulfillment}
             />
           ) : (
           <div
