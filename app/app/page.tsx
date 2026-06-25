@@ -7322,15 +7322,32 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
-            <div className="api-pro-title">Черновик API-данных за месяц</div>
+            <div className="api-pro-title">Черновик данных Ozon API за месяц</div>
             <p className="api-pro-sub">
-              Это предварительные данные из Ozon API. Они не сохраняются и не
-              списывают расчёт. Перед запуском финального API-расчёта сверим их с
-              файловым отчётом.
+              Это предварительные операции из Ozon API. Они не сохраняются, не
+              списывают расчёт и пока не учитывают вашу себестоимость. Финальную
+              чистую прибыль через API будем собирать отдельным этапом после
+              сверки.
             </p>
           </div>
 
           <div className="api-pro-body">
+            <div
+              className="api-alert"
+              role="note"
+              style={{
+                background: "rgba(245,158,11,.10)",
+                border: "1px solid rgba(245,158,11,.35)",
+                marginBottom: "1.1rem",
+              }}
+            >
+              <span className="api-alert-text">
+                <strong>Это не чистая прибыль.</strong> В этом черновике пока не
+                вычитаются себестоимость, налог, упаковка, доставка до склада,
+                зарплата и прочие ручные расходы. Блок нужен только для сверки
+                данных, которые отдаёт Ozon API.
+              </span>
+            </div>
             {!ozonConn?.connected ? (
               <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
                 Сначала подключите Ozon API
@@ -7410,7 +7427,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       }}
                     >
                       {[
-                        { label: "Выручка", value: `${fmt(draftResult.totals.revenue)} ₽` },
+                        { label: "Начисления Ozon", value: `${fmt(draftResult.totals.revenue)} ₽` },
                         { label: "Возвраты", value: `${fmt(draftResult.totals.returns)} ₽` },
                         { label: "Комиссии", value: `${fmt(draftResult.totals.commission)} ₽` },
                         { label: "Логистика", value: `${fmt(draftResult.totals.logistics)} ₽` },
@@ -7453,6 +7470,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
                         Сверка с файловым расчётом
                       </div>
+                      <p
+                        className="api-pro-sub"
+                        style={{ marginTop: 0, marginBottom: ".5rem" }}
+                      >
+                        Сравнивается только выручка/начисления, не чистая прибыль.
+                        Себестоимость и ручные расходы здесь не участвуют.
+                      </p>
                       {fileCalcForDraft ? (
                         <>
                           <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem" }}>
