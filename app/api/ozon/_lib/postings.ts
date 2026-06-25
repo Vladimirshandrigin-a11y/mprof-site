@@ -541,3 +541,243 @@ export function aggregatePostingsMatch(
     notes,
   };
 }
+
+// ---------------------------------------------------------------------------
+// PR #16: предварительный COST-черновик. Себестоимость считаем ТОЛЬКО по
+// сопоставленным товарам с указанной ценой: matchedCostTotal = Σ quantity*cost.
+//   • матч — тот же, что в диагностике: offer_id↔products.sku, затем точное
+//     Ozon-sku↔products.sku, без fuzzy;
+//   • сопоставленный товар без cost_price (0/невалид) → проблемный: его стоимость
+//     НЕ учитываем и кладём в itemsWithoutCost (это «неполнота» себестоимости);
+//   • unmatched-товары тоже попадают в itemsWithoutCost (их стоимость не учтена).
+// ПРИБЫЛЬ здесь НЕ считается — это делает route (operations − matchedCostTotal).
+// ---------------------------------------------------------------------------
+
+const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100;
+
+/** Покрытие каталогом (счётчики) — для блока «Сопоставлено/Не сопоставлено». */
+export type ProfitCoverage = {
+  uniqueOzonItems: number;
+  matchedItems: number;
+  unmatchedItems: number;
+  matchedQuantity: number;
+  unmatchedQuantity: number;
+};
+
+/** Товар, чья себестоимость НЕ учтена (не сопоставлен или нет cost_price). */
+export type ProfitProblemItem = {
+  offerId?: string;
+  sku?: string;
+  name?: string;
+  quantity: number;
+  reason: string;
+};
+
+/** Сопоставленный товар с себестоимостью — для списка крупнейших по стоимости. */
+export type ProfitTopCostItem = {
+  offerId?: string;
+  sku?: string;
+  name?: string;
+  quantity: number;
+  costPerUnit: number;
+  totalCost: number;
+  matchBy: "offer_id" | "sku" | "article";
+};
+
+export type ProfitCostDraft = {
+  coverage: ProfitCoverage;
+  matchedCostTotal: number;
+  matchedNoCostCount: number;
+  itemsWithoutCost: ProfitProblemItem[];
+  topCostItems: ProfitTopCostItem[];
+  warnings: string[];
+  notes: string[];
+};
+
+/**
+ * Свести позиции в уникальные товары и посчитать себестоимость сопоставленных.
+ * Возвращает покрытие (matched/unmatched), Σ себестоимости сопоставленных с ценой,
+ * список «без учёта стоимости» и топ по стоимости. Никакого fuzzy и никакой
+ * выдуманной себестоимости для unmatched. ПРИБЫЛЬ НЕ СЧИТАЕМ.
+ */
+export function aggregateProfitCostDraft(
+  items: OzonPostingItem[],
+  fetchWarnings: string[],
+  catalog: CatalogRow[]
+): ProfitCostDraft {
+  const warnings = [...fetchWarnings];
+  const notes: string[] = [];
+
+  // Индекс каталога по нормализованному products.sku (артикул продавца).
+  const catIndex = new Map<string, { name: string; cost: number }>();
+  for (const c of catalog) {
+    const key = normArticle(c.sku);
+    if (!key || catIndex.has(key)) continue;
+    catIndex.set(key, {
+      name: typeof c.name === "string" ? c.name : "",
+      cost: typeof c.cost_price === "number" && Number.isFinite(c.cost_price) ? c.cost_price : 0,
+    });
+  }
+
+  // Агрегируем позиции в уникальные товары (offer_id → sku → без идентификатора).
+  const agg = new Map<string, AggItem>();
+  for (const it of items) {
+    let keyKind: AggItem["keyKind"];
+    let aggKey: string;
+    if (it.offerId) {
+      keyKind = "offer_id";
+      aggKey = `o:${normArticle(it.offerId)}`;
+    } else if (it.sku) {
+      keyKind = "sku";
+      aggKey = `s:${normArticle(it.sku)}`;
+    } else {
+      keyKind = "unknown";
+      aggKey = `u:${normArticle(it.name) || "(без идентификатора)"}`;
+    }
+    const ex = agg.get(aggKey);
+    if (ex) {
+      ex.quantity += it.quantity;
+      if (!ex.name && it.name) ex.name = it.name;
+      if (ex.price == null && it.price != null) ex.price = it.price;
+      if (!ex.offerId && it.offerId) ex.offerId = it.offerId;
+      if (!ex.sku && it.sku) ex.sku = it.sku;
+    } else {
+      agg.set(aggKey, {
+        offerId: it.offerId,
+        sku: it.sku,
+        name: it.name,
+        quantity: it.quantity,
+        price: it.price,
+        keyKind,
+      });
+    }
+  }
+
+  const coverage: ProfitCoverage = {
+    uniqueOzonItems: 0,
+    matchedItems: 0,
+    unmatchedItems: 0,
+    matchedQuantity: 0,
+    unmatchedQuantity: 0,
+  };
+  let matchedCostRaw = 0;
+  let matchedNoCostCount = 0;
+  const itemsWithoutCost: ProfitProblemItem[] = [];
+  const topCostItems: ProfitTopCostItem[] = [];
+
+  for (const a of agg.values()) {
+    coverage.uniqueOzonItems += 1;
+
+    // Матч: сначала offer_id↔products.sku, затем точное Ozon-sku↔products.sku. Без fuzzy.
+    let hit: { name: string; cost: number } | undefined;
+    let matchBy: ProfitTopCostItem["matchBy"] | null = null;
+    if (a.offerId) {
+      const byOffer = catIndex.get(normArticle(a.offerId));
+      if (byOffer) {
+        hit = byOffer;
+        matchBy = "offer_id";
+      }
+    }
+    if (!hit && a.sku) {
+      const bySku = catIndex.get(normArticle(a.sku));
+      if (bySku) {
+        hit = bySku;
+        matchBy = "sku";
+      }
+    }
+
+    if (hit && matchBy) {
+      coverage.matchedItems += 1;
+      coverage.matchedQuantity += a.quantity;
+      const cost = hit.cost;
+      if (cost > 0 && Number.isFinite(cost)) {
+        matchedCostRaw += a.quantity * cost;
+        topCostItems.push({
+          ...(a.offerId ? { offerId: a.offerId } : {}),
+          ...(a.sku ? { sku: a.sku } : {}),
+          ...(a.name ? { name: a.name } : {}),
+          quantity: a.quantity,
+          costPerUnit: round2(cost),
+          totalCost: round2(a.quantity * cost),
+          matchBy,
+        });
+      } else {
+        // Артикул найден, но cost_price отсутствует/0/невалиден — стоимость не учитываем.
+        matchedNoCostCount += 1;
+        itemsWithoutCost.push({
+          ...(a.offerId ? { offerId: a.offerId } : {}),
+          ...(a.sku ? { sku: a.sku } : {}),
+          ...(a.name ? { name: a.name } : {}),
+          quantity: a.quantity,
+          reason: "Сопоставлен с каталогом, но себестоимость не указана (0) — стоимость не учтена",
+        });
+      }
+    } else {
+      coverage.unmatchedItems += 1;
+      coverage.unmatchedQuantity += a.quantity;
+      const reason =
+        a.keyKind === "unknown"
+          ? "Нет артикула (offer_id) и SKU — товар нельзя сопоставить, себестоимость не учтена"
+          : "Не найден в каталоге себестоимости — себестоимость не учтена";
+      itemsWithoutCost.push({
+        ...(a.offerId ? { offerId: a.offerId } : {}),
+        ...(a.sku ? { sku: a.sku } : {}),
+        ...(a.name ? { name: a.name } : {}),
+        quantity: a.quantity,
+        reason,
+      });
+    }
+  }
+
+  const matchedCostTotal = round2(matchedCostRaw);
+
+  // Сортировка: дорогие/крупные сверху.
+  topCostItems.sort(
+    (x, y) => y.totalCost - x.totalCost || (x.name ?? "").localeCompare(y.name ?? "", "ru")
+  );
+  itemsWithoutCost.sort(
+    (x, y) => y.quantity - x.quantity || (x.name ?? "").localeCompare(y.name ?? "", "ru")
+  );
+
+  const topOut = topCostItems.slice(0, MAX_LIST);
+  const withoutOut = itemsWithoutCost.slice(0, MAX_LIST);
+  if (topCostItems.length > MAX_LIST || itemsWithoutCost.length > MAX_LIST) {
+    notes.push(
+      `Показаны первые ${MAX_LIST} позиций в каждом списке (с себестоимостью ${topCostItems.length}, без учёта стоимости ${itemsWithoutCost.length}).`
+    );
+  }
+
+  // Пояснения / предупреждения.
+  if (catIndex.size === 0) {
+    warnings.push(
+      "Каталог себестоимости пуст — добавьте товары с артикулом и себестоимостью перед API-расчётом."
+    );
+  }
+  if (matchedNoCostCount > 0) {
+    warnings.push(
+      `Сопоставлено товаров без себестоимости в каталоге: ${matchedNoCostCount}. Их стоимость не учтена в черновике — добавьте cost_price.`
+    );
+  }
+  if (coverage.unmatchedItems > 0) {
+    warnings.push(
+      `Не сопоставлено товаров: ${coverage.unmatchedItems} (${coverage.unmatchedQuantity} ед.). Их себестоимость не учтена — расчёт неполный.`
+    );
+  }
+  if (coverage.uniqueOzonItems === 0) {
+    notes.push("За выбранный месяц отправления Ozon не найдены — себестоимость считать не из чего.");
+  } else {
+    notes.push(
+      "Себестоимость учтена только по сопоставленным товарам с указанной ценой. Несопоставленные товары и товары без cost_price в стоимость НЕ вошли."
+    );
+  }
+
+  return {
+    coverage,
+    matchedCostTotal,
+    matchedNoCostCount,
+    itemsWithoutCost: withoutOut,
+    topCostItems: topOut,
+    warnings,
+    notes,
+  };
+}
