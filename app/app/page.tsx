@@ -11,7 +11,6 @@ import {
   type KeyProductsSnapshot,
   type CostCoverageSnapshot,
 } from "./components/OzonProductBreakdown"
-import { ComingSoon } from "./components/ComingSoon"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
 import {
@@ -646,15 +645,29 @@ const eyeOffIcon = (
   </svg>
 );
 
-// === RELEASE v1.0 ===
-// «🔒 Скоро» остаётся ТОЛЬКО у незавершённых для v1 функций (AI, API-автозагрузка).
-// Тарифы и Premium РАЗБЛОКИРОВАНЫ (payment=false): карточки 149 ₽ / 449 ₽ видны
-// пользователю, чтобы проверить интерес; онлайн-оплата (ЮKassa) — в подготовке.
-// Реальный код всех блоков ПОЛНОСТЬЮ сохранён — ничего не удалено.
-const COMING_SOON = {
-  apiAutoload: true, // Автозагрузка через API (Ozon / WB) — пока «Скоро»
-  payment: false, // Тарифы + Premium РАЗБЛОКИРОВАНЫ — карточки видны
+// Безопасное подключение кабинета Ozon по API (PR #1). Сырой/зашифрованный ключ
+// в браузер НЕ приходит — фронт видит только статус, маску Client ID и ••••last4.
+// Форму с ключом отправляем на наш сервер (Timeweb), он шифрует и хранит её.
+type OzonConnStatus =
+  | "not_connected"
+  | "unknown"
+  | "connected"
+  | "invalid_key"
+  | "forbidden"
+  | "unavailable";
+
+type OzonConnView = {
+  connected: boolean;
+  status: OzonConnStatus;
+  clientIdMasked?: string;
+  keyLast4?: string | null;
+  lastCheckedAt?: string | null;
+  lastError?: string | null;
+  updatedAt?: string | null;
 };
+
+// Ответ /api/ozon/connection*: безопасная проекция ИЛИ { error } при ошибке.
+type OzonConnResponse = Partial<OzonConnView> & { error?: string };
 
 // ISO-дата (например, profiles.premium_until) → "DD.MM.YYYY". Пустая строка,
 // если строку не удалось распарсить — вызывающий код тогда дату не показывает.
@@ -776,11 +789,13 @@ export default function AppPage() {
   const [resetCooldown, setResetCooldown] = useState(0);
   const [ozonClientId, setOzonClientId] = useState("");
   const [ozonApiKey, setOzonApiKey] = useState("");
-  const [wbApiKey, setWbApiKey] = useState("");
-  const [apiSaveStatus, setApiSaveStatus] = useState<"idle" | "ok" | "err" | "saving">("idle");
-  const [apiSaveMessage, setApiSaveMessage] = useState("");
   const [showOzonKey, setShowOzonKey] = useState(false);
-  const [showWbKey, setShowWbKey] = useState(false);
+  // Безопасное подключение Ozon: статус/маски берём из БД через /api/ozon/connection.
+  // Сам ключ в браузере не держим — после успешного «Подключить» очищаем поле.
+  const [ozonConn, setOzonConn] = useState<OzonConnView | null>(null);
+  const [ozonConnLoading, setOzonConnLoading] = useState(false);
+  const [ozonBusy, setOzonBusy] = useState<"idle" | "connecting" | "checking" | "deleting">("idle");
+  const [ozonConnError, setOzonConnError] = useState("");
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("upload");
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
@@ -2592,9 +2607,6 @@ export default function AppPage() {
       /* ignore */
     }
   };
-  const [ozonLoadStatus, setOzonLoadStatus] = useState<"idle" | "loading" | "ok" | "err">("idle");
-  const [ozonLoadMessage, setOzonLoadMessage] = useState("");
-
   /* ===== Analytics filters ===== */
   type FilterPeriod = "7" | "14" | "30" | "all";
   type FilterMp = "all" | "ozon" | "wb";
@@ -2808,7 +2820,7 @@ export default function AppPage() {
     // Подгрузка данных пользователя НЕ должна блокировать снятие loading.
     const loadUserData = (uid: string) => {
       loadHistory(uid).then((calcs) => {
-        loadApiKeys(uid);
+        fetchOzonConnection();
         loadUploadedReportsCloud(uid, calcs);
       });
     };
@@ -2866,7 +2878,8 @@ export default function AppPage() {
         setResult(null);
         setOzonClientId("");
         setOzonApiKey("");
-        setWbApiKey("");
+        setOzonConn(null);
+        setOzonConnError("");
         setUploadedReports([]);
       }
     });
@@ -3169,9 +3182,8 @@ export default function AppPage() {
       setUploadedReports([]);
       setOzonClientId("");
       setOzonApiKey("");
-      setWbApiKey("");
-      setApiSaveMessage("");
-      setApiSaveStatus("idle");
+      setOzonConn(null);
+      setOzonConnError("");
       // Премиум-баннер — device-pref, привязанный к показу premium: сбрасываем,
       // чтобы состояние одного аккаунта не «утекло» следующему. mprof_calc_count
       // (анти-абуз анонимного лимита) и mprof_onboarded НЕ трогаем.
@@ -3188,59 +3200,164 @@ export default function AppPage() {
     }
   };
 
-  const loadApiKeys = async (userId: string) => {
-    const { data, error } = await supabase
-      .from("api_keys")
-      .select("ozon_client_id, ozon_api_key, wb_api_key")
-      .eq("user_id", userId)
-      .maybeSingle();
+  // Bearer-токен текущей сессии Supabase — для наших /api/ozon/*. user_id сервер
+  // берёт ИЗ токена, не из тела. Без сессии возвращаем пустые заголовки.
+  const ozonAuthHeaders = async (): Promise<Record<string, string>> => {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
 
-    if (error) {
-      console.error("loadApiKeys error:", formatSupabaseError(error));
-      return;
-    }
+  // Строка БД → локальный безопасный вид (без ключа). Один маппинг на все ответы.
+  const applyOzonView = (data: OzonConnResponse) => {
+    setOzonConn({
+      connected: !!data.connected,
+      status: (data.status as OzonConnStatus) ?? "not_connected",
+      clientIdMasked: data.clientIdMasked,
+      keyLast4: data.keyLast4 ?? null,
+      lastCheckedAt: data.lastCheckedAt ?? null,
+      lastError: data.lastError ?? null,
+      updatedAt: data.updatedAt ?? null,
+    });
+  };
 
-    if (data) {
-      setOzonClientId(data.ozon_client_id ?? "");
-      setOzonApiKey(data.ozon_api_key ?? "");
-      setWbApiKey(data.wb_api_key ?? "");
+  // GET статус подключения (без ключа). Гостя/сбой сети тихо трактуем как «не
+  // подключено» — это не ошибка пользователя.
+  const fetchOzonConnection = async () => {
+    setOzonConnLoading(true);
+    setOzonConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      if (!headers.Authorization) {
+        setOzonConn(null);
+        return;
+      }
+      const res = await fetch("/api/ozon/connection", {
+        method: "GET",
+        headers,
+        cache: "no-store",
+      });
+      const data = (await res.json()) as OzonConnResponse;
+      if (!res.ok) {
+        setOzonConn(null);
+        return;
+      }
+      applyOzonView(data);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("fetchOzonConnection error:", e);
+      setOzonConn(null);
+    } finally {
+      setOzonConnLoading(false);
     }
   };
 
-  const saveApiKeys = async () => {
+  // POST подключить: {clientId, apiKey} → сервер проверяет ключ у Ozon, шифрует и
+  // сохраняет. Сырой ключ после успеха стираем из state и прячем глазок.
+  const connectOzon = async () => {
     if (!user?.id) {
-      setApiSaveStatus("err");
-      setApiSaveMessage("Войдите в аккаунт, чтобы сохранить ключи");
+      setOzonConnError("Войдите в аккаунт, чтобы подключить Ozon");
+      return;
+    }
+    const clientId = ozonClientId.trim();
+    const apiKey = ozonApiKey.trim();
+    if (clientId.length < 3 || apiKey.length < 20) {
+      setOzonConnError("Укажите корректные Client ID и API-ключ Ozon");
       return;
     }
 
-    setApiSaveStatus("saving");
-    setApiSaveMessage("");
-
-    const { error } = await supabase
-      .from("api_keys")
-      .upsert(
-        [
-          {
-            user_id: user.id,
-            ozon_client_id: ozonClientId.trim() || null,
-            ozon_api_key: ozonApiKey.trim() || null,
-            wb_api_key: wbApiKey.trim() || null,
-          },
-        ],
-        { onConflict: "user_id" }
-      );
-
-    if (error) {
-      const fmt = formatSupabaseError(error);
-      console.error("saveApiKeys error:", fmt);
-      setApiSaveStatus("err");
-      setApiSaveMessage("Ошибка: " + fmt.message);
-      return;
+    setOzonBusy("connecting");
+    setOzonConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/connection", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId, apiKey }),
+        cache: "no-store",
+      });
+      const data = (await res.json()) as OzonConnResponse;
+      if (!res.ok) {
+        setOzonConnError(data.error || "Не удалось подключить кабинет Ozon");
+        return;
+      }
+      applyOzonView(data);
+      // Сырой ключ в браузере больше не нужен — стираем.
+      setOzonApiKey("");
+      setShowOzonKey(false);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("connectOzon error:", e);
+      setOzonConnError("Не удалось связаться с сервером");
+    } finally {
+      setOzonBusy("idle");
     }
+  };
 
-    setApiSaveStatus("ok");
-    setApiSaveMessage("Ключи сохранены");
+  // POST перепроверка уже сохранённого ключа — сервер сам берёт его из БД.
+  const verifyOzon = async () => {
+    if (!user?.id) return;
+    setOzonBusy("checking");
+    setOzonConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/connection/verify", {
+        method: "POST",
+        headers,
+        cache: "no-store",
+      });
+      const data = (await res.json()) as OzonConnResponse;
+      if (!res.ok) {
+        setOzonConnError(data.error || "Не удалось проверить подключение");
+        // verify-route при нечитаемом ключе отдаёт status — отразим в UI.
+        if (data.status) {
+          setOzonConn((prev) =>
+            prev
+              ? { ...prev, status: data.status as OzonConnStatus, connected: false }
+              : prev
+          );
+        }
+        return;
+      }
+      applyOzonView(data);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("verifyOzon error:", e);
+      setOzonConnError("Не удалось связаться с сервером");
+    } finally {
+      setOzonBusy("idle");
+    }
+  };
+
+  // DELETE отключить кабинет (по подтверждению). Чистим и локальные поля ввода.
+  const deleteOzon = async () => {
+    if (!user?.id) return;
+    if (!confirm("Отключить кабинет Ozon? Сохранённый ключ будет удалён.")) return;
+    setOzonBusy("deleting");
+    setOzonConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/connection", {
+        method: "DELETE",
+        headers,
+        cache: "no-store",
+      });
+      const data = (await res.json()) as OzonConnResponse;
+      if (!res.ok) {
+        setOzonConnError(data.error || "Не удалось отключить кабинет");
+        return;
+      }
+      setOzonConn(null);
+      setOzonClientId("");
+      setOzonApiKey("");
+      setShowOzonKey(false);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("deleteOzon error:", e);
+      setOzonConnError("Не удалось связаться с сервером");
+    } finally {
+      setOzonBusy("idle");
+    }
   };
 
   const clearHistory = async () => {
@@ -3581,51 +3698,6 @@ export default function AppPage() {
     }
   };
 
-  const loadFromOzon = async () => {
-    const clientId = ozonClientId.trim();
-    const apiKey = ozonApiKey.trim();
-
-    if (!clientId || !apiKey) {
-      setOzonLoadStatus("err");
-      setOzonLoadMessage("Заполните Ozon Client ID и Ozon API Key");
-      return;
-    }
-
-    setOzonLoadStatus("loading");
-    setOzonLoadMessage("");
-
-    try {
-      const res = await fetch("/api/ozon/report", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ clientId, apiKey, daysBack: 30 }),
-      });
-
-      const data = await res.json();
-
-      if (!res.ok || !data?.ok) {
-        throw new Error(data?.error || "Не удалось получить данные");
-      }
-
-      // подставляем выручку и переключаем калькулятор на Ozon
-      setMarketplace("ozon");
-      setForm((prev) => ({
-        ...prev,
-        revenue: String(data.revenue ?? 0),
-      }));
-
-      const formattedRev = Number(data.revenue ?? 0).toLocaleString("ru-RU");
-      setOzonLoadStatus("ok");
-      setOzonLoadMessage(
-        `Продажи успешно загружены: ${formattedRev} ₽ за ${data?.period?.days ?? 30} дней`
-      );
-    } catch (e) {
-      console.error("loadFromOzon error:", e);
-      setOzonLoadStatus("err");
-      setOzonLoadMessage("Не удалось получить данные Ozon API");
-    }
-  };
-
   const handleTariff = (tier: "single" | "unlimited") => {
     setSelectedTier(tier);
     setTariffModalOpen(true);
@@ -3932,6 +4004,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   border:1px solid var(--edge2);box-shadow:none;backdrop-filter:blur(10px)}
 .api-pro-btn.ghost:hover:not(:disabled){border-color:var(--gold);color:var(--gold2);
   background:var(--gold-bg);box-shadow:0 8px 24px rgba(201,168,76,.18)}
+.api-pro-btn.danger{background:rgba(224,85,102,.08);color:#FF8A98;
+  border:1px solid rgba(224,85,102,.32);box-shadow:none}
+.api-pro-btn.danger:hover:not(:disabled){background:rgba(224,85,102,.14);
+  border-color:rgba(224,85,102,.5);box-shadow:0 8px 24px rgba(224,85,102,.16)}
 .api-pro-btn .spin{display:inline-block;width:14px;height:14px;border-radius:50%;
   border:2px solid rgba(0,0,0,.18);border-top-color:rgba(0,0,0,.55);
   animation:apiSpin .8s linear infinite;margin-right:2px}
@@ -6979,192 +7055,157 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         </div>
         )}
 
-        {calcMode === "api" && COMING_SOON.apiAutoload && (
-          <ComingSoon
-            title="Автозагрузка через API"
-            description="Подключение Ozon и Wildberries по API: продажи, комиссии и расходы будут подтягиваться автоматически — без ручной выгрузки файлов."
-          />
-        )}
-
-        {calcMode === "api" && !COMING_SOON.apiAutoload && (
+        {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
-            <div className="api-pro-title">Подключение маркетплейсов</div>
+            <div className="api-pro-title">Подключение Ozon по API</div>
             <p className="api-pro-sub">
-              Подключите Ozon/WB API для автоматической загрузки продаж, комиссий и расходов.
+              Подключите кабинет Ozon, чтобы позже автоматически загружать продажи,
+              комиссии и расходы. Ключ хранится в зашифрованном виде на сервере.
             </p>
           </div>
 
-          {user &&
-            !ozonClientId.trim() &&
-            !ozonApiKey.trim() &&
-            !wbApiKey.trim() && (
-              <div className="api-empty">
-                <div className="api-empty-ico" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                    strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M9 7V3M15 7V3" />
-                    <rect x="6" y="7" width="12" height="6" rx="1.5" />
-                    <path d="M12 13v4a3 3 0 0 0 3 3h2" />
-                  </svg>
-                </div>
-                <div className="api-empty-title">
-                  Подключите API Ozon или WB
-                </div>
-                <p className="api-empty-sub">
-                  для автоматического анализа прибыли
-                </p>
-                <ul className="api-empty-list">
-                  <li>Автоматическая аналитика</li>
-                  <li>История продаж</li>
-                  <li>Расчёт чистой прибыли</li>
-                </ul>
-              </div>
-          )}
-
           <div className="api-pro-body">
-            <div className="api-pro-grid">
-              <div className="api-fld">
-                <label>Ozon Client ID</label>
-                <input
-                  className="api-input"
-                  type="text"
-                  placeholder="Например, 123456"
-                  value={ozonClientId}
-                  onChange={(e) => setOzonClientId(e.target.value)}
-                  disabled={!user}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-              </div>
-
-              <div className="api-fld">
-                <label>Ozon API Key</label>
-                <div className="api-secret">
-                  <input
-                    className="api-input"
-                    type={showOzonKey ? "text" : "password"}
-                    placeholder="Вставьте секретный ключ"
-                    value={ozonApiKey}
-                    onChange={(e) => setOzonApiKey(e.target.value)}
-                    disabled={!user}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                  <button
-                    type="button"
-                    className="api-eye"
-                    onClick={() => setShowOzonKey((v) => !v)}
-                    disabled={!user}
-                    aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
-                    title={showOzonKey ? "Скрыть" : "Показать"}
-                  >
-                    {showOzonKey ? eyeOffIcon : eyeIcon}
-                  </button>
-                </div>
-              </div>
-
-              <div className="api-fld api-fld-full">
-                <label>Wildberries API Key</label>
-                <div className="api-secret">
-                  <input
-                    className="api-input"
-                    type={showWbKey ? "text" : "password"}
-                    placeholder="Вставьте токен из личного кабинета WB"
-                    value={wbApiKey}
-                    onChange={(e) => setWbApiKey(e.target.value)}
-                    disabled={!user}
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                  <button
-                    type="button"
-                    className="api-eye"
-                    onClick={() => setShowWbKey((v) => !v)}
-                    disabled={!user}
-                    aria-label={showWbKey ? "Скрыть ключ" : "Показать ключ"}
-                    title={showWbKey ? "Скрыть" : "Показать"}
-                  >
-                    {showWbKey ? eyeOffIcon : eyeIcon}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {apiSaveMessage && (
-              <p
-                className={
-                  "api-pro-msg" +
-                  (apiSaveStatus === "ok" ? " ok" : "") +
-                  (apiSaveStatus === "err" ? " err" : "")
-                }
-                style={{ marginTop: "1rem" }}
-              >
-                {apiSaveMessage}
-              </p>
-            )}
-
-            {user ? (
-              <div className="api-pro-actions">
-                <button
-                  type="button"
-                  className="api-pro-btn ghost"
-                  onClick={saveApiKeys}
-                  disabled={apiSaveStatus === "saving"}
-                >
-                  {apiSaveStatus === "saving" ? "Сохраняем…" : "Сохранить API"}
-                </button>
-                <button
-                  type="button"
-                  className="api-pro-btn"
-                  onClick={loadFromOzon}
-                  disabled={ozonLoadStatus === "loading"}
-                >
-                  {ozonLoadStatus === "loading" ? (
-                    <>
-                      <span className="spin" />
-                      Загружаем продажи…
-                    </>
-                  ) : (
-                    "Загрузить данные из Ozon"
-                  )}
-                </button>
-              </div>
-            ) : (
+            {!user ? (
               <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr" }}>
                 <button type="button" className="api-pro-btn locked" disabled>
-                  Войдите в аккаунт для подключения API
+                  Войдите в аккаунт для подключения Ozon
                 </button>
               </div>
+            ) : ozonConnLoading ? (
+              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
+                Проверяем подключение…
+              </p>
+            ) : ozonConn?.connected ? (
+              <>
+                <div className="api-alert ok" role="status">
+                  <span className="api-alert-ico">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                    </svg>
+                  </span>
+                  <span className="api-alert-text">
+                    Подключено
+                    {ozonConn.clientIdMasked ? ` · Client ID ${ozonConn.clientIdMasked}` : ""}
+                    {ozonConn.keyLast4 ? ` · ключ ••••${ozonConn.keyLast4}` : ""}
+                  </span>
+                </div>
+                <div className="api-pro-actions">
+                  <button
+                    type="button"
+                    className="api-pro-btn ghost"
+                    onClick={verifyOzon}
+                    disabled={ozonBusy !== "idle"}
+                  >
+                    {ozonBusy === "checking" ? (
+                      <>
+                        <span className="spin" />
+                        Проверяем…
+                      </>
+                    ) : (
+                      "Проверить подключение"
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className="api-pro-btn danger"
+                    onClick={deleteOzon}
+                    disabled={ozonBusy !== "idle"}
+                  >
+                    {ozonBusy === "deleting" ? "Удаляем…" : "Удалить подключение"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                {ozonConn && ozonConn.status !== "not_connected" && (
+                  <div className="api-alert err" role="alert">
+                    <span className="api-alert-ico">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="9" />
+                        <path d="M12 8v5" />
+                        <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+                      </svg>
+                    </span>
+                    <span className="api-alert-text">
+                      {ozonConn.status === "invalid_key"
+                        ? "Неверный ключ — переподключите кабинет"
+                        : ozonConn.status === "forbidden"
+                        ? "Недостаточно прав у ключа — проверьте доступы в Ozon"
+                        : ozonConn.status === "unavailable"
+                        ? "Ozon временно недоступен — попробуйте «Проверить» позже"
+                        : "Кабинет не подключён"}
+                    </span>
+                  </div>
+                )}
+
+                <div className="api-pro-grid">
+                  <div className="api-fld">
+                    <label>Ozon Client ID</label>
+                    <input
+                      className="api-input"
+                      type="text"
+                      placeholder="Например, 123456"
+                      value={ozonClientId}
+                      onChange={(e) => setOzonClientId(e.target.value)}
+                      disabled={ozonBusy !== "idle"}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+
+                  <div className="api-fld">
+                    <label>Ozon API Key</label>
+                    <div className="api-secret">
+                      <input
+                        className="api-input"
+                        type={showOzonKey ? "text" : "password"}
+                        placeholder="Вставьте секретный ключ"
+                        value={ozonApiKey}
+                        onChange={(e) => setOzonApiKey(e.target.value)}
+                        disabled={ozonBusy !== "idle"}
+                        autoComplete="off"
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="api-eye"
+                        onClick={() => setShowOzonKey((v) => !v)}
+                        disabled={ozonBusy !== "idle"}
+                        aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
+                        title={showOzonKey ? "Скрыть" : "Показать"}
+                      >
+                        {showOzonKey ? eyeOffIcon : eyeIcon}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr" }}>
+                  <button
+                    type="button"
+                    className="api-pro-btn"
+                    onClick={connectOzon}
+                    disabled={ozonBusy !== "idle"}
+                  >
+                    {ozonBusy === "connecting" ? (
+                      <>
+                        <span className="spin" />
+                        Подключаем…
+                      </>
+                    ) : (
+                      "Подключить Ozon"
+                    )}
+                  </button>
+                </div>
+              </>
             )}
 
-            {ozonLoadStatus === "ok" && (
-              <div className="api-alert ok" role="status">
-                <span className="api-alert-ico">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m8.5 12.5 2.5 2.5 4.5-5" />
-                  </svg>
-                </span>
-                <span className="api-alert-text">
-                  {ozonLoadMessage || "Продажи успешно загружены"}
-                </span>
-              </div>
-            )}
-
-            {ozonLoadStatus === "err" && (
-              <div className="api-alert err" role="alert">
-                <span className="api-alert-ico">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="M12 8v5" />
-                    <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
-                  </svg>
-                </span>
-                <span className="api-alert-text">
-                  {ozonLoadMessage || "Не удалось получить данные Ozon API"}
-                </span>
-              </div>
+            {ozonConnError && (
+              <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
+                {ozonConnError}
+              </p>
             )}
 
             <div className="api-pro-hint">
@@ -7175,7 +7216,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
                 </svg>
               </span>
-              Ваши продажи, комиссии и расходы будут подтягиваться автоматически.
+              Ключ хранится в зашифрованном виде на сервере и не возвращается в браузер.
+              Автоматический расчёт по API будет добавлен позже.
             </div>
           </div>
         </div>

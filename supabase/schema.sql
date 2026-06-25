@@ -465,3 +465,80 @@ drop policy if exists "report_history_delete_own" on public.report_history;
 create policy "report_history_delete_own"
   on public.report_history for delete
   using (auth.uid() = user_id);
+
+-- ============================================================================
+-- ozon_connections — безопасное подключение кабинета Ozon Seller API.
+--
+-- ОДНА строка на пользователя (user_id = PK). Хранит ЗАШИФРОВАННЫЙ Api-Key
+-- (AES-256-GCM; ключ шифрования — серверный env OZON_KEYS_ENC_SECRET,
+-- см. app/api/ozon/_lib/crypto.ts) + last4 для отображения (••••1234) +
+-- Client-Id + статус последней проверки.
+--
+-- БЕЗОПАСНОСТЬ — таблица ПОЛНОСТЬЮ закрыта для клиентских ролей:
+--   • RLS включён, но клиентских policy НЕТ вовсе → под RLS это deny-all для
+--     anon/authenticated (в отличие от calculations, где есть *_own policy);
+--   • дополнительно REVOKE ALL у anon/authenticated;
+--   • единственный путь к строке — backend через service-role (мимо RLS),
+--     routes /api/ozon/connection*. Зашифрованный ключ НИКОГДА не уходит в браузер.
+-- Строже, чем subscriptions (там есть select-own): здесь нельзя отдавать клиенту
+-- даже зашифрованный ключ, поэтому select тоже закрыт.
+-- ============================================================================
+create table if not exists public.ozon_connections (
+  user_id            uuid        primary key references auth.users(id) on delete cascade,
+  client_id          text        not null,
+  api_key_encrypted  text        not null,
+  key_last4          text,
+  status             text        not null default 'unknown'
+    check (status in ('unknown', 'connected', 'invalid_key', 'forbidden', 'unavailable')),
+  last_checked_at    timestamptz,
+  last_error         text,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+
+-- Гарантируем нужные колонки, если таблица уже существовала ранее (как делалось
+-- для products/report_history). NOT NULL без дефолта (client_id, api_key_encrypted)
+-- через ALTER не ретрофитим — они приходят из CREATE TABLE; для нового объекта
+-- это no-op, повторный прогон безопасен.
+alter table public.ozon_connections add column if not exists key_last4       text;
+alter table public.ozon_connections add column if not exists status          text        not null default 'unknown';
+alter table public.ozon_connections add column if not exists last_checked_at timestamptz;
+alter table public.ozon_connections add column if not exists last_error      text;
+alter table public.ozon_connections add column if not exists created_at      timestamptz not null default now();
+alter table public.ozon_connections add column if not exists updated_at      timestamptz not null default now();
+
+-- Гарантируем check-constraint статуса, даже если колонку добавили без него.
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'ozon_connections_status_check'
+  ) then
+    alter table public.ozon_connections
+      add constraint ozon_connections_status_check
+      check (status in ('unknown', 'connected', 'invalid_key', 'forbidden', 'unavailable'));
+  end if;
+end $$;
+
+-- updated_at автообновляется на каждый UPDATE (тот же паттерн, что products).
+create or replace function public.touch_ozon_connections_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_ozon_connections_touch on public.ozon_connections;
+create trigger trg_ozon_connections_touch
+  before update on public.ozon_connections
+  for each row execute function public.touch_ozon_connections_updated_at();
+
+-- ROW LEVEL SECURITY — полный lockdown для клиента (никаких policy + revoke).
+alter table public.ozon_connections enable row level security;
+
+-- НАМЕРЕННО НЕТ ни одной policy: под включённым RLS отсутствие policy = deny-all
+-- для anon/authenticated. Зашифрованный ключ не должен быть доступен браузеру даже
+-- на чтение. Доступ — только backend через service-role (мимо RLS).
+revoke all on public.ozon_connections from anon, authenticated;
