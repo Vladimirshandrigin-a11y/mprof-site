@@ -755,6 +755,7 @@ type OzonProfitDraftResponse = {
   };
   costDraft: {
     matchedCostTotal: number;
+    matchedNoCostCount: number;
     itemsWithoutCost: Array<{
       offerId?: string;
       sku?: string;
@@ -3719,10 +3720,11 @@ export default function AppPage() {
     // (сервер проверит это повторно и откажет, если нет).
     if (
       profitResult.status !== "complete_cost" ||
-      profitResult.productCoverage.unmatchedItems !== 0
+      profitResult.productCoverage.unmatchedItems !== 0 ||
+      profitResult.costDraft.matchedNoCostCount !== 0
     ) {
       setApiSaveError(
-        "Сохранение доступно только когда все товары сопоставлены и себестоимость заполнена."
+        "Сохранение доступно только когда все товары сопоставлены и у каждого заполнена себестоимость."
       );
       return;
     }
@@ -8567,7 +8569,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </div>
                     )}
                     {profitResult.status === "complete_cost" &&
-                      profitResult.productCoverage.unmatchedItems === 0 && (
+                      profitResult.productCoverage.unmatchedItems === 0 &&
+                      profitResult.costDraft.matchedNoCostCount === 0 && (
                         <div className="api-alert ok" role="status" style={{ marginBottom: ".6rem" }}>
                           <span className="api-alert-text">
                             Все товары сопоставлены, себестоимость учтена. Проверьте
@@ -8701,7 +8704,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           apiSaving ||
                           apiSaved ||
                           profitResult.status !== "complete_cost" ||
-                          profitResult.productCoverage.unmatchedItems !== 0
+                          profitResult.productCoverage.unmatchedItems !== 0 ||
+                          profitResult.costDraft.matchedNoCostCount !== 0
                         }
                       >
                         {apiSaving ? (
@@ -8717,13 +8721,16 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </button>
 
                       {(profitResult.status !== "complete_cost" ||
-                        profitResult.productCoverage.unmatchedItems !== 0) && (
+                        profitResult.productCoverage.unmatchedItems !== 0 ||
+                        profitResult.costDraft.matchedNoCostCount !== 0) && (
                         <p
                           className="api-pro-sub"
                           style={{ marginTop: ".5rem", marginBottom: 0 }}
                         >
-                          Сохранение доступно только когда все товары сопоставлены и
-                          себестоимость заполнена.
+                          {profitResult.costDraft.matchedNoCostCount > 0 &&
+                          profitResult.productCoverage.unmatchedItems === 0
+                            ? `Сохранение недоступно: у ${profitResult.costDraft.matchedNoCostCount} сопоставленных товаров не указана себестоимость (cost_price = 0). Заполните её в каталоге.`
+                            : "Сохранение доступно только когда все товары сопоставлены и у каждого заполнена себестоимость."}
                         </p>
                       )}
 

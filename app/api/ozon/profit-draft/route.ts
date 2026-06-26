@@ -173,6 +173,7 @@ export async function POST(req: NextRequest) {
       productCoverage: cost.coverage,
       costDraft: {
         matchedCostTotal: computed.matchedCostTotal,
+        matchedNoCostCount: cost.matchedNoCostCount,
         itemsWithoutCost: cost.itemsWithoutCost,
         topCostItems: cost.topCostItems,
       },

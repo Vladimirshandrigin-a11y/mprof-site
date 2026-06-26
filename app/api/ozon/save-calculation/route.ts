@@ -19,8 +19,9 @@ import {
 //   1. auth (user_id ТОЛЬКО из токена), ключ Ozon ТОЛЬКО из ozon_connections;
 //   2. заново тянем данные Ozon API + каталог и ПЕРЕСЧИТЫВАЕМ ту же формулу,
 //      что и preview (общий _lib/profit → loadAndComputeApiProfit);
-//   3. финальное сохранение разрешено ТОЛЬКО при полном покрытии себестоимостью
-//      (status === "complete_cost" И unmatchedItems === 0) — иначе 400, без
+//   3. финальное сохранение разрешено ТОЛЬКО при ПОЛНОМ покрытии себестоимостью
+//      (status === "complete_cost" И unmatchedItems === 0 И matchedNoCostCount === 0 —
+//      т.е. НЕТ ни одного matched-товара с cost_price = 0) — иначе 400, без
 //      сохранения и БЕЗ списания;
 //   4. списываем РОВНО один расчёт тем же RPC consume_calculation (free/149₽/
 //      безлимит решает сам RPC) — ПЕРЕД сохранением. Нет доступа → 402, без
@@ -173,17 +174,26 @@ export async function POST(req: NextRequest) {
   const t = loaded.draft.totals;
   const c = loaded.computed;
 
-  // ---- 2) финальное сохранение ТОЛЬКО при полном покрытии себестоимостью ----
-  // НЕ сохраняем и НЕ списываем, если есть несопоставленные товары или нет
-  // себестоимости. («или текущий эквивалент полного покрытия» = status.)
-  if (c.status !== "complete_cost" || loaded.cost.coverage.unmatchedItems !== 0) {
+  // ---- 2) финальное сохранение ТОЛЬКО при ПОЛНОМ покрытии себестоимостью ----
+  // НЕ сохраняем и НЕ списываем, если есть несопоставленные товары ИЛИ есть хотя бы
+  // ОДИН сопоставленный товар без себестоимости (cost_price = 0 → matchedNoCostCount).
+  // Строго: unmatchedItems === 0 И matchedNoCostCount === 0. Одного status мало:
+  // он допускает complete_cost, когда часть matched-товаров имеет cost_price = 0
+  // (их стоимость просто не входит в matchedCostTotal) — это занизило бы расходы,
+  // поэтому matchedNoCostCount проверяем ЯВНО.
+  if (
+    c.status !== "complete_cost" ||
+    loaded.cost.coverage.unmatchedItems !== 0 ||
+    loaded.cost.matchedNoCostCount !== 0
+  ) {
     return NextResponse.json(
       {
         error:
-          "Сохранение доступно только когда все товары сопоставлены и себестоимость заполнена.",
+          "Сохранение доступно только когда все товары сопоставлены и у каждого заполнена себестоимость.",
         code: "incomplete_cost",
         status: c.status,
         unmatchedItems: loaded.cost.coverage.unmatchedItems,
+        matchedNoCostCount: loaded.cost.matchedNoCostCount,
       },
       { status: 400, headers: NO_STORE }
     );
