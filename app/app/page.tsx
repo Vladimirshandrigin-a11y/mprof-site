@@ -782,6 +782,31 @@ type OzonProfitDraftResponse = {
   notes: string[];
 };
 
+// Ответ /api/ozon/import-missing-products — добавление НЕсопоставленных товаров
+// Ozon в каталог себестоимости (PR #17). Только INSERT новых товаров
+// (sku = offer_id, cost_price = 0). Себестоимость НЕ выдумывается, расчёт НЕ
+// запускается и НЕ сохраняется — пользователь заполняет cost вручную.
+type OzonImportMissingResponse = {
+  period: { month: string; dateFrom: string; dateTo: string };
+  source: string;
+  totals: {
+    unmatchedFromOzon: number;
+    eligibleToImport: number;
+    created: number;
+    skippedExisting: number;
+    skippedNoOfferId: number;
+  };
+  created: Array<{ sku: string; name: string; costPrice: number | null }>;
+  skipped: Array<{
+    offerId?: string;
+    sku?: string;
+    name?: string;
+    reason: string;
+  }>;
+  warnings: string[];
+  notes: string[];
+};
+
 // Месяц по умолчанию для черновика — ПРОШЛЫЙ месяц (за него данные уже полные).
 // Формат "YYYY-MM" для нативного <input type="month">. Считаем в UTC, без смещения.
 function defaultDraftMonth(): string {
@@ -935,6 +960,13 @@ export default function AppPage() {
   const [profitLoading, setProfitLoading] = useState(false);
   const [profitError, setProfitError] = useState("");
   const [profitResult, setProfitResult] = useState<OzonProfitDraftResponse | null>(null);
+
+  // Добавление несопоставленных товаров в каталог (PR #17) — только INSERT новых,
+  // себестоимость НЕ выдумывается, расчёт НЕ запускается и НЕ сохраняется.
+  const [importMonth, setImportMonth] = useState<string>(() => defaultDraftMonth());
+  const [importLoading, setImportLoading] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [importResult, setImportResult] = useState<OzonImportMissingResponse | null>(null);
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("upload");
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
@@ -3621,6 +3653,49 @@ export default function AppPage() {
       setProfitError("Не удалось связаться с сервером");
     } finally {
       setProfitLoading(false);
+    }
+  };
+
+  // POST /api/ozon/import-missing-products — добавить в каталог несопоставленные
+  // товары Ozon (sku = offer_id, cost_price = 0). ТОЛЬКО INSERT новых товаров:
+  // существующие не трогаем, себестоимость НЕ выдумываем, прибыль НЕ считаем,
+  // расчёт НЕ запускаем/НЕ сохраняем/НЕ списываем. После — заполнить cost вручную.
+  const importMissingProducts = async () => {
+    if (!user?.id) {
+      setImportError("Войдите в аккаунт, чтобы добавить товары");
+      return;
+    }
+    if (!ozonConn?.connected) {
+      setImportError("Сначала подключите Ozon API");
+      return;
+    }
+    if (!/^\d{4}-\d{2}$/.test(importMonth)) {
+      setImportError("Выберите месяц");
+      return;
+    }
+    setImportLoading(true);
+    setImportError("");
+    setImportResult(null);
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/import-missing-products", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ month: importMonth }),
+        cache: "no-store",
+      });
+      const data = (await res.json()) as OzonImportMissingResponse & { error?: string };
+      if (!res.ok) {
+        setImportError(data.error || "Не удалось добавить товары в каталог");
+        return;
+      }
+      setImportResult(data);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("importMissingProducts error:", e);
+      setImportError("Не удалось связаться с сервером");
+    } finally {
+      setImportLoading(false);
     }
   };
 
@@ -7965,6 +8040,235 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               </span>
               Диагностика только сопоставляет товары с каталогом. Прибыль не
               считается, ничего не сохраняется и не списывает расчёт.
+            </div>
+          </div>
+        </div>
+        )}
+
+        {calcMode === "api" && (
+        <div className="card api-pro-card">
+          <div className="api-pro-head">
+            <div className="api-pro-title">Добавить несопоставленные товары в каталог</div>
+            <p className="api-pro-sub">
+              Сайт добавит товары из Ozon API, которых нет в каталоге.
+              Себестоимость не будет придумываться — после добавления заполните её
+              вручную в каталоге товаров.
+            </p>
+          </div>
+
+          <div className="api-pro-body">
+            {!ozonConn?.connected ? (
+              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
+                Сначала подключите Ozon API
+              </p>
+            ) : (
+              <>
+                <div
+                  className="api-pro-grid"
+                  style={{ gridTemplateColumns: "minmax(0,1fr) auto", alignItems: "end" }}
+                >
+                  <div className="api-fld">
+                    <label htmlFor="ozon-import-month">Месяц</label>
+                    <input
+                      id="ozon-import-month"
+                      className="api-input"
+                      type="month"
+                      value={importMonth}
+                      max={new Date().toISOString().slice(0, 7)}
+                      onChange={(e) => setImportMonth(e.target.value)}
+                      disabled={importLoading}
+                    />
+                  </div>
+                  <div className="api-fld">
+                    <button
+                      type="button"
+                      className="api-pro-btn"
+                      onClick={importMissingProducts}
+                      disabled={importLoading}
+                    >
+                      {importLoading ? (
+                        <>
+                          <span className="spin" />
+                          Добавляем…
+                        </>
+                      ) : (
+                        "Добавить несопоставленные в каталог"
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {importError && (
+                  <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
+                    {importError}
+                  </p>
+                )}
+
+                {importResult && (
+                  <div style={{ marginTop: "1rem" }}>
+                    {importResult.warnings.map((w) => (
+                      <div
+                        key={w}
+                        className="api-alert"
+                        role="alert"
+                        style={{
+                          background: "rgba(245,158,11,.10)",
+                          border: "1px solid rgba(245,158,11,.35)",
+                          marginBottom: ".5rem",
+                        }}
+                      >
+                        <span className="api-alert-text">{w}</span>
+                      </div>
+                    ))}
+
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                        gap: ".6rem",
+                        marginTop: ".25rem",
+                      }}
+                    >
+                      {[
+                        { label: "Не сопоставлено (Ozon)", value: fmt(importResult.totals.unmatchedFromOzon) },
+                        { label: "Добавлено в каталог", value: fmt(importResult.totals.created) },
+                        { label: "Уже в каталоге", value: fmt(importResult.totals.skippedExisting) },
+                        { label: "Без артикула (не добавлены)", value: fmt(importResult.totals.skippedNoOfferId) },
+                      ].map((c) => (
+                        <div
+                          key={c.label}
+                          style={{
+                            border: "1px solid rgba(127,127,127,.25)",
+                            borderRadius: "12px",
+                            padding: ".6rem .8rem",
+                          }}
+                        >
+                          <div style={{ fontSize: ".78rem", opacity: 0.7 }}>{c.label}</div>
+                          <div
+                            style={{
+                              fontSize: "1.05rem",
+                              fontWeight: 700,
+                              marginTop: ".15rem",
+                            }}
+                          >
+                            {c.value}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {importResult.totals.unmatchedFromOzon === 0 && (
+                      <div
+                        className="api-alert ok"
+                        role="status"
+                        style={{ marginTop: "1rem" }}
+                      >
+                        <span className="api-alert-text">
+                          Все товары уже есть в каталоге. Добавление не требуется.
+                        </span>
+                      </div>
+                    )}
+
+                    {importResult.totals.created > 0 && (
+                      <div
+                        className="api-alert ok"
+                        role="status"
+                        style={{ marginTop: "1rem" }}
+                      >
+                        <span className="api-alert-text">
+                          Товары добавлены в каталог. Теперь заполните себестоимость
+                          и повторите проверку сопоставления.
+                        </span>
+                      </div>
+                    )}
+
+                    {importResult.created.length > 0 && (
+                      <div
+                        style={{
+                          marginTop: "1rem",
+                          border: "1px solid rgba(127,127,127,.2)",
+                          borderRadius: "12px",
+                          padding: ".75rem .9rem",
+                        }}
+                      >
+                        <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
+                          Добавленные товары
+                        </div>
+                        <p
+                          className="api-pro-sub"
+                          style={{ marginTop: 0, marginBottom: ".5rem" }}
+                        >
+                          Себестоимость у этих товаров пока 0 — заполните её вручную
+                          в каталоге товаров, иначе следующий расчёт будет неполным.
+                        </p>
+                        <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
+                          {importResult.created.map((c, i) => (
+                            <div
+                              key={(c.sku || c.name || "x") + i}
+                              style={{
+                                display: "flex",
+                                flexWrap: "wrap",
+                                justifyContent: "space-between",
+                                gap: ".5rem",
+                                borderBottom: "1px solid rgba(127,127,127,.12)",
+                                paddingBottom: ".35rem",
+                              }}
+                            >
+                              <div style={{ minWidth: 0 }}>
+                                <div style={{ fontWeight: 600, fontSize: ".9rem" }}>
+                                  {c.name || c.sku || "—"}
+                                </div>
+                                <div style={{ fontSize: ".76rem", opacity: 0.7 }}>
+                                  {c.sku ? `Артикул: ${c.sku}` : ""}
+                                </div>
+                              </div>
+                              <div
+                                style={{
+                                  fontSize: ".82rem",
+                                  whiteSpace: "nowrap",
+                                  opacity: 0.85,
+                                }}
+                              >
+                                себестоимость 0 ₽
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {importResult.notes.length > 0 && (
+                      <ul
+                        style={{
+                          marginTop: ".75rem",
+                          paddingLeft: "1.1rem",
+                          opacity: 0.75,
+                          fontSize: ".82rem",
+                        }}
+                      >
+                        {importResult.notes.map((n) => (
+                          <li key={n} style={{ marginBottom: ".2rem" }}>
+                            {n}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="api-pro-hint">
+              <span className="api-pro-hint-ico">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 8v5" />
+                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
+                </svg>
+              </span>
+              Добавляются только новые товары (артикул = offer_id, себестоимость 0).
+              Существующие товары не изменяются, прибыль не считается, расчёт не
+              сохраняется и не списывается.
             </div>
           </div>
         </div>

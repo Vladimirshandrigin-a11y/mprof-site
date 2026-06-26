@@ -781,3 +781,174 @@ export function aggregateProfitCostDraft(
     notes,
   };
 }
+
+// ---------------------------------------------------------------------------
+// PR #17: план импорта несопоставленных товаров в каталог себестоимости.
+//   • матч — тот же, что в диагностике: offer_id↔products.sku, затем точное
+//     Ozon-sku↔products.sku, без fuzzy;
+//   • товар уже в каталоге (matched) → skippedExisting (НЕ трогаем, не дублируем);
+//   • не сопоставлен и БЕЗ offer_id → skippedNoOfferId (нельзя надёжно связать);
+//   • не сопоставлен и С offer_id → eligible (кандидат: новый товар sku = offer_id).
+// Чистая функция: в БД НЕ ходит, себестоимость НЕ выдумывает, ничего не пишет.
+// Реальный insert и подсчёт created делает route.
+// ---------------------------------------------------------------------------
+
+/** Кандидат на добавление в каталог: новый товар sku = offer_id, name из Ozon. */
+export type ImportEligibleItem = {
+  offerId: string;
+  name: string;
+};
+
+/** Пропущенный товар (уже в каталоге или без offer_id). */
+export type ImportSkippedItem = {
+  offerId?: string;
+  sku?: string;
+  name?: string;
+  reason: string;
+};
+
+export type MissingProductsPlan = {
+  /** Уникальных товаров Ozon, которых НЕТ в каталоге (eligible + без offer_id). */
+  unmatchedFromOzon: number;
+  /** Не сопоставлены и есть offer_id — кандидаты на insert. */
+  eligible: ImportEligibleItem[];
+  /** Уже есть в каталоге (matched) — пропускаем: не дублируем и не перезаписываем. */
+  skippedExisting: ImportSkippedItem[];
+  /** Не сопоставлены и нет offer_id — пропускаем (нельзя надёжно связать). */
+  skippedNoOfferId: ImportSkippedItem[];
+  warnings: string[];
+  notes: string[];
+};
+
+/**
+ * Спланировать, какие товары из Ozon postings нужно добавить в каталог.
+ * Тот же матчинг, что в диагностике (offer_id↔products.sku, затем точное
+ * Ozon-sku↔products.sku, без fuzzy). Никакой выдуманной себестоимости и
+ * никакой записи в БД — только классификация. Реальный insert делает route.
+ */
+export function planMissingProductsImport(
+  items: OzonPostingItem[],
+  fetchWarnings: string[],
+  catalog: CatalogRow[]
+): MissingProductsPlan {
+  const warnings = [...fetchWarnings];
+  const notes: string[] = [];
+
+  // Индекс существующих артикулов каталога (по нормализованному products.sku).
+  const catIndex = new Set<string>();
+  for (const c of catalog) {
+    const key = normArticle(c.sku);
+    if (key) catIndex.add(key);
+  }
+
+  // Свести позиции в уникальные товары (offer_id → sku → без идентификатора).
+  // Агрегация гарантирует, что один offer_id даст ровно один кандидат (без дублей).
+  const agg = new Map<string, AggItem>();
+  for (const it of items) {
+    let keyKind: AggItem["keyKind"];
+    let aggKey: string;
+    if (it.offerId) {
+      keyKind = "offer_id";
+      aggKey = `o:${normArticle(it.offerId)}`;
+    } else if (it.sku) {
+      keyKind = "sku";
+      aggKey = `s:${normArticle(it.sku)}`;
+    } else {
+      keyKind = "unknown";
+      aggKey = `u:${normArticle(it.name) || "(без идентификатора)"}`;
+    }
+    const ex = agg.get(aggKey);
+    if (ex) {
+      ex.quantity += it.quantity;
+      if (!ex.name && it.name) ex.name = it.name;
+      if (ex.price == null && it.price != null) ex.price = it.price;
+      if (!ex.offerId && it.offerId) ex.offerId = it.offerId;
+      if (!ex.sku && it.sku) ex.sku = it.sku;
+    } else {
+      agg.set(aggKey, {
+        offerId: it.offerId,
+        sku: it.sku,
+        name: it.name,
+        quantity: it.quantity,
+        price: it.price,
+        keyKind,
+      });
+    }
+  }
+
+  const eligible: ImportEligibleItem[] = [];
+  const skippedExisting: ImportSkippedItem[] = [];
+  const skippedNoOfferId: ImportSkippedItem[] = [];
+
+  for (const a of agg.values()) {
+    // Уже в каталоге? Матч: offer_id↔products.sku, затем точное Ozon-sku↔products.sku. Без fuzzy.
+    let inCatalog = false;
+    if (a.offerId && catIndex.has(normArticle(a.offerId))) {
+      inCatalog = true;
+    } else if (a.sku && catIndex.has(normArticle(a.sku))) {
+      inCatalog = true;
+    }
+
+    if (inCatalog) {
+      // Товар уже есть — пропускаем, существующую строку не трогаем (ни cost, ни name).
+      skippedExisting.push({
+        ...(a.offerId ? { offerId: a.offerId } : {}),
+        ...(a.sku ? { sku: a.sku } : {}),
+        ...(a.name ? { name: a.name } : {}),
+        reason: "Уже есть в каталоге — пропущен, существующий товар не изменён",
+      });
+      continue;
+    }
+
+    // Не в каталоге, но без offer_id — надёжно связать нельзя, не добавляем.
+    if (!a.offerId) {
+      skippedNoOfferId.push({
+        ...(a.sku ? { sku: a.sku } : {}),
+        ...(a.name ? { name: a.name } : {}),
+        reason: "Нет артикула (offer_id) — нельзя надёжно связать с каталогом, не добавлен",
+      });
+      continue;
+    }
+
+    // Не в каталоге и есть offer_id — кандидат на добавление (sku = offer_id).
+    eligible.push({
+      offerId: a.offerId,
+      name: a.name.trim() || a.offerId,
+    });
+  }
+
+  // Стабильный, предсказуемый порядок кандидатов — по названию.
+  eligible.sort((x, y) => x.name.localeCompare(y.name, "ru"));
+
+  const unmatchedFromOzon = eligible.length + skippedNoOfferId.length;
+
+  // Пояснения / предупреждения.
+  if (catIndex.size === 0) {
+    notes.push(
+      "Каталог себестоимости пуст — будут добавлены все товары Ozon с артикулом."
+    );
+  }
+  if (skippedNoOfferId.length > 0) {
+    warnings.push(
+      `Товаров без артикула (offer_id) пропущено: ${skippedNoOfferId.length}. Их нельзя надёжно связать с каталогом — добавьте вручную при необходимости.`
+    );
+  }
+  if (eligible.length === 0) {
+    notes.push(
+      "Несопоставленных товаров с артикулом нет — все товары Ozon уже есть в каталоге, добавление не требуется."
+    );
+  } else {
+    notes.push(
+      "Добавляются только товары, которых ещё нет в каталоге. Существующие товары не изменяются, себестоимость НЕ выдумывается — её нужно заполнить вручную."
+    );
+  }
+
+  return {
+    unmatchedFromOzon,
+    eligible,
+    skippedExisting,
+    skippedNoOfferId,
+    warnings,
+    notes,
+  };
+}
