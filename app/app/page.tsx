@@ -982,6 +982,12 @@ export default function AppPage() {
     salary: string;
     other: string;
   }>({ tax: "", packaging: "", warehouseDelivery: "", salary: "", other: "" });
+  // PR #19 — финальное сохранение API-расчёта в историю + списание попытки.
+  // Само сохранение/пересчёт/списание делает сервер (/api/ozon/save-calculation);
+  // здесь только состояние UI (loading/защита от двойного клика/ошибка/успех).
+  const [apiSaving, setApiSaving] = useState(false);
+  const [apiSaved, setApiSaved] = useState(false);
+  const [apiSaveError, setApiSaveError] = useState("");
 
   // Добавление несопоставленных товаров в каталог (PR #17) — только INSERT новых,
   // себестоимость НЕ выдумывается, расчёт НЕ запускается и НЕ сохраняется.
@@ -3655,6 +3661,9 @@ export default function AppPage() {
     setProfitLoading(true);
     setProfitError("");
     setProfitResult(null);
+    // Новый предпросмотр → сбрасываем состояние финального сохранения (PR #19).
+    setApiSaved(false);
+    setApiSaveError("");
     try {
       // Пустое/некорректное поле → 0; отрицательное клампим к 0 (бэкенд тоже
       // строго валидирует >= 0). manualExpenses НЕ сохраняются нигде.
@@ -3690,6 +3699,92 @@ export default function AppPage() {
       setProfitError("Не удалось связаться с сервером");
     } finally {
       setProfitLoading(false);
+    }
+  };
+
+  // PR #19 — финальное сохранение API-расчёта в историю + списание попытки.
+  // ВАЖНО: пересчёт, проверку полноты себестоимости, списание и запись в БД делает
+  // СЕРВЕР (/api/ozon/save-calculation). Здесь не доверяем числам из profitResult:
+  // отправляем только месяц и текущие ручные расходы (как в preview) — сервер сам
+  // заново тянет Ozon/каталог и пересчитывает. Кнопка доступна только при полном
+  // покрытии себестоимостью; защита от двойного клика — apiSaving.
+  const saveApiCalculation = async () => {
+    if (apiSaving) return; // защита от двойного клика
+    if (!user?.id) {
+      setApiSaveError("Войдите в аккаунт, чтобы сохранить расчёт");
+      return;
+    }
+    if (!profitResult) return;
+    // Сохранение только когда все товары сопоставлены и себестоимость заполнена
+    // (сервер проверит это повторно и откажет, если нет).
+    if (
+      profitResult.status !== "complete_cost" ||
+      profitResult.productCoverage.unmatchedItems !== 0
+    ) {
+      setApiSaveError(
+        "Сохранение доступно только когда все товары сопоставлены и себестоимость заполнена."
+      );
+      return;
+    }
+    setApiSaving(true);
+    setApiSaveError("");
+    try {
+      // Те же ручные расходы, что и в preview: пустое/≤0 → 0. Берём из полей ввода
+      // (apiExpenses), НЕ из старого ответа сервера — сервер валидирует заново.
+      const meNum = (s: string): number => {
+        const n = parseFloat(s);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      };
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/save-calculation", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          month: profitMonth,
+          manualExpenses: {
+            tax: meNum(apiExpenses.tax),
+            packaging: meNum(apiExpenses.packaging),
+            warehouseDelivery: meNum(apiExpenses.warehouseDelivery),
+            salary: meNum(apiExpenses.salary),
+            other: meNum(apiExpenses.other),
+          },
+        }),
+        cache: "no-store",
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        code?: string;
+      };
+
+      // Нет доступа (free/149₽ исчерпан) → открываем окно тарифа, как в обычном
+      // расчёте. Ничего не сохранено и не списано.
+      if (res.status === 402 || data.code === "limit_reached") {
+        setSelectedTier(null);
+        setTariffModalOpen(true);
+        return;
+      }
+      if (!res.ok || data.ok !== true) {
+        const msg = data.error || "Не удалось сохранить расчёт";
+        setApiSaveError(msg);
+        showToast(msg, "err");
+        return;
+      }
+
+      // Успех: показываем подтверждение и перезагружаем историю расчётов
+      // (и счётчик помесячных снимков), чтобы новая запись появилась сразу.
+      setApiSaved(true);
+      showToast("API-расчёт сохранён в историю", "ok");
+      await loadHistory(user.id);
+      setHistoryRefresh((k) => k + 1);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("saveApiCalculation error:", e);
+      const msg = "Не удалось связаться с сервером";
+      setApiSaveError(msg);
+      showToast(msg, "err");
+    } finally {
+      setApiSaving(false);
     }
   };
 
@@ -8572,6 +8667,89 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         </span>
                       </div>
                     )}
+
+                    {/* PR #19 — финальное сохранение API-расчёта в историю + списание
+                        попытки. Пересчёт/проверку/списание/запись делает сервер. */}
+                    <div
+                      style={{
+                        marginTop: "1rem",
+                        border: "1px solid rgba(127,127,127,.2)",
+                        borderRadius: "12px",
+                        padding: ".75rem .9rem",
+                      }}
+                    >
+                      <div
+                        className="api-alert"
+                        role="note"
+                        style={{
+                          background: "rgba(245,158,11,.12)",
+                          border: "1px solid rgba(245,158,11,.45)",
+                          marginBottom: ".6rem",
+                        }}
+                      >
+                        <span className="api-alert-text">
+                          Сохранение API-расчёта добавит результат в историю и спишет
+                          одну попытку, если у вас нет активного безлимитного тарифа.
+                        </span>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="api-pro-btn"
+                        onClick={saveApiCalculation}
+                        disabled={
+                          apiSaving ||
+                          apiSaved ||
+                          profitResult.status !== "complete_cost" ||
+                          profitResult.productCoverage.unmatchedItems !== 0
+                        }
+                      >
+                        {apiSaving ? (
+                          <>
+                            <span className="spin" />
+                            Сохраняем…
+                          </>
+                        ) : apiSaved ? (
+                          "API-расчёт сохранён ✓"
+                        ) : (
+                          "Сохранить API-расчёт и списать попытку"
+                        )}
+                      </button>
+
+                      {(profitResult.status !== "complete_cost" ||
+                        profitResult.productCoverage.unmatchedItems !== 0) && (
+                        <p
+                          className="api-pro-sub"
+                          style={{ marginTop: ".5rem", marginBottom: 0 }}
+                        >
+                          Сохранение доступно только когда все товары сопоставлены и
+                          себестоимость заполнена.
+                        </p>
+                      )}
+
+                      {apiSaved && (
+                        <p
+                          style={{
+                            marginTop: ".5rem",
+                            marginBottom: 0,
+                            color: "#10b981",
+                            fontWeight: 600,
+                            fontSize: ".88rem",
+                          }}
+                        >
+                          API-расчёт сохранён в историю.
+                        </p>
+                      )}
+
+                      {apiSaveError && (
+                        <p
+                          className="api-pro-msg err"
+                          style={{ marginTop: ".5rem", marginBottom: 0 }}
+                        >
+                          {apiSaveError}
+                        </p>
+                      )}
+                    </div>
 
                     <div
                       style={{
