@@ -15,18 +15,25 @@ import {
 } from "../_lib/postings";
 
 // ============================================================================
-// /api/ozon/profit-draft — ПРЕДВАРИТЕЛЬНАЯ прибыль через API (PR #16).
-//   POST { month: "YYYY-MM" } → operations Ozon (finance) минус себестоимость
-//   ТОЛЬКО сопоставленных товаров (postings ↔ каталог products).
+// /api/ozon/profit-draft — ПРЕДВАРИТЕЛЬНАЯ прибыль через API (PR #16 + PR #18).
+//   POST { month: "YYYY-MM", manualExpenses? } → operations Ozon (finance) минус
+//   себестоимость ТОЛЬКО сопоставленных товаров (postings ↔ каталог products),
+//   а затем (PR #18) минус ОПЦИОНАЛЬНЫЕ ручные расходы → предварительная
+//   чистая прибыль.
 //
-// Это НЕ чистая прибыль и НЕ финальный расчёт: НИЧЕГО не сохраняется
-// (ни calculations, ни report_history), consume_calculation не вызывается,
-// ручные расходы (налог/упаковка/доставка до склада/зарплата/прочее) НЕ вычитаются.
+// Это всё ещё preview/draft, НЕ чистая прибыль «на бумаге» и НЕ финальный расчёт:
+// НИЧЕГО не сохраняется (ни calculations, ни report_history), consume_calculation
+// не вызывается, AI/PDF не запускаются. manualExpenses в БД НЕ сохраняются —
+// они приходят в запросе, участвуют только в текущем preview-ответе и забываются.
 //
-// Формула (см. обсуждение PR #16): returns УЖЕ внутри signed revenue
+// Формула (PR #16, не ломаем): returns УЖЕ внутри signed revenue
 // (accruals_for_sale со знаком), поэтому повторно его НЕ прибавляем —
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
 //   profitBeforeManualExpenses = ozonOperationsTotal - matchedCostTotal
+// PR #18 добавляет:
+//   manualExpensesTotal = tax + packaging + warehouseDelivery + salary + other
+//   netProfitPreview    = profitBeforeManualExpenses - manualExpensesTotal
+//   marginPreview       = ozonOperationsTotal > 0 ? netProfitPreview/ozonOperationsTotal*100 : 0
 //
 // user_id берём ТОЛЬКО из токена (authenticateRequest). Ключ Ozon расшифровываем
 // на сервере, НИКОГДА не логируем и не возвращаем; api_key_encrypted наружу не идёт.
@@ -38,6 +45,67 @@ export const dynamic = "force-dynamic";
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 const round2 = (n: number): number => Math.round((n + Number.EPSILON) * 100) / 100;
+
+// ---- ручные расходы (PR #18): optional, в БД НЕ сохраняются ----------------
+type ManualExpenses = {
+  tax: number;
+  packaging: number;
+  warehouseDelivery: number;
+  salary: number;
+  other: number;
+};
+
+const MANUAL_EXPENSE_FIELDS = [
+  "tax",
+  "packaging",
+  "warehouseDelivery",
+  "salary",
+  "other",
+] as const;
+
+const MANUAL_EXPENSE_LABELS: Record<(typeof MANUAL_EXPENSE_FIELDS)[number], string> = {
+  tax: "Налог",
+  packaging: "Упаковка",
+  warehouseDelivery: "Доставка до склада",
+  salary: "Зарплата",
+  other: "Прочие расходы",
+};
+
+/**
+ * Разобрать ОПЦИОНАЛЬНЫЙ manualExpenses из тела запроса.
+ *   • отсутствует/null/любое отсутствующее поле → 0;
+ *   • каждое значение обязано быть finite number >= 0;
+ *   • строка/булево/NaN/Infinity/отрицательное → ошибка (route вернёт 400).
+ * Ничего не сохраняем в БД — это чистая валидация для текущего preview-ответа.
+ */
+function parseManualExpenses(
+  raw: unknown
+): { ok: true; value: ManualExpenses } | { ok: false; error: string } {
+  const out: ManualExpenses = {
+    tax: 0,
+    packaging: 0,
+    warehouseDelivery: 0,
+    salary: 0,
+    other: 0,
+  };
+  if (raw === undefined || raw === null) return { ok: true, value: out };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, error: "Поле manualExpenses должно быть объектом" };
+  }
+  const obj = raw as Record<string, unknown>;
+  for (const f of MANUAL_EXPENSE_FIELDS) {
+    const v = obj[f];
+    if (v === undefined || v === null) continue; // отсутствует → 0
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      return {
+        ok: false,
+        error: `Расход «${MANUAL_EXPENSE_LABELS[f]}» должен быть числом не меньше 0`,
+      };
+    }
+    out[f] = v;
+  }
+  return { ok: true, value: out };
+}
 
 /** Код ошибки Ozon → человеко-понятный текст + HTTP-статус. */
 function errorResponse(code: OzonFinanceErrorCode): NextResponse {
@@ -73,9 +141,9 @@ export async function POST(req: NextRequest) {
   }
 
   // ---- input ----
-  let body: { month?: unknown };
+  let body: { month?: unknown; manualExpenses?: unknown };
   try {
-    body = (await req.json()) as { month?: unknown };
+    body = (await req.json()) as { month?: unknown; manualExpenses?: unknown };
   } catch {
     return NextResponse.json(
       { error: "Некорректный JSON в теле запроса" },
@@ -103,6 +171,16 @@ export async function POST(req: NextRequest) {
       { status: 400, headers: NO_STORE }
     );
   }
+
+  // ---- ручные расходы (PR #18): optional; валидируем, в БД НЕ сохраняем ----
+  const meParsed = parseManualExpenses(body.manualExpenses);
+  if (!meParsed.ok) {
+    return NextResponse.json(
+      { error: meParsed.error },
+      { status: 400, headers: NO_STORE }
+    );
+  }
+  const manualExpenses = meParsed.value;
 
   // ---- подключение Ozon текущего пользователя ----
   const { data: conn, error: connErr } = await admin
@@ -175,6 +253,22 @@ export async function POST(req: NextRequest) {
   const matchedCostTotal = cost.matchedCostTotal;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
+  // ---- 5b) ручные расходы → ПРЕДВАРИТЕЛЬНАЯ чистая прибыль (PR #18) ----
+  // Существующую формулу выше не трогаем. manualExpenses в БД не сохраняются.
+  const meTax = round2(manualExpenses.tax);
+  const mePackaging = round2(manualExpenses.packaging);
+  const meWarehouseDelivery = round2(manualExpenses.warehouseDelivery);
+  const meSalary = round2(manualExpenses.salary);
+  const meOther = round2(manualExpenses.other);
+  const manualExpensesTotal = round2(
+    meTax + mePackaging + meWarehouseDelivery + meSalary + meOther
+  );
+  const netProfitValue = round2(profitBeforeManualExpenses - manualExpensesTotal);
+  const marginPreview =
+    ozonOperationsTotal > 0
+      ? round2((netProfitValue / ozonOperationsTotal) * 100)
+      : 0;
+
   // ---- 6) статус полноты себестоимости ----
   // no_cost: себестоимости нет совсем; partial_cost: есть несопоставленные;
   // complete_cost: всё сопоставлено и себестоимость > 0.
@@ -195,7 +289,7 @@ export async function POST(req: NextRequest) {
     "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются."
   );
   notes.push(
-    "Это предварительный API-черновик, а НЕ чистая прибыль и НЕ финальный расчёт. Налог, упаковка, доставка до склада, зарплата и прочие ручные расходы здесь НЕ вычитаются."
+    "Это предварительный API-расчёт. Он не сохраняется, не списывает попытку и требует проверки перед финальным сохранением."
   );
 
   return NextResponse.json(
@@ -223,6 +317,20 @@ export async function POST(req: NextRequest) {
         ozonOperationsTotal,
         matchedCostTotal,
         profitBeforeManualExpenses,
+      },
+      // PR #18 — ручные расходы (echo, в БД не сохранены) и предварительная
+      // ЧИСТАЯ прибыль (preview, не финал). UI пишет «Предварительная чистая прибыль».
+      manualExpenses: {
+        tax: meTax,
+        packaging: mePackaging,
+        warehouseDelivery: meWarehouseDelivery,
+        salary: meSalary,
+        other: meOther,
+        total: manualExpensesTotal,
+      },
+      netProfitPreview: {
+        value: netProfitValue,
+        margin: marginPreview,
       },
       manualExpensesNotIncluded: [
         "tax",

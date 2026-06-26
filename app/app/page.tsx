@@ -777,6 +777,19 @@ type OzonProfitDraftResponse = {
     matchedCostTotal: number;
     profitBeforeManualExpenses: number;
   };
+  // PR #18 — ручные расходы (echo, в БД не сохранены) + предварительная чистая прибыль.
+  manualExpenses: {
+    tax: number;
+    packaging: number;
+    warehouseDelivery: number;
+    salary: number;
+    other: number;
+    total: number;
+  };
+  netProfitPreview: {
+    value: number;
+    margin: number;
+  };
   manualExpensesNotIncluded: string[];
   warnings: string[];
   notes: string[];
@@ -960,6 +973,15 @@ export default function AppPage() {
   const [profitLoading, setProfitLoading] = useState(false);
   const [profitError, setProfitError] = useState("");
   const [profitResult, setProfitResult] = useState<OzonProfitDraftResponse | null>(null);
+  // PR #18 — ручные расходы для API-preview. Строки (поля ввода), в БД НЕ
+  // сохраняются и НЕ участвуют в файловом расчёте. Пустое поле трактуем как 0.
+  const [apiExpenses, setApiExpenses] = useState<{
+    tax: string;
+    packaging: string;
+    warehouseDelivery: string;
+    salary: string;
+    other: string;
+  }>({ tax: "", packaging: "", warehouseDelivery: "", salary: "", other: "" });
 
   // Добавление несопоставленных товаров в каталог (PR #17) — только INSERT новых,
   // себестоимость НЕ выдумывается, расчёт НЕ запускается и НЕ сохраняется.
@@ -3634,11 +3656,26 @@ export default function AppPage() {
     setProfitError("");
     setProfitResult(null);
     try {
+      // Пустое/некорректное поле → 0; отрицательное клампим к 0 (бэкенд тоже
+      // строго валидирует >= 0). manualExpenses НЕ сохраняются нигде.
+      const meNum = (s: string): number => {
+        const n = parseFloat(s);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      };
       const headers = await ozonAuthHeaders();
       const res = await fetch("/api/ozon/profit-draft", {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ month: profitMonth }),
+        body: JSON.stringify({
+          month: profitMonth,
+          manualExpenses: {
+            tax: meNum(apiExpenses.tax),
+            packaging: meNum(apiExpenses.packaging),
+            warehouseDelivery: meNum(apiExpenses.warehouseDelivery),
+            salary: meNum(apiExpenses.salary),
+            other: meNum(apiExpenses.other),
+          },
+        }),
         cache: "no-store",
       });
       const data = (await res.json()) as OzonProfitDraftResponse & { error?: string };
@@ -8279,10 +8316,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           <div className="api-pro-head">
             <div className="api-pro-title">Предварительная прибыль с себестоимостью</div>
             <p className="api-pro-sub">
-              Это черновик. Сайт учитывает данные Ozon API и себестоимость только
-              тех товаров, которые удалось сопоставить с каталогом. Налог, упаковка,
-              доставка до склада, зарплата и прочие ручные расходы пока не
-              вычитаются. Расчёт не сохраняется и не списывает попытку.
+              Это предварительный API-расчёт чистой прибыли. Данные не сохраняются
+              и не списывают попытку. Перед финальным сохранением нужно проверить
+              себестоимость и ручные расходы.
             </p>
           </div>
 
@@ -8325,6 +8361,58 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         "Посчитать предварительную прибыль"
                       )}
                     </button>
+                  </div>
+                </div>
+
+                {/* PR #18 — ручные расходы для предварительной чистой прибыли.
+                    Значения НЕ сохраняются в БД, пустое поле = 0. */}
+                <div
+                  style={{
+                    marginTop: "1rem",
+                    border: "1px solid rgba(127,127,127,.2)",
+                    borderRadius: "12px",
+                    padding: ".75rem .9rem",
+                  }}
+                >
+                  <div style={{ fontWeight: 700, marginBottom: ".15rem" }}>
+                    Ручные расходы
+                  </div>
+                  <p className="api-pro-sub" style={{ marginTop: 0, marginBottom: ".6rem" }}>
+                    Эти суммы не сохраняются — они нужны только для предварительного
+                    расчёта чистой прибыли. Пустое поле считается как 0.
+                  </p>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                      gap: ".6rem",
+                    }}
+                  >
+                    {([
+                      { key: "tax", label: "Налог" },
+                      { key: "packaging", label: "Упаковка" },
+                      { key: "warehouseDelivery", label: "Доставка до склада" },
+                      { key: "salary", label: "Зарплата" },
+                      { key: "other", label: "Прочие расходы" },
+                    ] as const).map((f) => (
+                      <div className="api-fld" key={f.key}>
+                        <label htmlFor={`ozon-me-${f.key}`}>{f.label}</label>
+                        <input
+                          id={`ozon-me-${f.key}`}
+                          className="api-input"
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          placeholder="0"
+                          value={apiExpenses[f.key]}
+                          onChange={(e) =>
+                            setApiExpenses((prev) => ({ ...prev, [f.key]: e.target.value }))
+                          }
+                          disabled={profitLoading}
+                        />
+                      </div>
+                    ))}
                   </div>
                 </div>
 
@@ -8383,15 +8471,15 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         </span>
                       </div>
                     )}
-                    {profitResult.status === "complete_cost" && (
-                      <div className="api-alert ok" role="status" style={{ marginBottom: ".6rem" }}>
-                        <span className="api-alert-text">
-                          Все найденные товары сопоставлены с каталогом. Можно
-                          переходить к следующему этапу — ручные расходы и финальный
-                          API-расчёт.
-                        </span>
-                      </div>
-                    )}
+                    {profitResult.status === "complete_cost" &&
+                      profitResult.productCoverage.unmatchedItems === 0 && (
+                        <div className="api-alert ok" role="status" style={{ marginBottom: ".6rem" }}>
+                          <span className="api-alert-text">
+                            Все товары сопоставлены, себестоимость учтена. Проверьте
+                            ручные расходы перед финальным сохранением.
+                          </span>
+                        </div>
+                      )}
 
                     <div
                       style={{
@@ -8401,10 +8489,20 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         marginTop: ".25rem",
                       }}
                     >
-                      {[
+                      {([
                         { label: "Операции Ozon", value: `${fmt(profitResult.preliminary.ozonOperationsTotal)} ₽` },
                         { label: "Себестоимость найденных товаров", value: `${fmt(profitResult.costDraft.matchedCostTotal)} ₽` },
+                        { label: "Ручные расходы всего", value: `${fmt(profitResult.manualExpenses.total)} ₽` },
                         { label: "Предварительная прибыль до ручных расходов", value: `${fmt(profitResult.preliminary.profitBeforeManualExpenses)} ₽` },
+                        {
+                          label: "Предварительная чистая прибыль",
+                          value: `${fmt(profitResult.netProfitPreview.value)} ₽`,
+                          accent: profitResult.netProfitPreview.value < 0 ? "#ef4444" : "#10b981",
+                        },
+                        {
+                          label: "Маржинальность preview",
+                          value: `${profitResult.netProfitPreview.margin.toLocaleString("ru-RU", { maximumFractionDigits: 1 })} %`,
+                        },
                         { label: "Сопоставлено товаров", value: fmt(profitResult.productCoverage.matchedItems) },
                         { label: "Не сопоставлено товаров", value: fmt(profitResult.productCoverage.unmatchedItems) },
                         {
@@ -8416,7 +8514,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 ? "Неполная"
                                 : "Нет себестоимости",
                         },
-                      ].map((c) => (
+                      ] as Array<{ label: string; value: string; accent?: string }>).map((c) => (
                         <div
                           key={c.label}
                           style={{
@@ -8426,12 +8524,54 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           }}
                         >
                           <div style={{ fontSize: ".78rem", opacity: 0.7 }}>{c.label}</div>
-                          <div style={{ fontSize: "1.05rem", fontWeight: 700, marginTop: ".15rem" }}>
+                          <div
+                            style={{
+                              fontSize: "1.05rem",
+                              fontWeight: 700,
+                              marginTop: ".15rem",
+                              color: c.accent,
+                            }}
+                          >
                             {c.value}
                           </div>
                         </div>
                       ))}
                     </div>
+
+                    {profitResult.manualExpenses.total === 0 && (
+                      <div
+                        className="api-alert"
+                        role="alert"
+                        style={{
+                          background: "rgba(245,158,11,.12)",
+                          border: "1px solid rgba(245,158,11,.45)",
+                          marginTop: ".6rem",
+                        }}
+                      >
+                        <span className="api-alert-text">
+                          Ручные расходы равны 0. Если у вас есть налог, упаковка,
+                          доставка до склада, зарплата или прочие расходы — заполните
+                          их перед финальным расчётом.
+                        </span>
+                      </div>
+                    )}
+
+                    {profitResult.netProfitPreview.value < 0 && (
+                      <div
+                        className="api-alert"
+                        role="alert"
+                        style={{
+                          background: "rgba(239,68,68,.12)",
+                          border: "1px solid rgba(239,68,68,.45)",
+                          marginTop: ".6rem",
+                        }}
+                      >
+                        <span className="api-alert-text">
+                          Предварительная чистая прибыль отрицательная. Проверьте
+                          себестоимость, комиссии и ручные расходы.
+                        </span>
+                      </div>
+                    )}
 
                     <div
                       style={{
@@ -8483,8 +8623,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     </div>
 
                     <p className="api-pro-sub" style={{ marginTop: ".75rem" }}>
-                      Не вычитается на этом этапе: налог, упаковка, доставка до
-                      склада, зарплата, прочие ручные расходы.
+                      Предварительная чистая прибыль = операции Ozon − себестоимость
+                      сопоставленных товаров − ручные расходы (налог, упаковка,
+                      доставка до склада, зарплата, прочее). Это всё ещё preview:
+                      данные не сохраняются и не списывают попытку.
                     </p>
 
                     {profitResult.costDraft.itemsWithoutCost.length > 0 && (
@@ -8625,9 +8767,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
                 </svg>
               </span>
-              Это предварительный API-черновик, а не чистая прибыль и не финальный
-              расчёт. Себестоимость учитывается только по сопоставленным товарам;
-              данные не сохраняются и не списывают попытку.
+              Это предварительная чистая прибыль, а не финальный расчёт.
+              Себестоимость учитывается только по сопоставленным товарам, а ручные
+              расходы вы вводите сами; данные не сохраняются и не списывают попытку.
             </div>
           </div>
         </div>
