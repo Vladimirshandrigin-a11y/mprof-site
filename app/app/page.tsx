@@ -983,12 +983,12 @@ export default function AppPage() {
     salary: string;
     other: string;
   }>({ tax: "", packaging: "", warehouseDelivery: "", salary: "", other: "" });
-  // PR #19 — финальное сохранение API-расчёта в историю + списание попытки.
-  // Само сохранение/пересчёт/списание делает сервер (/api/ozon/save-calculation);
-  // здесь только состояние UI (loading/защита от двойного клика/ошибка/успех).
-  const [apiSaving, setApiSaving] = useState(false);
+  // PR #20 — единое действие «Рассчитать и сохранить»: сервер
+  // (/api/ozon/save-calculation) проверяет доступ, пересчитывает, проверяет
+  // себестоимость, списывает попытку и сохраняет; полный расчёт показываем ТОЛЬКО
+  // после успеха. apiSaved=true означает «рассчитано и сохранено» (результат на
+  // экране). Прогресс/ошибки переиспользуют profitLoading/profitError.
   const [apiSaved, setApiSaved] = useState(false);
-  const [apiSaveError, setApiSaveError] = useState("");
 
   // Добавление несопоставленных товаров в каталог (PR #17) — только INSERT новых,
   // себестоимость НЕ выдумывается, расчёт НЕ запускается и НЕ сохраняется.
@@ -3643,12 +3643,18 @@ export default function AppPage() {
     }
   };
 
-  // POST /api/ozon/profit-draft — предварительная прибыль: операции Ozon минус
-  // себестоимость сопоставленных товаров. НИЧЕГО не сохраняет, не списывает
-  // расчёт и НЕ считает чистую прибыль (ручные расходы не вычитаются).
-  const loadProfitDraft = async () => {
+  // POST /api/ozon/save-calculation — ЕДИНОЕ действие «Рассчитать и сохранить»
+  // (PR #20). Закрывает дыру монетизации: раньше был бесплатный preview, который
+  // отдавал полный расчёт без списания. Теперь полный API-расчёт показываем ТОЛЬКО
+  // после успешного сохранения. Сервер сам ПРОВЕРЯЕТ доступ, заново тянет Ozon/
+  // каталог, пересчитывает, проверяет полноту себестоимости, СПИСЫВАЕТ ровно один
+  // расчёт (free/149₽; для безлимита — без списания) и пишет в историю — это
+  // единственная точка списания, двойного списания нет. Числам с фронта не верим:
+  // шлём только месяц и ручные расходы. Защита от двойного клика — profitLoading.
+  const calculateAndSaveApi = async () => {
+    if (profitLoading) return; // защита от двойного клика
     if (!user?.id) {
-      setProfitError("Войдите в аккаунт, чтобы посчитать прибыль");
+      setProfitError("Войдите в аккаунт, чтобы рассчитать прибыль");
       return;
     }
     if (!ozonConn?.connected) {
@@ -3662,77 +3668,9 @@ export default function AppPage() {
     setProfitLoading(true);
     setProfitError("");
     setProfitResult(null);
-    // Новый предпросмотр → сбрасываем состояние финального сохранения (PR #19).
     setApiSaved(false);
-    setApiSaveError("");
     try {
-      // Пустое/некорректное поле → 0; отрицательное клампим к 0 (бэкенд тоже
-      // строго валидирует >= 0). manualExpenses НЕ сохраняются нигде.
-      const meNum = (s: string): number => {
-        const n = parseFloat(s);
-        return Number.isFinite(n) && n > 0 ? n : 0;
-      };
-      const headers = await ozonAuthHeaders();
-      const res = await fetch("/api/ozon/profit-draft", {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          month: profitMonth,
-          manualExpenses: {
-            tax: meNum(apiExpenses.tax),
-            packaging: meNum(apiExpenses.packaging),
-            warehouseDelivery: meNum(apiExpenses.warehouseDelivery),
-            salary: meNum(apiExpenses.salary),
-            other: meNum(apiExpenses.other),
-          },
-        }),
-        cache: "no-store",
-      });
-      const data = (await res.json()) as OzonProfitDraftResponse & { error?: string };
-      if (!res.ok) {
-        setProfitError(data.error || "Не удалось посчитать предварительную прибыль");
-        return;
-      }
-      setProfitResult(data);
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("loadProfitDraft error:", e);
-      setProfitError("Не удалось связаться с сервером");
-    } finally {
-      setProfitLoading(false);
-    }
-  };
-
-  // PR #19 — финальное сохранение API-расчёта в историю + списание попытки.
-  // ВАЖНО: пересчёт, проверку полноты себестоимости, списание и запись в БД делает
-  // СЕРВЕР (/api/ozon/save-calculation). Здесь не доверяем числам из profitResult:
-  // отправляем только месяц и текущие ручные расходы (как в preview) — сервер сам
-  // заново тянет Ozon/каталог и пересчитывает. Кнопка доступна только при полном
-  // покрытии себестоимостью; защита от двойного клика — apiSaving.
-  const saveApiCalculation = async () => {
-    if (apiSaving) return; // защита от двойного клика
-    if (!user?.id) {
-      setApiSaveError("Войдите в аккаунт, чтобы сохранить расчёт");
-      return;
-    }
-    if (!profitResult) return;
-    // Сохранение только когда все товары сопоставлены и себестоимость заполнена
-    // (сервер проверит это повторно и откажет, если нет).
-    if (
-      profitResult.status !== "complete_cost" ||
-      profitResult.productCoverage.unmatchedItems !== 0 ||
-      profitResult.costDraft.matchedNoCostCount !== 0
-    ) {
-      setApiSaveError(
-        "Сохранение доступно только когда все товары сопоставлены и у каждого заполнена себестоимость."
-      );
-      return;
-    }
-    setApiSaving(true);
-    setApiSaveError("");
-    try {
-      // Те же ручные расходы, что и в preview: пустое/≤0 → 0. Берём из полей ввода
-      // (apiExpenses), НЕ из старого ответа сервера — сервер валидирует заново.
+      // Пустое/≤0 поле → 0. Сервер всё равно валидирует заново (>= 0).
       const meNum = (s: string): number => {
         const n = parseFloat(s);
         return Number.isFinite(n) && n > 0 ? n : 0;
@@ -3757,36 +3695,64 @@ export default function AppPage() {
         ok?: boolean;
         error?: string;
         code?: string;
+        status?: string;
+        unmatchedItems?: number;
+        matchedNoCostCount?: number;
+        profit?: OzonProfitDraftResponse;
       };
 
-      // Нет доступа (free/149₽ исчерпан) → открываем окно тарифа, как в обычном
-      // расчёте. Ничего не сохранено и не списано.
-      if (res.status === 402 || data.code === "limit_reached") {
+      // Нет доступа (free/149₽ исчерпан) → окно тарифа, как в обычном расчёте.
+      // Ничего не списано/сохранено; цифры НЕ пришли.
+      if (
+        res.status === 402 ||
+        data.code === "limit_reached" ||
+        data.code === "calculation_required"
+      ) {
         setSelectedTier(null);
         setTariffModalOpen(true);
         return;
       }
-      if (!res.ok || data.ok !== true) {
-        const msg = data.error || "Не удалось сохранить расчёт";
-        setApiSaveError(msg);
+      // Себестоимость не полная → 400 ДО списания. Показываем причину текстом,
+      // без единой цифры расчёта (сервер их не присылает в этом случае).
+      if (res.status === 400 && data.code === "incomplete_cost") {
+        const noCost =
+          typeof data.matchedNoCostCount === "number" ? data.matchedNoCostCount : 0;
+        const unmatched =
+          typeof data.unmatchedItems === "number" ? data.unmatchedItems : 0;
+        let msg: string;
+        if (data.status === "no_cost") {
+          msg =
+            "Себестоимость не найдена. Добавьте товары и себестоимость в каталог, затем повторите.";
+        } else if (unmatched > 0) {
+          msg = `Нельзя рассчитать: ${unmatched} товаров не сопоставлены с каталогом. Проверьте сопоставление и добавьте недостающие товары.`;
+        } else if (noCost > 0) {
+          msg = `Нельзя рассчитать: у ${noCost} сопоставленных товаров не заполнена себестоимость (cost_price = 0). Заполните её в каталоге.`;
+        } else {
+          msg = data.error || "Себестоимость заполнена не полностью.";
+        }
+        setProfitError(msg);
+        return;
+      }
+      if (!res.ok || data.ok !== true || !data.profit) {
+        const msg = data.error || "Не удалось рассчитать и сохранить расчёт";
+        setProfitError(msg);
         showToast(msg, "err");
         return;
       }
 
-      // Успех: показываем подтверждение и перезагружаем историю расчётов
-      // (и счётчик помесячных снимков), чтобы новая запись появилась сразу.
+      // Успех: показываем ПОЛНЫЙ расчёт (он уже сохранён, попытка списана) и
+      // обновляем историю/счётчик помесячных снимков.
+      setProfitResult(data.profit);
       setApiSaved(true);
-      showToast("API-расчёт сохранён в историю", "ok");
+      showToast("API-расчёт рассчитан и сохранён в историю", "ok");
       await loadHistory(user.id);
       setHistoryRefresh((k) => k + 1);
     } catch (e) {
       // eslint-disable-next-line no-console
-      console.error("saveApiCalculation error:", e);
-      const msg = "Не удалось связаться с сервером";
-      setApiSaveError(msg);
-      showToast(msg, "err");
+      console.error("calculateAndSaveApi error:", e);
+      setProfitError("Не удалось связаться с сервером");
     } finally {
-      setApiSaving(false);
+      setProfitLoading(false);
     }
   };
 
@@ -8411,11 +8377,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
-            <div className="api-pro-title">Предварительная прибыль с себестоимостью</div>
+            <div className="api-pro-title">Чистая прибыль по API с себестоимостью</div>
             <p className="api-pro-sub">
-              Это предварительный API-расчёт чистой прибыли. Данные не сохраняются
-              и не списывают попытку. Перед финальным сохранением нужно проверить
-              себестоимость и ручные расходы.
+              Единое действие «Рассчитать и сохранить»: сервер проверит доступ,
+              пересчитает прибыль по данным Ozon API и каталогу, проверит
+              себестоимость, спишет одну попытку (для активного безлимита — без
+              списания) и сохранит расчёт в историю. Полный результат показывается
+              только после успешного сохранения.
             </p>
           </div>
 
@@ -8438,7 +8406,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       type="month"
                       value={profitMonth}
                       max={new Date().toISOString().slice(0, 7)}
-                      onChange={(e) => setProfitMonth(e.target.value)}
+                      onChange={(e) => {
+                        // Новый месяц → сбрасываем сохранённый результат, чтобы
+                        // кнопка снова считала и не было показа чужих цифр.
+                        setProfitMonth(e.target.value);
+                        setApiSaved(false);
+                        setProfitResult(null);
+                        setProfitError("");
+                      }}
                       disabled={profitLoading}
                     />
                   </div>
@@ -8446,20 +8421,29 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     <button
                       type="button"
                       className="api-pro-btn"
-                      onClick={loadProfitDraft}
-                      disabled={profitLoading}
+                      onClick={calculateAndSaveApi}
+                      disabled={profitLoading || apiSaved}
                     >
                       {profitLoading ? (
                         <>
                           <span className="spin" />
-                          Считаем…
+                          Рассчитываем и сохраняем…
                         </>
+                      ) : apiSaved ? (
+                        "Рассчитано и сохранено ✓"
                       ) : (
-                        "Посчитать предварительную прибыль"
+                        "Рассчитать и сохранить API-расчёт"
                       )}
                     </button>
                   </div>
                 </div>
+
+                <p className="api-pro-sub" style={{ marginTop: ".5rem" }}>
+                  Кнопка проверит доступ, пересчитает прибыль по API, проверит
+                  себестоимость и сразу сохранит результат в историю, списав одну
+                  попытку (для активного безлимита — без списания). Полный расчёт
+                  показывается только после успешного сохранения.
+                </p>
 
                 {/* PR #18 — ручные расходы для предварительной чистой прибыли.
                     Значения НЕ сохраняются в БД, пустое поле = 0. */}
@@ -8503,9 +8487,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           inputMode="decimal"
                           placeholder="0"
                           value={apiExpenses[f.key]}
-                          onChange={(e) =>
-                            setApiExpenses((prev) => ({ ...prev, [f.key]: e.target.value }))
-                          }
+                          onChange={(e) => {
+                            setApiExpenses((prev) => ({ ...prev, [f.key]: e.target.value }));
+                            // Изменили расходы → разрешаем пересчёт (кнопка снова активна).
+                            setApiSaved(false);
+                          }}
                           disabled={profitLoading}
                         />
                       </div>
@@ -8573,8 +8559,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       profitResult.costDraft.matchedNoCostCount === 0 && (
                         <div className="api-alert ok" role="status" style={{ marginBottom: ".6rem" }}>
                           <span className="api-alert-text">
-                            Все товары сопоставлены, себестоимость учтена. Проверьте
-                            ручные расходы перед финальным сохранением.
+                            Все товары сопоставлены, себестоимость учтена. Расчёт
+                            сохранён в историю, попытка списана (для активного
+                            безлимита — без списания).
                           </span>
                         </div>
                       )}
@@ -8648,8 +8635,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       >
                         <span className="api-alert-text">
                           Ручные расходы равны 0. Если у вас есть налог, упаковка,
-                          доставка до склада, зарплата или прочие расходы — заполните
-                          их перед финальным расчётом.
+                          доставка до склада, зарплата или прочие расходы — добавьте
+                          их и пересчитайте.
                         </span>
                       </div>
                     )}
@@ -8671,92 +8658,26 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </div>
                     )}
 
-                    {/* PR #19 — финальное сохранение API-расчёта в историю + списание
-                        попытки. Пересчёт/проверку/списание/запись делает сервер. */}
-                    <div
-                      style={{
-                        marginTop: "1rem",
-                        border: "1px solid rgba(127,127,127,.2)",
-                        borderRadius: "12px",
-                        padding: ".75rem .9rem",
-                      }}
-                    >
+                    {/* PR #20 — единое действие «Рассчитать и сохранить» уже
+                        пересчитало, проверило себестоимость, списало попытку и
+                        сохранило результат на сервере. Здесь только подтверждение:
+                        полный расчёт ниже показывается ТОЛЬКО после успешного сейва. */}
+                    {apiSaved && (
                       <div
                         className="api-alert"
-                        role="note"
+                        role="status"
                         style={{
-                          background: "rgba(245,158,11,.12)",
-                          border: "1px solid rgba(245,158,11,.45)",
-                          marginBottom: ".6rem",
+                          marginTop: "1rem",
+                          background: "rgba(16,185,129,.12)",
+                          border: "1px solid rgba(16,185,129,.45)",
                         }}
                       >
                         <span className="api-alert-text">
-                          Сохранение API-расчёта добавит результат в историю и спишет
-                          одну попытку, если у вас нет активного безлимитного тарифа.
+                          API-расчёт сохранён в историю, попытка списана (для активного
+                          безлимитного тарифа — без списания).
                         </span>
                       </div>
-
-                      <button
-                        type="button"
-                        className="api-pro-btn"
-                        onClick={saveApiCalculation}
-                        disabled={
-                          apiSaving ||
-                          apiSaved ||
-                          profitResult.status !== "complete_cost" ||
-                          profitResult.productCoverage.unmatchedItems !== 0 ||
-                          profitResult.costDraft.matchedNoCostCount !== 0
-                        }
-                      >
-                        {apiSaving ? (
-                          <>
-                            <span className="spin" />
-                            Сохраняем…
-                          </>
-                        ) : apiSaved ? (
-                          "API-расчёт сохранён ✓"
-                        ) : (
-                          "Сохранить API-расчёт и списать попытку"
-                        )}
-                      </button>
-
-                      {(profitResult.status !== "complete_cost" ||
-                        profitResult.productCoverage.unmatchedItems !== 0 ||
-                        profitResult.costDraft.matchedNoCostCount !== 0) && (
-                        <p
-                          className="api-pro-sub"
-                          style={{ marginTop: ".5rem", marginBottom: 0 }}
-                        >
-                          {profitResult.costDraft.matchedNoCostCount > 0 &&
-                          profitResult.productCoverage.unmatchedItems === 0
-                            ? `Сохранение недоступно: у ${profitResult.costDraft.matchedNoCostCount} сопоставленных товаров не указана себестоимость (cost_price = 0). Заполните её в каталоге.`
-                            : "Сохранение доступно только когда все товары сопоставлены и у каждого заполнена себестоимость."}
-                        </p>
-                      )}
-
-                      {apiSaved && (
-                        <p
-                          style={{
-                            marginTop: ".5rem",
-                            marginBottom: 0,
-                            color: "#10b981",
-                            fontWeight: 600,
-                            fontSize: ".88rem",
-                          }}
-                        >
-                          API-расчёт сохранён в историю.
-                        </p>
-                      )}
-
-                      {apiSaveError && (
-                        <p
-                          className="api-pro-msg err"
-                          style={{ marginTop: ".5rem", marginBottom: 0 }}
-                        >
-                          {apiSaveError}
-                        </p>
-                      )}
-                    </div>
+                    )}
 
                     <div
                       style={{
@@ -8808,10 +8729,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     </div>
 
                     <p className="api-pro-sub" style={{ marginTop: ".75rem" }}>
-                      Предварительная чистая прибыль = операции Ozon − себестоимость
-                      сопоставленных товаров − ручные расходы (налог, упаковка,
-                      доставка до склада, зарплата, прочее). Это всё ещё preview:
-                      данные не сохраняются и не списывают попытку.
+                      Чистая прибыль = операции Ozon − себестоимость сопоставленных
+                      товаров − ручные расходы (налог, упаковка, доставка до склада,
+                      зарплата, прочее). Этот расчёт уже сохранён в историю, попытка
+                      списана (для активного безлимита — без списания).
                     </p>
 
                     {profitResult.costDraft.itemsWithoutCost.length > 0 && (
@@ -8952,9 +8873,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
                 </svg>
               </span>
-              Это предварительная чистая прибыль, а не финальный расчёт.
-              Себестоимость учитывается только по сопоставленным товарам, а ручные
-              расходы вы вводите сами; данные не сохраняются и не списывают попытку.
+              Чистая прибыль по API: себестоимость учитывается только по
+              сопоставленным товарам, а ручные расходы вы вводите сами. Расчёт
+              сохраняется в историю и списывает одну попытку (для активного
+              безлимита — без списания) при нажатии «Рассчитать и сохранить».
             </div>
           </div>
         </div>

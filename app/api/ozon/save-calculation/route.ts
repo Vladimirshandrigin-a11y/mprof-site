@@ -3,6 +3,7 @@ import { authenticateRequest, getUserScopedClient } from "../../cloud/_lib/auth"
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
 import {
+  buildApiProfitResponseBody,
   errorResponse,
   loadAndComputeApiProfit,
   parseManualExpenses,
@@ -348,6 +349,23 @@ export async function POST(req: NextRequest) {
     reportHistorySaved = true;
   }
 
+  // ---- 6) полный расчёт для UI (PR #20): та же форма, что и preview-ответ, но
+  // помечен как сохранённый. Фронт показывает эти цифры ТОЛЬКО после успешного
+  // сохранения (единое действие «Рассчитать и сохранить»), поэтому полный расчёт
+  // нельзя получить бесплатно. Общий билдер гарантирует идентичные поля с preview.
+  const profit = buildApiProfitResponseBody({
+    month,
+    range,
+    source: "ozon_api_saved_v1",
+    draft: loaded.draft,
+    cost: loaded.cost,
+    computed: c,
+    extraNotes: [
+      "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются.",
+      "Расчёт сохранён в историю; одна попытка списана (для активного безлимита — без списания).",
+    ],
+  });
+
   return NextResponse.json(
     {
       ok: true,
@@ -360,6 +378,7 @@ export async function POST(req: NextRequest) {
         used: typeof consume.used === "number" ? consume.used : undefined,
         allowance: typeof consume.allowance === "number" ? consume.allowance : undefined,
       },
+      // Краткая сводка (обратная совместимость) + полный расчёт для отрисовки.
       result: {
         month,
         status: c.status,
@@ -369,6 +388,7 @@ export async function POST(req: NextRequest) {
         netProfit: c.netProfit,
         margin: c.margin,
       },
+      profit,
     },
     { headers: NO_STORE }
   );

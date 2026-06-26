@@ -18,12 +18,13 @@ import {
 // ============================================================================
 // Общий модуль предварительной/финальной прибыли через Ozon API.
 //
-// Зачем он существует (PR #19): и preview (/api/ozon/profit-draft), и финальное
-// сохранение (/api/ozon/save-calculation) ОБЯЗАНЫ считать ОДНУ И ТУ ЖЕ цифру по
-// ОДНОЙ И ТОЙ ЖЕ формуле из ОДНИХ И ТЕХ ЖЕ источников (Ozon API + каталог
-// себестоимости). Бэкенд НЕ доверяет числам с фронтенда — он сам заново тянет
-// данные и пересчитывает. Чтобы две точки входа не разъехались, вся загрузка и
-// расчёт живут здесь, а роуты только собирают ответ/сохраняют.
+// Зачем он существует (PR #19): расчёт прибыли через Ozon API живёт в ОДНОМ месте
+// (загрузка из Ozon API + каталог себестоимости + формула), чтобы бэкенд считал
+// ОДНУ И ТУ ЖЕ цифру и НЕ доверял числам с фронтенда — он сам заново тянет данные
+// и пересчитывает. PR #20.1: единственный потребитель — финальное сохранение
+// /api/ozon/save-calculation (preview /api/ozon/profit-draft отключён: 410, чтобы
+// полный расчёт нельзя было получить без сохранения и списания). Раньше тот же
+// модуль обслуживал и preview — отсюда обобщённые имена ниже.
 //
 // Формула (PR #16, не ломаем): returns УЖЕ внутри signed revenue
 // (accruals_for_sale со знаком), поэтому повторно его НЕ прибавляем —
@@ -209,6 +210,105 @@ export function computeApiProfit(
     netProfit,
     margin,
     status,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Сборка тела ответа полного API-расчёта (PR #20).
+//
+// Успешный /api/ozon/save-calculation отдаёт полный API-расчёт
+// (apiTotals/costDraft/preliminary/netProfitPreview/...) — фронт рендерит цифры
+// ТОЛЬКО после сохранения. PR #20.1: preview-роут отключён (410), поэтому теперь
+// это единственный потребитель билдера. Вынесено в чистую функцию, чтобы форма
+// ответа была в одном месте. source/notes задаёт вызывающий.
+// ---------------------------------------------------------------------------
+
+export type ApiProfitResponseBody = {
+  period: { month: string; dateFrom: string; dateTo: string };
+  source: string;
+  status: CostStatus;
+  apiTotals: {
+    ozonAccruals: number;
+    returns: number;
+    commission: number;
+    logistics: number;
+    services: number;
+    storage: number;
+    other: number;
+    operationCount: number;
+  };
+  productCoverage: ProfitCostDraft["coverage"];
+  costDraft: {
+    matchedCostTotal: number;
+    matchedNoCostCount: number;
+    itemsWithoutCost: ProfitCostDraft["itemsWithoutCost"];
+    topCostItems: ProfitCostDraft["topCostItems"];
+  };
+  preliminary: {
+    ozonOperationsTotal: number;
+    matchedCostTotal: number;
+    profitBeforeManualExpenses: number;
+  };
+  manualExpenses: ApiProfitComputed["manualExpenses"];
+  netProfitPreview: { value: number; margin: number };
+  manualExpensesNotIncluded: string[];
+  warnings: string[];
+  notes: string[];
+};
+
+/**
+ * Собрать полный JSON API-расчёта из уже посчитанных агрегатов. ЧИСТАЯ функция:
+ * ничего не тянет и не сохраняет. extraNotes — контекстные пояснения вызывающего
+ * (preview: «не сохраняется»; save: «сохранён и списан»).
+ */
+export function buildApiProfitResponseBody(params: {
+  month: string;
+  range: MonthRange;
+  source: string;
+  draft: OzonDraftAggregate;
+  cost: ProfitCostDraft;
+  computed: ApiProfitComputed;
+  extraNotes?: string[];
+}): ApiProfitResponseBody {
+  const { month, range, source, draft, cost, computed, extraNotes } = params;
+  const t = draft.totals;
+  return {
+    period: { month, dateFrom: range.dateFrom, dateTo: range.dateTo },
+    source,
+    status: computed.status,
+    apiTotals: {
+      ozonAccruals: t.revenue,
+      returns: t.returns,
+      commission: t.commission,
+      logistics: t.logistics,
+      services: t.services,
+      storage: t.storage,
+      other: t.other,
+      operationCount: t.operationCount,
+    },
+    productCoverage: cost.coverage,
+    costDraft: {
+      matchedCostTotal: computed.matchedCostTotal,
+      matchedNoCostCount: cost.matchedNoCostCount,
+      itemsWithoutCost: cost.itemsWithoutCost,
+      topCostItems: cost.topCostItems,
+    },
+    preliminary: {
+      ozonOperationsTotal: computed.ozonOperationsTotal,
+      matchedCostTotal: computed.matchedCostTotal,
+      profitBeforeManualExpenses: computed.profitBeforeManualExpenses,
+    },
+    manualExpenses: computed.manualExpenses,
+    netProfitPreview: { value: computed.netProfit, margin: computed.margin },
+    manualExpensesNotIncluded: [
+      "tax",
+      "packaging",
+      "warehouse_delivery",
+      "salary",
+      "other_manual_expenses",
+    ],
+    warnings: [...draft.warnings, ...cost.warnings],
+    notes: [...draft.notes, ...cost.notes, ...(extraNotes ?? [])],
   };
 }
 
