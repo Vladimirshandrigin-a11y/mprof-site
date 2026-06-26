@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../../cloud/_lib/auth";
+import { checkCalculationEntitlement } from "../../cloud/_lib/entitlement";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
 import {
+  buildApiProfitResponseBody,
   errorResponse,
   loadAndComputeApiProfit,
   parseManualExpenses,
@@ -22,8 +24,15 @@ import {
 //
 // PR #19: загрузка данных Ozon/каталога и формула вынесены в общий _lib/profit
 // (loadAndComputeApiProfit), который ПОВТОРНО использует финальное сохранение —
-// чтобы preview и сохранение считали идентичную цифру. Поведение этого роута не
-// изменилось: тот же JSON, по-прежнему без сохранения и без списания.
+// чтобы preview и сохранение считали идентичную цифру.
+//
+// PR #20 (гейт монетизации): полный API-расчёт НЕЛЬЗЯ отдавать без права. До любых
+// обращений к Ozon API/каталогу проверяем checkCalculationEntitlement(admin,userId);
+// нет доступа → 402 { code: "calculation_required" } и НИКАКИХ цифр. Это только
+// ПРОВЕРКА (без списания). В текущем UI этот preview больше не используется — фронт
+// перешёл на единое действие «Рассчитать и сохранить» (/api/ozon/save-calculation),
+// где списание и показ цифр происходят одним consume. Гейт здесь — защита от прямых
+// вызовов API в обход UI (см. остаточный риск в отчёте PR #20).
 //
 // user_id берём ТОЛЬКО из токена (authenticateRequest). Ключ Ozon расшифровываем
 // на сервере, НИКОГДА не логируем и не возвращаем; api_key_encrypted наружу не идёт.
@@ -91,6 +100,24 @@ export async function POST(req: NextRequest) {
   }
   const manualExpenses = meParsed.value;
 
+  // ---- ГЕЙТ ДОСТУПА (PR #20): полный API-расчёт нельзя отдавать без права. ----
+  // Проверяем право на расчёт ДО любых обращений к Ozon API, расшифровки ключа и
+  // чтения каталога: нет доступа → 402 и НИКАКИХ цифр (ни apiTotals, ни costDraft,
+  // ни netProfit). Это ТОЛЬКО проверка, без списания — авторитетное списание делает
+  // /api/ozon/save-calculation одним consume. Лимит тот же, что у обычных расчётов
+  // (free trial / single-кредиты 149₽ / unlimited 449₽) — цены/тарифы не хардкодим.
+  const ent = await checkCalculationEntitlement(admin, userId);
+  if (!ent.hasAccess) {
+    return NextResponse.json(
+      {
+        error:
+          "Доступные расчёты закончились. Оформите тариф, чтобы рассчитать прибыль по API.",
+        code: "calculation_required",
+      },
+      { status: 402, headers: NO_STORE }
+    );
+  }
+
   // ---- подключение Ozon текущего пользователя ----
   const { data: conn, error: connErr } = await admin
     .from("ozon_connections")
@@ -142,70 +169,21 @@ export async function POST(req: NextRequest) {
   }
 
   const { draft, cost, computed } = loaded;
-  const t = draft.totals;
 
-  // ---- предупреждения / пояснения ----
+  // ---- тело ответа собирает общий билдер (PR #20) — та же форма, что у save ----
   // warnings: finance + (postings fetch warnings уже внутри cost.warnings).
-  const warnings = [...draft.warnings, ...cost.warnings];
-  const notes = [...draft.notes, ...cost.notes];
-  notes.push(
-    "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются."
-  );
-  notes.push(
-    "Это предварительный API-расчёт. Он не сохраняется, не списывает попытку и требует проверки перед финальным сохранением."
-  );
+  const responseBody = buildApiProfitResponseBody({
+    month,
+    range,
+    source: "ozon_profit_draft_v1",
+    draft,
+    cost,
+    computed,
+    extraNotes: [
+      "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются.",
+      "Это предварительный API-расчёт. Он не сохраняется, не списывает попытку и требует проверки перед финальным сохранением.",
+    ],
+  });
 
-  return NextResponse.json(
-    {
-      period: { month, dateFrom: range.dateFrom, dateTo: range.dateTo },
-      source: "ozon_profit_draft_v1",
-      status: computed.status,
-      apiTotals: {
-        ozonAccruals: t.revenue,
-        returns: t.returns,
-        commission: t.commission,
-        logistics: t.logistics,
-        services: t.services,
-        storage: t.storage,
-        other: t.other,
-        operationCount: t.operationCount,
-      },
-      productCoverage: cost.coverage,
-      costDraft: {
-        matchedCostTotal: computed.matchedCostTotal,
-        matchedNoCostCount: cost.matchedNoCostCount,
-        itemsWithoutCost: cost.itemsWithoutCost,
-        topCostItems: cost.topCostItems,
-      },
-      preliminary: {
-        ozonOperationsTotal: computed.ozonOperationsTotal,
-        matchedCostTotal: computed.matchedCostTotal,
-        profitBeforeManualExpenses: computed.profitBeforeManualExpenses,
-      },
-      // PR #18 — ручные расходы (echo, в БД не сохранены) и предварительная
-      // ЧИСТАЯ прибыль (preview, не финал). UI пишет «Предварительная чистая прибыль».
-      manualExpenses: {
-        tax: computed.manualExpenses.tax,
-        packaging: computed.manualExpenses.packaging,
-        warehouseDelivery: computed.manualExpenses.warehouseDelivery,
-        salary: computed.manualExpenses.salary,
-        other: computed.manualExpenses.other,
-        total: computed.manualExpenses.total,
-      },
-      netProfitPreview: {
-        value: computed.netProfit,
-        margin: computed.margin,
-      },
-      manualExpensesNotIncluded: [
-        "tax",
-        "packaging",
-        "warehouse_delivery",
-        "salary",
-        "other_manual_expenses",
-      ],
-      warnings,
-      notes,
-    },
-    { headers: NO_STORE }
-  );
+  return NextResponse.json(responseBody, { headers: NO_STORE });
 }
