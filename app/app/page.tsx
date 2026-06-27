@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
-import { StatsCards } from "./components/StatsCards"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { ProductCatalog } from "./components/ProductCatalog"
 import {
@@ -74,6 +73,7 @@ function cloudToLocal(c: CloudCalculation): CalcResult {
     createdAt: c.created_at,
     synced: true,
     aiInsights: c.ai_insights ?? null,
+    mode: c.mode,
   };
 }
 
@@ -100,6 +100,9 @@ interface CalcResult {
   /** Разбор net-profit 3-file расчёта (из calculations.ai_insights) — чтобы
    *  клик по истории мог восстановить combinedResult + profitInputs. */
   aiInsights?: unknown;
+  /** Тип расчёта из облака ("api" | "manual" | "upload"). Только для фильтра
+   *  по типу во вкладке «Отчёты»; на формулы и сохранение НЕ влияет. */
+  mode?: CloudCalcMode;
 }
 
 /** Структура, которую пишем в calculations.ai_insights для 3-file расчётов. */
@@ -404,6 +407,24 @@ function histReportMonthKey(h: CalcResult): string | null {
   const b = asNetProfitBreakdown(h.aiInsights);
   const ym = resolveReportMonth(b?.reportPeriod, null); // 'YYYY-MM-01' | null
   return ym ? ym.slice(0, 7) : null;
+}
+
+/**
+ * Месяц расчёта 'YYYY-MM' для вкладки «Отчёты»: приоритет — отчётный месяц
+ * (из периода отчёта), иначе месяц создания записи. null — месяц не определить.
+ * Чисто UI-деривация по уже загруженной истории: формулы, статистику, Supabase
+ * и сохранение НЕ затрагивает.
+ */
+function calcMonthKey(h: CalcResult): string | null {
+  const rep = histReportMonthKey(h);
+  if (rep) return rep;
+  if (h.createdAt) {
+    const d = new Date(h.createdAt);
+    if (!Number.isNaN(d.getTime())) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    }
+  }
+  return null;
 }
 
 const FIELDS: { key: string; label: string; hint?: string }[] = [
@@ -986,7 +1007,10 @@ export default function AppPage() {
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
   // когда user отсутствует, и тогда всегда показываем калькулятор.
-  const [mainTab, setMainTab] = useState<"calc" | "catalog">("calc");
+  const [mainTab, setMainTab] = useState<"calc" | "catalog" | "reports">("calc");
+  // Восстановление расчёта из «Отчётов» переключает на вкладку «Расчёт»; скролл
+  // к калькулятору откладываем до её отрисовки (ref ещё не в DOM на «Отчётах»).
+  const [pendingCalcScroll, setPendingCalcScroll] = useState(false);
   // Якорь для скролла «Последние расчёты» → калькулятор. Ведём scrollIntoView
   // сюда (табы режимов прямо над «Параметры расчёта»), а не на самый верх к
   // логотипу. scroll-margin-top в .calc-tabs компенсирует sticky-шапку .dash-top.
@@ -2002,6 +2026,9 @@ export default function AppPage() {
    * увидел подставленный расчёт.
    */
   const loadCalcIntoCalculator = (item: CalcResult) => {
+    // Клик мог прийти со вкладки «Отчёты» — возвращаем пользователя к
+    // калькулятору, где восстанавливается выбранный расчёт.
+    setMainTab("calc");
     const breakdown = asNetProfitBreakdown(item.aiInsights);
     if (breakdown) {
       // Upload-расчёт: вся логика восстановления уже в restoreUploadCalc.
@@ -2026,10 +2053,22 @@ export default function AppPage() {
       setSelectedId(item.id);
     }
     // Плавно подводим к блоку расчёта (табы + «Параметры расчёта»), а не к самому
-    // верху страницы. block:"start" + scroll-margin-top в .calc-tabs учитывают
-    // sticky-шапку, поэтому скролл останавливается на калькуляторе, не на логотипе.
-    calcSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    // верху страницы. На вкладке «Отчёты» калькулятор ещё не в DOM, поэтому
+    // скролл выполняем после переключения вкладки — через флаг + эффект ниже.
+    setPendingCalcScroll(true);
   };
+
+  // Отложенный скролл к калькулятору после восстановления расчёта из «Отчётов».
+  // Срабатывает, когда вкладка «Расчёт» уже отрисована (ref доступен). block:
+  // "start" + scroll-margin-top в .calc-tabs учитывают sticky-шапку.
+  useEffect(() => {
+    if (!pendingCalcScroll || mainTab !== "calc") return;
+    const raf = requestAnimationFrame(() => {
+      calcSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      setPendingCalcScroll(false);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [pendingCalcScroll, mainTab]);
 
   const acceptUploadFile = (file: File | null) => {
     if (!file) return;
@@ -2981,6 +3020,127 @@ export default function AppPage() {
       ? filteredHistory.reduce((sum, h) => sum + h.margin, 0) /
         filteredHistory.length
       : 0;
+
+  /* ===== Вкладка «Отчёты»: годовая сводка =====
+     Всё считается ТОЛЬКО на фронте по уже загруженной истории (history). Новых
+     запросов, таблиц и изменений сохранения нет. Денежные поля, которых в
+     расчётах фактически нет (нулевые суммы), в сводке НЕ показываем — данные не
+     выдумываем. Фильтры: год (по calcMonthKey) + тип расчёта (mode). */
+  type ReportsType = "all" | "api" | "manual" | "upload";
+  const [reportsYear, setReportsYear] = useState<string>("all");
+  const [reportsType, setReportsType] = useState<ReportsType>("all");
+
+  // Годы, за которые реально есть расчёты (новые сверху). Только UI-деривация.
+  const reportsYears = useMemo(() => {
+    const set = new Set<string>();
+    for (const h of history) {
+      const k = calcMonthKey(h);
+      if (k) set.add(k.slice(0, 4));
+    }
+    return Array.from(set).sort((a, b) => Number(b) - Number(a));
+  }, [history]);
+
+  // Если выбранный год пропал из данных (например, после очистки истории) —
+  // молча сбрасываем фильтр на «всё время», чтобы вкладка не оказалась пустой.
+  useEffect(() => {
+    if (reportsYear !== "all" && !reportsYears.includes(reportsYear)) {
+      setReportsYear("all");
+    }
+  }, [reportsYear, reportsYears]);
+
+  // История под фильтрами «Отчётов» (год + тип). Базируется на полном history,
+  // НЕ на filteredHistory, чтобы фильтры вкладки были независимы от фильтров
+  // детальной аналитики (период/маркетплейс/результат).
+  const reportsFiltered = useMemo(() => {
+    return history.filter((h) => {
+      if (reportsType !== "all" && (h.mode ?? "manual") !== reportsType) {
+        return false;
+      }
+      if (reportsYear !== "all") {
+        const k = calcMonthKey(h);
+        if (!k || k.slice(0, 4) !== reportsYear) return false;
+      }
+      return true;
+    });
+  }, [history, reportsYear, reportsType]);
+
+  // Помесячная разбивка прибыли/выручки (для графика и лучшего/худшего месяца).
+  // Записи без распознанного месяца в разбивку не попадают (но остаются в общих
+  // суммах сводки). Хронологический порядок: старый месяц слева → новый справа.
+  const reportsMonthly = useMemo(() => {
+    const map = new Map<
+      string,
+      { key: string; profit: number; revenue: number; count: number }
+    >();
+    for (const h of reportsFiltered) {
+      const k = calcMonthKey(h);
+      if (!k) continue;
+      const cur =
+        map.get(k) ?? { key: k, profit: 0, revenue: 0, count: 0 };
+      cur.profit += Number(h.profit) || 0;
+      cur.revenue += Number(h.revenue) || 0;
+      cur.count += 1;
+      map.set(k, cur);
+    }
+    return Array.from(map.values()).sort((a, b) =>
+      a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+    );
+  }, [reportsFiltered]);
+
+  // Годовая сводка. null — под фильтром нет расчётов. Денежные агрегаты
+  // отдаём как есть; решение «показывать ли карточку» (sum>0) принимает UI.
+  const yearlySummary = useMemo(() => {
+    const items = reportsFiltered;
+    const count = items.length;
+    if (count === 0) return null;
+    const sum = (sel: (h: CalcResult) => number) =>
+      items.reduce((s, h) => s + (Number(sel(h)) || 0), 0);
+    const revenue = sum((h) => h.revenue);
+    const profit = sum((h) => h.profit);
+    const cost = sum((h) => h.cost);
+    const expenses = sum((h) => h.expenses);
+    const commission = sum((h) => h.commission);
+    const logistics = sum((h) => h.logistics);
+    const storage = sum((h) => h.storage);
+    const ads = sum((h) => h.ads);
+    const tax = sum((h) => h.tax);
+    const other = sum((h) => h.other);
+    // Комиссии и логистика Ozon = комиссия + логистика + хранение.
+    const ozonFees = commission + logistics + storage;
+    // Средняя маржинальность: по выручке, если она есть; иначе среднее по margin.
+    const avgMargin =
+      revenue > 0
+        ? (profit / revenue) * 100
+        : items.reduce((s, h) => s + (Number(h.margin) || 0), 0) / count;
+    let best: { key: string; profit: number } | null = null;
+    let worst: { key: string; profit: number } | null = null;
+    for (const m of reportsMonthly) {
+      if (!best || m.profit > best.profit) best = { key: m.key, profit: m.profit };
+      if (!worst || m.profit < worst.profit) worst = { key: m.key, profit: m.profit };
+    }
+    // Лучший/худший месяц имеет смысл только при ≥2 месяцах с данными.
+    if (reportsMonthly.length < 2) {
+      best = null;
+      worst = null;
+    }
+    return {
+      count,
+      revenue,
+      profit,
+      cost,
+      expenses,
+      commission,
+      logistics,
+      storage,
+      ads,
+      tax,
+      other,
+      ozonFees,
+      avgMargin,
+      best,
+      worst,
+    };
+  }, [reportsFiltered, reportsMonthly]);
 
   const [authLoading, setAuthLoading] = useState(true);
 
@@ -6178,6 +6338,102 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 }
 
 /* ====== FILTER BAR (collapsible) ====== */
+/* === ВКЛАДКА «ОТЧЁТЫ»: годовая сводка === */
+.reports-hero{
+  background:var(--glass);border:1px solid var(--edge);border-radius:14px;
+  padding:1.15rem 1.15rem 1.25rem;margin-bottom:.75rem;
+  backdrop-filter:blur(14px) saturate(1.2);
+  -webkit-backdrop-filter:blur(14px) saturate(1.2);
+  box-shadow:0 14px 38px rgba(0,0,0,.24)
+}
+.reports-filters{display:flex;flex-wrap:wrap;gap:1.1rem 2.2rem;margin-bottom:1.15rem}
+.reports-filter-group{display:flex;flex-direction:column;gap:.5rem;min-width:0}
+.reports-filter-label{font-family:var(--mono);font-size:.62rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--txt3)}
+.reports-pills{display:flex;flex-wrap:wrap;gap:.4rem}
+.reports-pill{
+  all:unset;cursor:pointer;font-family:var(--sans);font-size:.8rem;font-weight:600;
+  color:var(--txt2);padding:7px 14px;border-radius:100px;
+  background:rgba(255,255,255,.035);border:1px solid var(--edge);
+  transition:color .2s ease, background .2s ease, border-color .2s ease, box-shadow .2s ease;
+  white-space:nowrap
+}
+.reports-pill:hover{color:var(--txt);border-color:rgba(201,168,76,.3);
+  background:rgba(255,255,255,.06)}
+.reports-pill:focus-visible{outline:none;box-shadow:0 0 0 2px rgba(201,168,76,.4)}
+.reports-pill.active{
+  color:var(--void);background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  border-color:transparent;box-shadow:0 4px 14px rgba(201,168,76,.3)
+}
+.reports-empty{
+  font-family:var(--sans);font-size:.9rem;color:var(--txt3);line-height:1.6;
+  text-align:center;padding:2rem 1rem;border:1px dashed var(--edge);border-radius:12px;
+  background:rgba(255,255,255,.02)
+}
+.reports-summary-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.7rem
+}
+.reports-card{
+  background:rgba(255,255,255,.025);border:1px solid var(--edge);border-radius:12px;
+  padding:.85rem .95rem;display:flex;flex-direction:column;gap:.35rem;min-width:0;
+  transition:border-color .2s ease, transform .2s ease
+}
+.reports-card:hover{border-color:rgba(201,168,76,.22);transform:translateY(-1px)}
+.reports-card-label{font-family:var(--mono);font-size:.6rem;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--txt3);line-height:1.3}
+.reports-card-value{font-family:var(--display);font-size:1.35rem;font-weight:600;
+  color:var(--txt);letter-spacing:-.01em;line-height:1.1;word-break:break-word}
+.reports-card.hero{
+  grid-column:span 2;
+  background:linear-gradient(135deg,rgba(201,168,76,.1) 0%,rgba(201,168,76,.02) 100%);
+  border-color:rgba(201,168,76,.28)
+}
+.reports-card.hero .reports-card-value{font-size:1.7rem}
+.reports-card.hero.pos .reports-card-value{color:var(--green)}
+.reports-card.hero.neg .reports-card-value{color:var(--red)}
+.reports-bestworst{display:flex;flex-wrap:wrap;gap:.7rem;margin-top:.7rem}
+.reports-bw-item{
+  flex:1 1 200px;display:flex;flex-direction:column;gap:.22rem;
+  padding:.75rem .9rem;border-radius:12px;border:1px solid var(--edge);
+  background:rgba(255,255,255,.02)
+}
+.reports-bw-item.pos{border-color:rgba(46,204,138,.25)}
+.reports-bw-item.neg{border-color:rgba(224,85,102,.22)}
+.reports-bw-cap{font-family:var(--mono);font-size:.58rem;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--txt3)}
+.reports-bw-month{font-family:var(--sans);font-size:.92rem;font-weight:600;color:var(--txt)}
+.reports-bw-val{font-family:var(--display);font-size:1.05rem;font-weight:600}
+.reports-bw-item.pos .reports-bw-val{color:var(--green)}
+.reports-bw-item.neg .reports-bw-val{color:var(--red)}
+.reports-chart{margin-top:1rem;border-top:1px solid var(--edge);padding-top:1rem}
+.reports-chart-head{display:flex;align-items:baseline;justify-content:space-between;
+  margin-bottom:.85rem}
+.reports-chart-title{font-family:var(--sans);font-size:.82rem;font-weight:600;color:var(--txt)}
+.reports-chart-sub{font-family:var(--mono);font-size:.62rem;letter-spacing:.05em;color:var(--txt3)}
+.reports-bars{display:flex;align-items:flex-end;gap:.5rem;height:140px;
+  overflow-x:auto;padding-bottom:.2rem}
+.reports-bar-col{flex:1 1 0;min-width:26px;display:flex;flex-direction:column;
+  align-items:center;gap:.45rem;height:100%}
+.reports-bar-track{flex:1;width:100%;display:flex;align-items:flex-end;justify-content:center}
+.reports-bar{width:62%;max-width:30px;min-height:3px;border-radius:6px 6px 3px 3px;
+  transition:height .35s cubic-bezier(.16,1,.3,1)}
+.reports-bar.pos{background:linear-gradient(180deg,var(--gold2) 0%,var(--gold) 100%);
+  box-shadow:0 0 14px rgba(201,168,76,.25)}
+.reports-bar.neg{background:linear-gradient(180deg,rgba(224,85,102,.85) 0%,rgba(224,85,102,.5) 100%)}
+.reports-bar-label{font-family:var(--mono);font-size:.58rem;color:var(--txt3);
+  white-space:nowrap;letter-spacing:.02em}
+.reports-section-cap{
+  font-family:var(--mono);font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--txt3);margin:1.3rem 0 .6rem;padding-bottom:.45rem;
+  border-bottom:1px solid var(--edge)
+}
+@media(max-width:640px){
+  .reports-summary-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  .reports-card-value{font-size:1.2rem}
+  .reports-card.hero .reports-card-value{font-size:1.45rem}
+  .reports-filters{gap:1rem 1.4rem}
+  .reports-bars{height:120px}
+}
 .filter-bar{
   background:var(--glass);border:1px solid var(--edge);border-radius:12px;
   margin-bottom:.55rem;overflow:hidden;
@@ -6948,7 +7204,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   <path d="M8 7h8M8 11h8M8 15h5" />
                 </svg>
               </span>
-              Калькулятор
+              Расчёт
             </button>
             <button
               type="button"
@@ -6966,6 +7222,23 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               </span>
               Каталог товаров
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "reports"}
+              className={"main-tab" + (mainTab === "reports" ? " active" : "")}
+              onClick={() => setMainTab("reports")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 4v16h16" />
+                  <path d="M9 16v-4" />
+                  <path d="M13.5 16V9" />
+                  <path d="M18 16v-7" />
+                </svg>
+              </span>
+              Отчёты
+            </button>
           </div>
         )}
 
@@ -6977,13 +7250,256 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         <p className="dash-lead">
           Введите данные по товару или периоду — посчитаем чистую прибыль и маржинальность.
         </p>
+          </>
+        )}
 
-        <StatsCards
-          totalRevenue={totalRevenue}
-          totalProfit={totalProfit}
-          avgMargin={avgMargin}
-          historyCount={filteredHistory.length}
-        />
+        {user && mainTab === "reports" && (
+          <>
+        <h1 className="dash-h1">
+          Ваши <em>отчёты</em>
+        </h1>
+        <p className="dash-lead">
+          История расчётов и годовая сводка по прибыли, выручке и расходам.
+          Считаем по сохранённым расчётам — без выдуманных данных.
+        </p>
+
+        {/* ===== Годовая сводка (новый блок вкладки «Отчёты») ===== */}
+        <div className="reports-hero">
+          <div className="reports-filters" role="region" aria-label="Фильтры отчётов">
+            <div className="reports-filter-group">
+              <div className="reports-filter-label">Год</div>
+              <div className="reports-pills">
+                <button
+                  type="button"
+                  className={"reports-pill" + (reportsYear === "all" ? " active" : "")}
+                  onClick={() => setReportsYear("all")}
+                  aria-pressed={reportsYear === "all"}
+                >
+                  Всё время
+                </button>
+                {reportsYears.map((y) => (
+                  <button
+                    type="button"
+                    key={y}
+                    className={"reports-pill" + (reportsYear === y ? " active" : "")}
+                    onClick={() => setReportsYear(y)}
+                    aria-pressed={reportsYear === y}
+                  >
+                    {y}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="reports-filter-group">
+              <div className="reports-filter-label">Тип расчёта</div>
+              <div className="reports-pills">
+                {(
+                  [
+                    ["all", "Все"],
+                    ["api", "API"],
+                    ["manual", "Ручной"],
+                    ["upload", "Файл"],
+                  ] as [ReportsType, string][]
+                ).map(([v, label]) => (
+                  <button
+                    type="button"
+                    key={v}
+                    className={"reports-pill" + (reportsType === v ? " active" : "")}
+                    onClick={() => setReportsType(v)}
+                    aria-pressed={reportsType === v}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {history.length === 0 ? (
+            <div className="reports-empty">
+              Здесь появится годовая сводка после первого сохранённого расчёта.
+            </div>
+          ) : !yearlySummary ? (
+            <div className="reports-empty">
+              За выбранный период и тип расчёта данных нет. Измените фильтры выше.
+            </div>
+          ) : (
+            <>
+              <div className="reports-summary-grid">
+                <div
+                  className={
+                    "reports-card hero " +
+                    (yearlySummary.profit >= 0 ? "pos" : "neg")
+                  }
+                >
+                  <div className="reports-card-label">
+                    Чистая прибыль
+                    {reportsYear !== "all" ? ` за ${reportsYear}` : ""}
+                  </div>
+                  <div className="reports-card-value">
+                    {yearlySummary.profit >= 0 ? "+" : "−"}
+                    {fmt(Math.abs(Math.round(yearlySummary.profit)))} ₽
+                  </div>
+                </div>
+
+                <div className="reports-card">
+                  <div className="reports-card-label">Выручка</div>
+                  <div className="reports-card-value">
+                    {fmt(Math.round(yearlySummary.revenue))} ₽
+                  </div>
+                </div>
+
+                <div className="reports-card">
+                  <div className="reports-card-label">Средняя маржинальность</div>
+                  <div className="reports-card-value">
+                    {yearlySummary.avgMargin.toFixed(1)}%
+                  </div>
+                </div>
+
+                <div className="reports-card">
+                  <div className="reports-card-label">Расчётов за период</div>
+                  <div className="reports-card-value">{yearlySummary.count}</div>
+                </div>
+
+                {yearlySummary.cost > 0 && (
+                  <div className="reports-card">
+                    <div className="reports-card-label">Себестоимость</div>
+                    <div className="reports-card-value">
+                      {fmt(Math.round(yearlySummary.cost))} ₽
+                    </div>
+                  </div>
+                )}
+
+                {yearlySummary.ozonFees > 0 && (
+                  <div className="reports-card">
+                    <div className="reports-card-label">Комиссии и логистика Ozon</div>
+                    <div className="reports-card-value">
+                      {fmt(Math.round(yearlySummary.ozonFees))} ₽
+                    </div>
+                  </div>
+                )}
+
+                {yearlySummary.ads > 0 && (
+                  <div className="reports-card">
+                    <div className="reports-card-label">Реклама</div>
+                    <div className="reports-card-value">
+                      {fmt(Math.round(yearlySummary.ads))} ₽
+                    </div>
+                  </div>
+                )}
+
+                {yearlySummary.tax > 0 && (
+                  <div className="reports-card">
+                    <div className="reports-card-label">Налог</div>
+                    <div className="reports-card-value">
+                      {fmt(Math.round(yearlySummary.tax))} ₽
+                    </div>
+                  </div>
+                )}
+
+                {yearlySummary.other > 0 && (
+                  <div className="reports-card">
+                    <div className="reports-card-label">Прочие расходы</div>
+                    <div className="reports-card-value">
+                      {fmt(Math.round(yearlySummary.other))} ₽
+                    </div>
+                  </div>
+                )}
+
+                {yearlySummary.expenses > 0 && (
+                  <div className="reports-card">
+                    <div className="reports-card-label">Все расходы</div>
+                    <div className="reports-card-value">
+                      {fmt(Math.round(yearlySummary.expenses))} ₽
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {(yearlySummary.best || yearlySummary.worst) && (
+                <div className="reports-bestworst">
+                  {yearlySummary.best && (
+                    <div className="reports-bw-item pos">
+                      <span className="reports-bw-cap">Лучший месяц</span>
+                      <span className="reports-bw-month">
+                        {formatMonthLabel(yearlySummary.best.key)}
+                      </span>
+                      <span className="reports-bw-val">
+                        +{fmt(Math.round(yearlySummary.best.profit))} ₽
+                      </span>
+                    </div>
+                  )}
+                  {yearlySummary.worst && (
+                    <div className="reports-bw-item neg">
+                      <span className="reports-bw-cap">Худший месяц</span>
+                      <span className="reports-bw-month">
+                        {formatMonthLabel(yearlySummary.worst.key)}
+                      </span>
+                      <span className="reports-bw-val">
+                        {yearlySummary.worst.profit >= 0 ? "+" : "−"}
+                        {fmt(Math.abs(Math.round(yearlySummary.worst.profit)))} ₽
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {reportsMonthly.length > 0 && (
+                <div className="reports-chart">
+                  <div className="reports-chart-head">
+                    <span className="reports-chart-title">Прибыль по месяцам</span>
+                    <span className="reports-chart-sub">
+                      {reportsMonthly.length}&nbsp;мес.
+                    </span>
+                  </div>
+                  <div
+                    className="reports-bars"
+                    role="img"
+                    aria-label="График прибыли по месяцам"
+                  >
+                    {(() => {
+                      const bars = reportsMonthly.slice(-12);
+                      const maxAbs = Math.max(
+                        1,
+                        ...bars.map((m) => Math.abs(m.profit))
+                      );
+                      return bars.map((m) => {
+                        const pos = m.profit >= 0;
+                        const hPct = Math.max(
+                          3,
+                          Math.round((Math.abs(m.profit) / maxAbs) * 100)
+                        );
+                        return (
+                          <div
+                            className="reports-bar-col"
+                            key={m.key}
+                            title={`${formatMonthLabel(m.key)}: ${
+                              pos ? "+" : "−"
+                            }${fmt(Math.abs(Math.round(m.profit)))} ₽`}
+                          >
+                            <div className="reports-bar-track">
+                              <div
+                                className={"reports-bar " + (pos ? "pos" : "neg")}
+                                style={{ height: hPct + "%" }}
+                              />
+                            </div>
+                            <div className="reports-bar-label">
+                              {formatMonthLabel(m.key).replace(/ \d{4}$/, "")}
+                            </div>
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {history.length > 0 && (
+          <div className="reports-section-cap">Детальная аналитика и история</div>
+        )}
 
         <div
           className={
@@ -7159,7 +7675,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             worst: reportKeyProducts?.worst ?? null,
           }}
         />
+          </>
+        )}
 
+        {(mainTab === "calc" || !user) && (
+          <>
         <div className="calc-tabs" role="tablist" ref={calcSectionRef}>
           <button
             type="button"
@@ -9740,6 +10260,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               </div>
             </div>
           )}
+          </>
+        )}
+
+        {user && mainTab === "reports" && (
+          <>
 
         {isLoadingHistory && (
           <div className="card hist-card">
