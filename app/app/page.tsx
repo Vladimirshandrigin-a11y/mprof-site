@@ -960,6 +960,21 @@ export default function AppPage() {
   // после успеха. apiSaved=true означает «рассчитано и сохранено» (результат на
   // экране). Прогресс/ошибки переиспользуют profitLoading/profitError.
   const [apiSaved, setApiSaved] = useState(false);
+  // PR #22 (UX) — структурированный показ «не хватает себестоимости». Сервер на
+  // 400 incomplete_cost присылает status/unmatchedItems/matchedNoCostCount ДО
+  // списания и без цифр расчёта. Держим их отдельно от profitError, чтобы показать
+  // понятный блок с действиями (перейти в каталог / добавить несопоставленные),
+  // а не сухой текст. null — блок скрыт.
+  const [apiCostGap, setApiCostGap] = useState<{
+    status?: string;
+    unmatchedItems: number;
+    matchedNoCostCount: number;
+  } | null>(null);
+  // PR #22 (UX) — свёрнутый второстепенный блок «Дополнительные действия и
+  // диагностика» (проверка/удаление подключения, диагностика сопоставления,
+  // добавление несопоставленных). По умолчанию закрыт, чтобы не мешать основному
+  // сценарию: подключить → выбрать месяц → ввести расходы → рассчитать.
+  const [apiDiagOpen, setApiDiagOpen] = useState(false);
 
   // Добавление несопоставленных товаров в каталог (PR #17) — только INSERT новых,
   // себестоимость НЕ выдумывается, расчёт НЕ запускается и НЕ сохраняется.
@@ -3573,6 +3588,16 @@ export default function AppPage() {
     }
   };
 
+  // PR #22 (UX) — быстрый переход в каталог товаров (заполнить себестоимость),
+  // когда расчёт упёрся в неполную себестоимость. Просто переключаем верхний
+  // раздел дашборда и скроллим вверх; никакой бизнес-логики/расчётов тут нет.
+  const goToCatalog = () => {
+    setMainTab("catalog");
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+  };
+
   // POST /api/ozon/save-calculation — ЕДИНОЕ действие «Рассчитать и сохранить»
   // (PR #20). Закрывает дыру монетизации: раньше был бесплатный preview, который
   // отдавал полный расчёт без списания. Теперь полный API-расчёт показываем ТОЛЬКО
@@ -3599,6 +3624,7 @@ export default function AppPage() {
     setProfitError("");
     setProfitResult(null);
     setApiSaved(false);
+    setApiCostGap(null);
     try {
       // Пустое/≤0 поле → 0. Сервер всё равно валидирует заново (>= 0).
       const meNum = (s: string): number => {
@@ -3642,25 +3668,21 @@ export default function AppPage() {
         setTariffModalOpen(true);
         return;
       }
-      // Себестоимость не полная → 400 ДО списания. Показываем причину текстом,
-      // без единой цифры расчёта (сервер их не присылает в этом случае).
+      // Себестоимость не полная → 400 ДО списания (сервер не присылает цифр).
+      // Вместо сухого текста показываем структурированный блок «Не хватает
+      // себестоимости у товаров» с понятными действиями (перейти в каталог /
+      // добавить несопоставленные товары). Ошибку-текст не ставим — блок сам всё
+      // объясняет.
       if (res.status === 400 && data.code === "incomplete_cost") {
-        const noCost =
-          typeof data.matchedNoCostCount === "number" ? data.matchedNoCostCount : 0;
-        const unmatched =
-          typeof data.unmatchedItems === "number" ? data.unmatchedItems : 0;
-        let msg: string;
-        if (data.status === "no_cost") {
-          msg =
-            "Себестоимость не найдена. Добавьте товары и себестоимость в каталог, затем повторите.";
-        } else if (unmatched > 0) {
-          msg = `Нельзя рассчитать: ${unmatched} товаров не сопоставлены с каталогом. Проверьте сопоставление и добавьте недостающие товары.`;
-        } else if (noCost > 0) {
-          msg = `Нельзя рассчитать: у ${noCost} сопоставленных товаров не заполнена себестоимость (cost_price = 0). Заполните её в каталоге.`;
-        } else {
-          msg = data.error || "Себестоимость заполнена не полностью.";
-        }
-        setProfitError(msg);
+        setApiCostGap({
+          status: data.status,
+          unmatchedItems:
+            typeof data.unmatchedItems === "number" ? data.unmatchedItems : 0,
+          matchedNoCostCount:
+            typeof data.matchedNoCostCount === "number"
+              ? data.matchedNoCostCount
+              : 0,
+        });
         return;
       }
       if (!res.ok || data.ok !== true || !data.profit) {
@@ -3690,7 +3712,11 @@ export default function AppPage() {
   // товары Ozon (sku = offer_id, cost_price = 0). ТОЛЬКО INSERT новых товаров:
   // существующие не трогаем, себестоимость НЕ выдумываем, прибыль НЕ считаем,
   // расчёт НЕ запускаем/НЕ сохраняем/НЕ списываем. После — заполнить cost вручную.
-  const importMissingProducts = async () => {
+  const importMissingProducts = async (monthArg?: string) => {
+    // monthArg позволяет вызвать импорт из блока «не хватает себестоимости»
+    // основного сценария (там используется profitMonth). По умолчанию — importMonth
+    // из второстепенного блока диагностики. Бэкенд и его поведение не меняются.
+    const month = monthArg ?? importMonth;
     if (!user?.id) {
       setImportError("Войдите в аккаунт, чтобы добавить товары");
       return;
@@ -3699,7 +3725,7 @@ export default function AppPage() {
       setImportError("Сначала подключите Ozon API");
       return;
     }
-    if (!/^\d{4}-\d{2}$/.test(importMonth)) {
+    if (!/^\d{4}-\d{2}$/.test(month)) {
       setImportError("Выберите месяц");
       return;
     }
@@ -3711,7 +3737,7 @@ export default function AppPage() {
       const res = await fetch("/api/ozon/import-missing-products", {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ month: importMonth }),
+        body: JSON.stringify({ month }),
         cache: "no-store",
       });
       const data = (await res.json()) as OzonImportMissingResponse & { error?: string };
@@ -4394,6 +4420,75 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .api-alert-ico{flex-shrink:0;margin-top:1px;display:inline-flex}
 .api-alert-ico svg{width:18px;height:18px;display:block}
 .api-alert-text{flex:1;min-width:0}
+
+/* PR #22 (UX) — упрощённый сценарий «Авторасчёт чистой прибыли Ozon»:
+   подключить → выбрать месяц → ввести расходы → рассчитать. */
+.api-step{margin-top:1.5rem}
+.api-step:first-of-type{margin-top:0}
+.api-step-head{display:flex;align-items:center;gap:.6rem;margin-bottom:.75rem}
+.api-step-num{flex-shrink:0;width:26px;height:26px;border-radius:50%;
+  display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);
+  font-size:.82rem;font-weight:600;color:var(--void);
+  background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
+  box-shadow:0 6px 18px rgba(201,168,76,.3)}
+.api-step-title{font-family:var(--display);font-size:1.02rem;font-weight:600;color:var(--txt)}
+.api-step-hint{font-size:.82rem;color:var(--txt3);line-height:1.5;margin:.1rem 0 .7rem 0}
+.api-conn-ok{display:flex;align-items:center;gap:.7rem;padding:.85rem 1.05rem;
+  border-radius:12px;background:rgba(46,204,138,.08);border:1px solid rgba(46,204,138,.32);
+  color:#7DEAB2;font-size:.88rem}
+.api-conn-ok svg{width:18px;height:18px;flex-shrink:0}
+.api-conn-ok b{color:#9FEFC6;font-weight:600}
+.api-conn-ok-meta{color:var(--txt3);font-size:.8rem}
+.api-main-cta{width:100%;min-width:0;margin-top:.2rem;padding:16px 22px;font-size:1.04rem}
+.api-costgap{margin-top:1.3rem;padding:1.1rem 1.2rem;border-radius:14px;
+  background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.4)}
+.api-costgap-title{font-family:var(--display);font-size:1.02rem;font-weight:700;color:#F7C66B;
+  margin-bottom:.45rem;display:flex;align-items:center;gap:.5rem}
+.api-costgap-sub{font-size:.86rem;color:var(--txt2);line-height:1.55;margin:0 0 .7rem}
+.api-costgap-stats{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.9rem}
+.api-costgap-chip{font-size:.8rem;padding:.35rem .7rem;border-radius:999px;
+  background:rgba(245,158,11,.14);border:1px solid rgba(245,158,11,.32);color:#F7C66B;font-weight:600}
+.api-costgap-actions{display:flex;flex-wrap:wrap;gap:.6rem}
+.api-costgap-actions .api-pro-btn{flex:0 1 auto;min-width:210px}
+.api-result{margin-top:1.4rem;border:1px solid var(--edge2);border-radius:16px;overflow:hidden;
+  background:rgba(255,255,255,.02)}
+.api-result-hero{padding:1.5rem 1.5rem 1.3rem;text-align:center;position:relative;
+  background:radial-gradient(420px 200px at 50% 0%, rgba(201,168,76,.1), transparent 65%)}
+.api-result-lbl{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--txt3)}
+.api-result-net{font-family:var(--display);font-size:2.15rem;font-weight:700;margin:.3rem 0 .15rem;
+  letter-spacing:-.01em}
+.api-result-net.pos{color:#7DEAB2}
+.api-result-net.neg{color:#FF8A98}
+.api-result-margin{font-size:.86rem;color:var(--txt2)}
+.api-result-saved{margin-top:.6rem;font-size:.78rem;color:#7DEAB2;font-weight:500;
+  display:inline-flex;align-items:center;gap:.35rem}
+.api-result-saved svg{width:15px;height:15px}
+.api-result-rows{padding:1.1rem 1.5rem 1.35rem;display:flex;flex-direction:column;gap:.5rem}
+.api-result-row{display:flex;justify-content:space-between;gap:1rem;font-size:.88rem;
+  padding-bottom:.5rem;border-bottom:1px solid rgba(127,127,127,.12)}
+.api-result-row:last-child{border-bottom:none;padding-bottom:0}
+.api-result-row .rl{color:var(--txt2)}
+.api-result-row .rv{font-weight:600;color:var(--txt);white-space:nowrap}
+.api-result-row .rv.neg{color:#FF8A98}
+.api-result-row.is-total{margin-top:.15rem;padding-top:.6rem;border-top:1px solid var(--edge2);
+  border-bottom:none;font-size:.95rem}
+.api-result-row.is-total .rl{color:var(--txt)}
+.api-extra-heading{margin-top:1.7rem;font-family:var(--display);font-size:.95rem;font-weight:600;
+  color:var(--txt2);letter-spacing:.01em}
+.api-extra-note{margin:.3rem 0 .9rem;font-size:.8rem;color:var(--txt3);line-height:1.5;max-width:62ch}
+.api-extra{opacity:.94}
+.api-extra-sum{position:relative;cursor:pointer;list-style:none;display:block;outline:none}
+.api-extra-sum::-webkit-details-marker{display:none}
+.api-extra-sum::after{content:"▸";position:absolute;right:1.7rem;top:1.55rem;color:var(--txt3);
+  transition:transform .2s ease;font-size:.85rem}
+details[open] > .api-extra-sum::after{transform:rotate(90deg)}
+.api-extra-sum:hover .api-pro-title{color:var(--gold2)}
+@media(max-width:640px){
+  .api-costgap-actions .api-pro-btn{min-width:0;width:100%}
+  .api-result-net{font-size:1.8rem}
+  .api-extra-sum::after{right:1.3rem}
+}
 
 .api-input:disabled,
 .api-input:disabled:hover{opacity:.5;cursor:not-allowed;background:rgba(255,255,255,.02);
@@ -7427,154 +7522,437 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
-            <div className="api-pro-title">Подключение Ozon по API</div>
+            <div className="api-pro-title">Авторасчёт чистой прибыли Ozon</div>
             <p className="api-pro-sub">
-              Подключите кабинет Ozon, чтобы позже автоматически загружать продажи,
-              комиссии и расходы. Ключ хранится в зашифрованном виде на сервере.
+              Подключите Ozon, выберите месяц и введите свои расходы — сайт сам
+              посчитает чистую прибыль по данным Ozon API и каталогу себестоимости
+              и сохранит результат в историю.
             </p>
           </div>
 
           <div className="api-pro-body">
-            {!user ? (
-              <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr" }}>
-                <button type="button" className="api-pro-btn locked" disabled>
+            {/* Тариф-нота (449₽). Тексты/цены не трогаем. */}
+            <div
+              className="api-alert"
+              role="note"
+              style={{
+                background: "rgba(201,168,76,.10)",
+                border: "1px solid rgba(201,168,76,.32)",
+                marginTop: 0,
+                marginBottom: "1.4rem",
+              }}
+            >
+              <span className="api-alert-text">
+                <strong>
+                  API-расчёты доступны в тарифе «Безлимит» — 449 ₽/месяц.
+                </strong>{" "}
+                Первый расчёт можно попробовать бесплатно, если пробный расчёт ещё
+                не использован. Разовый расчёт за 149 ₽ открывает только файловый
+                или ручной расчёт и не включает Ozon API.
+              </span>
+            </div>
+
+            {/* ШАГ 1 — подключение Ozon */}
+            <div className="api-step">
+              <div className="api-step-head">
+                <span className="api-step-num">1</span>
+                <span className="api-step-title">Подключите Ozon</span>
+              </div>
+
+              {!user ? (
+                <button type="button" className="api-pro-btn locked" disabled style={{ width: "100%" }}>
                   Войдите в аккаунт для подключения Ozon
                 </button>
-              </div>
-            ) : ozonConnLoading ? (
-              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
-                Проверяем подключение…
-              </p>
-            ) : ozonConn?.connected ? (
-              <>
-                <div className="api-alert ok" role="status">
-                  <span className="api-alert-ico">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <circle cx="12" cy="12" r="9" />
-                      <path d="m8.5 12.5 2.5 2.5 4.5-5" />
-                    </svg>
-                  </span>
-                  <span className="api-alert-text">
-                    Подключено
-                    {ozonConn.clientIdMasked ? ` · Client ID ${ozonConn.clientIdMasked}` : ""}
-                    {ozonConn.keyLast4 ? ` · ключ ••••${ozonConn.keyLast4}` : ""}
+              ) : ozonConnLoading ? (
+                <p className="api-pro-msg" style={{ marginTop: ".2rem" }}>
+                  Проверяем подключение…
+                </p>
+              ) : ozonConn?.connected ? (
+                <div className="api-conn-ok" role="status">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                  </svg>
+                  <span>
+                    <b>Ozon подключён</b>
+                    <span className="api-conn-ok-meta">
+                      {ozonConn.clientIdMasked ? ` · Client ID ${ozonConn.clientIdMasked}` : ""}
+                      {ozonConn.keyLast4 ? ` · ключ ••••${ozonConn.keyLast4}` : ""}
+                    </span>
                   </span>
                 </div>
-                <div className="api-pro-actions">
-                  <button
-                    type="button"
-                    className="api-pro-btn ghost"
-                    onClick={verifyOzon}
-                    disabled={ozonBusy !== "idle"}
-                  >
-                    {ozonBusy === "checking" ? (
-                      <>
-                        <span className="spin" />
-                        Проверяем…
-                      </>
-                    ) : (
-                      "Проверить подключение"
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    className="api-pro-btn danger"
-                    onClick={deleteOzon}
-                    disabled={ozonBusy !== "idle"}
-                  >
-                    {ozonBusy === "deleting" ? "Удаляем…" : "Удалить подключение"}
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                {ozonConn && ozonConn.status !== "not_connected" && (
-                  <div className="api-alert err" role="alert">
-                    <span className="api-alert-ico">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <circle cx="12" cy="12" r="9" />
-                        <path d="M12 8v5" />
-                        <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
-                      </svg>
-                    </span>
-                    <span className="api-alert-text">
-                      {ozonConn.status === "invalid_key"
-                        ? "Неверный ключ — переподключите кабинет"
-                        : ozonConn.status === "forbidden"
-                        ? "Недостаточно прав у ключа — проверьте доступы в Ozon"
-                        : ozonConn.status === "unavailable"
-                        ? "Ozon временно недоступен — попробуйте «Проверить» позже"
-                        : "Кабинет не подключён"}
-                    </span>
-                  </div>
-                )}
+              ) : (
+                <>
+                  {ozonConn && ozonConn.status !== "not_connected" && (
+                    <div className="api-alert err" role="alert">
+                      <span className="api-alert-ico">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="12" r="9" />
+                          <path d="M12 8v5" />
+                          <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+                        </svg>
+                      </span>
+                      <span className="api-alert-text">
+                        {ozonConn.status === "invalid_key"
+                          ? "Неверный ключ — переподключите кабинет"
+                          : ozonConn.status === "forbidden"
+                          ? "Недостаточно прав у ключа — проверьте доступы в Ozon"
+                          : ozonConn.status === "unavailable"
+                          ? "Ozon временно недоступен — попробуйте позже"
+                          : "Кабинет не подключён"}
+                      </span>
+                    </div>
+                  )}
 
-                <div className="api-pro-grid">
-                  <div className="api-fld">
-                    <label>Ozon Client ID</label>
-                    <input
-                      className="api-input"
-                      type="text"
-                      placeholder="Например, 123456"
-                      value={ozonClientId}
-                      onChange={(e) => setOzonClientId(e.target.value)}
-                      disabled={ozonBusy !== "idle"}
-                      autoComplete="off"
-                      spellCheck={false}
-                    />
-                  </div>
-
-                  <div className="api-fld">
-                    <label>Ozon API Key</label>
-                    <div className="api-secret">
+                  <div className="api-pro-grid">
+                    <div className="api-fld">
+                      <label>Ozon Client ID</label>
                       <input
                         className="api-input"
-                        type={showOzonKey ? "text" : "password"}
-                        placeholder="Вставьте секретный ключ"
-                        value={ozonApiKey}
-                        onChange={(e) => setOzonApiKey(e.target.value)}
+                        type="text"
+                        placeholder="Например, 123456"
+                        value={ozonClientId}
+                        onChange={(e) => setOzonClientId(e.target.value)}
                         disabled={ozonBusy !== "idle"}
                         autoComplete="off"
                         spellCheck={false}
                       />
-                      <button
-                        type="button"
-                        className="api-eye"
-                        onClick={() => setShowOzonKey((v) => !v)}
-                        disabled={ozonBusy !== "idle"}
-                        aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
-                        title={showOzonKey ? "Скрыть" : "Показать"}
-                      >
-                        {showOzonKey ? eyeOffIcon : eyeIcon}
-                      </button>
                     </div>
+
+                    <div className="api-fld">
+                      <label>Ozon API Key</label>
+                      <div className="api-secret">
+                        <input
+                          className="api-input"
+                          type={showOzonKey ? "text" : "password"}
+                          placeholder="Вставьте секретный ключ"
+                          value={ozonApiKey}
+                          onChange={(e) => setOzonApiKey(e.target.value)}
+                          disabled={ozonBusy !== "idle"}
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                        <button
+                          type="button"
+                          className="api-eye"
+                          onClick={() => setShowOzonKey((v) => !v)}
+                          disabled={ozonBusy !== "idle"}
+                          aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
+                          title={showOzonKey ? "Скрыть" : "Показать"}
+                        >
+                          {showOzonKey ? eyeOffIcon : eyeIcon}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr", marginTop: "1rem" }}>
+                    <button
+                      type="button"
+                      className="api-pro-btn"
+                      onClick={connectOzon}
+                      disabled={ozonBusy !== "idle"}
+                    >
+                      {ozonBusy === "connecting" ? (
+                        <>
+                          <span className="spin" />
+                          Подключаем…
+                        </>
+                      ) : (
+                        "Подключить Ozon"
+                      )}
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {ozonConnError && (
+                <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
+                  {ozonConnError}
+                </p>
+              )}
+            </div>
+
+            {/* ШАГИ 2–4 — доступны только после подключения Ozon */}
+            {ozonConn?.connected && (
+              <>
+                {/* ШАГ 2 — месяц */}
+                <div className="api-step">
+                  <div className="api-step-head">
+                    <span className="api-step-num">2</span>
+                    <span className="api-step-title">Выберите месяц</span>
+                  </div>
+                  <div className="api-fld" style={{ maxWidth: "320px" }}>
+                    <input
+                      id="ozon-profit-month"
+                      className="api-input"
+                      type="month"
+                      value={profitMonth}
+                      max={new Date().toISOString().slice(0, 7)}
+                      onChange={(e) => {
+                        // Новый месяц → сбрасываем прошлый результат/ошибки, чтобы
+                        // кнопка снова считала и не было показа чужих цифр.
+                        setProfitMonth(e.target.value);
+                        setApiSaved(false);
+                        setProfitResult(null);
+                        setProfitError("");
+                        setApiCostGap(null);
+                      }}
+                      disabled={profitLoading}
+                    />
                   </div>
                 </div>
 
-                <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr" }}>
+                {/* ШАГ 3 — ручные расходы */}
+                <div className="api-step">
+                  <div className="api-step-head">
+                    <span className="api-step-num">3</span>
+                    <span className="api-step-title">Введите свои расходы</span>
+                  </div>
+                  <p className="api-step-hint">
+                    Налог, упаковка, доставка до склада, зарплата и прочее. Эти
+                    суммы не сохраняются и нужны только для расчёта чистой прибыли.
+                    Пустое поле считается как 0.
+                  </p>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                      gap: ".6rem",
+                    }}
+                  >
+                    {([
+                      { key: "tax", label: "Налог" },
+                      { key: "packaging", label: "Упаковка" },
+                      { key: "warehouseDelivery", label: "Доставка до склада" },
+                      { key: "salary", label: "Зарплата" },
+                      { key: "other", label: "Прочие расходы" },
+                    ] as const).map((f) => (
+                      <div className="api-fld" key={f.key}>
+                        <label htmlFor={`ozon-me-${f.key}`}>{f.label}</label>
+                        <input
+                          id={`ozon-me-${f.key}`}
+                          className="api-input"
+                          type="number"
+                          min="0"
+                          step="0.01"
+                          inputMode="decimal"
+                          placeholder="0"
+                          value={apiExpenses[f.key]}
+                          onChange={(e) => {
+                            setApiExpenses((prev) => ({ ...prev, [f.key]: e.target.value }));
+                            // Изменили расходы → разрешаем пересчёт и убираем прошлый результат.
+                            setApiSaved(false);
+                            setProfitResult(null);
+                            setProfitError("");
+                            setApiCostGap(null);
+                          }}
+                          disabled={profitLoading}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* ШАГ 4 — главная кнопка */}
+                <div className="api-step">
+                  <div className="api-step-head">
+                    <span className="api-step-num">4</span>
+                    <span className="api-step-title">Рассчитайте чистую прибыль</span>
+                  </div>
                   <button
                     type="button"
-                    className="api-pro-btn"
-                    onClick={connectOzon}
-                    disabled={ozonBusy !== "idle"}
+                    className="api-pro-btn api-main-cta"
+                    onClick={calculateAndSaveApi}
+                    disabled={profitLoading || apiSaved}
                   >
-                    {ozonBusy === "connecting" ? (
+                    {profitLoading ? (
                       <>
                         <span className="spin" />
-                        Подключаем…
+                        Считаем…
                       </>
+                    ) : apiSaved ? (
+                      "Рассчитано и сохранено ✓"
                     ) : (
-                      "Подключить Ozon"
+                      "Рассчитать чистую прибыль"
                     )}
                   </button>
                 </div>
-              </>
-            )}
 
-            {ozonConnError && (
-              <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
-                {ozonConnError}
-              </p>
+                {/* Общая ошибка (не «нет тарифа» и не «нет себестоимости») */}
+                {profitError && (
+                  <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
+                    {profitError}
+                  </p>
+                )}
+
+                {/* Не хватает себестоимости — структурированный блок с действиями.
+                    Расчёт не сделан, попытка не списана. */}
+                {apiCostGap && (
+                  <div className="api-costgap" role="alert">
+                    <div className="api-costgap-title">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18, flexShrink: 0 }}>
+                        <circle cx="12" cy="12" r="9" />
+                        <path d="M12 8v5" />
+                        <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+                      </svg>
+                      Не хватает себестоимости у товаров
+                    </div>
+                    <p className="api-costgap-sub">
+                      Чтобы рассчитать чистую прибыль, заполните себестоимость всех
+                      товаров в каталоге. Сейчас расчёт не сделан и попытка не
+                      списана.
+                    </p>
+                    <div className="api-costgap-stats">
+                      {apiCostGap.unmatchedItems > 0 && (
+                        <span className="api-costgap-chip">
+                          Не сопоставлено с каталогом: {fmt(apiCostGap.unmatchedItems)}
+                        </span>
+                      )}
+                      {apiCostGap.matchedNoCostCount > 0 && (
+                        <span className="api-costgap-chip">
+                          Без себестоимости (0 ₽): {fmt(apiCostGap.matchedNoCostCount)}
+                        </span>
+                      )}
+                      {apiCostGap.status === "no_cost" &&
+                        apiCostGap.unmatchedItems === 0 &&
+                        apiCostGap.matchedNoCostCount === 0 && (
+                          <span className="api-costgap-chip">
+                            Себестоимость не найдена
+                          </span>
+                        )}
+                    </div>
+                    <div className="api-costgap-actions">
+                      <button type="button" className="api-pro-btn" onClick={goToCatalog}>
+                        Перейти в каталог товаров
+                      </button>
+                      {apiCostGap.unmatchedItems > 0 && (
+                        <button
+                          type="button"
+                          className="api-pro-btn ghost"
+                          onClick={() => importMissingProducts(profitMonth)}
+                          disabled={importLoading}
+                        >
+                          {importLoading ? (
+                            <>
+                              <span className="spin" />
+                              Добавляем…
+                            </>
+                          ) : (
+                            "Добавить несопоставленные товары в каталог"
+                          )}
+                        </button>
+                      )}
+                    </div>
+                    {importError && (
+                      <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
+                        {importError}
+                      </p>
+                    )}
+                    {importResult && (
+                      <p className="api-pro-msg ok" style={{ marginTop: ".8rem" }}>
+                        Добавлено в каталог: {fmt(importResult.totals.created)}. Теперь
+                        заполните им себестоимость в каталоге товаров и повторите
+                        расчёт.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Успех — чистый результат. Показываем только после сохранения. */}
+                {profitResult && apiSaved && (
+                  <div className="api-result" role="region" aria-label="Результат расчёта">
+                    <div className="api-result-hero">
+                      <div className="api-result-lbl">
+                        Чистая прибыль · {profitResult.period.month}
+                      </div>
+                      <div
+                        className={
+                          "api-result-net " +
+                          (profitResult.netProfitPreview.value >= 0 ? "pos" : "neg")
+                        }
+                      >
+                        {profitResult.netProfitPreview.value >= 0 ? "+" : "−"}
+                        {fmt(Math.abs(profitResult.netProfitPreview.value))} ₽
+                      </div>
+                      <div className="api-result-margin">
+                        Маржинальность{" "}
+                        {profitResult.netProfitPreview.margin.toLocaleString("ru-RU", {
+                          maximumFractionDigits: 1,
+                        })}
+                        %
+                      </div>
+                      <div className="api-result-saved">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="12" r="9" />
+                          <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                        </svg>
+                        Расчёт сохранён в историю
+                      </div>
+                    </div>
+                    <div className="api-result-rows">
+                      <div className="api-result-row">
+                        <span className="rl">Операции Ozon</span>
+                        <span className="rv">
+                          {fmt(profitResult.preliminary.ozonOperationsTotal)} ₽
+                        </span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Себестоимость товаров</span>
+                        <span className="rv neg">
+                          − {fmt(profitResult.costDraft.matchedCostTotal)} ₽
+                        </span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Ручные расходы</span>
+                        <span className="rv neg">
+                          − {fmt(profitResult.manualExpenses.total)} ₽
+                        </span>
+                      </div>
+                      <div className="api-result-row is-total">
+                        <span className="rl">Чистая прибыль</span>
+                        <span
+                          className={
+                            "rv " + (profitResult.netProfitPreview.value < 0 ? "neg" : "")
+                          }
+                        >
+                          {profitResult.netProfitPreview.value >= 0 ? "+" : "−"}
+                          {fmt(Math.abs(profitResult.netProfitPreview.value))} ₽
+                        </span>
+                      </div>
+                    </div>
+                    <div className="api-result-rows" style={{ paddingTop: 0 }}>
+                      <p className="api-step-hint" style={{ margin: "0 0 .4rem" }}>
+                        В составе «Операций Ozon» (справочно, уже учтены выше):
+                      </p>
+                      <div className="api-result-row">
+                        <span className="rl">Начисления Ozon</span>
+                        <span className="rv">{fmt(profitResult.apiTotals.ozonAccruals)} ₽</span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Комиссия Ozon</span>
+                        <span className="rv">{fmt(profitResult.apiTotals.commission)} ₽</span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Логистика</span>
+                        <span className="rv">{fmt(profitResult.apiTotals.logistics)} ₽</span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Доп. услуги</span>
+                        <span className="rv">{fmt(profitResult.apiTotals.services)} ₽</span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Хранение</span>
+                        <span className="rv">{fmt(profitResult.apiTotals.storage)} ₽</span>
+                      </div>
+                      <div className="api-result-row">
+                        <span className="rl">Прочее</span>
+                        <span className="rv">{fmt(profitResult.apiTotals.other)} ₽</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
 
             <div className="api-pro-hint">
@@ -7585,23 +7963,80 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
                 </svg>
               </span>
-              Ключ хранится в зашифрованном виде на сервере и не возвращается в браузер.
-              Автоматический расчёт по API будет добавлен позже.
+              По кнопке сайт сам проверит доступ, пересчитает прибыль по Ozon API и
+              каталогу, проверит себестоимость, спишет одну попытку (для активного
+              безлимита — без списания) и сохранит расчёт в историю. Ключ хранится в
+              зашифрованном виде на сервере и не возвращается в браузер.
             </div>
           </div>
         </div>
         )}
 
         {calcMode === "api" && (
-        <div className="card api-pro-card">
-          <div className="api-pro-head">
+        <>
+        <div className="api-extra-heading">Дополнительные действия и диагностика</div>
+        <p className="api-extra-note">
+          Эти инструменты не нужны для обычного расчёта. Откройте их, только если
+          часть товаров не сопоставлена с каталогом или нужно перепроверить
+          подключение. Прибыль здесь не считается и попытка не списывается.
+        </p>
+        <details className="card api-pro-card api-extra">
+          <summary className="api-pro-head api-extra-sum">
+            <div className="api-pro-title">Управление подключением Ozon</div>
+            <p className="api-pro-sub">
+              Перепроверить сохранённый ключ или отключить кабинет. Для обычного
+              расчёта не требуется.
+            </p>
+          </summary>
+
+          <div className="api-pro-body">
+            {!ozonConn?.connected ? (
+              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
+                Сначала подключите Ozon выше.
+              </p>
+            ) : (
+              <div className="api-pro-actions">
+                <button
+                  type="button"
+                  className="api-pro-btn ghost"
+                  onClick={verifyOzon}
+                  disabled={ozonBusy !== "idle"}
+                >
+                  {ozonBusy === "checking" ? (
+                    <>
+                      <span className="spin" />
+                      Проверяем…
+                    </>
+                  ) : (
+                    "Проверить подключение"
+                  )}
+                </button>
+                <button
+                  type="button"
+                  className="api-pro-btn danger"
+                  onClick={deleteOzon}
+                  disabled={ozonBusy !== "idle"}
+                >
+                  {ozonBusy === "deleting" ? "Удаляем…" : "Удалить подключение"}
+                </button>
+              </div>
+            )}
+            {ozonConnError && (
+              <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
+                {ozonConnError}
+              </p>
+            )}
+          </div>
+        </details>
+        <details className="card api-pro-card api-extra">
+          <summary className="api-pro-head api-extra-sum">
             <div className="api-pro-title">Диагностика сопоставления товаров</div>
             <p className="api-pro-sub">
               Проверяем, какие товары из Ozon API удалось найти в каталоге
               себестоимости. Это ещё не расчёт прибыли — данные не сохраняются и не
               списывают попытку.
             </p>
-          </div>
+          </summary>
 
           <div className="api-pro-body">
             {!ozonConn?.connected ? (
@@ -7814,19 +8249,20 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               считается, ничего не сохраняется и не списывает расчёт.
             </div>
           </div>
-        </div>
+        </details>
+        </>
         )}
 
         {calcMode === "api" && (
-        <div className="card api-pro-card">
-          <div className="api-pro-head">
+        <details className="card api-pro-card api-extra">
+          <summary className="api-pro-head api-extra-sum">
             <div className="api-pro-title">Добавить несопоставленные товары в каталог</div>
             <p className="api-pro-sub">
               Сайт добавит товары из Ozon API, которых нет в каталоге.
               Себестоимость не будет придумываться — после добавления заполните её
               вручную в каталоге товаров.
             </p>
-          </div>
+          </summary>
 
           <div className="api-pro-body">
             {!ozonConn?.connected ? (
@@ -7855,7 +8291,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     <button
                       type="button"
                       className="api-pro-btn"
-                      onClick={importMissingProducts}
+                      onClick={() => importMissingProducts()}
                       disabled={importLoading}
                     >
                       {importLoading ? (
@@ -8043,533 +8479,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               сохраняется и не списывается.
             </div>
           </div>
-        </div>
-        )}
-
-        {calcMode === "api" && (
-        <div className="card api-pro-card">
-          <div className="api-pro-head">
-            <div className="api-pro-title">Чистая прибыль по API с себестоимостью</div>
-            <p className="api-pro-sub">
-              Единое действие «Рассчитать и сохранить»: сервер проверит доступ,
-              пересчитает прибыль по данным Ozon API и каталогу, проверит
-              себестоимость, спишет одну попытку (для активного безлимита — без
-              списания) и сохранит расчёт в историю. Полный результат показывается
-              только после успешного сохранения.
-            </p>
-          </div>
-
-          <div className="api-pro-body">
-            <div
-              className="api-alert"
-              role="note"
-              style={{
-                background: "rgba(201,168,76,.10)",
-                border: "1px solid rgba(201,168,76,.32)",
-                marginBottom: "1.1rem",
-              }}
-            >
-              <span className="api-alert-text">
-                <strong>
-                  API-расчёты доступны в тарифе «Безлимит» — 449 ₽/месяц.
-                </strong>{" "}
-                Первый расчёт можно попробовать бесплатно, если пробный расчёт ещё
-                не использован. Разовый расчёт за 149 ₽ открывает только файловый
-                или ручной расчёт и не включает Ozon API.
-              </span>
-            </div>
-            {!ozonConn?.connected ? (
-              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
-                Сначала подключите Ozon API
-              </p>
-            ) : (
-              <>
-                <div
-                  className="api-pro-grid"
-                  style={{ gridTemplateColumns: "minmax(0,1fr) auto", alignItems: "end" }}
-                >
-                  <div className="api-fld">
-                    <label htmlFor="ozon-profit-month">Месяц</label>
-                    <input
-                      id="ozon-profit-month"
-                      className="api-input"
-                      type="month"
-                      value={profitMonth}
-                      max={new Date().toISOString().slice(0, 7)}
-                      onChange={(e) => {
-                        // Новый месяц → сбрасываем сохранённый результат, чтобы
-                        // кнопка снова считала и не было показа чужих цифр.
-                        setProfitMonth(e.target.value);
-                        setApiSaved(false);
-                        setProfitResult(null);
-                        setProfitError("");
-                      }}
-                      disabled={profitLoading}
-                    />
-                  </div>
-                  <div className="api-fld">
-                    <button
-                      type="button"
-                      className="api-pro-btn"
-                      onClick={calculateAndSaveApi}
-                      disabled={profitLoading || apiSaved}
-                    >
-                      {profitLoading ? (
-                        <>
-                          <span className="spin" />
-                          Рассчитываем и сохраняем…
-                        </>
-                      ) : apiSaved ? (
-                        "Рассчитано и сохранено ✓"
-                      ) : (
-                        "Рассчитать и сохранить API-расчёт"
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                <p className="api-pro-sub" style={{ marginTop: ".5rem" }}>
-                  Кнопка проверит доступ, пересчитает прибыль по API, проверит
-                  себестоимость и сразу сохранит результат в историю, списав одну
-                  попытку (для активного безлимита — без списания). Полный расчёт
-                  показывается только после успешного сохранения.
-                </p>
-
-                {/* PR #18 — ручные расходы для предварительной чистой прибыли.
-                    Значения НЕ сохраняются в БД, пустое поле = 0. */}
-                <div
-                  style={{
-                    marginTop: "1rem",
-                    border: "1px solid rgba(127,127,127,.2)",
-                    borderRadius: "12px",
-                    padding: ".75rem .9rem",
-                  }}
-                >
-                  <div style={{ fontWeight: 700, marginBottom: ".15rem" }}>
-                    Ручные расходы
-                  </div>
-                  <p className="api-pro-sub" style={{ marginTop: 0, marginBottom: ".6rem" }}>
-                    Эти суммы не сохраняются — они нужны только для предварительного
-                    расчёта чистой прибыли. Пустое поле считается как 0.
-                  </p>
-                  <div
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-                      gap: ".6rem",
-                    }}
-                  >
-                    {([
-                      { key: "tax", label: "Налог" },
-                      { key: "packaging", label: "Упаковка" },
-                      { key: "warehouseDelivery", label: "Доставка до склада" },
-                      { key: "salary", label: "Зарплата" },
-                      { key: "other", label: "Прочие расходы" },
-                    ] as const).map((f) => (
-                      <div className="api-fld" key={f.key}>
-                        <label htmlFor={`ozon-me-${f.key}`}>{f.label}</label>
-                        <input
-                          id={`ozon-me-${f.key}`}
-                          className="api-input"
-                          type="number"
-                          min="0"
-                          step="0.01"
-                          inputMode="decimal"
-                          placeholder="0"
-                          value={apiExpenses[f.key]}
-                          onChange={(e) => {
-                            setApiExpenses((prev) => ({ ...prev, [f.key]: e.target.value }));
-                            // Изменили расходы → разрешаем пересчёт (кнопка снова активна).
-                            setApiSaved(false);
-                          }}
-                          disabled={profitLoading}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {profitError && (
-                  <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
-                    {profitError}
-                  </p>
-                )}
-
-                {profitResult && (
-                  <div style={{ marginTop: "1rem" }}>
-                    {profitResult.warnings.map((w) => (
-                      <div
-                        key={w}
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(245,158,11,.10)",
-                          border: "1px solid rgba(245,158,11,.35)",
-                          marginBottom: ".5rem",
-                        }}
-                      >
-                        <span className="api-alert-text">{w}</span>
-                      </div>
-                    ))}
-
-                    {profitResult.status === "partial_cost" && (
-                      <div
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(245,158,11,.12)",
-                          border: "1px solid rgba(245,158,11,.45)",
-                          marginBottom: ".6rem",
-                        }}
-                      >
-                        <span className="api-alert-text">
-                          Расчёт неполный: часть товаров не сопоставлена с
-                          каталогом, поэтому их себестоимость не учтена.
-                        </span>
-                      </div>
-                    )}
-                    {profitResult.status === "no_cost" && (
-                      <div
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(239,68,68,.12)",
-                          border: "1px solid rgba(239,68,68,.45)",
-                          marginBottom: ".6rem",
-                        }}
-                      >
-                        <span className="api-alert-text">
-                          Себестоимость не найдена. Добавьте товары и себестоимость
-                          в каталог перед API-расчётом.
-                        </span>
-                      </div>
-                    )}
-                    {profitResult.status === "complete_cost" &&
-                      profitResult.productCoverage.unmatchedItems === 0 &&
-                      profitResult.costDraft.matchedNoCostCount === 0 && (
-                        <div className="api-alert ok" role="status" style={{ marginBottom: ".6rem" }}>
-                          <span className="api-alert-text">
-                            Все товары сопоставлены, себестоимость учтена. Расчёт
-                            сохранён в историю, попытка списана (для активного
-                            безлимита — без списания).
-                          </span>
-                        </div>
-                      )}
-
-                    <div
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-                        gap: ".6rem",
-                        marginTop: ".25rem",
-                      }}
-                    >
-                      {([
-                        { label: "Операции Ozon", value: `${fmt(profitResult.preliminary.ozonOperationsTotal)} ₽` },
-                        { label: "Себестоимость найденных товаров", value: `${fmt(profitResult.costDraft.matchedCostTotal)} ₽` },
-                        { label: "Ручные расходы всего", value: `${fmt(profitResult.manualExpenses.total)} ₽` },
-                        { label: "Предварительная прибыль до ручных расходов", value: `${fmt(profitResult.preliminary.profitBeforeManualExpenses)} ₽` },
-                        {
-                          label: "Предварительная чистая прибыль",
-                          value: `${fmt(profitResult.netProfitPreview.value)} ₽`,
-                          accent: profitResult.netProfitPreview.value < 0 ? "#ef4444" : "#10b981",
-                        },
-                        {
-                          label: "Маржинальность preview",
-                          value: `${profitResult.netProfitPreview.margin.toLocaleString("ru-RU", { maximumFractionDigits: 1 })} %`,
-                        },
-                        { label: "Сопоставлено товаров", value: fmt(profitResult.productCoverage.matchedItems) },
-                        { label: "Не сопоставлено товаров", value: fmt(profitResult.productCoverage.unmatchedItems) },
-                        {
-                          label: "Статус себестоимости",
-                          value:
-                            profitResult.status === "complete_cost"
-                              ? "Полная"
-                              : profitResult.status === "partial_cost"
-                                ? "Неполная"
-                                : "Нет себестоимости",
-                        },
-                      ] as Array<{ label: string; value: string; accent?: string }>).map((c) => (
-                        <div
-                          key={c.label}
-                          style={{
-                            border: "1px solid rgba(127,127,127,.25)",
-                            borderRadius: "12px",
-                            padding: ".6rem .8rem",
-                          }}
-                        >
-                          <div style={{ fontSize: ".78rem", opacity: 0.7 }}>{c.label}</div>
-                          <div
-                            style={{
-                              fontSize: "1.05rem",
-                              fontWeight: 700,
-                              marginTop: ".15rem",
-                              color: c.accent,
-                            }}
-                          >
-                            {c.value}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    {profitResult.manualExpenses.total === 0 && (
-                      <div
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(245,158,11,.12)",
-                          border: "1px solid rgba(245,158,11,.45)",
-                          marginTop: ".6rem",
-                        }}
-                      >
-                        <span className="api-alert-text">
-                          Ручные расходы равны 0. Если у вас есть налог, упаковка,
-                          доставка до склада, зарплата или прочие расходы — добавьте
-                          их и пересчитайте.
-                        </span>
-                      </div>
-                    )}
-
-                    {profitResult.netProfitPreview.value < 0 && (
-                      <div
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(239,68,68,.12)",
-                          border: "1px solid rgba(239,68,68,.45)",
-                          marginTop: ".6rem",
-                        }}
-                      >
-                        <span className="api-alert-text">
-                          Предварительная чистая прибыль отрицательная. Проверьте
-                          себестоимость, комиссии и ручные расходы.
-                        </span>
-                      </div>
-                    )}
-
-                    {/* PR #20 — единое действие «Рассчитать и сохранить» уже
-                        пересчитало, проверило себестоимость, списало попытку и
-                        сохранило результат на сервере. Здесь только подтверждение:
-                        полный расчёт ниже показывается ТОЛЬКО после успешного сейва. */}
-                    {apiSaved && (
-                      <div
-                        className="api-alert"
-                        role="status"
-                        style={{
-                          marginTop: "1rem",
-                          background: "rgba(16,185,129,.12)",
-                          border: "1px solid rgba(16,185,129,.45)",
-                        }}
-                      >
-                        <span className="api-alert-text">
-                          API-расчёт сохранён в историю, попытка списана (для активного
-                          безлимитного тарифа — без списания).
-                        </span>
-                      </div>
-                    )}
-
-                    <div
-                      style={{
-                        marginTop: "1rem",
-                        border: "1px solid rgba(127,127,127,.2)",
-                        borderRadius: "12px",
-                        padding: ".75rem .9rem",
-                      }}
-                    >
-                      <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
-                        Состав операций Ozon
-                      </div>
-                      <div
-                        style={{
-                          display: "grid",
-                          gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-                          gap: ".4rem .8rem",
-                        }}
-                      >
-                        {[
-                          { label: "Начисления Ozon", value: profitResult.apiTotals.ozonAccruals },
-                          { label: "Комиссия", value: profitResult.apiTotals.commission },
-                          { label: "Логистика", value: profitResult.apiTotals.logistics },
-                          { label: "Услуги", value: profitResult.apiTotals.services },
-                          { label: "Хранение", value: profitResult.apiTotals.storage },
-                          { label: "Прочее", value: profitResult.apiTotals.other },
-                        ].map((r) => (
-                          <div
-                            key={r.label}
-                            style={{
-                              display: "flex",
-                              justifyContent: "space-between",
-                              gap: ".5rem",
-                              fontSize: ".84rem",
-                            }}
-                          >
-                            <span style={{ opacity: 0.7 }}>{r.label}</span>
-                            <span style={{ fontWeight: 600, whiteSpace: "nowrap" }}>
-                              {fmt(r.value)} ₽
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                      <p className="api-pro-sub" style={{ marginTop: ".5rem", marginBottom: 0 }}>
-                        Возвраты: {fmt(profitResult.apiTotals.returns)} ₽ — показаны
-                        справочно, уже учтены в «Начислениях Ozon» и повторно не
-                        вычитаются.
-                      </p>
-                    </div>
-
-                    <p className="api-pro-sub" style={{ marginTop: ".75rem" }}>
-                      Чистая прибыль = операции Ozon − себестоимость сопоставленных
-                      товаров − ручные расходы (налог, упаковка, доставка до склада,
-                      зарплата, прочее). Этот расчёт уже сохранён в историю, попытка
-                      списана (для активного безлимита — без списания).
-                    </p>
-
-                    {profitResult.costDraft.itemsWithoutCost.length > 0 && (
-                      <div
-                        style={{
-                          marginTop: "1rem",
-                          border: "1px solid rgba(127,127,127,.2)",
-                          borderRadius: "12px",
-                          padding: ".75rem .9rem",
-                        }}
-                      >
-                        <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
-                          Товары без учёта себестоимости
-                        </div>
-                        <p
-                          className="api-pro-sub"
-                          style={{ marginTop: 0, marginBottom: ".5rem" }}
-                        >
-                          Эти товары не дали себестоимость в черновик. Добавьте
-                          артикул/себестоимость в каталог, чтобы учесть их в
-                          следующем API-расчёте.
-                        </p>
-                        <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
-                          {profitResult.costDraft.itemsWithoutCost.map((u, i) => (
-                            <div
-                              key={(u.offerId || u.sku || u.name || "x") + i}
-                              style={{
-                                display: "flex",
-                                flexWrap: "wrap",
-                                justifyContent: "space-between",
-                                gap: ".5rem",
-                                borderBottom: "1px solid rgba(127,127,127,.12)",
-                                paddingBottom: ".35rem",
-                              }}
-                            >
-                              <div style={{ minWidth: 0 }}>
-                                <div style={{ fontWeight: 600, fontSize: ".9rem" }}>
-                                  {u.name || u.offerId || u.sku || "—"}
-                                </div>
-                                <div style={{ fontSize: ".76rem", opacity: 0.7 }}>
-                                  {u.offerId ? `Артикул: ${u.offerId}` : ""}
-                                  {u.offerId && u.sku ? " · " : ""}
-                                  {u.sku ? `SKU: ${u.sku}` : ""}
-                                </div>
-                                <div style={{ fontSize: ".76rem", opacity: 0.6 }}>
-                                  {u.reason}
-                                </div>
-                              </div>
-                              <div
-                                style={{
-                                  fontSize: ".82rem",
-                                  whiteSpace: "nowrap",
-                                  opacity: 0.85,
-                                }}
-                              >
-                                {fmt(u.quantity)} шт.
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {profitResult.costDraft.topCostItems.length > 0 && (
-                      <div
-                        style={{
-                          marginTop: "1rem",
-                          border: "1px solid rgba(127,127,127,.2)",
-                          borderRadius: "12px",
-                          padding: ".75rem .9rem",
-                        }}
-                      >
-                        <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
-                          Основные товары по себестоимости
-                        </div>
-                        <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
-                          {profitResult.costDraft.topCostItems.slice(0, 8).map((it, i) => (
-                            <div
-                              key={(it.offerId || it.sku || it.name || "y") + i}
-                              style={{
-                                display: "flex",
-                                flexWrap: "wrap",
-                                justifyContent: "space-between",
-                                gap: ".5rem",
-                                borderBottom: "1px solid rgba(127,127,127,.12)",
-                                paddingBottom: ".35rem",
-                              }}
-                            >
-                              <div style={{ minWidth: 0 }}>
-                                <div style={{ fontWeight: 600, fontSize: ".9rem" }}>
-                                  {it.name || it.offerId || it.sku || "—"}
-                                </div>
-                                <div style={{ fontSize: ".76rem", opacity: 0.7 }}>
-                                  {fmt(it.quantity)} шт. × {fmt(it.costPerUnit)} ₽
-                                </div>
-                              </div>
-                              <div
-                                style={{
-                                  fontSize: ".82rem",
-                                  whiteSpace: "nowrap",
-                                  fontWeight: 600,
-                                }}
-                              >
-                                {fmt(it.totalCost)} ₽
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {profitResult.notes.length > 0 && (
-                      <ul
-                        style={{
-                          marginTop: ".75rem",
-                          paddingLeft: "1.1rem",
-                          opacity: 0.75,
-                          fontSize: ".82rem",
-                        }}
-                      >
-                        {profitResult.notes.map((n) => (
-                          <li key={n} style={{ marginBottom: ".2rem" }}>
-                            {n}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-
-            <div className="api-pro-hint">
-              <span className="api-pro-hint-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 8v5" />
-                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
-                </svg>
-              </span>
-              Чистая прибыль по API: себестоимость учитывается только по
-              сопоставленным товарам, а ручные расходы вы вводите сами. Расчёт
-              сохраняется в историю и списывает одну попытку (для активного
-              безлимита — без списания) при нажатии «Рассчитать и сохранить».
-            </div>
-          </div>
-        </div>
+        </details>
         )}
 
         {calcMode === "upload" && (
