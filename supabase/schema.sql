@@ -342,6 +342,84 @@ revoke all on function public.consume_calculation() from public;
 grant execute on function public.consume_calculation() to authenticated;
 
 -- ============================================================================
+-- consume_api_calculation() — server-authoritative списание ОДНОГО Ozon API-расчёта.
+--
+-- Отдельная, БОЛЕЕ СТРОГАЯ квота для API-расчётов (PR #21). В отличие от
+-- consume_calculation() (файловые/ручные расчёты), здесь single-кредиты (149₽)
+-- НЕ дают права на API. API-расчёт доступен ТОЛЬКО:
+--   • активный unlimited (449₽) со свежим premium_until > now() → ok, БЕЗ списания;
+--   • ИНАЧЕ — ровно один бесплатный ПРОБНЫЙ расчёт: общий счётчик
+--     calculations_used < 1 → инкремент того же счётчика + ok; иначе limit_reached.
+--
+-- Счётчик calculations_used СПЕЦИАЛЬНО общий с consume_calculation(): «первый
+-- бесплатный расчёт» — единый пробный на пользователя (файловый/ручной ИЛИ API),
+-- а не отдельный бесплатный API-расчёт сверху. Поэтому 149₽ (single) не открывает
+-- API: single-кредиты в allowance здесь НЕ учитываются, а пробный — один на всех.
+--
+-- SECURITY DEFINER / FOR UPDATE / отсутствие идемпотентности — по тем же причинам,
+-- что и в consume_calculation() (см. блок выше): authenticated отозван UPDATE на
+-- profiles; row-lock сериализует параллельные расчёты (анти-double-spend); каждый
+-- успешный вызов = ровно один расход, звать РОВНО один раз перед сохранением.
+-- Старую RPC consume_calculation() НЕ трогаем — её зовут файловый/ручной расчёты.
+-- ============================================================================
+create or replace function public.consume_api_calculation()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  uid        uuid := auth.uid();
+  prof       public.profiles%rowtype;
+  used       int;
+  free_limit constant int := 1;
+begin
+  if uid is null then
+    return jsonb_build_object('ok', false, 'reason', 'not_authenticated');
+  end if;
+
+  -- Блокируем строку профиля до конца транзакции (анти-double-spend).
+  select * into prof from public.profiles where id = uid for update;
+  if not found then
+    -- Профиль создаётся триггером на signup; его отсутствие — аномалия. Для API
+    -- fail-closed: не выдаём бесплатный расчёт «в пустоту» (в отличие от
+    -- consume_calculation(), здесь профиль НЕ досоздаём).
+    return jsonb_build_object('ok', false, 'reason', 'profile_not_found');
+  end if;
+
+  -- Безлимит: тариф unlimited (449₽) со свежим сроком. Счётчик НЕ расходуем.
+  if prof.plan = 'unlimited'
+     and prof.premium_until is not null
+     and prof.premium_until > now() then
+    return jsonb_build_object('ok', true, 'unlimited', true);
+  end if;
+
+  -- Без безлимита API доступен ТОЛЬКО как единственный бесплатный пробный расчёт.
+  -- single-кредиты (149₽) НАМЕРЕННО не учитываются → 149₽ не открывает API.
+  used := coalesce(prof.calculations_used, 0);
+
+  if used >= free_limit then
+    return jsonb_build_object(
+      'ok', false, 'reason', 'limit_reached',
+      'used', used, 'allowance', free_limit
+    );
+  end if;
+
+  update public.profiles
+     set calculations_used = used + 1
+   where id = uid;
+
+  return jsonb_build_object(
+    'ok', true, 'unlimited', false, 'used', used + 1, 'allowance', free_limit
+  );
+end;
+$$;
+
+-- Доступ к функции: только залогиненным (как у consume_calculation()).
+revoke all on function public.consume_api_calculation() from public;
+grant execute on function public.consume_api_calculation() to authenticated;
+
+-- ============================================================================
 -- products — каталог товаров пользователя (Артикул / Название / Себестоимость)
 --
 -- Таблица создаётся идемпотентно. Если она уже была заведена вручную в Supabase

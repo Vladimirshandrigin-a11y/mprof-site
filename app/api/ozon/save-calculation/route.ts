@@ -24,14 +24,17 @@ import {
 //      (status === "complete_cost" И unmatchedItems === 0 И matchedNoCostCount === 0 —
 //      т.е. НЕТ ни одного matched-товара с cost_price = 0) — иначе 400, без
 //      сохранения и БЕЗ списания;
-//   4. списываем РОВНО один расчёт тем же RPC consume_calculation (free/149₽/
-//      безлимит решает сам RPC) — ПЕРЕД сохранением. Нет доступа → 402, без
-//      сохранения (RPC при лимите ничего не инкрементит);
+//   4. списываем РОВНО один API-расчёт СТРОГИМ RPC consume_api_calculation
+//      (PR #21): доступ ТОЛЬКО при активном безлимите 449₽ ИЛИ первом бесплатном
+//      пробном расчёте; 149₽ single-кредит API НЕ открывает. Списание — ПЕРЕД
+//      сохранением. Нет доступа → 402, без сохранения (RPC при лимите ничего не
+//      инкрементит);
 //   5. пишем строку в calculations (mode='api', снимок в ai_insights) и снимок
 //      за месяц в report_history (для помесячных графиков).
 //
 // Списание идёт ПЕРЕД insert (как в рабочем ручном/файловом сохранении: оно тоже
-// зовёт consume_calculation до сохранения). Атомарной транзакции «списал+сохранил»
+// зовёт свой RPC до сохранения; ручной/файловый — consume_calculation, API —
+// consume_api_calculation). Атомарной транзакции «списал+сохранил»
 // в текущей архитектуре нет (RPC идёт user-scoped клиентом, insert — service-role
 // клиентом), поэтому повторяем существующий порядок. Остаточный риск (списание
 // прошло, а insert упал → расчёт «потрачен» без строки) такой же, как в текущем
@@ -59,7 +62,7 @@ export async function POST(req: NextRequest) {
   if (!auth.ok) return auth.response;
   const { admin, userId } = auth;
 
-  // Bearer-токен для USER-SCOPED клиента (consume_calculation опирается на
+  // Bearer-токен для USER-SCOPED клиента (consume_api_calculation опирается на
   // auth.uid()). authenticateRequest уже подтвердил, что токен валиден.
   const authHeader = req.headers.get("authorization") || "";
   const token = authHeader.toLowerCase().startsWith("bearer ")
@@ -200,10 +203,11 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // ---- 3) списываем РОВНО один расчёт (server-authoritative, ПЕРЕД сохранением) ----
-  // USER-SCOPED клиент: consume_calculation опирается на auth.uid(); service-role
-  // обошёл бы auth и вернул not_authenticated. Тот же RPC, что у файлового/ручного
-  // расчёта — никаких новых правил тарификации и хардкода цен.
+  // ---- 3) списываем РОВНО один API-расчёт (server-authoritative, ПЕРЕД сохранением) ----
+  // USER-SCOPED клиент: consume_api_calculation опирается на auth.uid(); service-role
+  // обошёл бы auth и вернул not_authenticated. СТРОГИЙ API-RPC (PR #21): доступ
+  // только при активном безлимите 449₽ ИЛИ первом бесплатном пробном расчёте;
+  // 149₽ single-кредит API НЕ открывает. Цены не хардкодим — решает RPC.
   const userClient = getUserScopedClient(token);
   if (!userClient) {
     return NextResponse.json(
@@ -217,7 +221,7 @@ export async function POST(req: NextRequest) {
   }
 
   const { data: consumeData, error: consumeErr } =
-    await userClient.rpc("consume_calculation");
+    await userClient.rpc("consume_api_calculation");
   if (consumeErr) {
     // eslint-disable-next-line no-console
     console.error("[api/ozon/save-calculation] consume rpc error", consumeErr);
@@ -235,7 +239,7 @@ export async function POST(req: NextRequest) {
       {
         error: notAuth
           ? "Сессия недействительна"
-          : "Доступные расчёты закончились. Оформите тариф, чтобы сохранить API-расчёт.",
+          : "API-расчёт доступен на тарифе «Безлимит» (449 ₽/мес) или как первый бесплатный пробный расчёт. Оформите тариф, чтобы продолжить.",
         code: notAuth ? "not_authenticated" : "limit_reached",
         consume: {
           ok: false,

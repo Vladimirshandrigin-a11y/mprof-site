@@ -669,30 +669,6 @@ type OzonConnView = {
 // Ответ /api/ozon/connection*: безопасная проекция ИЛИ { error } при ошибке.
 type OzonConnResponse = Partial<OzonConnView> & { error?: string };
 
-// ---- PR #2: предварительный API-черновик финансов Ozon за месяц ----
-// Сервер (/api/ozon/calc-draft) считает независимые агрегаты по полям финансовых
-// операций Ozon. Это НЕ чистая прибыль и НЕ сохраняется — только preview для сверки.
-type OzonDraftTotals = {
-  revenue: number;
-  returns: number;
-  commission: number;
-  logistics: number;
-  storage: number;
-  services: number;
-  other: number;
-  operationCount: number;
-};
-
-type OzonDraftResponse = {
-  period: { month: string; dateFrom: string; dateTo: string };
-  source: string;
-  partial: boolean;
-  empty?: boolean;
-  totals: OzonDraftTotals;
-  warnings: string[];
-  notes: string[];
-};
-
 // Ответ /api/ozon/postings-match-diagnostic — read-only диагностика сопоставления
 // товаров Ozon (FBO+FBS) с каталогом себестоимости. Прибыль здесь НЕ считается.
 type OzonPostingsMatchResponse = {
@@ -957,11 +933,6 @@ export default function AppPage() {
   const [ozonConnLoading, setOzonConnLoading] = useState(false);
   const [ozonBusy, setOzonBusy] = useState<"idle" | "connecting" | "checking" | "deleting">("idle");
   const [ozonConnError, setOzonConnError] = useState("");
-  // PR #2: предварительный API-черновик финансов Ozon за месяц (не сохраняется).
-  const [draftMonth, setDraftMonth] = useState<string>(() => defaultDraftMonth());
-  const [draftLoading, setDraftLoading] = useState(false);
-  const [draftError, setDraftError] = useState("");
-  const [draftResult, setDraftResult] = useState<OzonDraftResponse | null>(null);
 
   // Диагностика сопоставления товаров (PR #15) — read-only, ничего не сохраняет.
   const [matchMonth, setMatchMonth] = useState<string>(() => defaultDraftMonth());
@@ -3560,47 +3531,6 @@ export default function AppPage() {
     }
   };
 
-  // POST /api/ozon/calc-draft — предварительный черновик финансов за месяц.
-  // НИЧЕГО не сохраняет и не списывает расчёт: только показываем агрегаты для сверки.
-  const loadOzonDraft = async () => {
-    if (!user?.id) {
-      setDraftError("Войдите в аккаунт, чтобы загрузить черновик");
-      return;
-    }
-    if (!ozonConn?.connected) {
-      setDraftError("Сначала подключите Ozon API");
-      return;
-    }
-    if (!/^\d{4}-\d{2}$/.test(draftMonth)) {
-      setDraftError("Выберите месяц");
-      return;
-    }
-    setDraftLoading(true);
-    setDraftError("");
-    setDraftResult(null);
-    try {
-      const headers = await ozonAuthHeaders();
-      const res = await fetch("/api/ozon/calc-draft", {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ month: draftMonth }),
-        cache: "no-store",
-      });
-      const data = (await res.json()) as OzonDraftResponse & { error?: string };
-      if (!res.ok) {
-        setDraftError(data.error || "Не удалось загрузить черновик");
-        return;
-      }
-      setDraftResult(data);
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("loadOzonDraft error:", e);
-      setDraftError("Не удалось связаться с сервером");
-    } finally {
-      setDraftLoading(false);
-    }
-  };
-
   // POST /api/ozon/postings-match-diagnostic — read-only диагностика: какие товары
   // из Ozon postings (FBO+FBS) есть в каталоге себестоимости. НИЧЕГО не сохраняет,
   // не списывает расчёт и НЕ считает прибыль — только сопоставление по артикулу.
@@ -3798,23 +3728,6 @@ export default function AppPage() {
       setImportLoading(false);
     }
   };
-
-  // Мягкая сверка: ищем в УЖЕ загруженной истории файловый расчёт Ozon за тот же
-  // месяц (по reportPeriod из ai_insights). Только чтение — историю не трогаем.
-  const fileCalcForDraft = useMemo(() => {
-    if (!draftResult) return null;
-    const ym = draftResult.period.month; // "YYYY-MM"
-    for (const h of history) {
-      if (h.marketplace !== "ozon") continue;
-      const bd = asNetProfitBreakdown(h.aiInsights);
-      if (!bd) continue;
-      const m = extractReportMonthFromText(bd.reportPeriod);
-      if (m && m.slice(0, 7) === ym) {
-        return { revenue: bd.revenueOzon, profit: h.profit };
-      }
-    }
-    return null;
-  }, [draftResult, history]);
 
   const clearHistory = async () => {
     const ok = confirm("Удалить всю историю?");
@@ -7682,247 +7595,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
-            <div className="api-pro-title">Черновик данных Ozon API за месяц</div>
-            <p className="api-pro-sub">
-              Это предварительные операции из Ozon API. Они не сохраняются, не
-              списывают расчёт и пока не учитывают вашу себестоимость. Финальную
-              чистую прибыль через API будем собирать отдельным этапом после
-              сверки.
-            </p>
-          </div>
-
-          <div className="api-pro-body">
-            <div
-              className="api-alert"
-              role="note"
-              style={{
-                background: "rgba(245,158,11,.10)",
-                border: "1px solid rgba(245,158,11,.35)",
-                marginBottom: "1.1rem",
-              }}
-            >
-              <span className="api-alert-text">
-                <strong>Это не чистая прибыль.</strong> В этом черновике пока не
-                вычитаются себестоимость, налог, упаковка, доставка до склада,
-                зарплата и прочие ручные расходы. Блок нужен только для сверки
-                данных, которые отдаёт Ozon API.
-              </span>
-            </div>
-            {!ozonConn?.connected ? (
-              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
-                Сначала подключите Ozon API
-              </p>
-            ) : (
-              <>
-                <div
-                  className="api-pro-grid"
-                  style={{ gridTemplateColumns: "minmax(0,1fr) auto", alignItems: "end" }}
-                >
-                  <div className="api-fld">
-                    <label htmlFor="ozon-draft-month">Месяц</label>
-                    <input
-                      id="ozon-draft-month"
-                      className="api-input"
-                      type="month"
-                      value={draftMonth}
-                      max={new Date().toISOString().slice(0, 7)}
-                      onChange={(e) => setDraftMonth(e.target.value)}
-                      disabled={draftLoading}
-                    />
-                  </div>
-                  <div className="api-fld">
-                    <button
-                      type="button"
-                      className="api-pro-btn"
-                      onClick={loadOzonDraft}
-                      disabled={draftLoading}
-                    >
-                      {draftLoading ? (
-                        <>
-                          <span className="spin" />
-                          Загружаем…
-                        </>
-                      ) : (
-                        "Загрузить черновик"
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                {draftError && (
-                  <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
-                    {draftError}
-                  </p>
-                )}
-
-                {draftResult && draftResult.empty && (
-                  <p className="api-pro-msg" style={{ marginTop: "1rem" }}>
-                    За этот месяц операции не найдены
-                  </p>
-                )}
-
-                {draftResult && !draftResult.empty && (
-                  <div style={{ marginTop: "1rem" }}>
-                    {draftResult.warnings.map((w) => (
-                      <div
-                        key={w}
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(245,158,11,.10)",
-                          border: "1px solid rgba(245,158,11,.35)",
-                          marginBottom: ".5rem",
-                        }}
-                      >
-                        <span className="api-alert-text">{w}</span>
-                      </div>
-                    ))}
-
-                    <div
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-                        gap: ".6rem",
-                        marginTop: ".25rem",
-                      }}
-                    >
-                      {[
-                        { label: "Начисления Ozon", value: `${fmt(draftResult.totals.revenue)} ₽` },
-                        { label: "Возвраты", value: `${fmt(draftResult.totals.returns)} ₽` },
-                        { label: "Комиссии", value: `${fmt(draftResult.totals.commission)} ₽` },
-                        { label: "Логистика", value: `${fmt(draftResult.totals.logistics)} ₽` },
-                        { label: "Доп. услуги", value: `${fmt(draftResult.totals.services)} ₽` },
-                        { label: "Складское хранение", value: `${fmt(draftResult.totals.storage)} ₽` },
-                        { label: "Прочие операции", value: `${fmt(draftResult.totals.other)} ₽` },
-                        { label: "Количество операций", value: fmt(draftResult.totals.operationCount) },
-                        { label: "Статус", value: draftResult.partial ? "Частичный" : "Полный" },
-                      ].map((c) => (
-                        <div
-                          key={c.label}
-                          style={{
-                            border: "1px solid rgba(127,127,127,.25)",
-                            borderRadius: "12px",
-                            padding: ".6rem .8rem",
-                          }}
-                        >
-                          <div style={{ fontSize: ".78rem", opacity: 0.7 }}>{c.label}</div>
-                          <div
-                            style={{
-                              fontSize: "1.05rem",
-                              fontWeight: 700,
-                              marginTop: ".15rem",
-                            }}
-                          >
-                            {c.value}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div
-                      style={{
-                        marginTop: "1rem",
-                        border: "1px solid rgba(127,127,127,.2)",
-                        borderRadius: "12px",
-                        padding: ".75rem .9rem",
-                      }}
-                    >
-                      <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
-                        Сверка с файловым расчётом
-                      </div>
-                      <p
-                        className="api-pro-sub"
-                        style={{ marginTop: 0, marginBottom: ".5rem" }}
-                      >
-                        Сравнивается только выручка/начисления, не чистая прибыль.
-                        Себестоимость и ручные расходы здесь не участвуют.
-                      </p>
-                      {fileCalcForDraft ? (
-                        <>
-                          <div style={{ display: "flex", flexWrap: "wrap", gap: "1rem" }}>
-                            <div>
-                              <div style={{ fontSize: ".78rem", opacity: 0.7 }}>
-                                API-выручка
-                              </div>
-                              <div style={{ fontWeight: 700 }}>
-                                {fmt(draftResult.totals.revenue)} ₽
-                              </div>
-                            </div>
-                            <div>
-                              <div style={{ fontSize: ".78rem", opacity: 0.7 }}>
-                                Файловая выручка
-                              </div>
-                              <div style={{ fontWeight: 700 }}>
-                                {fmt(fileCalcForDraft.revenue)} ₽
-                              </div>
-                            </div>
-                            <div>
-                              <div style={{ fontSize: ".78rem", opacity: 0.7 }}>Разница</div>
-                              <div style={{ fontWeight: 700 }}>
-                                {fmt(draftResult.totals.revenue - fileCalcForDraft.revenue)} ₽
-                                {fileCalcForDraft.revenue !== 0
-                                  ? ` (${(
-                                      ((draftResult.totals.revenue - fileCalcForDraft.revenue) /
-                                        fileCalcForDraft.revenue) *
-                                      100
-                                    ).toLocaleString("ru-RU", {
-                                      maximumFractionDigits: 1,
-                                    })}%)`
-                                  : ""}
-                              </div>
-                            </div>
-                          </div>
-                          <p className="api-pro-sub" style={{ marginTop: ".5rem" }}>
-                            Сверка предварительная. API-данные могут отличаться из-за
-                            округлений, НДС, дат начислений и закрытия периода.
-                          </p>
-                        </>
-                      ) : (
-                        <p className="api-pro-sub" style={{ margin: 0 }}>
-                          Для сверки загрузите файловый отчёт за этот же месяц.
-                        </p>
-                      )}
-                    </div>
-
-                    {draftResult.notes.length > 0 && (
-                      <ul
-                        style={{
-                          marginTop: ".75rem",
-                          paddingLeft: "1.1rem",
-                          opacity: 0.75,
-                          fontSize: ".82rem",
-                        }}
-                      >
-                        {draftResult.notes.map((n) => (
-                          <li key={n} style={{ marginBottom: ".2rem" }}>
-                            {n}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-
-            <div className="api-pro-hint">
-              <span className="api-pro-hint-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 8v5" />
-                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
-                </svg>
-              </span>
-              Черновик не сохраняется и не списывает расчёт. Это предварительные
-              данные для сверки с файловым отчётом.
-            </div>
-          </div>
-        </div>
-        )}
-
-        {calcMode === "api" && (
-        <div className="card api-pro-card">
-          <div className="api-pro-head">
             <div className="api-pro-title">Диагностика сопоставления товаров</div>
             <p className="api-pro-sub">
               Проверяем, какие товары из Ozon API удалось найти в каталоге
@@ -8388,6 +8060,24 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           </div>
 
           <div className="api-pro-body">
+            <div
+              className="api-alert"
+              role="note"
+              style={{
+                background: "rgba(201,168,76,.10)",
+                border: "1px solid rgba(201,168,76,.32)",
+                marginBottom: "1.1rem",
+              }}
+            >
+              <span className="api-alert-text">
+                <strong>
+                  API-расчёты доступны в тарифе «Безлимит» — 449 ₽/месяц.
+                </strong>{" "}
+                Первый расчёт можно попробовать бесплатно, если пробный расчёт ещё
+                не использован. Разовый расчёт за 149 ₽ открывает только файловый
+                или ручной расчёт и не включает Ozon API.
+              </span>
+            </div>
             {!ozonConn?.connected ? (
               <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
                 Сначала подключите Ozon API
@@ -10097,7 +9787,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   </div>
                   <div className="tariff-period">Один платёж</div>
                   <ul className="tariff-list">
-                    <li>Один расчёт за месячный отчёт</li>
+                    <li>Один расчёт по отчёту или вручную</li>
+                    <li>Без Ozon API-расчёта (только файл или ручной ввод)</li>
                     <li>Сохранение результата в историю</li>
                     <li>Без подписки и автосписаний</li>
                   </ul>
@@ -10122,9 +9813,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <div className="tariff-period">Подписка на 30 дней</div>
                   <ul className="tariff-list">
                     <li>Неограниченное число расчётов в месяц</li>
-                    <li>AI аналитика и рекомендации</li>
-                    <li>Приоритетный доступ к новым функциям</li>
-                    <li>Полная история без ограничений</li>
+                    <li>Расчёты по Ozon API (автозагрузка данных)</li>
+                    <li>AI-аналитика и рекомендации (в ближайших обновлениях)</li>
+                    <li>Полная история и графики без ограничений</li>
                   </ul>
                   <button
                     type="button"
