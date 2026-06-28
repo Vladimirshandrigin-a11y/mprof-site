@@ -4432,18 +4432,18 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   -webkit-backdrop-filter:blur(16px) saturate(1.2);
   border-bottom:1px solid var(--edge)}
 .dash-top-inner{max-width:1100px;margin:0 auto;
-  display:flex;align-items:center;justify-content:space-between;
-  gap:1rem 1.4rem;flex-wrap:wrap;padding:.8rem 2rem}
-.dash-brand{flex:1 1 0;font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
+  display:grid;grid-template-columns:1fr auto 1fr;align-items:center;
+  gap:1rem 1.4rem;padding:.8rem 2rem}
+.dash-brand{grid-column:1;justify-self:start;font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
 .dash-brand em{font-style:italic;color:var(--gold)}
-.dash-status{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.66rem;
+.dash-status{grid-column:3;justify-self:end;display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.66rem;
   color:var(--gold2);letter-spacing:.06em;border:1px solid rgba(201,168,76,.3);
   padding:6px 16px;border-radius:100px;background:var(--gold-bg)}
 .status-dot{width:6px;height:6px;border-radius:50%;background:var(--gold);
   animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.6)}}
 
-.dash-user{flex:1 1 0;display:flex;align-items:center;justify-content:flex-end;gap:10px}
+.dash-user{grid-column:3;justify-self:end;display:flex;align-items:center;justify-content:flex-end;gap:10px}
 .dash-user-email{font-family:var(--mono);font-size:.63rem;color:var(--txt2);letter-spacing:.04em;
   max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dash-signout{font-family:var(--sans);font-size:.75rem;font-weight:500;background:transparent;
@@ -4606,7 +4606,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 /* === HEADER NAV — вкладки в шапке (Расчёт / Каталог / Отчёты / Личный кабинет) === */
 .dash-nav{display:flex;gap:5px;background:var(--glass);border:1px solid var(--edge);
   border-radius:13px;padding:5px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  box-shadow:0 8px 22px rgba(0,0,0,.20);flex:0 1 auto}
+  box-shadow:0 8px 22px rgba(0,0,0,.20);grid-column:2;justify-self:center}
 .main-tab{flex:0 0 auto;font-family:var(--sans);font-size:.83rem;font-weight:600;padding:9px 15px;
   border-radius:9px;cursor:pointer;border:1px solid transparent;background:transparent;
   color:var(--txt2);transition:all .22s ease;display:inline-flex;align-items:center;
@@ -7136,7 +7136,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   color:var(--red);
 }
 @media(max-width:900px){
-  .dash-top-inner{padding:.7rem 1.2rem;gap:.55rem .8rem}
+  .dash-top-inner{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;padding:.7rem 1.2rem;gap:.55rem .8rem}
   .dash-status{font-size:.6rem;padding:5px 12px}
   .dash-wrap{padding:1.5rem 1.2rem 4rem}
   .dash-grid{grid-template-columns:1fr}
