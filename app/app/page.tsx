@@ -1071,7 +1071,7 @@ export default function AppPage() {
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
   // когда user отсутствует, и тогда всегда показываем калькулятор.
-  const [mainTab, setMainTab] = useState<"calc" | "catalog" | "reports">("calc");
+  const [mainTab, setMainTab] = useState<"calc" | "catalog" | "reports" | "cabinet">("calc");
   // Восстановление расчёта из «Отчётов» переключает на вкладку «Расчёт»; скролл
   // к калькулятору откладываем до её отрисовки (ref ещё не в DOM на «Отчётах»).
   const [pendingCalcScroll, setPendingCalcScroll] = useState(false);
@@ -4361,6 +4361,8 @@ export default function AppPage() {
     singleCredits,
     premiumUntil,
     canCalculate,
+    calcCount,
+    freeCalculationsLimit,
     loaded: entitlementsLoaded,
     consumeCalculation,
   } = useEntitlements();
@@ -7246,6 +7248,43 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
     animation:none !important;transform:none !important;opacity:1 !important
   }
 }
+
+/* PR #26 — вкладка «Личный кабинет» (.cab-*) */
+.cab-wrap{margin-top:1.4rem}
+.cab-head{margin-bottom:1.4rem}
+.cab-h{font-family:var(--display);font-size:1.5rem;font-weight:600;letter-spacing:-.01em;color:var(--txt);margin:0}
+.cab-sub{margin:.4rem 0 0;font-size:.92rem;color:var(--txt2);line-height:1.5}
+.cab-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.1rem}
+.cab-card{background:var(--glass);border:1px solid var(--edge);border-radius:18px;padding:1.5rem 1.5rem 1.4rem;display:flex;flex-direction:column}
+.cab-card-wide{grid-column:1 / -1}
+.cab-card-head{display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}
+.cab-card-ico{flex-shrink:0;width:38px;height:38px;border-radius:11px;display:inline-flex;align-items:center;justify-content:center;background:var(--gold-bg);border:1px solid rgba(201,168,76,.28);color:var(--gold2)}
+.cab-card-ico svg{width:20px;height:20px;display:block}
+.cab-card-title{font-family:var(--display);font-size:1.06rem;font-weight:600;color:var(--txt)}
+.cab-rows{display:flex;flex-direction:column}
+.cab-row{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.62rem 0;border-bottom:1px solid var(--edge)}
+.cab-row:last-child{border-bottom:none}
+.cab-k{font-size:.85rem;color:var(--txt3);flex-shrink:0}
+.cab-v{font-size:.9rem;color:var(--txt);font-weight:500;text-align:right;word-break:break-word;min-width:0}
+.cab-muted{font-size:.86rem;color:var(--txt2);line-height:1.55;margin:0}
+.cab-badge{display:inline-flex;align-items:center;padding:.18rem .6rem;border-radius:999px;font-size:.72rem;font-weight:600;letter-spacing:.02em;background:rgba(255,255,255,.06);border:1px solid var(--edge2);color:var(--txt2)}
+.cab-badge.ok{background:rgba(46,204,138,.1);border-color:rgba(46,204,138,.34);color:var(--green)}
+.cab-tariff-status{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap}
+.cab-tariff-name{font-family:var(--display);font-size:1.05rem;font-weight:600;color:var(--gold2)}
+.cab-tariff-actions{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-top:1.2rem}
+.cab-quick{display:grid;grid-template-columns:repeat(3,1fr);gap:.7rem}
+.cab-quick .api-pro-btn{width:100%}
+@media(max-width:760px){
+  .cab-grid{grid-template-columns:1fr}
+  .cab-tariff-actions{grid-template-columns:1fr}
+  .cab-quick{grid-template-columns:1fr}
+  .cab-h{font-size:1.3rem}
+}
+
+/* PR #26 — пустой статус Ozon в шаге 1 «Расчёта» (форма подключения переехала в кабинет) */
+.api-conn-empty{display:flex;flex-direction:column;gap:.7rem}
+.api-conn-empty-row{display:flex;align-items:center;gap:.55rem;font-weight:600;color:var(--txt)}
+.api-conn-empty-dot{width:9px;height:9px;border-radius:50%;background:var(--gold);box-shadow:0 0 0 3px rgba(201,168,76,.16);flex-shrink:0}
       `}</style>
 
       <div className="dash-top">
@@ -7434,6 +7473,21 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 </svg>
               </span>
               Отчёты
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "cabinet"}
+              className={"main-tab" + (mainTab === "cabinet" ? " active" : "")}
+              onClick={() => setMainTab("cabinet")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="8" r="3.4" />
+                  <path d="M5 20c0-3.6 3.1-5.6 7-5.6s7 2 7 5.6" />
+                </svg>
+              </span>
+              Личный кабинет
             </button>
           </div>
         )}
@@ -8037,7 +8091,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   <div className="upgrade-hint-left">
                     <span className="upgrade-hint-dot" aria-hidden="true" />
                     <span className="upgrade-hint-text">
-                      Лимит расчётов исчерпан — выберите тариф в блоке ниже
+                      Лимит расчётов исчерпан —{" "}
+                      {user
+                        ? "оформите тариф во вкладке «Личный кабинет»"
+                        : "выберите тариф в блоке ниже"}
                     </span>
                   </div>
                 </div>
@@ -8272,7 +8329,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             <div className="api-step">
               <div className="api-step-head">
                 <span className="api-step-num">1</span>
-                <span className="api-step-title">Подключите Ozon</span>
+                <span className="api-step-title">Подключение Ozon</span>
               </div>
 
               {!user ? (
@@ -8298,94 +8355,25 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   </span>
                 </div>
               ) : (
-                <>
-                  {ozonConn && ozonConn.status !== "not_connected" && (
-                    <div className="api-alert err" role="alert">
-                      <span className="api-alert-ico">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <circle cx="12" cy="12" r="9" />
-                          <path d="M12 8v5" />
-                          <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
-                        </svg>
-                      </span>
-                      <span className="api-alert-text">
-                        {ozonConn.status === "invalid_key"
-                          ? "Неверный ключ — переподключите кабинет"
-                          : ozonConn.status === "forbidden"
-                          ? "Недостаточно прав у ключа — проверьте доступы в Ozon"
-                          : ozonConn.status === "unavailable"
-                          ? "Ozon временно недоступен — попробуйте позже"
-                          : "Кабинет не подключён"}
-                      </span>
-                    </div>
-                  )}
-
-                  <div className="api-pro-grid">
-                    <div className="api-fld">
-                      <label>Ozon Client ID</label>
-                      <input
-                        className="api-input"
-                        type="text"
-                        placeholder="Например, 123456"
-                        value={ozonClientId}
-                        onChange={(e) => setOzonClientId(e.target.value)}
-                        disabled={ozonBusy !== "idle"}
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                    </div>
-
-                    <div className="api-fld">
-                      <label>Ozon API Key</label>
-                      <div className="api-secret">
-                        <input
-                          className="api-input"
-                          type={showOzonKey ? "text" : "password"}
-                          placeholder="Вставьте секретный ключ"
-                          value={ozonApiKey}
-                          onChange={(e) => setOzonApiKey(e.target.value)}
-                          disabled={ozonBusy !== "idle"}
-                          autoComplete="off"
-                          spellCheck={false}
-                        />
-                        <button
-                          type="button"
-                          className="api-eye"
-                          onClick={() => setShowOzonKey((v) => !v)}
-                          disabled={ozonBusy !== "idle"}
-                          aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
-                          title={showOzonKey ? "Скрыть" : "Показать"}
-                        >
-                          {showOzonKey ? eyeOffIcon : eyeIcon}
-                        </button>
-                      </div>
-                    </div>
+                <div className="api-conn-empty">
+                  <div className="api-conn-empty-row">
+                    <span className="api-conn-empty-dot" aria-hidden="true" />
+                    <span>Ozon API не подключён</span>
                   </div>
-
-                  <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr", marginTop: "1rem" }}>
-                    <button
-                      type="button"
-                      className="api-pro-btn"
-                      onClick={connectOzon}
-                      disabled={ozonBusy !== "idle"}
-                    >
-                      {ozonBusy === "connecting" ? (
-                        <>
-                          <span className="spin" />
-                          Подключаем…
-                        </>
-                      ) : (
-                        "Подключить Ozon"
-                      )}
-                    </button>
-                  </div>
-                </>
-              )}
-
-              {ozonConnError && (
-                <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
-                  {ozonConnError}
-                </p>
+                  <p className="api-pro-msg" style={{ marginTop: 0 }}>
+                    Подключение Ozon API и управление ключами теперь в «Личном
+                    кабинете». Подключите кабинет — и авторасчёт по API станет
+                    доступен здесь.
+                  </p>
+                  <button
+                    type="button"
+                    className="api-pro-btn"
+                    onClick={() => setMainTab("cabinet")}
+                    style={{ width: "100%" }}
+                  >
+                    Перейти в Личный кабинет
+                  </button>
+                </div>
               )}
             </div>
 
@@ -8693,57 +8681,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         <div className="api-extra-heading">Дополнительные действия и диагностика</div>
         <p className="api-extra-note">
           Эти инструменты не нужны для обычного расчёта. Откройте их, только если
-          часть товаров не сопоставлена с каталогом или нужно перепроверить
-          подключение. Прибыль здесь не считается и попытка не списывается.
+          часть товаров не сопоставлена с каталогом. Подключение и проверка Ozon
+          API — во вкладке «Личный кабинет». Прибыль здесь не считается и попытка
+          не списывается.
         </p>
-        <details className="card api-pro-card api-extra">
-          <summary className="api-pro-head api-extra-sum">
-            <div className="api-pro-title">Управление подключением Ozon</div>
-            <p className="api-pro-sub">
-              Перепроверить сохранённый ключ или отключить кабинет. Для обычного
-              расчёта не требуется.
-            </p>
-          </summary>
-
-          <div className="api-pro-body">
-            {!ozonConn?.connected ? (
-              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
-                Сначала подключите Ozon выше.
-              </p>
-            ) : (
-              <div className="api-pro-actions">
-                <button
-                  type="button"
-                  className="api-pro-btn ghost"
-                  onClick={verifyOzon}
-                  disabled={ozonBusy !== "idle"}
-                >
-                  {ozonBusy === "checking" ? (
-                    <>
-                      <span className="spin" />
-                      Проверяем…
-                    </>
-                  ) : (
-                    "Проверить подключение"
-                  )}
-                </button>
-                <button
-                  type="button"
-                  className="api-pro-btn danger"
-                  onClick={deleteOzon}
-                  disabled={ozonBusy !== "idle"}
-                >
-                  {ozonBusy === "deleting" ? "Удаляем…" : "Удалить подключение"}
-                </button>
-              </div>
-            )}
-            {ozonConnError && (
-              <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
-                {ozonConnError}
-              </p>
-            )}
-          </div>
-        </details>
         <details className="card api-pro-card api-extra">
           <summary className="api-pro-head api-extra-sum">
             <div className="api-pro-title">Диагностика сопоставления товаров</div>
@@ -10357,13 +10298,13 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             </div>
           )}
 
-        {/* Тарифный блок dashboard. Показ зависит от прав (entitlements):
-            • unlimited активен → блок СТАТУСА тарифа (без карточек покупки),
-              скрывается крестиком (localStorage mprof_unlimited_banner_hidden);
+        {/* Тарифный блок лендинга для НЕвошедших гостей (logged-out). Для вошедших
+            пользователей тарифы/покупка живут во вкладке «Личный кабинет», поэтому
+            здесь блок гейтится по !user. Показ зависит от прав (entitlements):
             • не unlimited И (есть single-кредит ИЛИ нет доступа) → карточки покупки;
             • иначе (free с остатком бесплатного расчёта) → ничего.
             entitlementsLoaded-гейт убирает мерцание до ответа Supabase. */}
-        {entitlementsLoaded && hasPremium && !unlimitedBannerHidden && (
+        {!user && entitlementsLoaded && hasPremium && !unlimitedBannerHidden && (
           <div className="card tariff-card tariff-status" id="dash-tariff-status">
             <button
               type="button"
@@ -10395,7 +10336,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           </div>
         )}
 
-        {entitlementsLoaded &&
+        {!user &&
+          entitlementsLoaded &&
           !hasPremium &&
           (singleCredits > 0 || !canCalculate) && (
             <div className="card tariff-card" id="dash-tariffs">
@@ -10808,6 +10750,346 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         {user && mainTab === "catalog" && (
           <ProductCatalog user={user} showToast={showToast} />
         )}
+
+        {/* PR #26: вкладка «Личный кабинет». Гейтится по user (для гостя её нет —
+            показывается карточка входа выше), поэтому внутри user уже не null.
+            Покупка тарифов и подключение Ozon API живут здесь; вкладка «Расчёт»
+            только потребляет статус. Бэкенд/handlers переиспользуются как есть. */}
+        {user &&
+          mainTab === "cabinet" &&
+          (() => {
+            const remaining = Math.max(
+              0,
+              freeCalculationsLimit + singleCredits - calcCount,
+            );
+            const planLabel = !entitlementsLoaded
+              ? "…"
+              : hasPremium
+              ? "Безлимит"
+              : singleCredits > 0
+              ? "Разовые расчёты"
+              : "Бесплатный";
+            return (
+              <div className="cab-wrap">
+                <div className="cab-head">
+                  <h2 className="cab-h">Личный кабинет</h2>
+                  <p className="cab-sub">
+                    Профиль, тариф и подключение Ozon API — в одном месте.
+                  </p>
+                </div>
+
+                <div className="cab-grid">
+                  {/* Профиль и информация по аккаунту */}
+                  <div className="cab-card">
+                    <div className="cab-card-head">
+                      <span className="cab-card-ico" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="8" r="3.4" />
+                          <path d="M5 20c0-3.6 3.1-5.6 7-5.6s7 2 7 5.6" />
+                        </svg>
+                      </span>
+                      <div className="cab-card-title">Профиль</div>
+                    </div>
+                    <div className="cab-rows">
+                      <div className="cab-row">
+                        <span className="cab-k">Email</span>
+                        <span className="cab-v">{user.email}</span>
+                      </div>
+                      <div className="cab-row">
+                        <span className="cab-k">Текущий тариф</span>
+                        <span className="cab-v">{planLabel}</span>
+                      </div>
+                      <div className="cab-row">
+                        <span className="cab-k">Доступно расчётов</span>
+                        <span className="cab-v">
+                          {!entitlementsLoaded
+                            ? "…"
+                            : hasPremium
+                            ? "Без ограничений"
+                            : String(remaining)}
+                        </span>
+                      </div>
+                      {hasPremium && formatRuDate(premiumUntil) && (
+                        <div className="cab-row">
+                          <span className="cab-k">Подписка до</span>
+                          <span className="cab-v">
+                            {formatRuDate(premiumUntil)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      className="api-pro-btn ghost"
+                      onClick={signOut}
+                      disabled={signingOut}
+                      aria-busy={signingOut}
+                      style={{ width: "100%", marginTop: "1.1rem" }}
+                    >
+                      {signingOut ? "Выходим…" : "Выйти из аккаунта"}
+                    </button>
+                  </div>
+
+                  {/* Тариф: статус + покупка */}
+                  <div className="cab-card">
+                    <div className="cab-card-head">
+                      <span className="cab-card-ico" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20.6 13.4 13.4 20.6a2 2 0 0 1-2.8 0l-7-7V4h9.6l7.4 7.4a2 2 0 0 1 0 2z" />
+                          <circle cx="7.5" cy="7.5" r="1.2" fill="currentColor" stroke="none" />
+                        </svg>
+                      </span>
+                      <div className="cab-card-title">Тариф</div>
+                    </div>
+
+                    {!entitlementsLoaded ? (
+                      <p className="cab-muted">Загружаем данные тарифа…</p>
+                    ) : hasPremium ? (
+                      <>
+                        <div className="cab-tariff-status">
+                          <span className="cab-badge ok">Активно</span>
+                          <span className="cab-tariff-name">
+                            Тариф: Безлимит
+                          </span>
+                        </div>
+                        <p className="cab-muted" style={{ marginTop: ".7rem" }}>
+                          Неограниченное количество расчётов
+                          {formatRuDate(premiumUntil)
+                            ? ` до ${formatRuDate(premiumUntil)}`
+                            : ""}
+                          .
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="cab-tariff-status">
+                          <span className="cab-badge">
+                            {singleCredits > 0 ? "Разовые" : "Бесплатный"}
+                          </span>
+                          <span className="cab-tariff-name">
+                            {singleCredits > 0
+                              ? "Разовые расчёты"
+                              : "Бесплатный доступ"}
+                          </span>
+                        </div>
+                        <p className="cab-muted" style={{ marginTop: ".7rem" }}>
+                          {remaining > 0
+                            ? `Доступно расчётов: ${remaining}`
+                            : "Лимит расчётов исчерпан — оформите тариф ниже."}
+                        </p>
+                        <div className="cab-tariff-actions">
+                          <button
+                            type="button"
+                            className="api-pro-btn ghost"
+                            onClick={() => handleTariff("single")}
+                          >
+                            Разовый — 149&nbsp;₽
+                          </button>
+                          <button
+                            type="button"
+                            className="api-pro-btn"
+                            onClick={() => handleTariff("unlimited")}
+                          >
+                            Безлимит — 449&nbsp;₽
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {/* Подключение Ozon API — на всю ширину */}
+                  <div className="cab-card cab-card-wide">
+                    <div className="cab-card-head">
+                      <span className="cab-card-ico" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="4" y="5" width="16" height="14" rx="2" />
+                          <path d="M4 9.5h16" />
+                          <circle cx="7" cy="7.2" r=".6" fill="currentColor" stroke="none" />
+                        </svg>
+                      </span>
+                      <div className="cab-card-title">Подключение Ozon API</div>
+                    </div>
+                    <p className="cab-muted" style={{ marginBottom: "1rem" }}>
+                      Ключ хранится в зашифрованном виде и в браузер не
+                      возвращается — видны только статус и маска. После подключения
+                      авторасчёт по API доступен во вкладке «Расчёт».
+                    </p>
+
+                    {ozonConnLoading ? (
+                      <p className="api-pro-msg" style={{ marginTop: ".2rem" }}>
+                        Проверяем подключение…
+                      </p>
+                    ) : ozonConn?.connected ? (
+                      <>
+                        <div className="api-conn-ok" role="status">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="9" />
+                            <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                          </svg>
+                          <span>
+                            <b>Ozon подключён</b>
+                            <span className="api-conn-ok-meta">
+                              {ozonConn.clientIdMasked ? ` · Client ID ${ozonConn.clientIdMasked}` : ""}
+                              {ozonConn.keyLast4 ? ` · ключ ••••${ozonConn.keyLast4}` : ""}
+                            </span>
+                          </span>
+                        </div>
+                        <div className="api-pro-actions">
+                          <button
+                            type="button"
+                            className="api-pro-btn ghost"
+                            onClick={verifyOzon}
+                            disabled={ozonBusy !== "idle"}
+                          >
+                            {ozonBusy === "checking" ? (
+                              <>
+                                <span className="spin" />
+                                Проверяем…
+                              </>
+                            ) : (
+                              "Проверить подключение"
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            className="api-pro-btn danger"
+                            onClick={deleteOzon}
+                            disabled={ozonBusy !== "idle"}
+                          >
+                            {ozonBusy === "deleting" ? "Отключаем…" : "Отключить"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        {ozonConn && ozonConn.status !== "not_connected" && (
+                          <div className="api-alert err" role="alert">
+                            <span className="api-alert-ico">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="9" />
+                                <path d="M12 8v5" />
+                                <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+                              </svg>
+                            </span>
+                            <span className="api-alert-text">
+                              {ozonConn.status === "invalid_key"
+                                ? "Неверный ключ — переподключите кабинет"
+                                : ozonConn.status === "forbidden"
+                                ? "Недостаточно прав у ключа — проверьте доступы в Ozon"
+                                : ozonConn.status === "unavailable"
+                                ? "Ozon временно недоступен — попробуйте позже"
+                                : "Кабинет не подключён"}
+                            </span>
+                          </div>
+                        )}
+
+                        <div className="api-pro-grid">
+                          <div className="api-fld">
+                            <label>Ozon Client ID</label>
+                            <input
+                              className="api-input"
+                              type="text"
+                              placeholder="Например, 123456"
+                              value={ozonClientId}
+                              onChange={(e) => setOzonClientId(e.target.value)}
+                              disabled={ozonBusy !== "idle"}
+                              autoComplete="off"
+                              spellCheck={false}
+                            />
+                          </div>
+
+                          <div className="api-fld">
+                            <label>Ozon API Key</label>
+                            <div className="api-secret">
+                              <input
+                                className="api-input"
+                                type={showOzonKey ? "text" : "password"}
+                                placeholder="Вставьте секретный ключ"
+                                value={ozonApiKey}
+                                onChange={(e) => setOzonApiKey(e.target.value)}
+                                disabled={ozonBusy !== "idle"}
+                                autoComplete="off"
+                                spellCheck={false}
+                              />
+                              <button
+                                type="button"
+                                className="api-eye"
+                                onClick={() => setShowOzonKey((v) => !v)}
+                                disabled={ozonBusy !== "idle"}
+                                aria-label={showOzonKey ? "Скрыть ключ" : "Показать ключ"}
+                                title={showOzonKey ? "Скрыть" : "Показать"}
+                              >
+                                {showOzonKey ? eyeOffIcon : eyeIcon}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr", marginTop: "1rem" }}>
+                          <button
+                            type="button"
+                            className="api-pro-btn"
+                            onClick={connectOzon}
+                            disabled={ozonBusy !== "idle"}
+                          >
+                            {ozonBusy === "connecting" ? (
+                              <>
+                                <span className="spin" />
+                                Подключаем…
+                              </>
+                            ) : (
+                              "Подключить Ozon"
+                            )}
+                          </button>
+                        </div>
+                      </>
+                    )}
+
+                    {ozonConnError && (
+                      <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
+                        {ozonConnError}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Быстрые действия — на всю ширину */}
+                  <div className="cab-card cab-card-wide">
+                    <div className="cab-card-head">
+                      <span className="cab-card-ico" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M13 3 4 14h7l-1 7 9-11h-7z" />
+                        </svg>
+                      </span>
+                      <div className="cab-card-title">Быстрые действия</div>
+                    </div>
+                    <div className="cab-quick">
+                      <button
+                        type="button"
+                        className="api-pro-btn ghost"
+                        onClick={() => setMainTab("calc")}
+                      >
+                        Перейти к расчёту
+                      </button>
+                      <button
+                        type="button"
+                        className="api-pro-btn ghost"
+                        onClick={() => setMainTab("catalog")}
+                      >
+                        Каталог товаров
+                      </button>
+                      <button
+                        type="button"
+                        className="api-pro-btn ghost"
+                        onClick={() => setMainTab("reports")}
+                      >
+                        Отчёты
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
       </div>
 
       {/* PR #25: модалка-предупреждение о дубле расчёта за месяц. Открывается
