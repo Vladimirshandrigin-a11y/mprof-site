@@ -4427,12 +4427,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   radial-gradient(700px 500px at -10% 110%,rgba(201,168,76,.05),transparent 60%);
   background-attachment:fixed;min-height:100vh}
 
-.dash-top{position:sticky;top:0;z-index:80;display:flex;align-items:center;justify-content:space-between;
-  gap:1rem 1.4rem;flex-wrap:wrap;
-  padding:.8rem 2rem;background:rgba(8,10,20,.82);backdrop-filter:blur(18px) saturate(1.3);
-  -webkit-backdrop-filter:blur(18px) saturate(1.3);
+.dash-top{position:sticky;top:0;z-index:80;
+  background:rgba(8,10,20,.97);backdrop-filter:blur(16px) saturate(1.2);
+  -webkit-backdrop-filter:blur(16px) saturate(1.2);
   border-bottom:1px solid var(--edge)}
-.dash-brand{font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
+.dash-top-inner{max-width:1100px;margin:0 auto;
+  display:flex;align-items:center;justify-content:space-between;
+  gap:1rem 1.4rem;flex-wrap:wrap;padding:.8rem 2rem}
+.dash-brand{flex:1 1 0;font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
 .dash-brand em{font-style:italic;color:var(--gold)}
 .dash-status{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.66rem;
   color:var(--gold2);letter-spacing:.06em;border:1px solid rgba(201,168,76,.3);
@@ -4441,7 +4443,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.6)}}
 
-.dash-user{display:inline-flex;align-items:center;gap:10px}
+.dash-user{flex:1 1 0;display:flex;align-items:center;justify-content:flex-end;gap:10px}
 .dash-user-email{font-family:var(--mono);font-size:.63rem;color:var(--txt2);letter-spacing:.04em;
   max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dash-signout{font-family:var(--sans);font-size:.75rem;font-weight:500;background:transparent;
@@ -7134,7 +7136,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   color:var(--red);
 }
 @media(max-width:900px){
-  .dash-top{padding:.7rem 1.2rem;gap:.55rem .8rem}
+  .dash-top-inner{padding:.7rem 1.2rem;gap:.55rem .8rem}
   .dash-status{font-size:.6rem;padding:5px 12px}
   .dash-wrap{padding:1.5rem 1.2rem 4rem}
   .dash-grid{grid-template-columns:1fr}
@@ -7295,6 +7297,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
       `}</style>
 
       <div className="dash-top">
+        <div className="dash-top-inner">
         <a href="/" className="dash-brand">
           M&#8209;<em>Prof</em>
         </a>
@@ -7386,6 +7389,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             Первый расчёт бесплатно
           </div>
         )}
+        </div>
       </div>
 
       <div className="dash-wrap">
