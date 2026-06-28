@@ -118,6 +118,10 @@ export function ProductCatalog({ user, showToast }: Props) {
   const [costSavingId, setCostSavingId] = useState<string | null>(null);
   const [costErr, setCostErr] = useState<Record<string, string>>({});
 
+  // «Сохранить все»: идёт массовое сохранение инлайн-правок себестоимости
+  // (несколько изменённых строк сразу). Блокирует кнопку на время запросов.
+  const [savingAll, setSavingAll] = useState(false);
+
   // Поиск и фильтры каталога. Чисто UI-слой: фильтруют уже отсортированный
   // список для отображения и НЕ трогают Supabase, формулы прибыли, парсеры,
   // Excel или сохранение себестоимости.
@@ -654,6 +658,119 @@ export function ProductCatalog({ user, showToast }: Props) {
     }
   }
 
+  // --- «Сохранить все»: массовое сохранение инлайн-правок себестоимости -----
+  // Dirty-строки берём из costDraft — это поля себестоимости, которые
+  // пользователь руками менял прямо в строках таблицы. Цель ровно одна:
+  // сохранить ВСЕ изменённые строки одной кнопкой, каждую с её собственным
+  // значением. Никакой новой Supabase-логики и bulk-роута (его нет) — для
+  // каждой строки переиспользуем существующую updateProductInCloud, как уже
+  // делают saveCost и applyBulkCost. Schema/RPC/роуты/формулы не трогаем.
+  //
+  //   dirtyCostTargets   — валидные изменённые строки (число > 0 и отличается
+  //                        от сохранённого cost_price); только их сохраняем и
+  //                        показываем счётчик в кнопке «Сохранить все (N)»;
+  //   dirtyCostInvalidIds — строки, где введён текст, но он невалиден (≤ 0 или
+  //                        мусор): НЕ сохраняем (данные не выдумываем), при
+  //                        клике подсвечиваем ошибку и не теряем ввод.
+  const { dirtyCostTargets, dirtyCostInvalidIds } = useMemo(() => {
+    const targets: { product: Product; parsed: number }[] = [];
+    const invalid: string[] = [];
+    for (const p of products) {
+      const raw = costDraft[p.id];
+      if (raw === undefined) continue; // строку не трогали
+      if (raw.trim() === "") continue; // поле очищено — сохранять нечего
+      const parsed = parseCost(raw); // запятая → точка внутри parseCost
+      if (parsed === null || parsed <= 0) {
+        invalid.push(p.id);
+        continue;
+      }
+      if (parsed === p.cost_price) continue; // значение фактически не менялось
+      targets.push({ product: p, parsed });
+    }
+    return { dirtyCostTargets: targets, dirtyCostInvalidIds: invalid };
+  }, [products, costDraft]);
+  const dirtyCostCount = dirtyCostTargets.length;
+
+  // Сохранить все изменённые строки. Контролируемо и последовательно (без сотни
+  // параллельных запросов): идём по одному updateProductInCloud. Успешные строки
+  // чистим от черновика/ошибки и точечно вносим в локальный state (без reload —
+  // чтобы список не мигал и не сбивалась сортировка, cost_price не в ключе сорта).
+  // Неуспешные и невалидные значения НЕ теряем: оставляем ввод и помечаем ошибкой.
+  async function saveAllCosts() {
+    if (savingAll) return;
+    const targets = dirtyCostTargets;
+    const invalidIds = dirtyCostInvalidIds;
+
+    // Невалидный ввод подсвечиваем (значение в поле остаётся, не теряется).
+    if (invalidIds.length > 0) {
+      setCostErr((e) => {
+        const next = { ...e };
+        for (const id of invalidIds) next[id] = "Введите число больше 0";
+        return next;
+      });
+    }
+    if (targets.length === 0) {
+      if (invalidIds.length > 0) {
+        showToast("Проверьте подсвеченные поля: нужно число больше 0", "warn");
+      }
+      return;
+    }
+
+    setSavingAll(true);
+    let ok = 0;
+    let failed = 0;
+    const updatedById = new Map<string, Product>();
+    const failedIds: string[] = [];
+    for (const { product, parsed } of targets) {
+      const { data, error } = await updateProductInCloud(
+        product.id,
+        { cost_price: parsed },
+        user.id
+      );
+      if (error) {
+        failed++;
+        failedIds.push(product.id);
+      } else {
+        ok++;
+        updatedById.set(product.id, data ?? { ...product, cost_price: parsed });
+      }
+    }
+
+    // Точечно обновляем сохранённые строки в локальном state.
+    if (updatedById.size > 0) {
+      setProducts((prev) => prev.map((x) => updatedById.get(x.id) ?? x));
+    }
+    // Черновик/ошибку чистим ТОЛЬКО у успешно сохранённых; у неуспешных
+    // оставляем введённое значение и помечаем ошибкой (ввод не теряется).
+    setCostDraft((d) => {
+      const next = { ...d };
+      updatedById.forEach((_, id) => delete next[id]);
+      return next;
+    });
+    setCostErr((e) => {
+      const next = { ...e };
+      updatedById.forEach((_, id) => delete next[id]);
+      for (const id of failedIds) next[id] = "Не удалось сохранить";
+      return next;
+    });
+    setSavingAll(false);
+
+    if (failed === 0 && invalidIds.length === 0) {
+      showToast(`Сохранено: ${ok} ${pluralProducts(ok)}`, "ok");
+    } else if (ok > 0) {
+      const left = failed + invalidIds.length;
+      showToast(
+        `Сохранено: ${ok} ${pluralProducts(ok)}, не удалось — ${left}`,
+        "warn"
+      );
+    } else {
+      showToast(
+        "Не удалось сохранить. Проверьте значения и попробуйте ещё раз.",
+        "err"
+      );
+    }
+  }
+
   return (
     <section className="pc">
       <div className="pc-head">
@@ -667,6 +784,33 @@ export function ProductCatalog({ user, showToast }: Props) {
         </div>
         {!formOpen && (
           <div className="pc-actions">
+            <button
+              type="button"
+              className={"pc-saveall" + (dirtyCostCount > 0 ? " has-changes" : "")}
+              onClick={saveAllCosts}
+              disabled={savingAll || dirtyCostCount === 0}
+              title={
+                dirtyCostCount > 0
+                  ? `Сохранить изменённую себестоимость: ${dirtyCostCount} ${pluralProducts(dirtyCostCount)}`
+                  : "Измените себестоимость в строках, чтобы сохранить всё разом"
+              }
+            >
+              {savingAll ? (
+                <>
+                  <span className="pc-spinner pc-spinner-sm" aria-hidden="true" />
+                  Сохраняем…
+                </>
+              ) : (
+                <>
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M5 13l4 4L19 7" />
+                  </svg>
+                  {dirtyCostCount > 0
+                    ? `Сохранить все (${dirtyCostCount})`
+                    : "Сохранить все"}
+                </>
+              )}
+            </button>
             <button
               type="button"
               className="pc-import-btn"
@@ -1260,6 +1404,49 @@ export function ProductCatalog({ user, showToast }: Props) {
           width: 15px;
           height: 15px;
           border-width: 2px;
+        }
+
+        .pc-saveall {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          min-height: 44px;
+          padding: 0 16px;
+          font-family: var(--sans);
+          font-size: 0.88rem;
+          font-weight: 600;
+          color: var(--txt2);
+          cursor: pointer;
+          border: 1px solid var(--edge2);
+          border-radius: 11px;
+          background: rgba(255, 255, 255, 0.03);
+          transition: color 0.18s ease, border-color 0.18s ease,
+            background 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+          white-space: nowrap;
+        }
+        .pc-saveall:disabled {
+          opacity: 0.55;
+          cursor: default;
+        }
+        .pc-saveall.has-changes {
+          color: var(--void);
+          font-weight: 700;
+          border-color: transparent;
+          background: linear-gradient(135deg, var(--gold) 0%, var(--gold2) 100%);
+          box-shadow: 0 8px 24px rgba(201, 168, 76, 0.28);
+        }
+        .pc-saveall.has-changes:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 12px 30px rgba(201, 168, 76, 0.36);
+        }
+        .pc-saveall svg {
+          width: 16px;
+          height: 16px;
+          stroke: currentColor;
+          stroke-width: 2.2;
+          fill: none;
+          stroke-linecap: round;
+          stroke-linejoin: round;
         }
 
         .pc-import {
@@ -2059,7 +2246,8 @@ export function ProductCatalog({ user, showToast }: Props) {
             flex-direction: column-reverse;
           }
           .pc-add,
-          .pc-import-btn {
+          .pc-import-btn,
+          .pc-saveall {
             width: 100%;
             justify-content: center;
           }
