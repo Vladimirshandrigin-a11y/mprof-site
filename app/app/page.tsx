@@ -923,6 +923,70 @@ export default function AppPage() {
   const [, setHistoryRefresh] = useState(0);
   // Ошибка загрузки истории из облака → показываем error-state с кнопкой «Повторить».
   const [historyError, setHistoryError] = useState(false);
+
+  // ── PR #25: защита от случайного дубля расчёта за один месяц ──────────────
+  // Мягкое предупреждение (НЕ overwrite/НЕ удаление старого): перед сохранением
+  // НОВОГО расчёта за месяц, который уже есть в истории, показываем модалку с
+  // выбором «Отмена» / «Создать новый расчёт всё равно». Проверка читает уже
+  // загруженную историю; месяц определяется так же, как в отчётах (calcMonthKey).
+  // Никаких новых запросов/таблиц/SQL — чисто клиентская защита.
+  const [dupModal, setDupModal] = useState<{
+    monthLabel: string;
+    existing: CalcResult;
+  } | null>(null);
+  // resolve открытого confirm-промиса: true = «создать всё равно», false = «отмена».
+  const dupResolveRef = useRef<((proceed: boolean) => void) | null>(null);
+
+  // Ищет в истории расчёт за тот же месяц и маркетплейс (Ozon-дубль — среди
+  // Ozon-расчётов). Месяц берётся через calcMonthKey: отчётный месяц из периода,
+  // иначе месяц создания. mode-agnostic — два расчёта одного месяца (API + ручной +
+  // файл) одинаково попадают в отчёты, поэтому дублем считаем любой по месяцу+МП.
+  const findCalcForMonth = useCallback(
+    (monthKey: string | null, mp: Marketplace): CalcResult | null => {
+      if (!monthKey) return null;
+      return (
+        history.find(
+          (h) => h.marketplace === mp && calcMonthKey(h) === monthKey
+        ) ?? null
+      );
+    },
+    [history]
+  );
+
+  // Promise-обёртка confirm-модалки. monthKey === null (месяц надёжно не определить)
+  // или дубля нет → сразу resolve(true): НЕ блокируем сохранение. Есть дубль →
+  // открываем модалку и ждём решения пользователя (resolve лежит в dupResolveRef).
+  const confirmNoMonthDuplicate = useCallback(
+    (monthKey: string | null, mp: Marketplace): Promise<boolean> => {
+      const existing = findCalcForMonth(monthKey, mp);
+      if (!monthKey || !existing) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => {
+        dupResolveRef.current = resolve;
+        setDupModal({ monthLabel: formatMonthLabel(monthKey), existing });
+      });
+    },
+    [findCalcForMonth]
+  );
+
+  // Закрывает модалку и резолвит ожидающий промис. proceed=false («Отмена») →
+  // вызывающий код просто выходит, ничего не сохраняет и НЕ списывает попытку.
+  const resolveDupModal = useCallback((proceed: boolean) => {
+    const resolve = dupResolveRef.current;
+    dupResolveRef.current = null;
+    setDupModal(null);
+    resolve?.(proceed);
+  }, []);
+
+  // Esc закрывает дубль-модалку как «Отмена» (доступность).
+  useEffect(() => {
+    if (!dupModal) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") resolveDupModal(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [dupModal, resolveDupModal]);
+  // ── /PR #25 ───────────────────────────────────────────────────────────────
   // История грузится дольше 10с → мягкая подсказка (не ошибка) про интернет/обновление.
   const [historySlow, setHistorySlow] = useState(false);
   const [user, setUser] = useState<User | null>(null);
@@ -2585,6 +2649,24 @@ export default function AppPage() {
       return;
     }
 
+    // PR #25: дубль-гард ДО списания. Месяц — из периода отчёта (приоритет) или
+    // имени XLSX-файла; если месяц надёжно не определить (null) → НЕ блокируем,
+    // сохранение важнее. «Отмена» → откатываем статус в idle и выходим ДО
+    // consumeCalculation (попытка НЕ списывается).
+    const uploadMonth = resolveReportMonth(
+      xlsxRes.report.period,
+      slotXlsx?.name ?? null
+    );
+    if (
+      !(await confirmNoMonthDuplicate(
+        uploadMonth ? uploadMonth.slice(0, 7) : null,
+        "ozon"
+      ))
+    ) {
+      setCombinedStatus("idle");
+      return;
+    }
+
     // Все парсы прошли. Списываем расчёт server-authoritative ДО построения и
     // сохранения результата — кредит не сгорает на ошибке парсинга файлов.
     const consumed = await consumeCalculation();
@@ -3780,6 +3862,10 @@ export default function AppPage() {
       setProfitError("Выберите месяц");
       return;
     }
+    // PR #25: дубль-гард ДО любого запроса/списания. profitMonth уже 'YYYY-MM'.
+    // «Отмена» → выходим сразу: /api/ozon/save-calculation НЕ вызывается, поэтому
+    // попытка НЕ списывается (для API это критично — списание на сервере в save).
+    if (!(await confirmNoMonthDuplicate(profitMonth, "ozon"))) return;
     setProfitLoading(true);
     setProfitError("");
     setProfitResult(null);
@@ -4119,6 +4205,16 @@ export default function AppPage() {
       setSelectedTier(null);
       setTariffModalOpen(true);
       return;
+    }
+    // PR #25: дубль-гард. Ручной расчёт всегда относится к ТЕКУЩЕМУ месяцу
+    // (периода отчёта нет → calcMonthKey берёт месяц создания записи). «Отмена» →
+    // выходим ДО setIsCalculating/consumeCalculation: попытка НЕ списывается.
+    {
+      const dnow = new Date();
+      const curMonthKey = `${dnow.getFullYear()}-${String(
+        dnow.getMonth() + 1
+      ).padStart(2, "0")}`;
+      if (!(await confirmNoMonthDuplicate(curMonthKey, marketplace))) return;
     }
     setIsCalculating(true);
 
@@ -7049,6 +7145,106 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   .tariff-status-x{width:44px;height:44px}
   .upload-slot-remove{width:44px;height:44px}
   .onboard-close{width:44px;height:44px}
+}
+
+/* ── PR #25: модалка-предупреждение о дубле расчёта за месяц ─────────────── */
+.dg-overlay{
+  position:fixed;inset:0;z-index:1100;
+  background:rgba(4,6,14,.78);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  display:flex;align-items:center;justify-content:center;
+  padding:1.5rem;animation:dgFade .24s ease both;
+  font-family:'Outfit',sans-serif;color:#E8EEF8
+}
+@keyframes dgFade{from{opacity:0}to{opacity:1}}
+.dg-card{
+  position:relative;max-width:480px;width:100%;
+  background:linear-gradient(160deg,
+    rgba(201,168,76,.10) 0%, rgba(13,16,32,.96) 70%);
+  border:1px solid rgba(201,168,76,.32);
+  border-radius:20px;padding:2.2rem 2rem 1.8rem;
+  backdrop-filter:blur(22px) saturate(1.3);
+  -webkit-backdrop-filter:blur(22px) saturate(1.3);
+  box-shadow:0 32px 90px rgba(0,0,0,.6),0 0 90px rgba(201,168,76,.14);
+  animation:dgSlide .32s cubic-bezier(.22,1,.36,1) both
+}
+@keyframes dgSlide{
+  from{opacity:0;transform:translateY(12px) scale(.97)}
+  to{opacity:1;transform:translateY(0) scale(1)}
+}
+.dg-ico{
+  width:44px;height:44px;border-radius:13px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,
+    rgba(201,168,76,.26),rgba(201,168,76,.06));
+  border:1px solid rgba(201,168,76,.32);
+  color:#E8C97A;margin-bottom:1rem
+}
+.dg-ico svg{width:22px;height:22px;display:block}
+.dg-title{
+  font-family:'Playfair Display',Georgia,serif;
+  font-size:1.4rem;font-weight:700;color:#E8EEF8;
+  letter-spacing:-.01em;line-height:1.22;margin:0 0 .65rem
+}
+.dg-text{
+  font-size:.94rem;color:#B9C6DA;font-weight:300;
+  line-height:1.55;margin:0 0 1.15rem
+}
+.dg-text b{color:#E8EEF8;font-weight:600}
+.dg-found{
+  border:1px solid rgba(255,255,255,.10);border-radius:13px;
+  background:rgba(255,255,255,.03);padding:.85rem 1rem;
+  display:flex;flex-direction:column;gap:.5rem;margin-bottom:1.4rem
+}
+.dg-row{
+  display:flex;align-items:baseline;justify-content:space-between;gap:1rem
+}
+.dg-k{
+  font-size:.78rem;color:#8A9FBB;font-weight:400;letter-spacing:.02em
+}
+.dg-v{
+  font-size:.9rem;color:#E8EEF8;font-weight:500;text-align:right
+}
+.dg-v.prof{
+  font-family:'Playfair Display',Georgia,serif;
+  font-weight:700;font-size:1.02rem
+}
+.dg-actions{display:flex;gap:.7rem;flex-wrap:wrap}
+.dg-btn{
+  flex:1;min-width:150px;font-family:'Outfit',sans-serif;
+  font-size:.9rem;font-weight:600;padding:12px 20px;border-radius:11px;
+  cursor:pointer;border:none;-webkit-appearance:none;appearance:none;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  transition:transform .2s ease,box-shadow .2s ease,background .2s ease,
+    color .2s ease,border-color .2s ease
+}
+.dg-btn-ghost{
+  background:rgba(255,255,255,.04);color:#E8EEF8;
+  border:1px solid rgba(255,255,255,.14)
+}
+.dg-btn-ghost:hover{
+  border-color:#C9A84C;color:#E8C97A;
+  background:rgba(201,168,76,.08);transform:translateY(-1px)
+}
+.dg-btn-gold{
+  background:linear-gradient(135deg,#C9A84C 0%,#E8C97A 100%);
+  color:#05070f;box-shadow:0 10px 28px rgba(201,168,76,.30)
+}
+.dg-btn-gold:hover{
+  transform:translateY(-2px) scale(1.02);
+  box-shadow:0 18px 44px rgba(201,168,76,.48),
+    0 0 28px rgba(201,168,76,.2)
+}
+@media(max-width:640px){
+  .dg-card{padding:1.7rem 1.3rem 1.4rem;border-radius:16px}
+  .dg-title{font-size:1.2rem}
+  .dg-actions{flex-direction:column}
+  .dg-btn{width:100%;min-width:0}
+}
+@media (prefers-reduced-motion: reduce){
+  .dg-overlay,.dg-card{
+    animation:none !important;transform:none !important;opacity:1 !important
+  }
 }
       `}</style>
 
@@ -10613,6 +10809,83 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           <ProductCatalog user={user} showToast={showToast} />
         )}
       </div>
+
+      {/* PR #25: модалка-предупреждение о дубле расчёта за месяц. Открывается
+          ТОЛЬКО когда найден существующий расчёт за тот же месяц+МП. «Отмена» и
+          клик по фону/Esc → resolveDupModal(false); «Создать новый» → (true). */}
+      {dupModal && (
+        <>
+          <div
+            className="dg-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="dg-title"
+            onClick={() => resolveDupModal(false)}
+          >
+            <div className="dg-card" onClick={(e) => e.stopPropagation()}>
+              <span className="dg-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                  strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                  <path d="M12 9v4" />
+                  <circle cx="12" cy="17" r=".7" fill="currentColor" />
+                </svg>
+              </span>
+              <h3 id="dg-title" className="dg-title">
+                За этот месяц уже есть расчёт
+              </h3>
+              <p className="dg-text">
+                В истории уже есть расчёт за <b>{dupModal.monthLabel}</b>. Если
+                создать новый, в отчётах появятся два расчёта за один месяц.
+              </p>
+              <div className="dg-found">
+                <div className="dg-row">
+                  <span className="dg-k">Месяц</span>
+                  <span className="dg-v">{dupModal.monthLabel}</span>
+                </div>
+                <div className="dg-row">
+                  <span className="dg-k">Чистая прибыль</span>
+                  <span className="dg-v prof">
+                    {Math.round(dupModal.existing.profit).toLocaleString("ru-RU")} ₽
+                  </span>
+                </div>
+                <div className="dg-row">
+                  <span className="dg-k">Создан</span>
+                  <span className="dg-v">{dupModal.existing.date}</span>
+                </div>
+                {dupModal.existing.mode && (
+                  <div className="dg-row">
+                    <span className="dg-k">Тип расчёта</span>
+                    <span className="dg-v">
+                      {dupModal.existing.mode === "api"
+                        ? "Ozon API"
+                        : dupModal.existing.mode === "upload"
+                        ? "Загрузка отчёта"
+                        : "Ручной расчёт"}
+                    </span>
+                  </div>
+                )}
+              </div>
+              <div className="dg-actions">
+                <button
+                  type="button"
+                  className="dg-btn dg-btn-ghost"
+                  onClick={() => resolveDupModal(false)}
+                >
+                  Отмена
+                </button>
+                <button
+                  type="button"
+                  className="dg-btn dg-btn-gold"
+                  onClick={() => resolveDupModal(true)}
+                >
+                  Создать новый расчёт
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
 
       <TariffModal
         open={tariffModalOpen}
