@@ -4427,12 +4427,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   radial-gradient(700px 500px at -10% 110%,rgba(201,168,76,.05),transparent 60%);
   background-attachment:fixed;min-height:100vh}
 
-.dash-top{position:sticky;top:0;z-index:50;display:flex;align-items:center;justify-content:space-between;
-  padding:1rem 2rem;background:rgba(8,10,20,.75);backdrop-filter:blur(18px) saturate(1.3);
+.dash-top{position:sticky;top:0;z-index:80;display:flex;align-items:center;justify-content:space-between;
+  gap:1rem 1.4rem;flex-wrap:wrap;
+  padding:.8rem 2rem;background:rgba(8,10,20,.82);backdrop-filter:blur(18px) saturate(1.3);
+  -webkit-backdrop-filter:blur(18px) saturate(1.3);
   border-bottom:1px solid var(--edge)}
 .dash-brand{font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
 .dash-brand em{font-style:italic;color:var(--gold)}
-.dash-brand-sub{font-family:var(--mono);font-size:.58rem;color:var(--txt3);letter-spacing:.14em;text-transform:uppercase;margin-left:10px;vertical-align:middle}
 .dash-status{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.66rem;
   color:var(--gold2);letter-spacing:.06em;border:1px solid rgba(201,168,76,.3);
   padding:6px 16px;border-radius:100px;background:var(--gold-bg)}
@@ -4600,21 +4601,28 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   .calc-tabs{flex-direction:column;gap:6px}
   .calc-tab{padding:11px}
 }
-/* === MAIN TABS (Калькулятор / Каталог товаров) === */
-.main-tabs{display:flex;gap:6px;background:var(--glass);border:1px solid var(--edge);
-  border-radius:14px;padding:6px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
-  margin:.2rem 0 1.1rem;box-shadow:0 10px 28px rgba(0,0,0,.20);max-width:520px}
-.main-tab{flex:1;font-family:var(--sans);font-size:.9rem;font-weight:600;padding:12px 18px;
-  border-radius:10px;cursor:pointer;border:1px solid transparent;background:transparent;
+/* === HEADER NAV — вкладки в шапке (Расчёт / Каталог / Отчёты / Личный кабинет) === */
+.dash-nav{display:flex;gap:5px;background:var(--glass);border:1px solid var(--edge);
+  border-radius:13px;padding:5px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  box-shadow:0 8px 22px rgba(0,0,0,.20);flex:0 1 auto}
+.main-tab{flex:0 0 auto;font-family:var(--sans);font-size:.83rem;font-weight:600;padding:9px 15px;
+  border-radius:9px;cursor:pointer;border:1px solid transparent;background:transparent;
   color:var(--txt2);transition:all .22s ease;display:inline-flex;align-items:center;
-  justify-content:center;gap:9px;min-height:44px}
+  justify-content:center;gap:8px;min-height:38px;white-space:nowrap}
 .main-tab:hover{color:var(--txt);background:rgba(255,255,255,.03)}
 .main-tab.active{color:var(--void);
   background:linear-gradient(135deg,var(--gold) 0%,var(--gold2) 100%);
   box-shadow:0 8px 26px rgba(201,168,76,.3),inset 0 1px 0 rgba(255,255,255,.22)}
-.main-tab-ico{display:inline-flex;align-items:center;justify-content:center;width:17px;height:17px}
-.main-tab-ico svg{width:17px;height:17px;display:block}
-@media(max-width:640px){.main-tabs{max-width:none}}
+.main-tab-ico{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px}
+.main-tab-ico svg{width:16px;height:16px;display:block}
+@media(max-width:900px){
+  .dash-nav{order:3;flex-basis:100%;width:100%}
+  .main-tab{flex:1 1 auto}
+}
+@media(max-width:560px){
+  .dash-nav{gap:4px;padding:4px}
+  .main-tab{flex:1 1 calc(50% - 3px);font-size:.8rem;padding:9px 8px;gap:6px}
+}
 
 .api-pro-card{margin-bottom:.25rem;position:relative;overflow:hidden;
   box-shadow:0 24px 60px rgba(0,0,0,.35),0 0 50px rgba(201,168,76,.06)}
@@ -7126,10 +7134,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   color:var(--red);
 }
 @media(max-width:900px){
-  .dash-top{padding:.85rem 1.2rem}
-  .dash-brand-sub{display:none}
+  .dash-top{padding:.7rem 1.2rem;gap:.55rem .8rem}
   .dash-status{font-size:.6rem;padding:5px 12px}
-  .dash-wrap{padding:1.8rem 1.2rem 4rem}
+  .dash-wrap{padding:1.5rem 1.2rem 4rem}
   .dash-grid{grid-template-columns:1fr}
   .dash-user-email{display:none}
 }
@@ -7290,8 +7297,75 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
       <div className="dash-top">
         <a href="/" className="dash-brand">
           M&#8209;<em>Prof</em>
-          <span className="dash-brand-sub">Dashboard</span>
         </a>
+
+        {user && (
+          <div className="dash-nav" role="tablist" aria-label="Разделы">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "calc"}
+              className={"main-tab" + (mainTab === "calc" ? " active" : "")}
+              onClick={() => setMainTab("calc")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="4" y="3" width="16" height="18" rx="2.5" />
+                  <path d="M8 7h8M8 11h8M8 15h5" />
+                </svg>
+              </span>
+              Расчёт
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "catalog"}
+              className={"main-tab" + (mainTab === "catalog" ? " active" : "")}
+              onClick={() => setMainTab("catalog")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 7l9-4 9 4-9 4-9-4z" />
+                  <path d="M3 7v10l9 4 9-4V7" />
+                  <path d="M12 11v10" />
+                </svg>
+              </span>
+              Каталог товаров
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "reports"}
+              className={"main-tab" + (mainTab === "reports" ? " active" : "")}
+              onClick={() => setMainTab("reports")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M4 4v16h16" />
+                  <path d="M9 16v-4" />
+                  <path d="M13.5 16V9" />
+                  <path d="M18 16v-7" />
+                </svg>
+              </span>
+              Отчёты
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mainTab === "cabinet"}
+              className={"main-tab" + (mainTab === "cabinet" ? " active" : "")}
+              onClick={() => setMainTab("cabinet")}
+            >
+              <span className="main-tab-ico" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="8" r="3.4" />
+                  <path d="M5 20c0-3.6 3.1-5.6 7-5.6s7 2 7 5.6" />
+                </svg>
+              </span>
+              Личный кабинет
+            </button>
+          </div>
+        )}
 
         {user ? (
           <div className="dash-user">
@@ -7421,74 +7495,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             )}
 
             {authMessage && <p className="auth-msg">{authMessage}</p>}
-          </div>
-        )}
-
-        {user && (
-          <div className="main-tabs" role="tablist" aria-label="Разделы">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mainTab === "calc"}
-              className={"main-tab" + (mainTab === "calc" ? " active" : "")}
-              onClick={() => setMainTab("calc")}
-            >
-              <span className="main-tab-ico" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="4" y="3" width="16" height="18" rx="2.5" />
-                  <path d="M8 7h8M8 11h8M8 15h5" />
-                </svg>
-              </span>
-              Расчёт
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mainTab === "catalog"}
-              className={"main-tab" + (mainTab === "catalog" ? " active" : "")}
-              onClick={() => setMainTab("catalog")}
-            >
-              <span className="main-tab-ico" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M3 7l9-4 9 4-9 4-9-4z" />
-                  <path d="M3 7v10l9 4 9-4V7" />
-                  <path d="M12 11v10" />
-                </svg>
-              </span>
-              Каталог товаров
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mainTab === "reports"}
-              className={"main-tab" + (mainTab === "reports" ? " active" : "")}
-              onClick={() => setMainTab("reports")}
-            >
-              <span className="main-tab-ico" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M4 4v16h16" />
-                  <path d="M9 16v-4" />
-                  <path d="M13.5 16V9" />
-                  <path d="M18 16v-7" />
-                </svg>
-              </span>
-              Отчёты
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={mainTab === "cabinet"}
-              className={"main-tab" + (mainTab === "cabinet" ? " active" : "")}
-              onClick={() => setMainTab("cabinet")}
-            >
-              <span className="main-tab-ico" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="8" r="3.4" />
-                  <path d="M5 20c0-3.6 3.1-5.6 7-5.6s7 2 7 5.6" />
-                </svg>
-              </span>
-              Личный кабинет
-            </button>
           </div>
         )}
 
