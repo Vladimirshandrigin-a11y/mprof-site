@@ -4431,9 +4431,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   background:rgba(8,10,20,.97);backdrop-filter:blur(16px) saturate(1.2);
   -webkit-backdrop-filter:blur(16px) saturate(1.2);
   border-bottom:1px solid var(--edge)}
-.dash-top-inner{max-width:1100px;margin:0 auto;
-  display:grid;grid-template-columns:1fr auto 1fr;align-items:center;
-  gap:1rem 1.4rem;padding:.8rem 2rem}
+.dash-top-inner{width:100%;max-width:none;margin:0;box-sizing:border-box;
+  display:grid;grid-template-columns:minmax(160px,1fr) auto minmax(160px,1fr);align-items:center;
+  gap:1rem;padding:.8rem 2rem}
 .dash-brand{grid-column:1;justify-self:start;font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
 .dash-brand em{font-style:italic;color:var(--gold)}
 .dash-status{grid-column:3;justify-self:end;display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:.66rem;
