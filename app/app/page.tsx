@@ -4780,6 +4780,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .api-result-row.is-total{margin-top:.15rem;padding-top:.6rem;border-top:1px solid var(--edge2);
   border-bottom:none;font-size:.95rem}
 .api-result-row.is-total .rl{color:var(--txt)}
+.api-result-row.is-sub{padding-left:.9rem;padding-bottom:.3rem;border-bottom:none;font-size:.78rem;opacity:.82}
+.api-result-row.is-sub .rl{color:var(--txt3)}
+.api-result-row.is-sub .rv{font-weight:500;color:var(--txt2)}
 .api-extra-heading{margin-top:1.7rem;font-family:var(--display);font-size:.95rem;font-weight:600;
   color:var(--txt2);letter-spacing:.01em}
 .api-extra-note{margin:.3rem 0 .9rem;font-size:.8rem;color:var(--txt3);line-height:1.5;max-width:62ch}
@@ -8543,9 +8546,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     <span className="api-step-title">Введите свои расходы</span>
                   </div>
                   <p className="api-step-hint">
-                    Налог, упаковка, доставка до склада, зарплата и прочее. Эти
-                    суммы не сохраняются и нужны только для расчёта чистой прибыли.
-                    Пустое поле считается как 0.
+                    Налог укажите в процентах от выручки Ozon (например, 6) —
+                    сумму в рублях посчитаем сами. Упаковку, доставку до склада,
+                    зарплату и прочее вводите в рублях. Пустое поле считается как 0.
                   </p>
                   <div
                     style={{
@@ -8555,11 +8558,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     }}
                   >
                     {([
-                      { key: "tax", label: "Налог" },
-                      { key: "packaging", label: "Упаковка" },
-                      { key: "warehouseDelivery", label: "Доставка до склада" },
-                      { key: "salary", label: "Зарплата" },
-                      { key: "other", label: "Прочие расходы" },
+                      { key: "tax", label: "Налог, %", placeholder: "напр. 6", hint: "% от выручки Ozon" },
+                      { key: "packaging", label: "Упаковка, ₽", placeholder: "0", hint: "" },
+                      { key: "warehouseDelivery", label: "Доставка до склада, ₽", placeholder: "0", hint: "" },
+                      { key: "salary", label: "Зарплата, ₽", placeholder: "0", hint: "" },
+                      { key: "other", label: "Прочие расходы, ₽", placeholder: "0", hint: "" },
                     ] as const).map((f) => (
                       <div className="api-fld" key={f.key}>
                         <label htmlFor={`ozon-me-${f.key}`}>{f.label}</label>
@@ -8570,7 +8573,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           min="0"
                           step="0.01"
                           inputMode="decimal"
-                          placeholder="0"
+                          placeholder={f.placeholder}
                           value={apiExpenses[f.key]}
                           onChange={(e) => {
                             setApiExpenses((prev) => ({ ...prev, [f.key]: e.target.value }));
@@ -8582,6 +8585,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           }}
                           disabled={profitLoading}
                         />
+                        {f.hint ? <span className="api-hint">{f.hint}</span> : null}
                       </div>
                     ))}
                   </div>
@@ -8742,6 +8746,16 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           − {fmt(profitResult.manualExpenses.total)} ₽
                         </span>
                       </div>
+                      {profitResult.manualExpenses.tax > 0 && (
+                        <div className="api-result-row is-sub">
+                          <span className="rl">
+                            в т.ч. налог{apiExpenses.tax ? ` (${apiExpenses.tax}%)` : ""}
+                          </span>
+                          <span className="rv">
+                            {fmt(profitResult.manualExpenses.tax)} ₽
+                          </span>
+                        </div>
+                      )}
                       <div className="api-result-row is-total">
                         <span className="rl">Чистая прибыль</span>
                         <span
