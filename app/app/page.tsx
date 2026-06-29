@@ -760,6 +760,26 @@ type OzonPostingsMatchResponse = {
     price?: number;
     reason: string;
   }>;
+  // Диагностика (read-only): разбивка сопоставленной себестоимости по статусам
+  // отправлений Ozon. Боевой расчёт не меняет — только объясняет расхождение.
+  costByStatus?: {
+    totalMatchedCost: number;
+    totalMatchedQuantity: number;
+    deliveredMatchedCost: number;
+    cancelledMatchedCost: number;
+    nonDeliveredMatchedCost: number;
+    rows: Array<{
+      status: string;
+      label: string;
+      postingCount: number;
+      itemsQuantity: number;
+      matchedQuantity: number;
+      unmatchedQuantity: number;
+      matchedCost: number;
+      shareOfMatchedCost: number;
+    }>;
+    notes: string[];
+  };
   warnings: string[];
   notes: string[];
 };
@@ -8941,6 +8961,175 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         </div>
                       ))}
                     </div>
+
+                    {(() => {
+                      const cbs = matchResult.costByStatus;
+                      if (!cbs || cbs.rows.length === 0) return null;
+                      const pct = (x: number) =>
+                        `${(x * 100).toLocaleString("ru-RU", {
+                          maximumFractionDigits: 1,
+                        })}%`;
+                      const highlights = [
+                        {
+                          label: "Себестоимость всего",
+                          value: cbs.totalMatchedCost,
+                          accent: false,
+                        },
+                        {
+                          label: "Доставлено",
+                          value: cbs.deliveredMatchedCost,
+                          accent: false,
+                        },
+                        {
+                          label: "Не доставлено",
+                          value: cbs.nonDeliveredMatchedCost,
+                          accent: true,
+                        },
+                        {
+                          label: "Отменено",
+                          value: cbs.cancelledMatchedCost,
+                          accent: true,
+                        },
+                      ];
+                      return (
+                        <div
+                          style={{
+                            marginTop: "1rem",
+                            border: "1px solid rgba(201,168,76,.3)",
+                            borderRadius: "14px",
+                            padding: ".85rem .9rem",
+                            background: "rgba(201,168,76,.05)",
+                          }}
+                        >
+                          <div style={{ fontWeight: 700, marginBottom: ".15rem" }}>
+                            Себестоимость по статусам отправлений
+                          </div>
+                          <p
+                            className="api-pro-sub"
+                            style={{ marginTop: 0, marginBottom: ".7rem" }}
+                          >
+                            Диагностика: показывает, из каких статусов складывается
+                            себестоимость API. «Доставлено» — выручка признана;
+                            «Не доставлено» и «Отменено» в расчёте по документам
+                            отсутствуют. Боевой расчёт это не меняет.
+                          </p>
+
+                          <div
+                            style={{
+                              display: "grid",
+                              gridTemplateColumns:
+                                "repeat(auto-fit, minmax(140px, 1fr))",
+                              gap: ".6rem",
+                              marginBottom: ".85rem",
+                            }}
+                          >
+                            {highlights.map((h) => (
+                              <div
+                                key={h.label}
+                                style={{
+                                  border: h.accent
+                                    ? "1px solid rgba(245,158,11,.4)"
+                                    : "1px solid rgba(127,127,127,.25)",
+                                  borderRadius: "12px",
+                                  padding: ".6rem .8rem",
+                                  background: h.accent
+                                    ? "rgba(245,158,11,.07)"
+                                    : "transparent",
+                                }}
+                              >
+                                <div style={{ fontSize: ".78rem", opacity: 0.7 }}>
+                                  {h.label}
+                                </div>
+                                <div
+                                  style={{
+                                    fontSize: "1.05rem",
+                                    fontWeight: 700,
+                                    marginTop: ".15rem",
+                                  }}
+                                >
+                                  {fmt(h.value)} ₽
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <div
+                            style={{
+                              display: "flex",
+                              flexDirection: "column",
+                              gap: ".4rem",
+                            }}
+                          >
+                            {cbs.rows.map((r) => (
+                              <div
+                                key={r.status || "(empty)"}
+                                style={{
+                                  display: "flex",
+                                  flexWrap: "wrap",
+                                  justifyContent: "space-between",
+                                  gap: ".5rem",
+                                  borderBottom:
+                                    "1px solid rgba(127,127,127,.12)",
+                                  paddingBottom: ".35rem",
+                                }}
+                              >
+                                <div style={{ minWidth: 0 }}>
+                                  <div
+                                    style={{ fontWeight: 600, fontSize: ".9rem" }}
+                                  >
+                                    {r.label}
+                                  </div>
+                                  <div
+                                    style={{ fontSize: ".76rem", opacity: 0.65 }}
+                                  >
+                                    {fmt(r.postingCount)} отпр. ·{" "}
+                                    {fmt(r.matchedQuantity)} ед. с себест.
+                                    {r.unmatchedQuantity > 0
+                                      ? ` · ${fmt(r.unmatchedQuantity)} ед. без`
+                                      : ""}
+                                  </div>
+                                </div>
+                                <div
+                                  style={{
+                                    textAlign: "right",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  <div
+                                    style={{ fontWeight: 700, fontSize: ".95rem" }}
+                                  >
+                                    {fmt(r.matchedCost)} ₽
+                                  </div>
+                                  <div
+                                    style={{ fontSize: ".76rem", opacity: 0.65 }}
+                                  >
+                                    {pct(r.shareOfMatchedCost)}
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          {cbs.notes.length > 0 && (
+                            <ul
+                              style={{
+                                marginTop: ".7rem",
+                                marginBottom: 0,
+                                paddingLeft: "1.1rem",
+                                opacity: 0.75,
+                                fontSize: ".8rem",
+                              }}
+                            >
+                              {cbs.notes.map((n) => (
+                                <li key={n} style={{ marginBottom: ".2rem" }}>
+                                  {n}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      );
+                    })()}
 
                     {matchResult.totals.itemRows > 0 &&
                       matchResult.totals.unmatchedItems === 0 && (
