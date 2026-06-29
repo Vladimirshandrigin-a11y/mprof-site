@@ -7294,6 +7294,36 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .api-conn-empty{display:flex;flex-direction:column;gap:.7rem}
 .api-conn-empty-row{display:flex;align-items:center;gap:.55rem;font-weight:600;color:var(--txt)}
 .api-conn-empty-dot{width:9px;height:9px;border-radius:50%;background:var(--gold);box-shadow:0 0 0 3px rgba(201,168,76,.16);flex-shrink:0}
+
+/* ===== Пояснения о режимах расчёта (info-блоки + FAQ + предупреждение) =====
+   Только UI/текст: помогают понять, почему «Загрузка отчёта» и «Авторасчёт
+   через API» могут давать разные значения. Формулы/расчёты не затрагивают. */
+.mode-note{margin-top:1rem;padding:.95rem 1.1rem;border:1px solid var(--edge2);
+  border-left:3px solid var(--gold);border-radius:12px;background:var(--glass);
+  -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.mode-note-title{font-family:var(--display);font-size:.95rem;font-weight:600;
+  color:var(--gold2);margin:0 0 .35rem;letter-spacing:.01em}
+.mode-note-text{font-family:var(--sans);font-size:.84rem;line-height:1.55;
+  color:var(--txt2);margin:0}
+.mode-note-sub{display:block;margin-top:.5rem;font-size:.76rem;line-height:1.5;
+  color:var(--txt3)}
+.faq-disc{margin:1.4rem 0 .4rem;border:1px solid var(--edge2);border-radius:12px;
+  background:var(--glass);overflow:hidden}
+.faq-disc>summary{list-style:none;cursor:pointer;padding:.95rem 1.1rem;
+  font-family:var(--sans);font-size:.88rem;font-weight:600;color:var(--txt);
+  display:flex;align-items:center;gap:.6rem}
+.faq-disc>summary::-webkit-details-marker{display:none}
+.faq-disc>summary::before{content:"";width:7px;height:7px;
+  border-right:2px solid var(--gold);border-bottom:2px solid var(--gold);
+  transform:rotate(-45deg);transition:transform .2s ease;flex:0 0 auto}
+.faq-disc[open]>summary::before{transform:rotate(45deg)}
+.faq-disc-body{padding:0 1.1rem 1.05rem;font-family:var(--sans);font-size:.83rem;
+  line-height:1.6;color:var(--txt2)}
+.reports-warn{margin:.2rem 0 1.15rem;padding:.8rem 1rem;
+  border:1px solid rgba(201,168,76,.28);border-radius:11px;
+  background:rgba(201,168,76,.07);font-family:var(--sans);font-size:.8rem;
+  line-height:1.5;color:var(--txt2);display:flex;gap:.6rem;align-items:flex-start}
+.reports-warn-ico{flex:0 0 auto;color:var(--gold);margin-top:.05rem}
       `}</style>
 
       <div className="dash-top">
@@ -7522,6 +7552,30 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           История расчётов и годовая сводка по прибыли, выручке и расходам.
           Считаем по сохранённым расчётам — без выдуманных данных.
         </p>
+
+        <div className="reports-warn" role="note">
+          <svg
+            className="reports-warn-ico"
+            width="16"
+            height="16"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 8v5" />
+            <path d="M12 16.5v.5" />
+          </svg>
+          <span>
+            Если за один месяц есть несколько расчётов разными способами,
+            итоговая аналитика может суммировать их. Для финальной сверки
+            используйте один основной расчёт за месяц.
+          </span>
+        </div>
 
         {/* ===== Годовая сводка (новый блок вкладки «Отчёты») ===== */}
         <div className="reports-hero">
@@ -8310,6 +8364,20 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               Подключите Ozon, выберите месяц и введите свои расходы — сайт сам
               посчитает чистую прибыль по данным Ozon API и каталогу себестоимости
               и сохранит результат в историю.
+            </p>
+          </div>
+
+          <div className="mode-note" role="note">
+            <div className="mode-note-title">Расчёт по операциям Ozon API</div>
+            <p className="mode-note-text">
+              Этот режим считает прибыль по финансовым операциям Ozon за
+              выбранный месяц: начислениям, комиссиям, логистике, хранению и
+              другим удержаниям. Такой расчёт ближе к фактическому движению денег
+              в кабинете Ozon.
+              <span className="mode-note-sub">
+                Значения могут отличаться от расчёта по загруженным документам,
+                потому что документы и API отражают данные в разных разрезах.
+              </span>
             </p>
           </div>
 
@@ -9160,6 +9228,21 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 агентское вознаграждение). Сайт считает прибыль на основе
                 выручки Ozon, выплат от партнёров, расходов по УПД и агентского
                 вознаграждения.
+              </p>
+            </div>
+
+            <div className="mode-note" role="note">
+              <div className="mode-note-title">Расчёт по документам Ozon</div>
+              <p className="mode-note-text">
+                Этот режим считает прибыль по загруженным документам Ozon:
+                отчёту о реализации, УПД по услугам и УПД по агентскому
+                вознаграждению. Такой расчёт ближе к сверке с документами и
+                бухгалтерией.
+                <span className="mode-note-sub">
+                  Если сравнивать его с API-расчётом, возможны расхождения из-за
+                  разных источников данных, периода операций, бонусов/лояльности,
+                  ручных расходов и способа учёта налога.
+                </span>
               </p>
             </div>
 
@@ -10408,6 +10491,23 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               </div>
             </div>
           )}
+
+          {/* FAQ: почему API и загрузка отчётов могут давать разные значения */}
+          <details className="faq-disc">
+            <summary>
+              Почему расчёт через API и загрузку отчётов может отличаться?
+            </summary>
+            <div className="faq-disc-body">
+              Это два разных способа расчёта. Загрузка отчётов использует
+              документы Ozon и удобна для сверки с бухгалтерией. API использует
+              финансовые операции Ozon и удобен для быстрой автоматической
+              проверки месяца. Чтобы расчёты были максимально близкими,
+              используйте один и тот же месяц, полностью заполните себестоимость
+              по всем товарам и указывайте одинаковые ручные расходы. Небольшие
+              расхождения из-за разных источников данных, периода операций,
+              возвратов, бонусов и округлений являются нормальными.
+            </div>
+          </details>
           </>
         )}
 
