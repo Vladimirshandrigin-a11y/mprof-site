@@ -47,10 +47,24 @@ export type OzonPostingItem = {
   /** Цена за единицу (из строки price). null — если поля нет/не число. */
   price: number | null;
   scheme: "fbo" | "fbs";
+  /**
+   * Статус отправления Ozon в нижнем регистре (delivered/cancelled/delivering/…).
+   * "" если Ozon не вернул статус. ТОЛЬКО для диагностики разбивки себестоимости
+   * по статусам (aggregateCostByStatus) — боевой расчёт (aggregateProfitCostDraft)
+   * это поле НЕ читает и поведение НЕ меняет.
+   */
+  status: string;
 };
 
 type PostingsFetch =
-  | { ok: true; items: OzonPostingItem[]; postingCount: number; partial: boolean }
+  | {
+      ok: true;
+      items: OzonPostingItem[];
+      postingCount: number;
+      partial: boolean;
+      /** Кол-во отправлений по нормализованному статусу (для диагностики). */
+      statusPostingCounts: Record<string, number>;
+    }
   | { ok: false; code: OzonFinanceErrorCode };
 
 /** Каталог себестоимости пользователя — ровно то, что отдаёт таблица products. */
@@ -104,6 +118,8 @@ export type MonthPostings = {
   postingCount: number;
   partial: boolean;
   warnings: string[];
+  /** Кол-во отправлений по нормализованному статусу (FBO+FBS, для диагностики). */
+  statusPostingCounts: Record<string, number>;
   /** Фатальная ошибка (например ключ невалиден) — route отдаёт errorResponse. */
   fatalCode?: OzonFinanceErrorCode;
 };
@@ -172,7 +188,22 @@ function parsePrice(x: unknown): number | null {
   return null;
 }
 
-function extractItems(products: unknown, scheme: "fbo" | "fbs"): OzonPostingItem[] {
+/** Статус отправления → нижний регистр без пробелов по краям. "" если нет. */
+function readPostingStatus(posting: unknown): string {
+  const s = (posting as { status?: unknown })?.status;
+  return typeof s === "string" ? s.trim().toLowerCase() : "";
+}
+
+/** Инкремент счётчика отправлений по статусу (для диагностики). */
+function bumpStatus(counts: Record<string, number>, status: string): void {
+  counts[status] = (counts[status] ?? 0) + 1;
+}
+
+function extractItems(
+  products: unknown,
+  scheme: "fbo" | "fbs",
+  status: string
+): OzonPostingItem[] {
   if (!Array.isArray(products)) return [];
   const out: OzonPostingItem[] = [];
   for (const raw of products) {
@@ -193,7 +224,7 @@ function extractItems(products: unknown, scheme: "fbo" | "fbs"): OzonPostingItem
     const name = typeof p.name === "string" ? p.name : "";
     const quantity =
       typeof p.quantity === "number" && Number.isFinite(p.quantity) ? p.quantity : 0;
-    out.push({ offerId, sku, name, quantity, price: parsePrice(p.price), scheme });
+    out.push({ offerId, sku, name, quantity, price: parsePrice(p.price), scheme, status });
   }
   return out;
 }
@@ -208,6 +239,7 @@ async function fetchFboPostings(
   range: MonthRange
 ): Promise<PostingsFetch> {
   const items: OzonPostingItem[] = [];
+  const statusPostingCounts: Record<string, number> = {};
   let postingCount = 0;
 
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -225,14 +257,16 @@ async function fetchFboPostings(
     const postings = Array.isArray(result) ? result : [];
     postingCount += postings.length;
     for (const posting of postings) {
-      items.push(...extractItems((posting as { products?: unknown })?.products, "fbo"));
+      const status = readPostingStatus(posting);
+      bumpStatus(statusPostingCounts, status);
+      items.push(...extractItems((posting as { products?: unknown })?.products, "fbo", status));
     }
 
     if (postings.length < PAGE_SIZE) {
-      return { ok: true, items, postingCount, partial: false };
+      return { ok: true, items, postingCount, partial: false, statusPostingCounts };
     }
   }
-  return { ok: true, items, postingCount, partial: true };
+  return { ok: true, items, postingCount, partial: true, statusPostingCounts };
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +279,7 @@ async function fetchFbsPostings(
   range: MonthRange
 ): Promise<PostingsFetch> {
   const items: OzonPostingItem[] = [];
+  const statusPostingCounts: Record<string, number> = {};
   let postingCount = 0;
 
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -261,15 +296,17 @@ async function fetchFbsPostings(
     const postings = Array.isArray(result?.postings) ? result!.postings : [];
     postingCount += postings.length;
     for (const posting of postings) {
-      items.push(...extractItems((posting as { products?: unknown })?.products, "fbs"));
+      const status = readPostingStatus(posting);
+      bumpStatus(statusPostingCounts, status);
+      items.push(...extractItems((posting as { products?: unknown })?.products, "fbs", status));
     }
 
     const hasNext = result?.has_next === true;
     if (!hasNext || postings.length === 0) {
-      return { ok: true, items, postingCount, partial: false };
+      return { ok: true, items, postingCount, partial: false, statusPostingCounts };
     }
   }
-  return { ok: true, items, postingCount, partial: true };
+  return { ok: true, items, postingCount, partial: true, statusPostingCounts };
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +321,7 @@ export async function fetchMonthPostings(
 ): Promise<MonthPostings> {
   const items: OzonPostingItem[] = [];
   const warnings: string[] = [];
+  const statusPostingCounts: Record<string, number> = {};
   let postingCount = 0;
   let partial = false;
   let invalidKey = false;
@@ -302,6 +340,9 @@ export async function fetchMonthPostings(
       items.push(...r.items);
       postingCount += r.postingCount;
       partial = partial || r.partial;
+      for (const [st, n] of Object.entries(r.statusPostingCounts)) {
+        statusPostingCounts[st] = (statusPostingCounts[st] ?? 0) + n;
+      }
       continue;
     }
     switch (r.code) {
@@ -344,7 +385,7 @@ export async function fetchMonthPostings(
     );
   }
 
-  return { items, postingCount, partial, warnings, fatalCode };
+  return { items, postingCount, partial, warnings, statusPostingCounts, fatalCode };
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +819,209 @@ export function aggregateProfitCostDraft(
     itemsWithoutCost: withoutOut,
     topCostItems: topOut,
     warnings,
+    notes,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// ДИАГНОСТИКА (read-only): разбивка СОПОСТАВЛЕННОЙ себестоимости по статусам
+// отправлений Ozon (delivered / cancelled / delivering / awaiting_* / …).
+//
+// Зачем: понять, из каких статусов складывается API-себестоимость и почему она
+// расходится с расчётом по документам. Документы берут только РЕАЛИЗОВАННОЕ
+// количество (за вычетом возвратов), а боевой API-расчёт (aggregateProfitCostDraft)
+// суммирует себестоимость по ВСЕМ отправлениям всех статусов (GROSS). Эта функция
+// НИЧЕГО не фильтрует и не меняет боевой расчёт — только раскладывает ту же
+// сумму по статусам, чтобы измерить вклад «Отменён» / «Не доставлено».
+//
+// Матч идентичен боевому: offer_id↔products.sku, затем точное Ozon-sku↔products.sku,
+// учитываем стоимость только при cost_price > 0. Сумма totalMatchedCost совпадает
+// с matchedCostTotal из aggregateProfitCostDraft (та же логика, один round2).
+// ---------------------------------------------------------------------------
+
+/** Человеко-понятные подписи известных статусов Ozon (иначе показываем сам код). */
+const STATUS_LABELS: Record<string, string> = {
+  delivered: "Доставлен",
+  cancelled: "Отменён",
+  canceled: "Отменён",
+  delivering: "В доставке",
+  driver_pickup: "Передан водителю",
+  awaiting_packaging: "Ожидает сборки",
+  awaiting_deliver: "Ожидает отгрузки",
+  awaiting_registration: "Ожидает регистрации",
+  awaiting_approve: "Ожидает подтверждения",
+  acceptance_in_progress: "Идёт приёмка",
+  arbitration: "Арбитраж",
+  client_arbitration: "Клиентский арбитраж",
+  not_accepted: "Не принят на сортировке",
+  sent_by_seller: "Отправлен продавцом",
+};
+
+function statusLabel(norm: string): string {
+  if (!norm) return "(без статуса)";
+  return STATUS_LABELS[norm] ?? norm;
+}
+
+/** Строка разбивки себестоимости по одному статусу отправлений. */
+export type CostStatusRow = {
+  /** Нормализованный код статуса ("delivered", "cancelled", "" — без статуса). */
+  status: string;
+  /** Человеко-понятная подпись (RU) либо сам код, если статус неизвестен. */
+  label: string;
+  /** Сколько отправлений Ozon с этим статусом (FBO+FBS). */
+  postingCount: number;
+  /** Суммарное количество единиц во всех позициях статуса. */
+  itemsQuantity: number;
+  /** Из них единиц с учтённой себестоимостью (сопоставлены, cost_price>0). */
+  matchedQuantity: number;
+  /** Единиц без учёта стоимости (не сопоставлены или cost_price=0). */
+  unmatchedQuantity: number;
+  /** Σ quantity×cost по сопоставленным позициям статуса, ₽ (round2). */
+  matchedCost: number;
+  /** Доля matchedCost от total (0..1, round4). */
+  shareOfMatchedCost: number;
+};
+
+/** Итог разбивки себестоимости по статусам отправлений (диагностика). */
+export type CostByStatus = {
+  /** Σ сопоставленной себестоимости по всем статусам (= боевой matchedCostTotal). */
+  totalMatchedCost: number;
+  /** Σ единиц с учтённой себестоимостью. */
+  totalMatchedQuantity: number;
+  /** Себестоимость доставленных (status === "delivered"). */
+  deliveredMatchedCost: number;
+  /** Себестоимость отменённых (status содержит "cancel"). */
+  cancelledMatchedCost: number;
+  /** Себестоимость НЕ доставленных = total − delivered (включает «Отменён» и в пути). */
+  nonDeliveredMatchedCost: number;
+  /** Разбивка по каждому статусу, отсортирована по себестоимости (убыв.). */
+  rows: CostStatusRow[];
+  notes: string[];
+};
+
+/**
+ * Разложить сопоставленную себестоимость отправлений по статусам Ozon.
+ * Чистая функция: в БД не ходит, ничего не сохраняет, боевой расчёт не трогает.
+ */
+export function aggregateCostByStatus(
+  items: OzonPostingItem[],
+  statusPostingCounts: Record<string, number>,
+  catalog: CatalogRow[]
+): CostByStatus {
+  // Индекс каталога по нормализованному products.sku → cost_price (как в остальных функциях).
+  const catIndex = new Map<string, number>();
+  for (const c of catalog) {
+    const key = normArticle(c.sku);
+    if (!key || catIndex.has(key)) continue;
+    catIndex.set(
+      key,
+      typeof c.cost_price === "number" && Number.isFinite(c.cost_price) ? c.cost_price : 0
+    );
+  }
+
+  // Себестоимость единицы товара или null, если товар не сопоставлен с каталогом.
+  const lookupCost = (it: OzonPostingItem): number | null => {
+    if (it.offerId) {
+      const v = catIndex.get(normArticle(it.offerId));
+      if (v != null) return v;
+    }
+    if (it.sku) {
+      const v = catIndex.get(normArticle(it.sku));
+      if (v != null) return v;
+    }
+    return null;
+  };
+
+  type Acc = {
+    postingCount: number;
+    itemsQuantity: number;
+    matchedQuantity: number;
+    unmatchedQuantity: number;
+    matchedCostRaw: number;
+  };
+  const groups = new Map<string, Acc>();
+  const ensure = (norm: string): Acc => {
+    let g = groups.get(norm);
+    if (!g) {
+      g = {
+        postingCount: 0,
+        itemsQuantity: 0,
+        matchedQuantity: 0,
+        unmatchedQuantity: 0,
+        matchedCostRaw: 0,
+      };
+      groups.set(norm, g);
+    }
+    return g;
+  };
+
+  // Счётчики отправлений по статусам (чтобы статус без позиций тоже был виден).
+  for (const [norm, n] of Object.entries(statusPostingCounts)) {
+    ensure(norm).postingCount += n;
+  }
+
+  let totalMatchedRaw = 0;
+  let totalMatchedQuantity = 0;
+  for (const it of items) {
+    const norm = (it.status ?? "").trim().toLowerCase();
+    const g = ensure(norm);
+    g.itemsQuantity += it.quantity;
+    const cost = lookupCost(it);
+    if (cost != null && cost > 0 && Number.isFinite(cost)) {
+      g.matchedQuantity += it.quantity;
+      g.matchedCostRaw += it.quantity * cost;
+      totalMatchedRaw += it.quantity * cost;
+      totalMatchedQuantity += it.quantity;
+    } else {
+      g.unmatchedQuantity += it.quantity;
+    }
+  }
+
+  const totalMatchedCost = round2(totalMatchedRaw);
+
+  const rows: CostStatusRow[] = [];
+  let deliveredRaw = 0;
+  let cancelledRaw = 0;
+  for (const [norm, g] of groups.entries()) {
+    if (norm === "delivered") deliveredRaw += g.matchedCostRaw;
+    if (norm.includes("cancel")) cancelledRaw += g.matchedCostRaw;
+    rows.push({
+      status: norm,
+      label: statusLabel(norm),
+      postingCount: g.postingCount,
+      itemsQuantity: g.itemsQuantity,
+      matchedQuantity: g.matchedQuantity,
+      unmatchedQuantity: g.unmatchedQuantity,
+      matchedCost: round2(g.matchedCostRaw),
+      shareOfMatchedCost:
+        totalMatchedRaw > 0
+          ? Math.round((g.matchedCostRaw / totalMatchedRaw) * 10000) / 10000
+          : 0,
+    });
+  }
+
+  // Дорогие статусы сверху, затем по количеству единиц.
+  rows.sort((a, b) => b.matchedCost - a.matchedCost || b.itemsQuantity - a.itemsQuantity);
+
+  const notes: string[] = [];
+  if (items.length === 0) {
+    notes.push("За выбранный месяц отправления Ozon не найдены — раскладывать по статусам нечего.");
+  } else {
+    notes.push(
+      "Разбивка себестоимости по статусам — диагностика. «Доставлен» — выручка по этим отправлениям признана; «Отменён» и прочие НЕ доставленные статусы в расчёте по документам отсутствуют. Боевой API-расчёт сейчас берёт ВСЕ статусы (GROSS) — отсюда расхождение с документами."
+    );
+    notes.push(
+      "«Не доставлено» = вся сопоставленная себестоимость минус «Доставлен» (включает «Отменён» и товары в пути/ожидании)."
+    );
+  }
+
+  return {
+    totalMatchedCost,
+    totalMatchedQuantity,
+    deliveredMatchedCost: round2(deliveredRaw),
+    cancelledMatchedCost: round2(cancelledRaw),
+    nonDeliveredMatchedCost: round2(totalMatchedRaw - deliveredRaw),
+    rows,
     notes,
   };
 }

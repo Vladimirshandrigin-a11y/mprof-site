@@ -7,6 +7,7 @@ import {
   type OzonFinanceErrorCode,
 } from "../_lib/finance";
 import {
+  aggregateCostByStatus,
   aggregatePostingsMatch,
   fetchMonthPostings,
   type CatalogRow,
@@ -151,6 +152,15 @@ export async function POST(req: NextRequest) {
     (catalog ?? []) as CatalogRow[]
   );
 
+  // ---- диагностика: разбивка себестоимости по статусам отправлений (read-only) ----
+  // Та же сумма, что и в боевом расчёте, но разложена по статусам Ozon, чтобы
+  // увидеть вклад «Отменён» / «Не доставлено». Боевой расчёт это не меняет.
+  const costByStatus = aggregateCostByStatus(
+    postings.items,
+    postings.statusPostingCounts,
+    (catalog ?? []) as CatalogRow[]
+  );
+
   return NextResponse.json(
     {
       period: { month, dateFrom: range.dateFrom, dateTo: range.dateTo },
@@ -158,6 +168,7 @@ export async function POST(req: NextRequest) {
       totals: result.totals,
       matched: result.matched,
       unmatched: result.unmatched,
+      costByStatus,
       warnings: result.warnings,
       notes: result.notes,
     },
