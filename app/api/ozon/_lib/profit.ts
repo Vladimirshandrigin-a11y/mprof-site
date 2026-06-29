@@ -31,7 +31,10 @@ import {
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
 //   profitBeforeManualExpenses = ozonOperationsTotal − matchedCostTotal
 // PR #18 (ручные расходы):
-//   manualExpensesTotal = tax + packaging + warehouseDelivery + salary + other
+//   taxAmount           = revenue × tax% / 100  (налог задаётся ПРОЦЕНТОМ от
+//                         выручки Ozon = totals.revenue — gross-начисления ДО
+//                         удержаний Ozon; в БД/историю/отчёты идёт сумма в ₽)
+//   manualExpensesTotal = taxAmount + packaging + warehouseDelivery + salary + other
 //   netProfit           = profitBeforeManualExpenses − manualExpensesTotal
 //   margin              = ozonOperationsTotal > 0 ? netProfit/ozonOperationsTotal*100 : 0
 // ============================================================================
@@ -43,6 +46,7 @@ const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 // ---- ручные расходы (PR #18): optional, в БД сохраняем ТОЛЬКО при финале -----
 export type ManualExpenses = {
+  /** Налог: ПРОЦЕНТ от выручки Ozon (не ₽). Сумма в ₽ считается в computeApiProfit. */
   tax: number;
   packaging: number;
   warehouseDelivery: number;
@@ -168,7 +172,11 @@ export function computeApiProfit(
   const matchedCostTotal = cost.matchedCostTotal;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
-  const meTax = round2(manualExpenses.tax);
+  // Налог задаётся ПРОЦЕНТОМ от выручки Ozon (gross-начисления ДО удержаний =
+  // totals.revenue, та же база, что у УСН-налога в ручном/файловом расчёте), а не
+  // суммой в ₽. В результат/историю/отчёты идёт уже рассчитанная сумма в ₽.
+  // Пример: revenue 100000, ставка 6 → 6000 ₽.
+  const meTax = round2(totals.revenue * (manualExpenses.tax / 100));
   const mePackaging = round2(manualExpenses.packaging);
   const meWarehouseDelivery = round2(manualExpenses.warehouseDelivery);
   const meSalary = round2(manualExpenses.salary);
