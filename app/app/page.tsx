@@ -8051,7 +8051,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 <path d="M12 3v13" />
               </svg>
             </span>
-            Загрузить отчёт
+            Расчёт по документам Ozon
           </button>
           <button
             type="button"
@@ -8065,7 +8065,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
               </svg>
             </span>
-            Авторасчёт через API
+            Авторасчёт Ozon API
           </button>
           <button
             type="button"
@@ -8080,9 +8080,19 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 <path d="M8 7h8M8 11h8M8 15h5" />
               </svg>
             </span>
-            Ручной расчёт
+            Ручной калькулятор
           </button>
         </div>
+
+        {calcMode === "manual" && (
+          <div className="mode-note" role="note">
+            <div className="mode-note-title">Ручной калькулятор</div>
+            <p className="mode-note-text">
+              Быстрый расчёт: вы сами вводите все показатели — без подключения
+              Ozon API и без загрузки документов.
+            </p>
+          </div>
+        )}
 
         {calcMode === "manual" && showOnboarding && (
           <div className="onboard-card" role="note">
@@ -8410,12 +8420,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           </div>
 
           <div className="mode-note" role="note">
-            <div className="mode-note-title">Расчёт по операциям Ozon API</div>
+            <div className="mode-note-title">Авторасчёт по операциям Ozon API</div>
             <p className="mode-note-text">
-              Этот режим считает прибыль по финансовым операциям Ozon за
-              выбранный месяц: начислениям, комиссиям, логистике, хранению и
-              другим удержаниям. Такой расчёт ближе к фактическому движению денег
-              в кабинете Ozon.
+              Ozon автоматически подтягивает выручку, комиссии, логистику и
+              операции за выбранный месяц. Дополнительные расходы — налог,
+              упаковку, зарплату, доставку и прочее — вы добавляете вручную.
               <span className="mode-note-sub">
                 Значения могут отличаться от расчёта по загруженным документам,
                 потому что документы и API отражают данные в разных разрезах.
