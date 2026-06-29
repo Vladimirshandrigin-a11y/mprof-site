@@ -399,14 +399,52 @@ function formatMonthLabel(ym: string): string {
   return `${RU_MONTHS_NOM[mi] ?? m[2]} ${m[1]}`;
 }
 /**
- * Месяц расчёта 'YYYY-MM' из периода отчёта (для фильтра в «Последние расчёты»).
- * null — период не распознан (ручной/старый расчёт). Чисто UI-деривация: на
- * формулы, статистику, Supabase и сохранение report_history не влияет.
+ * Месяц 'YYYY-MM' из API-снимка Ozon (ai_insights.kind === "ozon-api-v1").
+ * Бэкенд /api/ozon/save-calculation пишет ВЫБРАННЫЙ месяц в period.month
+ * (строка 'YYYY-MM'); если его нет — аккуратно достаём месяц из period.dateTo,
+ * затем period.dateFrom (ISO-даты конца/начала диапазона — обе в одном месяце).
+ * Возвращает null, если это не API-снимок или месяц не распознан. ОТДЕЛЬНЫЙ
+ * парсер (НЕ asNetProfitBreakdown), чтобы не задеть upload-логику. Чисто
+ * UI-деривация: формулы, сохранение и Supabase не затрагивает.
+ */
+function apiSnapshotMonthKey(v: unknown): string | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  if (o.kind !== "ozon-api-v1") return null;
+  if (!o.period || typeof o.period !== "object") return null;
+  const p = o.period as Record<string, unknown>;
+  // 1) period.month — каноничный источник ('YYYY-MM').
+  if (typeof p.month === "string" && /^\d{4}-\d{2}$/.test(p.month)) {
+    return p.month;
+  }
+  // 2) fallback: месяц из конечной/начальной даты диапазона (обе в одном месяце).
+  const fromText = (s: unknown): string | null => {
+    const ym = extractReportMonthFromText(typeof s === "string" ? s : null);
+    return ym ? ym.slice(0, 7) : null;
+  };
+  return fromText(p.dateTo) ?? fromText(p.dateFrom) ?? null;
+}
+
+/**
+ * Месяц расчёта 'YYYY-MM' из снимка ai_insights (для фильтра/группировки в
+ * истории и «Отчётах»). Порядок источников:
+ *   1) upload-снимок (net-profit-3file) — строка периода отчёта (reportPeriod);
+ *   2) API-снимок (ozon-api-v1) — ВЫБРАННЫЙ месяц из period.month;
+ *   3) иначе null (ручной/старый расчёт — месяц добирается из createdAt уже в calcMonthKey).
+ * null — период не распознан. Чисто UI-деривация: на формулы, статистику,
+ * Supabase и сохранение report_history не влияет.
  */
 function histReportMonthKey(h: CalcResult): string | null {
+  // 1) upload-снимок: месяц из строки периода отчёта (как раньше).
   const b = asNetProfitBreakdown(h.aiInsights);
-  const ym = resolveReportMonth(b?.reportPeriod, null); // 'YYYY-MM-01' | null
-  return ym ? ym.slice(0, 7) : null;
+  if (b) {
+    const ym = resolveReportMonth(b.reportPeriod, null); // 'YYYY-MM-01' | null
+    if (ym) return ym.slice(0, 7);
+  }
+  // 2) API-снимок: ВЫБРАННЫЙ месяц из period.month (НЕ месяц создания).
+  const apiYm = apiSnapshotMonthKey(h.aiInsights);
+  if (apiYm) return apiYm;
+  return null;
 }
 
 /**
@@ -10729,17 +10767,34 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             <div className="hist-list">
               {visibleHistory.map((h) => {
                 const removing = removingIds.has(h.id);
-                // Разбор upload-расчёта из ai_insights. null → ручной/старый расчёт.
+                // Разбор upload-расчёта из ai_insights. null → API/ручной/старый расчёт.
                 const breakdown = asNetProfitBreakdown(h.aiInsights);
                 const isReport = !!breakdown;
-                // Период отчёта Ozon. Нет периода → «Период не указан».
-                const reportPeriod = breakdown?.reportPeriod ?? null;
                 // Введена ли себестоимость → прибыль уже «чистая»; иначе «до себестоимости».
                 const hasCost = (breakdown?.costPrice ?? 0) > 0;
                 const mpName = h.marketplace === "ozon" ? "Ozon" : "WB";
-                const histTitle = isReport
-                  ? `Отчёт ${mpName}`
-                  : `Ручной расчёт ${mpName}`;
+                // Тип расчёта определяем по сохранённому mode (api/upload/manual), а НЕ
+                // по наличию breakdown: иначе API-расчёт (breakdown=null) подписывался
+                // как «Ручной расчёт». На формулы/сохранение не влияет — только подпись.
+                const calcMode: CloudCalcMode = h.mode ?? "manual";
+                const histTitle =
+                  calcMode === "api"
+                    ? `Расчёт по API ${mpName}`
+                    : calcMode === "upload"
+                    ? `Расчёт по документам ${mpName}`
+                    : `Ручной расчёт ${mpName}`;
+                // Месяц расчёта через исправленный calcMonthKey: upload→период отчёта,
+                // API→period.month, иначе→месяц создания. null → «не указан».
+                const monthKey = calcMonthKey(h);
+                const monthLabel = monthKey ? formatMonthLabel(monthKey) : null;
+                // Дата создания записи в формате ДД.ММ.ГГГГ (с безопасным фолбэком).
+                const createdDate = (() => {
+                  if (!h.createdAt) return h.date;
+                  const d = new Date(h.createdAt);
+                  return Number.isNaN(d.getTime())
+                    ? h.date
+                    : d.toLocaleDateString("ru-RU");
+                })();
                 const profitLabel =
                   isReport && !hasCost
                     ? "Прибыль до себестоимости"
@@ -10764,14 +10819,14 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       <div className="hist-info">
                         <div className="hist-rev">{histTitle}</div>
                         <div className="hist-period">
-                          {reportPeriod
-                            ? `Период отчёта: ${reportPeriod}`
-                            : "Период отчёта: не указан"}
+                          {monthLabel
+                            ? `Месяц расчёта: ${monthLabel}`
+                            : "Месяц расчёта: не указан"}
                         </div>
                         <div className="hist-revenue">
                           Выручка: {fmt(h.revenue)} ₽
                         </div>
-                        <div className="hist-date">Создан: {h.date}</div>
+                        <div className="hist-date">Создан: {createdDate}</div>
                       </div>
 
                       <div
