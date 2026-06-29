@@ -7084,7 +7084,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .hist-mp.ozon{border-color:rgba(61,123,255,.35);color:#7fb0ff;background:rgba(61,123,255,.08)}
 .hist-mp.wb{border-color:rgba(203,17,171,.35);color:#e878d6;background:rgba(203,17,171,.08)}
 .hist-info{flex:1;min-width:0}
-.hist-rev{font-size:.82rem;color:var(--txt);font-weight:600}
+.hist-rev{font-size:.82rem;color:var(--txt);font-weight:600;display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
+.hist-type-badge{display:inline-flex;align-items:center;padding:.14rem .5rem;border-radius:999px;font-family:var(--sans);font-size:.6rem;font-weight:700;letter-spacing:.05em;text-transform:uppercase;background:var(--glass);border:1px solid var(--edge2);color:var(--txt2);white-space:nowrap;line-height:1.3;max-width:100%}
+.hist-type-badge.hist-type-api{background:rgba(201,168,76,.12);border-color:rgba(201,168,76,.42);color:var(--gold2)}
+.hist-type-badge.hist-type-upload{background:var(--glass2);border-color:var(--edge2);color:var(--txt)}
+.hist-type-badge.hist-type-manual{background:rgba(255,255,255,.035);border-color:var(--edge);color:var(--txt2)}
 .hist-period{font-family:var(--mono);font-size:.72rem;color:var(--gold2);font-weight:600;margin-top:3px;letter-spacing:.01em}
 .hist-revenue{font-size:.7rem;color:var(--txt2);font-weight:400;margin-top:3px}
 .hist-date{font-family:var(--mono);font-size:.62rem;color:var(--txt3);margin-top:1px}
@@ -7649,8 +7653,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   [
                     ["all", "Все"],
                     ["api", "API"],
+                    ["upload", "Документы"],
                     ["manual", "Ручной"],
-                    ["upload", "Файл"],
                   ] as [ReportsType, string][]
                 ).map(([v, label]) => (
                   <button
@@ -10772,17 +10776,17 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 const isReport = !!breakdown;
                 // Введена ли себестоимость → прибыль уже «чистая»; иначе «до себестоимости».
                 const hasCost = (breakdown?.costPrice ?? 0) > 0;
-                const mpName = h.marketplace === "ozon" ? "Ozon" : "WB";
                 // Тип расчёта определяем по сохранённому mode (api/upload/manual), а НЕ
                 // по наличию breakdown: иначе API-расчёт (breakdown=null) подписывался
                 // как «Ручной расчёт». На формулы/сохранение не влияет — только подпись.
                 const calcMode: CloudCalcMode = h.mode ?? "manual";
-                const histTitle =
+                // Короткий бейдж типа расчёта; маркетплейс показывает соседний .hist-mp.
+                const typeLabel =
                   calcMode === "api"
-                    ? `Расчёт по API ${mpName}`
+                    ? "API"
                     : calcMode === "upload"
-                    ? `Расчёт по документам ${mpName}`
-                    : `Ручной расчёт ${mpName}`;
+                    ? "Документы"
+                    : "Ручной";
                 // Месяц расчёта через исправленный calcMonthKey: upload→период отчёта,
                 // API→period.month, иначе→месяц создания. null → «не указан».
                 const monthKey = calcMonthKey(h);
@@ -10817,7 +10821,13 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       </div>
 
                       <div className="hist-info">
-                        <div className="hist-rev">{histTitle}</div>
+                        <div className="hist-rev">
+                          <span
+                            className={"hist-type-badge hist-type-" + calcMode}
+                          >
+                            {typeLabel}
+                          </span>
+                        </div>
                         <div className="hist-period">
                           {monthLabel
                             ? `Месяц расчёта: ${monthLabel}`
