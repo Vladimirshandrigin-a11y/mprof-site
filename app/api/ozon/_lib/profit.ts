@@ -30,10 +30,12 @@ import {
 // (accruals_for_sale со знаком), поэтому повторно его НЕ прибавляем —
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
 //   profitBeforeManualExpenses = ozonOperationsTotal − matchedCostTotal
-// PR #18 (ручные расходы):
-//   taxAmount           = revenue × tax% / 100  (налог задаётся ПРОЦЕНТОМ от
-//                         выручки Ozon = totals.revenue — gross-начисления ДО
-//                         удержаний Ozon; в БД/историю/отчёты идёт сумма в ₽)
+// PR #18 (ручные расходы), уточнено — налоговая база ЯВНАЯ:
+//   taxAmount           = taxRevenueBase × tax% / 100  (taxRevenueBase — «Выручка»
+//                         из Ozon «Экономика магазина», вводит пользователь; НЕ
+//                         totals.revenue и НЕ ozonOperationsTotal — в totals.revenue
+//                         входят баллы за скидки/программы партнёров; пусто/0 → 0 ₽;
+//                         в БД/историю/отчёты идёт сумма в ₽)
 //   manualExpensesTotal = taxAmount + packaging + warehouseDelivery + salary + other
 //   netProfit           = profitBeforeManualExpenses − manualExpensesTotal
 //   margin              = ozonOperationsTotal > 0 ? netProfit/ozonOperationsTotal*100 : 0
@@ -46,8 +48,13 @@ const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 // ---- ручные расходы (PR #18): optional, в БД сохраняем ТОЛЬКО при финале -----
 export type ManualExpenses = {
-  /** Налог: ПРОЦЕНТ от выручки Ozon (не ₽). Сумма в ₽ считается в computeApiProfit. */
+  /** Налог: ПРОЦЕНТ от taxRevenueBase (не ₽). Сумма в ₽ считается в computeApiProfit. */
   tax: number;
+  /** База налога в ₽ — «Выручка» из Ozon «Экономика магазина», вводит пользователь.
+   *  Налог считается ТОЛЬКО от неё (НЕ totals.revenue / НЕ ozonOperationsTotal —
+   *  там баллы за скидки и программы партнёров). Пусто/0 → налог 0 ₽ (без
+   *  сомнительной автоподстановки). */
+  taxRevenueBase: number;
   packaging: number;
   warehouseDelivery: number;
   salary: number;
@@ -85,6 +92,7 @@ export function parseManualExpenses(
 ): { ok: true; value: ManualExpenses } | { ok: false; error: string } {
   const out: ManualExpenses = {
     tax: 0,
+    taxRevenueBase: 0,
     packaging: 0,
     warehouseDelivery: 0,
     salary: 0,
@@ -105,6 +113,18 @@ export function parseManualExpenses(
       };
     }
     out[f] = v;
+  }
+  // Налоговая база — отдельное поле (НЕ «расход»): «Выручка» из Ozon «Экономика
+  // магазина». Та же валидация (finite >= 0); отсутствует/null → 0.
+  const trb = obj["taxRevenueBase"];
+  if (trb !== undefined && trb !== null) {
+    if (typeof trb !== "number" || !Number.isFinite(trb) || trb < 0) {
+      return {
+        ok: false,
+        error: "«Выручка для налога» должна быть числом не меньше 0",
+      };
+    }
+    out.taxRevenueBase = trb;
   }
   return { ok: true, value: out };
 }
@@ -140,6 +160,7 @@ export type ApiProfitComputed = {
   profitBeforeManualExpenses: number;
   manualExpenses: {
     tax: number;
+    taxRevenueBase: number;
     packaging: number;
     warehouseDelivery: number;
     salary: number;
@@ -172,11 +193,12 @@ export function computeApiProfit(
   const matchedCostTotal = cost.matchedCostTotal;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
-  // Налог задаётся ПРОЦЕНТОМ от выручки Ozon (gross-начисления ДО удержаний =
-  // totals.revenue, та же база, что у УСН-налога в ручном/файловом расчёте), а не
-  // суммой в ₽. В результат/историю/отчёты идёт уже рассчитанная сумма в ₽.
-  // Пример: revenue 100000, ставка 6 → 6000 ₽.
-  const meTax = round2(totals.revenue * (manualExpenses.tax / 100));
+  // Налог считается ПРОЦЕНТОМ от ЯВНОЙ базы taxRevenueBase («Выручка» из Ozon
+  // «Экономика магазина», вводит пользователь) — НЕ от totals.revenue (туда входят
+  // баллы за скидки/программы партнёров) и НЕ от ozonOperationsTotal. Пусто/0 →
+  // налог 0 ₽ (без сомнительной автоподстановки). В результат/историю/отчёты идёт
+  // уже рассчитанная сумма в ₽. Пример: база 227571, ставка 7 → 15929.97 ₽.
+  const meTax = round2(manualExpenses.taxRevenueBase * (manualExpenses.tax / 100));
   const mePackaging = round2(manualExpenses.packaging);
   const meWarehouseDelivery = round2(manualExpenses.warehouseDelivery);
   const meSalary = round2(manualExpenses.salary);
@@ -209,6 +231,7 @@ export function computeApiProfit(
     profitBeforeManualExpenses,
     manualExpenses: {
       tax: meTax,
+      taxRevenueBase: round2(manualExpenses.taxRevenueBase),
       packaging: mePackaging,
       warehouseDelivery: meWarehouseDelivery,
       salary: meSalary,
