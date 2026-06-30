@@ -836,6 +836,9 @@ type OzonProfitDraftResponse = {
   // PR #18 — ручные расходы (echo, в БД не сохранены) + предварительная чистая прибыль.
   manualExpenses: {
     tax: number;
+    // База налога (₽) — «Выручка» из Ozon «Экономика магазина». optional: старые
+    // снимки в истории её не содержат.
+    taxRevenueBase?: number;
     packaging: number;
     warehouseDelivery: number;
     salary: number;
@@ -1092,11 +1095,12 @@ export default function AppPage() {
   // сохраняются и НЕ участвуют в файловом расчёте. Пустое поле трактуем как 0.
   const [apiExpenses, setApiExpenses] = useState<{
     tax: string;
+    taxRevenueBase: string;
     packaging: string;
     warehouseDelivery: string;
     salary: string;
     other: string;
-  }>({ tax: "", packaging: "", warehouseDelivery: "", salary: "", other: "" });
+  }>({ tax: "", taxRevenueBase: "", packaging: "", warehouseDelivery: "", salary: "", other: "" });
   // PR #20 — единое действие «Рассчитать и сохранить»: сервер
   // (/api/ozon/save-calculation) проверяет доступ, пересчитывает, проверяет
   // себестоимость, списывает попытку и сохраняет; полный расчёт показываем ТОЛЬКО
@@ -3943,6 +3947,7 @@ export default function AppPage() {
           month: profitMonth,
           manualExpenses: {
             tax: meNum(apiExpenses.tax),
+            taxRevenueBase: meNum(apiExpenses.taxRevenueBase),
             packaging: meNum(apiExpenses.packaging),
             warehouseDelivery: meNum(apiExpenses.warehouseDelivery),
             salary: meNum(apiExpenses.salary),
@@ -8566,9 +8571,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     <span className="api-step-title">Введите свои расходы</span>
                   </div>
                   <p className="api-step-hint">
-                    Налог укажите в процентах от выручки Ozon (например, 6) —
-                    сумму в рублях посчитаем сами. Упаковку, доставку до склада,
-                    зарплату и прочее вводите в рублях. Пустое поле считается как 0.
+                    Налог укажите в процентах, а рядом — «Выручку для налога» из
+                    Ozon «Экономика магазина» (именно с неё считаем сумму налога).
+                    Упаковку, доставку до склада, зарплату и прочее вводите в рублях.
+                    Пустое поле считается как 0.
                   </p>
                   <div
                     style={{
@@ -8578,7 +8584,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     }}
                   >
                     {([
-                      { key: "tax", label: "Налог, %", placeholder: "напр. 6", hint: "% от выручки Ozon" },
+                      { key: "tax", label: "Налог, %", placeholder: "напр. 6", hint: "% от «Выручки для налога»" },
+                      { key: "taxRevenueBase", label: "Выручка для налога, ₽", placeholder: "напр. 227571", hint: "Берётся из Ozon → Экономика магазина → Выручка" },
                       { key: "packaging", label: "Упаковка, ₽", placeholder: "0", hint: "" },
                       { key: "warehouseDelivery", label: "Доставка до склада, ₽", placeholder: "0", hint: "" },
                       { key: "salary", label: "Зарплата, ₽", placeholder: "0", hint: "" },
@@ -8609,6 +8616,17 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       </div>
                     ))}
                   </div>
+                  {Number(apiExpenses.tax) > 0 &&
+                    !(Number(apiExpenses.taxRevenueBase) > 0) && (
+                      <p
+                        className="api-step-hint"
+                        style={{ color: "var(--gold)", marginTop: ".55rem" }}
+                      >
+                        Укажите «Выручку для налога» — её берут из Ozon «Экономика
+                        магазина» → Выручка. Без неё налог посчитается как 0 ₽
+                        (автоматически её не подставляем).
+                      </p>
+                    )}
                 </div>
 
                 {/* ШАГ 4 — главная кнопка */}
@@ -8769,7 +8787,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       {profitResult.manualExpenses.tax > 0 && (
                         <div className="api-result-row is-sub">
                           <span className="rl">
-                            в т.ч. налог{apiExpenses.tax ? ` (${apiExpenses.tax}%)` : ""}
+                            в т.ч. налог{apiExpenses.tax ? ` ${apiExpenses.tax}%` : ""}
+                            {profitResult.manualExpenses.taxRevenueBase
+                              ? ` от ${fmt(profitResult.manualExpenses.taxRevenueBase)} ₽`
+                              : ""}
                           </span>
                           <span className="rv">
                             {fmt(profitResult.manualExpenses.tax)} ₽
