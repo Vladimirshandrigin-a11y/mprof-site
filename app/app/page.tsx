@@ -8566,7 +8566,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     <span className="api-step-title">Введите свои расходы</span>
                   </div>
                   <p className="api-step-hint">
-                    Налог укажите в процентах от выручки Ozon (например, 6) —
+                    Налог укажите в процентах от Итого Ozon (например, 7) —
                     сумму в рублях посчитаем сами. Упаковку, доставку до склада,
                     зарплату и прочее вводите в рублях. Пустое поле считается как 0.
                   </p>
@@ -8578,7 +8578,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     }}
                   >
                     {([
-                      { key: "tax", label: "Налог, %", placeholder: "напр. 6", hint: "% от выручки Ozon" },
+                      { key: "tax", label: "Налог, %", placeholder: "напр. 7", hint: "% от Итого Ozon" },
                       { key: "packaging", label: "Упаковка, ₽", placeholder: "0", hint: "" },
                       { key: "warehouseDelivery", label: "Доставка до склада, ₽", placeholder: "0", hint: "" },
                       { key: "salary", label: "Зарплата, ₽", placeholder: "0", hint: "" },
@@ -8769,7 +8769,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       {profitResult.manualExpenses.tax > 0 && (
                         <div className="api-result-row is-sub">
                           <span className="rl">
-                            в т.ч. налог{apiExpenses.tax ? ` (${apiExpenses.tax}%)` : ""}
+                            Налог{apiExpenses.tax ? ` ${apiExpenses.tax}%` : ""} от Итого Ozon{" "}
+                            {fmt(profitResult.preliminary.ozonOperationsTotal)} ₽
                           </span>
                           <span className="rv">
                             {fmt(profitResult.manualExpenses.tax)} ₽
