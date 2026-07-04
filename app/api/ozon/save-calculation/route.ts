@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest, getUserScopedClient } from "../../cloud/_lib/auth";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
+import type { CatalogRow } from "../_lib/postings";
 import {
   buildApiProfitResponseBody,
   errorResponse,
@@ -9,6 +10,10 @@ import {
   parseManualExpenses,
   round2,
 } from "../_lib/profit";
+import {
+  loadRealizationDiagnostic,
+  type RealizationDiagnostic,
+} from "../_lib/realization";
 
 // ============================================================================
 // POST /api/ozon/save-calculation — ФИНАЛЬНОЕ сохранение API-расчёта Ozon в
@@ -353,6 +358,37 @@ export async function POST(req: NextRequest) {
     reportHistorySaved = true;
   }
 
+  // ---- 5.1) СПРАВОЧНАЯ диагностика отчёта о реализации Ozon (read-only) --------
+  // Считаем ЗДЕСЬ — ПОСЛЕ успешного списания/сохранения, то есть строго ВНУТРИ
+  // платного API-потока (это НЕ бесплатный финансовый endpoint). Диагностика ничего
+  // не меняет: candidate COGS — справочная величина, она НЕ входит в netProfit /
+  // matchedCostTotal / налог и никуда не сохраняется (в calculations/report_history
+  // выше уже записаны боевые числа). Best-effort: любая ошибка отчёта реализации НЕ
+  // валит уже сохранённый расчёт — просто отдадим diagnostic.connected=false.
+  // Каталог перечитываем отдельным read-only запросом, чтобы НЕ трогать модуль
+  // прибыли (_lib/profit) — так боевые прибыль/налог/COGS гарантированно не задеты.
+  let realizationDiagnostic: RealizationDiagnostic | null = null;
+  try {
+    const { data: catalog2, error: cat2Err } = await admin
+      .from("products")
+      .select("sku, name, cost_price")
+      .eq("user_id", userId);
+    if (cat2Err) {
+      // eslint-disable-next-line no-console
+      console.error("[api/ozon/save-calculation] realization catalog select error", cat2Err);
+    }
+    realizationDiagnostic = await loadRealizationDiagnostic({
+      clientId,
+      apiKey,
+      month,
+      catalog: (catalog2 ?? []) as CatalogRow[],
+    });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error("[api/ozon/save-calculation] realization diagnostic error", e);
+    realizationDiagnostic = null;
+  }
+
   // ---- 6) полный расчёт для UI (PR #20): та же форма, что и preview-ответ, но
   // помечен как сохранённый. Фронт показывает эти цифры ТОЛЬКО после успешного
   // сохранения (единое действие «Рассчитать и сохранить»), поэтому полный расчёт
@@ -393,6 +429,8 @@ export async function POST(req: NextRequest) {
         margin: c.margin,
       },
       profit,
+      // Справочная диагностика отчёта реализации (не влияет на сохранённые числа).
+      realizationDiagnostic,
     },
     { headers: NO_STORE }
   );
