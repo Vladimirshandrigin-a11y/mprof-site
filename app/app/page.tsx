@@ -894,6 +894,15 @@ type RealizationDiagnostic = {
     bankCoinvestment: boolean;
     stars: boolean;
   };
+  // Диагностика структуры ответа: реальные имена ключей rows[0] и где лежит
+  // идентификатор товара (item.offer_id vs offer_id). Только имена/типы, без значений.
+  debug: {
+    rowKeys: string[];
+    nestedKeys: Array<{ key: string; keys: string[] }>;
+    identifierScan: Array<{ path: string; type: string; present: boolean }>;
+    hasNestedItem: boolean;
+    resolvedOfferIdPath: string | null;
+  };
   sample: Array<{
     offerId: string;
     productName: string;
@@ -4894,6 +4903,25 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .rz-chip.no{color:var(--txt3);opacity:.75}
 .rz-notes{margin:.85rem 0 0;padding-left:1.1rem;display:flex;flex-direction:column;gap:.3rem}
 .rz-notes li{font-size:.78rem;color:var(--txt3);line-height:1.45}
+/* Диагностика структуры ответа (свёрнуто) */
+.rz-debug{margin-top:.9rem;border:1px dashed rgba(127,127,127,.32);border-radius:12px;
+  background:rgba(127,127,127,.05)}
+.rz-debug-sum{cursor:pointer;list-style:none;padding:.6rem .8rem;font-size:.8rem;
+  color:var(--txt2);font-weight:600;user-select:none}
+.rz-debug-sum::-webkit-details-marker{display:none}
+.rz-debug-sum::before{content:"▸ ";color:var(--txt3)}
+.rz-debug[open] .rz-debug-sum::before{content:"▾ "}
+.rz-debug-body{padding:.2rem .8rem .8rem;display:flex;flex-direction:column;gap:.5rem}
+.rz-debug-line{font-size:.76rem;color:var(--txt3);line-height:1.5}
+.rz-debug-k{color:var(--txt2);margin-right:.35rem}
+.rz-debug-none{color:#F59E0B}
+.rz-debug-hint{color:var(--txt3)}
+.rz-keys{display:inline-flex;flex-wrap:wrap;gap:.3rem;margin-top:.2rem}
+.rz-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.72rem;
+  padding:.1rem .35rem;border-radius:6px;background:rgba(127,127,127,.14);
+  border:1px solid rgba(127,127,127,.2);color:var(--txt2);white-space:nowrap}
+.rz-code.ok{color:#7BE0A0;border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.08)}
+.rz-code.no{color:var(--txt3);opacity:.7}
 .api-extra-heading{margin-top:1.7rem;font-family:var(--display);font-size:.95rem;font-weight:600;
   color:var(--txt2);letter-spacing:.01em}
 .api-extra-note{margin:.3rem 0 .9rem;font-size:.8rem;color:var(--txt3);line-height:1.5;max-width:62ch}
@@ -9001,6 +9029,76 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                             </span>
                           ))}
                         </div>
+
+                        {/* Диагностика СТРУКТУРЫ ответа: реальные имена ключей
+                            rows[0] и где лежит идентификатор товара. Свёрнуто,
+                            чтобы не перегружать основной результат. Значения полей
+                            не показываются — только имена ключей/типы. */}
+                        <details className="rz-debug">
+                          <summary className="rz-debug-sum">
+                            Структура ответа реализации (имена полей rows[0])
+                          </summary>
+                          <div className="rz-debug-body">
+                            <div className="rz-debug-line">
+                              <span className="rz-debug-k">Идентификатор товара:</span>{" "}
+                              {realizationDiag.debug.resolvedOfferIdPath ? (
+                                <code className="rz-code ok">
+                                  {realizationDiag.debug.resolvedOfferIdPath}
+                                </code>
+                              ) : (
+                                <span className="rz-debug-none">не найден в строке</span>
+                              )}
+                              {realizationDiag.debug.hasNestedItem && (
+                                <span className="rz-debug-hint">
+                                  {" "}
+                                  — товарные поля вложены в объект <code className="rz-code">item</code>
+                                </span>
+                              )}
+                            </div>
+
+                            {realizationDiag.debug.rowKeys.length > 0 && (
+                              <div className="rz-debug-line">
+                                <span className="rz-debug-k">Поля строки rows[0]:</span>
+                                <span className="rz-keys">
+                                  {realizationDiag.debug.rowKeys.map((k) => (
+                                    <code key={k} className="rz-code">
+                                      {k}
+                                    </code>
+                                  ))}
+                                </span>
+                              </div>
+                            )}
+
+                            {realizationDiag.debug.nestedKeys.map((nk) => (
+                              <div className="rz-debug-line" key={nk.key}>
+                                <span className="rz-debug-k">{nk.key} {"{}"}:</span>
+                                <span className="rz-keys">
+                                  {nk.keys.map((k) => (
+                                    <code key={k} className="rz-code">
+                                      {k}
+                                    </code>
+                                  ))}
+                                </span>
+                              </div>
+                            ))}
+
+                            {realizationDiag.debug.identifierScan.length > 0 && (
+                              <div className="rz-debug-line">
+                                <span className="rz-debug-k">Идентификаторы (скан):</span>
+                                <span className="rz-keys">
+                                  {realizationDiag.debug.identifierScan.map((s) => (
+                                    <code
+                                      key={s.path}
+                                      className={"rz-code " + (s.present ? "ok" : "no")}
+                                    >
+                                      {s.present ? "✓" : "—"} {s.path}:{s.type}
+                                    </code>
+                                  ))}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        </details>
 
                         {realizationDiag.warnings.length > 0 && (
                           <ul className="rz-notes">
