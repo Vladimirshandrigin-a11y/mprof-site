@@ -21,14 +21,19 @@
 //   candidate COGS НЕ идёт ни в netProfit, ни в matchedCostTotal, ни в историю.
 //
 // Api-Key приходит сюда уже расшифрованным (из route) и НИКОГДА не логируется и
-// не возвращается. Форма ответа v2 сверена с офиц. полями:
-//   result.rows[]: row_number, product_id, product_name, offer_id, barcode,
-//   commission_ratio, seller_price_per_instance,
-//   delivery_commission{amount,bonus,commission,compensation,price_per_instance,
-//     quantity,standard_fee,bank_coinvestment,stars,total},
-//   return_commission{ ...та же форма... }.
+// не возвращается. Форма ответа v2 (сверена с офиц. схемой Ozon Seller API,
+// метод «Отчёт о реализации товаров»):
+//   result.rows[]: rowNumber, commission_ratio, seller_price_per_instance,
+//     item{ name, barcode, offer_id, sku },   ← идентификаторы товара ВЛОЖЕНЫ в item
+//     delivery_commission{amount,bonus,commission,compensation,price_per_instance,
+//       quantity,standard_fee,bank_coinvestment,stars,total},
+//     return_commission{ ...та же форма... }.
+//   ВАЖНО: offer_id / sku лежат в row.item.*, а НЕ на верхнем уровне строки. Из-за
+//   этого раньше сопоставление по r.offer_id давало 0 совпадений (строки и
+//   количества читались, а идентификатор — нет). Теперь артикул берём через
+//   item.offer_id (с запасом на старую «плоскую» форму offer_id на верхнем уровне).
 // Если Ozon отдаёт другую (старую «плоскую») форму — мягко читаем запасные поля
-// (sale_qty/sale_amount/return_qty/return_amount) и сообщаем, каких полей нет.
+// (offer_id/sale_qty/sale_amount/return_qty/return_amount) и сообщаем, каких нет.
 // ============================================================================
 
 import type { OzonFinanceErrorCode } from "./finance";
@@ -64,17 +69,28 @@ type RealizationCommission = {
   total?: number;
 };
 
+/** Вложенный объект item из строки отчёта v2 — идентификаторы товара. */
+type RealizationItem = {
+  name?: string;
+  barcode?: string;
+  offer_id?: string;
+  sku?: number;
+};
+
 type RealizationRow = {
   row_number?: number;
-  product_id?: number;
-  product_name?: string;
-  offer_id?: string;
-  barcode?: string;
+  rowNumber?: number; // v2 отдаёт camelCase
+  // v2: идентификаторы товара ВЛОЖЕНЫ в item (item.offer_id / item.sku).
+  item?: RealizationItem;
   commission_ratio?: number;
   seller_price_per_instance?: number;
   delivery_commission?: RealizationCommission;
   return_commission?: RealizationCommission;
-  // Запасная «плоская» форма (на случай иной версии ответа):
+  // Запасная «плоская»/старая форма (идентификаторы на верхнем уровне строки):
+  product_id?: number;
+  product_name?: string;
+  offer_id?: string;
+  barcode?: string;
   sale_qty?: number;
   sale_amount?: number;
   return_qty?: number;
@@ -111,6 +127,23 @@ export type RealizationFieldPresence = {
   bonus: boolean;
   bankCoinvestment: boolean;
   stars: boolean;
+};
+
+/** Диагностика СТРУКТУРЫ ответа: реальные имена полей первой строки, чтобы увидеть,
+ *  где лежит идентификатор товара (item.offer_id vs offer_id верхнего уровня).
+ *  Значения полей НЕ раскрываются — только имена ключей, типы и признак «непусто».
+ *  Персональные/секретные данные (Api-Key, ИНН из header) сюда не попадают. */
+export type RealizationDebug = {
+  /** Object.keys(rows[0]) — имена полей верхнего уровня первой строки. */
+  rowKeys: string[];
+  /** Для каждого вложенного объекта в rows[0] — его ключи (item / *_commission). */
+  nestedKeys: Array<{ key: string; keys: string[] }>;
+  /** Скан «идентификаторных» ключей: путь + тип + признак непустоты (БЕЗ значений). */
+  identifierScan: Array<{ path: string; type: string; present: boolean }>;
+  /** true — в строке есть вложенный объект item (форма v2). */
+  hasNestedItem: boolean;
+  /** Где реально найден offer_id: "item.offer_id" | "offer_id" | null. */
+  resolvedOfferIdPath: string | null;
 };
 
 export type RealizationDiagnostic = {
@@ -153,6 +186,8 @@ export type RealizationDiagnostic = {
     unmatchedSaleQuantity: number;
   };
   fieldsPresent: RealizationFieldPresence;
+  /** Диагностика структуры ответа (имена ключей rows[0], где лежит offer_id). */
+  debug: RealizationDebug;
   /** Первые строки для наглядности (без сумм-секретов: артикул, имя, кол-ва). */
   sample: Array<{
     offerId: string;
@@ -240,6 +275,102 @@ function returnQtyOf(r: RealizationRow): number {
   return 0;
 }
 
+// --- Идентификаторы товара: сначала вложенный item (v2), потом плоская форма. ---
+
+/** Артикул продавца: item.offer_id (v2) → offer_id верхнего уровня (запас). */
+function offerIdOf(r: RealizationRow): string {
+  const nested = r.item?.offer_id;
+  if (typeof nested === "string" && nested.trim() !== "") return nested;
+  if (typeof r.offer_id === "string" && r.offer_id.trim() !== "") return r.offer_id;
+  return "";
+}
+
+/** Имя товара: item.name (v2) → product_name (запас). */
+function productNameOf(r: RealizationRow): string {
+  const nested = r.item?.name;
+  if (typeof nested === "string" && nested.trim() !== "") return nested;
+  return typeof r.product_name === "string" ? r.product_name : "";
+}
+
+/** Штрихкод: item.barcode (v2) → barcode (запас). */
+function barcodeOf(r: RealizationRow): string {
+  const nested = r.item?.barcode;
+  if (typeof nested === "string" && nested.trim() !== "") return nested;
+  return typeof r.barcode === "string" ? r.barcode : "";
+}
+
+/** Ozon-sku/идентификатор товара: item.sku (v2) → product_id (запас). */
+function skuNumOf(r: RealizationRow): number | null {
+  const s = r.item?.sku;
+  if (typeof s === "number" && Number.isFinite(s)) return s;
+  if (typeof r.product_id === "number" && Number.isFinite(r.product_id)) return r.product_id;
+  return null;
+}
+
+// «Идентификаторные» ключи для скана структуры (offer/sku/article/barcode/…):
+const ID_KEY_RE = /offer|sku|article|barcode|posting|product|item|name/i;
+
+/**
+ * Собрать СПРАВОЧНУЮ диагностику структуры первой строки: имена ключей верхнего
+ * уровня, ключи вложенных объектов и скан «идентификаторных» полей. ТОЛЬКО имена
+ * ключей/типы/признак непустоты — значения (в т.ч. персональные) не раскрываются.
+ */
+function buildRealizationDebug(rows: RealizationRow[]): RealizationDebug {
+  const empty: RealizationDebug = {
+    rowKeys: [],
+    nestedKeys: [],
+    identifierScan: [],
+    hasNestedItem: false,
+    resolvedOfferIdPath: null,
+  };
+  const first = rows[0] as Record<string, unknown> | undefined;
+  if (!first || typeof first !== "object") return empty;
+
+  const rowKeys = Object.keys(first);
+  const nestedKeys: RealizationDebug["nestedKeys"] = [];
+  for (const k of rowKeys) {
+    const v = first[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      nestedKeys.push({ key: k, keys: Object.keys(v as Record<string, unknown>) });
+    }
+  }
+
+  const identifierScan: RealizationDebug["identifierScan"] = [];
+  const scan = (obj: Record<string, unknown>, base: string, depth: number): void => {
+    if (depth > 3 || identifierScan.length >= 24) return;
+    for (const [k, v] of Object.entries(obj)) {
+      const path = base ? `${base}.${k}` : k;
+      if (ID_KEY_RE.test(k)) {
+        const type = v === null ? "null" : Array.isArray(v) ? "array" : typeof v;
+        const present =
+          type === "string"
+            ? (v as string).trim() !== ""
+            : type === "number"
+              ? Number.isFinite(v as number)
+              : v != null && type !== "null";
+        identifierScan.push({ path, type, present });
+      }
+      if (v && typeof v === "object" && !Array.isArray(v) && depth < 3) {
+        scan(v as Record<string, unknown>, path, depth + 1);
+      }
+    }
+  };
+  scan(first, "", 0);
+
+  const item = (rows[0] as RealizationRow).item;
+  const hasNestedItem = !!item && typeof item === "object";
+  const itemOffer = item?.offer_id;
+  const topOffer = (rows[0] as RealizationRow).offer_id;
+  const resolvedOfferIdPath =
+    typeof itemOffer === "string" && itemOffer.trim() !== ""
+      ? "item.offer_id"
+      : typeof topOffer === "string" && topOffer.trim() !== ""
+        ? "offer_id"
+        : null;
+
+  return { rowKeys, nestedKeys, identifierScan, hasNestedItem, resolvedOfferIdPath };
+}
+
 /**
  * Собрать диагностику по строкам отчёта реализации + каталогу себестоимости.
  * ЧИСТАЯ функция. candidate COGS — СПРАВОЧНАЯ величина, она НЕ участвует в
@@ -302,6 +433,13 @@ export function buildRealizationDiagnostic(
         unmatchedSaleQuantity: 0,
       },
       fieldsPresent,
+      debug: {
+        rowKeys: [],
+        nestedKeys: [],
+        identifierScan: [],
+        hasNestedItem: false,
+        resolvedOfferIdPath: null,
+      },
       sample: [],
       notes,
       warnings,
@@ -309,6 +447,7 @@ export function buildRealizationDiagnostic(
   }
 
   const rows = fetched.rows;
+  const debug = buildRealizationDebug(rows);
 
   // Индекс каталога по нормализованному products.sku (артикул продавца) — как в
   // aggregateProfitCostDraft/OzonProductBreakdown.
@@ -348,10 +487,15 @@ export function buildRealizationDiagnostic(
     const dc = r.delivery_commission ?? {};
     const rc = r.return_commission ?? {};
 
+    // Идентификаторы — через item.* (v2) с запасом на плоскую форму.
+    const offerId = offerIdOf(r);
+    const barcode = barcodeOf(r);
+    const skuNum = skuNumOf(r);
+
     // presence-детект (виден хотя бы раз непустой ключ соответствующей формы).
-    if (typeof r.offer_id === "string" && r.offer_id.trim() !== "") fieldsPresent.offerId = true;
-    if (typeof r.product_id === "number") fieldsPresent.productId = true;
-    if (typeof r.barcode === "string" && r.barcode.trim() !== "") fieldsPresent.barcode = true;
+    if (offerId !== "") fieldsPresent.offerId = true;
+    if (skuNum !== null) fieldsPresent.productId = true;
+    if (barcode !== "") fieldsPresent.barcode = true;
     if (typeof dc.quantity === "number" || typeof r.sale_qty === "number" || typeof r.quantity === "number")
       fieldsPresent.deliveryQuantity = true;
     if (typeof rc.quantity === "number" || typeof r.return_qty === "number")
@@ -378,7 +522,7 @@ export function buildRealizationDiagnostic(
     sellerPriceValue += num(r.seller_price_per_instance) * sQty;
 
     // candidate COGS: матч по offer_id ↔ products.sku (точное, без fuzzy).
-    const offer = normArticle(r.offer_id);
+    const offer = normArticle(offerId);
     const hit = offer ? catIndex.get(offer) : undefined;
     let matched = false;
     let costPerUnit: number | null = null;
@@ -400,8 +544,8 @@ export function buildRealizationDiagnostic(
 
     if (sample.length < MAX_SAMPLE) {
       sample.push({
-        offerId: typeof r.offer_id === "string" ? r.offer_id : "",
-        productName: typeof r.product_name === "string" ? r.product_name : "",
+        offerId,
+        productName: productNameOf(r),
         saleQty: sQty,
         returnQty: rQty,
         matched,
@@ -419,6 +563,14 @@ export function buildRealizationDiagnostic(
     notes.push(
       "Диагностика справочная: candidate COGS считается из количества отчёта реализации и себестоимости каталога, НЕ участвует в чистой прибыли и никуда не сохраняется."
     );
+  }
+  if (rows.length > 0 && debug.hasNestedItem) {
+    notes.push(
+      "Форма ответа v2: идентификаторы товара лежат в объекте item (item.offer_id, item.sku) — сопоставление берёт item.offer_id."
+    );
+  }
+  if (rows.length > 0 && debug.resolvedOfferIdPath) {
+    notes.push(`Артикул (offer_id) найден по пути: ${debug.resolvedOfferIdPath}.`);
   }
   if (rows.length > 0 && !fieldsPresent.offerId) {
     warnings.push(
@@ -470,6 +622,7 @@ export function buildRealizationDiagnostic(
       unmatchedSaleQuantity: round2(unmatchedSaleQuantity),
     },
     fieldsPresent,
+    debug,
     sample,
     notes,
     warnings,
