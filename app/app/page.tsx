@@ -851,6 +851,61 @@ type OzonProfitDraftResponse = {
   notes: string[];
 };
 
+// Довесок к ответу /api/ozon/save-calculation — СПРАВОЧНАЯ диагностика отчёта о
+// реализации Ozon (/v2/finance/realization). Read-only: candidate COGS НЕ входит в
+// чистую прибыль/налог/боевую себестоимость и никуда не сохраняется — показываем,
+// чтобы сверить источник себестоимости с документальным расчётом.
+type RealizationDiagnostic = {
+  connected: boolean;
+  errorCode?: string;
+  month: number;
+  year: number;
+  rowCount: number;
+  sums: {
+    saleQuantity: number;
+    returnQuantity: number;
+    netQuantity: number;
+    deliveryAmount: number;
+    returnAmount: number;
+    bonus: number;
+    bankCoinvestment: number;
+    stars: number;
+    sellerPriceValue: number;
+  };
+  candidateCogs: {
+    bySaleQty: number;
+    byNetQty: number;
+    matchedRows: number;
+    unmatchedRows: number;
+    matchedNoCostRows: number;
+    matchedSaleQuantity: number;
+    unmatchedSaleQuantity: number;
+  };
+  fieldsPresent: {
+    offerId: boolean;
+    productId: boolean;
+    barcode: boolean;
+    deliveryQuantity: boolean;
+    returnQuantity: boolean;
+    deliveryAmount: boolean;
+    returnAmount: boolean;
+    sellerPricePerInstance: boolean;
+    bonus: boolean;
+    bankCoinvestment: boolean;
+    stars: boolean;
+  };
+  sample: Array<{
+    offerId: string;
+    productName: string;
+    saleQty: number;
+    returnQty: number;
+    matched: boolean;
+    costPerUnit: number | null;
+  }>;
+  notes: string[];
+  warnings: string[];
+};
+
 // Ответ /api/ozon/import-missing-products — добавление НЕсопоставленных товаров
 // Ozon в каталог себестоимости (PR #17). Только INSERT новых товаров
 // (sku = offer_id, cost_price = 0). Себестоимость НЕ выдумывается, расчёт НЕ
@@ -1113,6 +1168,11 @@ export default function AppPage() {
     unmatchedItems: number;
     matchedNoCostCount: number;
   } | null>(null);
+  // СПРАВОЧНАЯ диагностика отчёта о реализации Ozon (read-only): приходит довеском
+  // к успешному save-calculation. candidate COGS НЕ влияет на прибыль/налог/COGS и
+  // никуда не сохраняется — показываем, чтобы сверить источник себестоимости с
+  // документальным расчётом. null — блок скрыт.
+  const [realizationDiag, setRealizationDiag] = useState<RealizationDiagnostic | null>(null);
   // PR #22 (UX) — свёрнутый второстепенный блок «Дополнительные действия и
   // диагностика» (проверка/удаление подключения, диагностика сопоставления,
   // добавление несопоставленных). По умолчанию закрыт, чтобы не мешать основному
@@ -3929,6 +3989,7 @@ export default function AppPage() {
     setProfitResult(null);
     setApiSaved(false);
     setApiCostGap(null);
+    setRealizationDiag(null);
     try {
       // Пустое/≤0 поле → 0. Сервер всё равно валидирует заново (>= 0).
       const meNum = (s: string): number => {
@@ -3959,6 +4020,7 @@ export default function AppPage() {
         unmatchedItems?: number;
         matchedNoCostCount?: number;
         profit?: OzonProfitDraftResponse;
+        realizationDiagnostic?: RealizationDiagnostic | null;
       };
 
       // Нет доступа (free/149₽ исчерпан) → окно тарифа, как в обычном расчёте.
@@ -3999,6 +4061,7 @@ export default function AppPage() {
       // Успех: показываем ПОЛНЫЙ расчёт (он уже сохранён, попытка списана) и
       // обновляем историю/счётчик помесячных снимков.
       setProfitResult(data.profit);
+      setRealizationDiag(data.realizationDiagnostic ?? null);
       setApiSaved(true);
       showToast("API-расчёт рассчитан и сохранён в историю", "ok");
       await loadHistory(user.id);
@@ -4803,6 +4866,34 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .api-result-row.is-sub{padding-left:.9rem;padding-bottom:.3rem;border-bottom:none;font-size:.78rem;opacity:.82}
 .api-result-row.is-sub .rl{color:var(--txt3)}
 .api-result-row.is-sub .rv{font-weight:500;color:var(--txt2)}
+/* Диагностика отчёта реализации Ozon (read-only, справочная) */
+.rz-diag{margin-top:1.3rem;border:1px solid rgba(201,168,76,.32);border-radius:16px;
+  padding:1.1rem 1.25rem 1.2rem;background:rgba(201,168,76,.05)}
+.rz-head{margin-bottom:.85rem}
+.rz-title{font-family:var(--display);font-weight:700;font-size:1rem;color:var(--txt)}
+.rz-sub{margin:.3rem 0 0;font-size:.8rem;color:var(--txt3);line-height:1.5;max-width:64ch}
+.rz-warn{padding:.7rem .85rem;border-radius:12px;font-size:.85rem;line-height:1.45;
+  background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.35);color:var(--txt2)}
+.rz-cand{border:1px solid var(--edge2);border-radius:14px;padding:.85rem .95rem;
+  background:var(--glass);margin-bottom:.9rem}
+.rz-cand-row{display:flex;justify-content:space-between;gap:1rem;align-items:baseline}
+.rz-cand-row.sub{margin-top:.4rem}
+.rz-cand-lbl{color:var(--txt2);font-size:.85rem}
+.rz-cand-row.sub .rz-cand-lbl{color:var(--txt3);font-size:.8rem}
+.rz-cand-val{font-weight:800;font-size:1.15rem;color:var(--gold);white-space:nowrap}
+.rz-cand-row.sub .rz-cand-val{font-weight:600;font-size:.95rem;color:var(--txt)}
+.rz-cand-hint{margin:.55rem 0 0;font-size:.76rem;color:var(--txt3);line-height:1.45}
+.rz-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:.55rem;margin-bottom:.85rem}
+.rz-cell{border:1px solid rgba(127,127,127,.22);border-radius:12px;padding:.55rem .7rem}
+.rz-cell-lbl{font-size:.74rem;color:var(--txt3)}
+.rz-cell-val{font-size:.98rem;font-weight:700;color:var(--txt);margin-top:.15rem;white-space:nowrap}
+.rz-fields{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center}
+.rz-fields-cap{font-size:.78rem;color:var(--txt3);margin-right:.15rem}
+.rz-chip{font-size:.74rem;padding:.22rem .5rem;border-radius:999px;border:1px solid rgba(127,127,127,.25);white-space:nowrap}
+.rz-chip.ok{color:#7BE0A0;border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.08)}
+.rz-chip.no{color:var(--txt3);opacity:.75}
+.rz-notes{margin:.85rem 0 0;padding-left:1.1rem;display:flex;flex-direction:column;gap:.3rem}
+.rz-notes li{font-size:.78rem;color:var(--txt3);line-height:1.45}
 .api-extra-heading{margin-top:1.7rem;font-family:var(--display);font-size:.95rem;font-weight:600;
   color:var(--txt2);letter-spacing:.01em}
 .api-extra-note{margin:.3rem 0 .9rem;font-size:.8rem;color:var(--txt3);line-height:1.5;max-width:62ch}
@@ -8553,6 +8644,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         setProfitResult(null);
                         setProfitError("");
                         setApiCostGap(null);
+                        setRealizationDiag(null);
                       }}
                       disabled={profitLoading}
                     />
@@ -8602,6 +8694,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                             setProfitResult(null);
                             setProfitError("");
                             setApiCostGap(null);
+                            setRealizationDiag(null);
                           }}
                           disabled={profitLoading}
                         />
@@ -8817,6 +8910,107 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         <span className="rv">{fmt(profitResult.apiTotals.other)} ₽</span>
                       </div>
                     </div>
+                  </div>
+                )}
+
+                {/* СПРАВОЧНАЯ диагностика отчёта о реализации Ozon (read-only).
+                    Приходит довеском к сохранённому расчёту. НЕ влияет на прибыль/
+                    налог/себестоимость выше — candidate COGS показываем, чтобы сверить
+                    источник себестоимости с документальным расчётом. */}
+                {realizationDiag && apiSaved && profitResult && (
+                  <div
+                    className="rz-diag"
+                    role="region"
+                    aria-label="Диагностика отчёта реализации Ozon"
+                  >
+                    <div className="rz-head">
+                      <div className="rz-title">Диагностика отчёта реализации Ozon</div>
+                      <p className="rz-sub">
+                        Справочно (read-only). Не влияет на чистую прибыль, налог и
+                        себестоимость выше — показывает, что даёт отчёт о реализации
+                        Ozon за {profitResult.period.month}.
+                      </p>
+                    </div>
+
+                    {!realizationDiag.connected ? (
+                      <div className="rz-warn" role="alert">
+                        Отчёт о реализации получить не удалось
+                        {realizationDiag.errorCode ? ` (${realizationDiag.errorCode})` : ""}.
+                        Диагностика недоступна — сохранённый расчёт выше не затронут.
+                      </div>
+                    ) : (
+                      <>
+                        <div className="rz-cand">
+                          <div className="rz-cand-row">
+                            <span className="rz-cand-lbl">
+                              Кандидатная себестоимость (по количеству продаж)
+                            </span>
+                            <span className="rz-cand-val">
+                              {fmt(realizationDiag.candidateCogs.bySaleQty)} ₽
+                            </span>
+                          </div>
+                          <div className="rz-cand-row sub">
+                            <span className="rz-cand-lbl">
+                              С вычетом возвратов (продажи − возвраты)
+                            </span>
+                            <span className="rz-cand-val">
+                              {fmt(realizationDiag.candidateCogs.byNetQty)} ₽
+                            </span>
+                          </div>
+                          <p className="rz-cand-hint">
+                            Сравните с себестоимостью в «Расчёте по документам Ozon» за
+                            тот же месяц. Величина справочная — в прибыль не входит.
+                          </p>
+                        </div>
+
+                        <div className="rz-grid">
+                          {[
+                            { label: "Строк в отчёте", value: fmt(realizationDiag.rowCount) },
+                            { label: "Продано, ед.", value: fmt(realizationDiag.sums.saleQuantity) },
+                            { label: "Возвраты, ед.", value: fmt(realizationDiag.sums.returnQuantity) },
+                            { label: "Выручка (delivery)", value: `${fmt(realizationDiag.sums.deliveryAmount)} ₽` },
+                            { label: "Возвраты (amount)", value: `${fmt(realizationDiag.sums.returnAmount)} ₽` },
+                            { label: "Баллы за скидки", value: `${fmt(realizationDiag.sums.bonus)} ₽` },
+                            { label: "Со-инвест. банка", value: `${fmt(realizationDiag.sums.bankCoinvestment)} ₽` },
+                            { label: "Программы (stars)", value: `${fmt(realizationDiag.sums.stars)} ₽` },
+                            { label: "Сопоставлено строк", value: fmt(realizationDiag.candidateCogs.matchedRows) },
+                            { label: "Не сопоставлено", value: fmt(realizationDiag.candidateCogs.unmatchedRows) },
+                            { label: "Без себестоимости", value: fmt(realizationDiag.candidateCogs.matchedNoCostRows) },
+                          ].map((c) => (
+                            <div className="rz-cell" key={c.label}>
+                              <div className="rz-cell-lbl">{c.label}</div>
+                              <div className="rz-cell-val">{c.value}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div className="rz-fields">
+                          <span className="rz-fields-cap">Поля отчёта:</span>
+                          {([
+                            ["Артикул (offer_id)", realizationDiag.fieldsPresent.offerId],
+                            ["Кол-во продаж", realizationDiag.fieldsPresent.deliveryQuantity],
+                            ["Кол-во возвратов", realizationDiag.fieldsPresent.returnQuantity],
+                            ["Выручка", realizationDiag.fieldsPresent.deliveryAmount],
+                            ["Цена продавца", realizationDiag.fieldsPresent.sellerPricePerInstance],
+                            ["Баллы", realizationDiag.fieldsPresent.bonus],
+                            ["Со-инвест.", realizationDiag.fieldsPresent.bankCoinvestment],
+                            ["Stars", realizationDiag.fieldsPresent.stars],
+                          ] as const).map(([lbl, ok]) => (
+                            <span key={lbl} className={"rz-chip " + (ok ? "ok" : "no")}>
+                              {ok ? "✓" : "—"} {lbl}
+                            </span>
+                          ))}
+                        </div>
+
+                        {realizationDiag.warnings.length > 0 && (
+                          <ul className="rz-notes">
+                            {realizationDiag.warnings.map((w) => (
+                              <li key={w}>{w}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </>
+                    )}
                   </div>
                 )}
               </>
