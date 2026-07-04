@@ -31,9 +31,9 @@ import {
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
 //   profitBeforeManualExpenses = ozonOperationsTotal − matchedCostTotal
 // PR #18 (ручные расходы):
-//   taxAmount           = revenue × tax% / 100  (налог задаётся ПРОЦЕНТОМ от
-//                         выручки Ozon = totals.revenue — gross-начисления ДО
-//                         удержаний Ozon; в БД/историю/отчёты идёт сумма в ₽)
+//   taxAmount           = ozonOperationsTotal × tax% / 100  (налог задаётся
+//                         ПРОЦЕНТОМ от Итого Ozon = ozonOperationsTotal — суммы
+//                         операций Ozon; в БД/историю/отчёты идёт сумма в ₽)
 //   manualExpensesTotal = taxAmount + packaging + warehouseDelivery + salary + other
 //   netProfit           = profitBeforeManualExpenses − manualExpensesTotal
 //   margin              = ozonOperationsTotal > 0 ? netProfit/ozonOperationsTotal*100 : 0
@@ -172,11 +172,12 @@ export function computeApiProfit(
   const matchedCostTotal = cost.matchedCostTotal;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
-  // Налог задаётся ПРОЦЕНТОМ от выручки Ozon (gross-начисления ДО удержаний =
-  // totals.revenue, та же база, что у УСН-налога в ручном/файловом расчёте), а не
-  // суммой в ₽. В результат/историю/отчёты идёт уже рассчитанная сумма в ₽.
-  // Пример: revenue 100000, ставка 6 → 6000 ₽.
-  const meTax = round2(totals.revenue * (manualExpenses.tax / 100));
+  // Налог задаётся ПРОЦЕНТОМ от Итого Ozon (ozonOperationsTotal — сумма операций
+  // Ozon), а не суммой в ₽. В результат/историю/отчёты идёт уже рассчитанная
+  // сумма в ₽. ozonOperationsTotal посчитан выше, поэтому порядок вычислений
+  // верный: ozonOperationsTotal → meTax → manualExpensesTotal → netProfit.
+  // Пример: Итого Ozon 213917, ставка 7 → 14974.19 ₽.
+  const meTax = round2(ozonOperationsTotal * (manualExpenses.tax / 100));
   const mePackaging = round2(manualExpenses.packaging);
   const meWarehouseDelivery = round2(manualExpenses.warehouseDelivery);
   const meSalary = round2(manualExpenses.salary);
