@@ -14,6 +14,10 @@ import {
   type CatalogRow,
   type ProfitCostDraft,
 } from "./postings";
+import {
+  loadRealizationDiagnostic,
+  type RealizationDiagnostic,
+} from "./realization";
 
 // ============================================================================
 // Общий модуль предварительной/финальной прибыли через Ozon API.
@@ -26,17 +30,27 @@ import {
 // полный расчёт нельзя было получить без сохранения и списания). Раньше тот же
 // модуль обслуживал и preview — отсюда обобщённые имена ниже.
 //
-// Формула (PR #16, не ломаем): returns УЖЕ внутри signed revenue
-// (accruals_for_sale со знаком), поэтому повторно его НЕ прибавляем —
+// Формула (returns УЖЕ внутри signed revenue = accruals_for_sale со знаком,
+// поэтому повторно его НЕ прибавляем):
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
-//   profitBeforeManualExpenses = ozonOperationsTotal − matchedCostTotal
-// PR #18 (ручные расходы):
-//   taxAmount           = revenue × tax% / 100  (налог задаётся ПРОЦЕНТОМ от
-//                         выручки Ozon = totals.revenue — gross-начисления ДО
-//                         удержаний Ozon; в БД/историю/отчёты идёт сумма в ₽)
+//   productionCost      = себестоимость из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
+//                         (/v2/finance/realization → candidateCogs.bySaleQty:
+//                         Σ количество продаж × cost_price каталога по offer_id).
+//   profitBeforeManualExpenses = ozonOperationsTotal − productionCost
+//   taxAmount           = ozonOperationsTotal × tax% / 100  (налог задаётся
+//                         ПРОЦЕНТОМ от Итого Ozon = ozonOperationsTotal; в БД/
+//                         историю/отчёты идёт сумма в ₽)
 //   manualExpensesTotal = taxAmount + packaging + warehouseDelivery + salary + other
 //   netProfit           = profitBeforeManualExpenses − manualExpensesTotal
 //   margin              = ozonOperationsTotal > 0 ? netProfit/ozonOperationsTotal*100 : 0
+//
+// ИСТОЧНИК СЕБЕСТОИМОСТИ (боевой): отчёт о реализации Ozon (тот же источник, что и
+// документальный расчёт), а НЕ отправления (postings delivered-only). Себестоимость
+// по отправлениям остаётся только СПРАВОЧНОЙ (postingsReferenceCost) и НЕ участвует
+// в прибыли. byNetQty (продажи−возвраты) остаётся ТОЛЬКО в диагностике. Если из
+// отчёта реализации нельзя надёжно получить себестоимость (нет offer_id, есть
+// несопоставленные/без себестоимости строки, отчёт пуст/не получен) —
+// loadAndComputeApiProfit возвращает ошибку, боевой расчёт НЕ показывается.
 // ============================================================================
 
 export const round2 = (n: number): number =>
@@ -46,7 +60,7 @@ const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 // ---- ручные расходы (PR #18): optional, в БД сохраняем ТОЛЬКО при финале -----
 export type ManualExpenses = {
-  /** Налог: ПРОЦЕНТ от выручки Ozon (не ₽). Сумма в ₽ считается в computeApiProfit. */
+  /** Налог: ПРОЦЕНТ от Итого Ozon (не ₽). Сумма в ₽ считается в computeApiProfit. */
   tax: number;
   packaging: number;
   warehouseDelivery: number;
@@ -152,13 +166,19 @@ export type ApiProfitComputed = {
 };
 
 /**
- * Свести агрегаты финансов + себестоимости + ручные расходы в итоговые числа.
- * ЧИСТАЯ функция — никаких сетей и БД. Используется И в preview, И в финальном
- * сохранении, чтобы цифры были идентичны. Формулу выше не меняем.
+ * Свести агрегаты финансов + БОЕВУЮ себестоимость (из отчёта реализации Ozon) +
+ * ручные расходы в итоговые числа. ЧИСТАЯ функция — никаких сетей и БД.
+ *
+ * productionCost — боевая себестоимость из отчёта о реализации Ozon
+ * (candidateCogs.bySaleQty), уже провалидированная вызывающим (полное покрытие).
+ * Полнота проверяется ДО вызова (resolveRealizationProductionCost →
+ * loadAndComputeApiProfit): сюда productionCost приходит только когда всё
+ * сопоставлено и себестоимость > 0, поэтому status здесь = complete_cost.
+ * Налог считается ПРОЦЕНТОМ от Итого Ozon (ozonOperationsTotal).
  */
 export function computeApiProfit(
   totals: OzonDraftTotals,
-  cost: ProfitCostDraft,
+  productionCost: number,
   manualExpenses: ManualExpenses
 ): ApiProfitComputed {
   const ozonOperationsTotal = round2(
@@ -169,14 +189,18 @@ export function computeApiProfit(
       totals.storage +
       totals.other
   );
-  const matchedCostTotal = cost.matchedCostTotal;
+  // Боевая себестоимость = из отчёта о реализации Ozon (bySaleQty), НЕ из
+  // отправлений. Отрицательную/нечисловую себестоимость не пропускаем.
+  const matchedCostTotal =
+    Number.isFinite(productionCost) && productionCost > 0
+      ? round2(productionCost)
+      : 0;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
-  // Налог задаётся ПРОЦЕНТОМ от выручки Ozon (gross-начисления ДО удержаний =
-  // totals.revenue, та же база, что у УСН-налога в ручном/файловом расчёте), а не
-  // суммой в ₽. В результат/историю/отчёты идёт уже рассчитанная сумма в ₽.
-  // Пример: revenue 100000, ставка 6 → 6000 ₽.
-  const meTax = round2(totals.revenue * (manualExpenses.tax / 100));
+  // Налог задаётся ПРОЦЕНТОМ от Итого Ozon (ozonOperationsTotal), а не суммой в ₽.
+  // В результат/историю/отчёты идёт уже рассчитанная сумма в ₽.
+  // Пример: Итого Ozon 376742, ставка 7 → 26371.94 ₽.
+  const meTax = round2(ozonOperationsTotal * (manualExpenses.tax / 100));
   const mePackaging = round2(manualExpenses.packaging);
   const meWarehouseDelivery = round2(manualExpenses.warehouseDelivery);
   const meSalary = round2(manualExpenses.salary);
@@ -189,19 +213,10 @@ export function computeApiProfit(
   const margin =
     ozonOperationsTotal > 0 ? round2((netProfit / ozonOperationsTotal) * 100) : 0;
 
-  // no_cost: себестоимости нет совсем; partial_cost: есть несопоставленные;
-  // complete_cost: всё сопоставлено и себестоимость > 0.
-  let status: CostStatus;
-  if (matchedCostTotal <= 0) {
-    status = "no_cost";
-  } else if (
-    cost.coverage.unmatchedItems > 0 ||
-    cost.coverage.unmatchedQuantity > 0
-  ) {
-    status = "partial_cost";
-  } else {
-    status = "complete_cost";
-  }
+  // Себестоимость из реализации приходит уже полной (валидатор отсёк неполноту),
+  // поэтому complete_cost при cost>0. Защитный no_cost — если по какой-то причине
+  // себестоимость всё же 0 (боевой расчёт в этом случае не должен сохраняться).
+  const status: CostStatus = matchedCostTotal > 0 ? "complete_cost" : "no_cost";
 
   return {
     ozonOperationsTotal,
@@ -222,6 +237,81 @@ export function computeApiProfit(
 }
 
 // ---------------------------------------------------------------------------
+// Боевая себестоимость из отчёта о реализации Ozon: валидация + резолюция.
+//
+// Себестоимость для API-прибыли берётся из /v2/finance/realization
+// (candidateCogs.bySaleQty). Прежде чем использовать её как боевую, проверяем
+// НАДЁЖНОСТЬ. Любая из проблем → боевой расчёт останавливается понятной ошибкой
+// (мы НЕ показываем неверную прибыль и НЕ используем postings как тихий фолбэк):
+//   • not_connected — отчёт реализации не получен (сеть/ключ);
+//   • no_rows       — отчёт пуст (нет строк) → себестоимость не определить;
+//   • no_offer_id   — в строках нет offer_id → сопоставить с каталогом нельзя;
+//   • unmatched     — есть строки, не сопоставленные с каталогом;
+//   • no_cost       — есть сопоставленные строки без cost_price (0 ₽);
+//   • zero_cost     — bySaleQty ≤ 0 (нечего использовать как себестоимость).
+// unmatched/no_cost решаются пользователем в каталоге (заполнить себестоимость).
+// ---------------------------------------------------------------------------
+
+export type RealizationCostErrorCode =
+  | "not_connected"
+  | "no_rows"
+  | "no_offer_id"
+  | "unmatched"
+  | "no_cost"
+  | "zero_cost";
+
+export type RealizationCostResolution =
+  | { ok: true; productionCost: number }
+  | {
+      ok: false;
+      code: RealizationCostErrorCode;
+      /** Кол-во несопоставленных строк реализации (для сообщения/каталога). */
+      unmatchedRows: number;
+      /** Кол-во сопоставленных строк без себестоимости (cost=0). */
+      noCostRows: number;
+      /** Код ошибки Ozon, если отчёт реализации не получен (not_connected). */
+      ozonErrorCode?: OzonFinanceErrorCode;
+    };
+
+/**
+ * Провалидировать диагностику отчёта реализации и вернуть боевую себестоимость
+ * (bySaleQty) ЛИБО причину, по которой её нельзя использовать. ЧИСТАЯ функция.
+ * byNetQty здесь НЕ используется (остаётся только в диагностике).
+ */
+export function resolveRealizationProductionCost(
+  rz: RealizationDiagnostic
+): RealizationCostResolution {
+  const unmatchedRows = rz.candidateCogs.unmatchedRows;
+  const noCostRows = rz.candidateCogs.matchedNoCostRows;
+  if (!rz.connected) {
+    return {
+      ok: false,
+      code: "not_connected",
+      unmatchedRows: 0,
+      noCostRows: 0,
+      ozonErrorCode: rz.errorCode,
+    };
+  }
+  if (rz.rowCount === 0) {
+    return { ok: false, code: "no_rows", unmatchedRows: 0, noCostRows: 0 };
+  }
+  if (!rz.fieldsPresent.offerId) {
+    return { ok: false, code: "no_offer_id", unmatchedRows, noCostRows };
+  }
+  if (unmatchedRows > 0) {
+    return { ok: false, code: "unmatched", unmatchedRows, noCostRows };
+  }
+  if (noCostRows > 0) {
+    return { ok: false, code: "no_cost", unmatchedRows, noCostRows };
+  }
+  const productionCost = round2(rz.candidateCogs.bySaleQty);
+  if (!(productionCost > 0)) {
+    return { ok: false, code: "zero_cost", unmatchedRows: 0, noCostRows: 0 };
+  }
+  return { ok: true, productionCost };
+}
+
+// ---------------------------------------------------------------------------
 // Сборка тела ответа полного API-расчёта (PR #20).
 //
 // Успешный /api/ozon/save-calculation отдаёт полный API-расчёт
@@ -235,6 +325,11 @@ export type ApiProfitResponseBody = {
   period: { month: string; dateFrom: string; dateTo: string };
   source: string;
   status: CostStatus;
+  /** Источник боевой себестоимости: "realization" (отчёт о реализации Ozon). */
+  costSource: "realization";
+  /** СПРАВОЧНАЯ себестоимость по отправлениям (postings delivered-only): показываем
+   *  как справку, в чистую прибыль НЕ входит. 0 — если отправления недоступны. */
+  postingsReferenceCost: number;
   apiTotals: {
     ozonAccruals: number;
     returns: number;
@@ -276,14 +371,19 @@ export function buildApiProfitResponseBody(params: {
   draft: OzonDraftAggregate;
   cost: ProfitCostDraft;
   computed: ApiProfitComputed;
+  /** СПРАВОЧНАЯ себестоимость по отправлениям (postings). НЕ в прибыли. */
+  postingsReferenceCost: number;
   extraNotes?: string[];
 }): ApiProfitResponseBody {
-  const { month, range, source, draft, cost, computed, extraNotes } = params;
+  const { month, range, source, draft, cost, computed, postingsReferenceCost, extraNotes } =
+    params;
   const t = draft.totals;
   return {
     period: { month, dateFrom: range.dateFrom, dateTo: range.dateTo },
     source,
     status: computed.status,
+    costSource: "realization",
+    postingsReferenceCost: round2(postingsReferenceCost),
     apiTotals: {
       ozonAccruals: t.revenue,
       returns: t.returns,
@@ -330,6 +430,8 @@ export type ApiProfitInputs = {
   clientId: string;
   apiKey: string;
   range: MonthRange;
+  /** Месяц отчёта "YYYY-MM" — для отчёта о реализации (боевая себестоимость). */
+  month: string;
   manualExpenses: ManualExpenses;
 };
 
@@ -337,16 +439,33 @@ export type ApiProfitLoaded =
   | {
       ok: true;
       draft: OzonDraftAggregate;
+      /** СПРАВОЧНАЯ себестоимость по отправлениям (postings). НЕ в прибыли. */
       cost: ProfitCostDraft;
+      /** Диагностика отчёта о реализации Ozon (источник боевой себестоимости). */
+      realization: RealizationDiagnostic;
+      /** Боевая себестоимость (bySaleQty) — уже провалидированная. */
+      productionCost: number;
       computed: ApiProfitComputed;
     }
   | { ok: false; kind: "ozon"; code: OzonFinanceErrorCode }
-  | { ok: false; kind: "catalog" };
+  | { ok: false; kind: "catalog" }
+  | {
+      ok: false;
+      kind: "realization_cost";
+      resolution: Extract<RealizationCostResolution, { ok: false }>;
+    };
 
 /**
- * Заново получить данные Ozon API (финансы + отправления) и каталог
- * себестоимости пользователя, затем пересчитать прибыль. Бэкенд НЕ доверяет
- * числам с фронтенда — это единственный источник истины для обоих роутов.
+ * Заново получить данные Ozon API + каталог себестоимости и пересчитать боевую
+ * прибыль. Бэкенд НЕ доверяет числам с фронтенда — единственный источник истины.
+ *
+ * Боевая СЕБЕСТОИМОСТЬ берётся из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon (/v2/finance/realization,
+ * candidateCogs.bySaleQty) — тот же источник, что и документальный расчёт. Отчёт
+ * реализации получаем и валидируем ДО расчёта: если себестоимость нельзя надёжно
+ * получить (нет offer_id / несопоставленные / без себестоимости / пусто / не
+ * получен) — возвращаем kind:"realization_cost" и НЕ считаем прибыль (боевой расчёт
+ * не показывается). Себестоимость по отправлениям (postings) остаётся ТОЛЬКО
+ * справочной (postingsReferenceCost) и НЕ используется как тихий фолбэк.
  *
  * НИЧЕГО не сохраняет и НЕ списывает — это делает вызывающий роут.
  * apiKey приходит уже расшифрованным; здесь он НЕ логируется и НЕ возвращается.
@@ -354,18 +473,15 @@ export type ApiProfitLoaded =
 export async function loadAndComputeApiProfit(
   input: ApiProfitInputs
 ): Promise<ApiProfitLoaded> {
-  const { admin, userId, clientId, apiKey, range, manualExpenses } = input;
+  const { admin, userId, clientId, apiKey, range, month, manualExpenses } = input;
 
-  // 1) финансы Ozon (operations)
+  // 1) финансы Ozon (operations) → Итого Ozon
   const tx = await fetchOzonTransactions(clientId, apiKey, range);
   if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
   const draft = aggregateDraft(tx.operations, tx.partial);
 
-  // 2) отправления FBO+FBS (фатальная ошибка схемы → код Ozon)
-  const postings = await fetchMonthPostings(clientId, apiKey, range);
-  if (postings.fatalCode) return { ok: false, kind: "ozon", code: postings.fatalCode };
-
-  // 3) каталог себестоимости пользователя (read-only, только свои строки)
+  // 2) каталог себестоимости пользователя (read-only, только свои строки) — нужен
+  //    и для сопоставления отчёта реализации, и для справочной себестоимости.
   const { data: catalog, error: catErr } = await admin
     .from("products")
     .select("sku, name, cost_price")
@@ -375,16 +491,35 @@ export async function loadAndComputeApiProfit(
     console.error("[ozon/profit] products select error", catErr);
     return { ok: false, kind: "catalog" };
   }
+  const catalogRows = (catalog ?? []) as CatalogRow[];
 
-  // 4) себестоимость ТОЛЬКО по сопоставленным товарам (без fuzzy)
+  // 3) БОЕВАЯ себестоимость из отчёта о реализации Ozon + валидация надёжности.
+  //    productionCost = candidateCogs.bySaleQty (Σ кол-во продаж × cost каталога).
+  const realization = await loadRealizationDiagnostic({
+    clientId,
+    apiKey,
+    month,
+    catalog: catalogRows,
+  });
+  const resolution = resolveRealizationProductionCost(realization);
+  if (!resolution.ok) {
+    return { ok: false, kind: "realization_cost", resolution };
+  }
+  const productionCost = resolution.productionCost;
+
+  // 4) СПРАВОЧНАЯ себестоимость по отправлениям (postings) — best-effort. НЕ
+  //    участвует в прибыли и НЕ гейтит расчёт: фатальная ошибка отправлений НЕ
+  //    валит боевой расчёт (показываем справку 0). Прежняя delivered-only логика
+  //    больше НЕ боевая себестоимость.
+  const postings = await fetchMonthPostings(clientId, apiKey, range);
   const cost = aggregateProfitCostDraft(
-    postings.items,
+    postings.fatalCode ? [] : postings.items,
     postings.warnings,
-    (catalog ?? []) as CatalogRow[]
+    catalogRows
   );
 
-  // 5) формула
-  const computed = computeApiProfit(draft.totals, cost, manualExpenses);
+  // 5) формула: себестоимость из реализации + налог от Итого Ozon.
+  const computed = computeApiProfit(draft.totals, productionCost, manualExpenses);
 
-  return { ok: true, draft, cost, computed };
+  return { ok: true, draft, cost, realization, productionCost, computed };
 }

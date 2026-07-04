@@ -791,6 +791,11 @@ type OzonProfitDraftResponse = {
   period: { month: string; dateFrom: string; dateTo: string };
   source: string;
   status: "complete_cost" | "partial_cost" | "no_cost";
+  // Источник боевой себестоимости: "realization" (отчёт о реализации Ozon).
+  costSource?: "realization";
+  // СПРАВОЧНАЯ себестоимость по отправлениям (postings delivered-only): показываем
+  // как справку, в чистую прибыль НЕ входит. 0/undefined — отправления недоступны.
+  postingsReferenceCost?: number;
   apiTotals: {
     ozonAccruals: number;
     returns: number;
@@ -8881,6 +8886,23 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           − {fmt(profitResult.costDraft.matchedCostTotal)} ₽
                         </span>
                       </div>
+                      <p
+                        className="api-step-hint"
+                        style={{ margin: "-.15rem 0 .1rem" }}
+                      >
+                        Себестоимость получена из отчёта реализации Ozon
+                      </p>
+                      {typeof profitResult.postingsReferenceCost === "number" &&
+                        profitResult.postingsReferenceCost > 0 && (
+                          <div className="api-result-row is-sub">
+                            <span className="rl">
+                              Справочно: по отправлениям было
+                            </span>
+                            <span className="rv">
+                              {fmt(profitResult.postingsReferenceCost)} ₽
+                            </span>
+                          </div>
+                        )}
                       <div className="api-result-row">
                         <span className="rl">Ручные расходы</span>
                         <span className="rv neg">
@@ -8890,7 +8912,12 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       {profitResult.manualExpenses.tax > 0 && (
                         <div className="api-result-row is-sub">
                           <span className="rl">
-                            в т.ч. налог{apiExpenses.tax ? ` (${apiExpenses.tax}%)` : ""}
+                            в т.ч. налог
+                            {apiExpenses.tax
+                              ? ` (${apiExpenses.tax}% от Итого Ozon ${fmt(
+                                  profitResult.preliminary.ozonOperationsTotal
+                                )} ₽)`
+                              : ""}
                           </span>
                           <span className="rv">
                             {fmt(profitResult.manualExpenses.tax)} ₽

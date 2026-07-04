@@ -2,7 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest, getUserScopedClient } from "../../cloud/_lib/auth";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
-import type { CatalogRow } from "../_lib/postings";
 import {
   buildApiProfitResponseBody,
   errorResponse,
@@ -10,10 +9,7 @@ import {
   parseManualExpenses,
   round2,
 } from "../_lib/profit";
-import {
-  loadRealizationDiagnostic,
-  type RealizationDiagnostic,
-} from "../_lib/realization";
+import { type RealizationDiagnostic } from "../_lib/realization";
 
 // ============================================================================
 // POST /api/ozon/save-calculation — ФИНАЛЬНОЕ сохранение API-расчёта Ozon в
@@ -21,14 +17,30 @@ import {
 //
 //   Вход: { month: "YYYY-MM", manualExpenses? }.
 //
+// Целевая формула API-расчёта:
+//   Чистая прибыль = Итого Ozon − Себестоимость из отчёта реализации Ozon
+//                    − Налог от Итого Ozon − Внешние расходы вручную.
+//   • Итого Ozon (ozonOperationsTotal) — из финопераций Ozon API;
+//   • Себестоимость (productionCost) — из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
+//     (/v2/finance/realization → candidateCogs.bySaleQty), сопоставленного с
+//     каталогом по item.offer_id; postings delivered-only COGS БОЛЬШЕ НЕ боевая
+//     (остаётся только справочной строкой postingsReferenceCost);
+//   • Налог = round2(ozonOperationsTotal × tax% / 100) — ПРОЦЕНТ от Итого Ozon;
+//   • Внешние расходы — вводит пользователь вручную.
+//
 // Поток (server-authoritative, бэкенд НЕ доверяет числам с фронтенда):
 //   1. auth (user_id ТОЛЬКО из токена), ключ Ozon ТОЛЬКО из ozon_connections;
-//   2. заново тянем данные Ozon API + каталог и ПЕРЕСЧИТЫВАЕМ ту же формулу,
-//      что и preview (общий _lib/profit → loadAndComputeApiProfit);
-//   3. финальное сохранение разрешено ТОЛЬКО при ПОЛНОМ покрытии себестоимостью
-//      (status === "complete_cost" И unmatchedItems === 0 И matchedNoCostCount === 0 —
-//      т.е. НЕТ ни одного matched-товара с cost_price = 0) — иначе 400, без
-//      сохранения и БЕЗ списания;
+//   2. заново тянем данные Ozon API (финоперации + отчёт реализации) + каталог и
+//      ПЕРЕСЧИТЫВАЕМ ту же формулу, что и preview (общий _lib/profit →
+//      loadAndComputeApiProfit);
+//   3. финальное сохранение разрешено ТОЛЬКО когда боевая себестоимость надёжно
+//      получена ИЗ ОТЧЁТА РЕАЛИЗАЦИИ: realization подключился, есть строки и
+//      item.offer_id, все строки сопоставлены с каталогом (unmatchedRows === 0) и
+//      у всех есть cost_price (noCostRows === 0), bySaleQty > 0. Иначе:
+//        • unmatched/no-cost → 400 incomplete_cost (пользователь заполняет каталог);
+//        • not_connected/no_rows/no_offer_id/zero_cost → 422 realization_unavailable;
+//      в обоих случаях БЕЗ сохранения и БЕЗ списания — некорректная прибыль НЕ
+//      показывается;
 //   4. списываем РОВНО один API-расчёт СТРОГИМ RPC consume_api_calculation
 //      (PR #21): доступ ТОЛЬКО при активном безлимите 449₽ ИЛИ первом бесплатном
 //      пробном расчёте; 149₽ single-кредит API НЕ открывает. Списание — ПЕРЕД
@@ -164,49 +176,73 @@ export async function POST(req: NextRequest) {
   const clientId = conn.client_id as string;
 
   // ---- 1) ЗАНОВО получаем данные Ozon + каталог и пересчитываем (общий модуль) ----
+  // Боевая СЕБЕСТОИМОСТЬ берётся из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon (тот же источник, что и
+  // документальный расчёт), налог — от Итого Ozon. Полнота себестоимости из отчёта
+  // реализации проверяется ВНУТРИ loadAndComputeApiProfit ДО расчёта: при проблеме
+  // возвращается kind:"realization_cost" и прибыль НЕ считается.
   const loaded = await loadAndComputeApiProfit({
     admin,
     userId,
     clientId,
     apiKey,
     range,
+    month,
     manualExpenses,
   });
   if (!loaded.ok) {
     if (loaded.kind === "ozon") return errorResponse(loaded.code);
+    if (loaded.kind === "catalog") {
+      return NextResponse.json(
+        { error: "Ошибка чтения каталога себестоимости" },
+        { status: 502, headers: NO_STORE }
+      );
+    }
+    // ---- 2) себестоимость из отчёта реализации ненадёжна → НЕ сохраняем и НЕ
+    //         списываем (боевой расчёт не показывается, чтобы не показать неверную
+    //         прибыль). unmatched/no_cost → тот же блок «не хватает себестоимости»
+    //         (пользователь заполняет каталог); остальные причины — понятная ошибка
+    //         (отчёт не получен / пуст / без offer_id / нулевая себестоимость).
+    const r = loaded.resolution;
+    if (r.code === "unmatched" || r.code === "no_cost") {
+      return NextResponse.json(
+        {
+          error:
+            "Сохранение доступно только когда все товары из отчёта о реализации сопоставлены и у каждого заполнена себестоимость.",
+          code: "incomplete_cost",
+          status: "partial_cost",
+          unmatchedItems: r.unmatchedRows,
+          matchedNoCostCount: r.noCostRows,
+        },
+        { status: 400, headers: NO_STORE }
+      );
+    }
+    if (r.code === "not_connected" && r.ozonErrorCode) {
+      return errorResponse(r.ozonErrorCode);
+    }
+    const msgByCode: Record<string, string> = {
+      not_connected:
+        "Не удалось получить отчёт о реализации Ozon для расчёта себестоимости. Расчёт не сделан, попытка не списана.",
+      no_rows:
+        "Отчёт о реализации Ozon за выбранный месяц пуст — себестоимость определить нельзя. Расчёт не сделан, попытка не списана.",
+      no_offer_id:
+        "В отчёте о реализации Ozon нет артикулов (offer_id) — сопоставить с каталогом нельзя. Расчёт не сделан, попытка не списана.",
+      zero_cost:
+        "Себестоимость из отчёта о реализации Ozon равна 0 — проверьте себестоимость товаров в каталоге. Расчёт не сделан, попытка не списана.",
+    };
     return NextResponse.json(
-      { error: "Ошибка чтения каталога себестоимости" },
-      { status: 502, headers: NO_STORE }
+      {
+        error:
+          msgByCode[r.code] ??
+          "Не удалось определить себестоимость из отчёта о реализации Ozon. Расчёт не сделан, попытка не списана.",
+        code: "realization_unavailable",
+        reason: r.code,
+      },
+      { status: 422, headers: NO_STORE }
     );
   }
 
   const t = loaded.draft.totals;
   const c = loaded.computed;
-
-  // ---- 2) финальное сохранение ТОЛЬКО при ПОЛНОМ покрытии себестоимостью ----
-  // НЕ сохраняем и НЕ списываем, если есть несопоставленные товары ИЛИ есть хотя бы
-  // ОДИН сопоставленный товар без себестоимости (cost_price = 0 → matchedNoCostCount).
-  // Строго: unmatchedItems === 0 И matchedNoCostCount === 0. Одного status мало:
-  // он допускает complete_cost, когда часть matched-товаров имеет cost_price = 0
-  // (их стоимость просто не входит в matchedCostTotal) — это занизило бы расходы,
-  // поэтому matchedNoCostCount проверяем ЯВНО.
-  if (
-    c.status !== "complete_cost" ||
-    loaded.cost.coverage.unmatchedItems !== 0 ||
-    loaded.cost.matchedNoCostCount !== 0
-  ) {
-    return NextResponse.json(
-      {
-        error:
-          "Сохранение доступно только когда все товары сопоставлены и у каждого заполнена себестоимость.",
-        code: "incomplete_cost",
-        status: c.status,
-        unmatchedItems: loaded.cost.coverage.unmatchedItems,
-        matchedNoCostCount: loaded.cost.matchedNoCostCount,
-      },
-      { status: 400, headers: NO_STORE }
-    );
-  }
 
   // ---- 3) списываем РОВНО один API-расчёт (server-authoritative, ПЕРЕД сохранением) ----
   // USER-SCOPED клиент: consume_api_calculation опирается на auth.uid(); service-role
@@ -358,36 +394,11 @@ export async function POST(req: NextRequest) {
     reportHistorySaved = true;
   }
 
-  // ---- 5.1) СПРАВОЧНАЯ диагностика отчёта о реализации Ozon (read-only) --------
-  // Считаем ЗДЕСЬ — ПОСЛЕ успешного списания/сохранения, то есть строго ВНУТРИ
-  // платного API-потока (это НЕ бесплатный финансовый endpoint). Диагностика ничего
-  // не меняет: candidate COGS — справочная величина, она НЕ входит в netProfit /
-  // matchedCostTotal / налог и никуда не сохраняется (в calculations/report_history
-  // выше уже записаны боевые числа). Best-effort: любая ошибка отчёта реализации НЕ
-  // валит уже сохранённый расчёт — просто отдадим diagnostic.connected=false.
-  // Каталог перечитываем отдельным read-only запросом, чтобы НЕ трогать модуль
-  // прибыли (_lib/profit) — так боевые прибыль/налог/COGS гарантированно не задеты.
-  let realizationDiagnostic: RealizationDiagnostic | null = null;
-  try {
-    const { data: catalog2, error: cat2Err } = await admin
-      .from("products")
-      .select("sku, name, cost_price")
-      .eq("user_id", userId);
-    if (cat2Err) {
-      // eslint-disable-next-line no-console
-      console.error("[api/ozon/save-calculation] realization catalog select error", cat2Err);
-    }
-    realizationDiagnostic = await loadRealizationDiagnostic({
-      clientId,
-      apiKey,
-      month,
-      catalog: (catalog2 ?? []) as CatalogRow[],
-    });
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.error("[api/ozon/save-calculation] realization diagnostic error", e);
-    realizationDiagnostic = null;
-  }
+  // ---- 5.1) диагностика отчёта о реализации Ozon: ТА ЖЕ, что дала боевую
+  //          себестоимость выше (loaded.realization) — повторно НЕ запрашиваем.
+  //          Показываем ровно те количества/сопоставления, из которых посчитана
+  //          боевая COGS (bySaleQty). byNetQty остаётся справочным (не в прибыли).
+  const realizationDiagnostic: RealizationDiagnostic = loaded.realization;
 
   // ---- 6) полный расчёт для UI (PR #20): та же форма, что и preview-ответ, но
   // помечен как сохранённый. Фронт показывает эти цифры ТОЛЬКО после успешного
@@ -400,7 +411,10 @@ export async function POST(req: NextRequest) {
     draft: loaded.draft,
     cost: loaded.cost,
     computed: c,
+    postingsReferenceCost: loaded.cost.matchedCostTotal,
     extraNotes: [
+      "Себестоимость взята из отчёта о реализации Ozon (тот же источник, что и документальный расчёт); себестоимость по отправлениям показана справочно и в прибыль не входит.",
+      "Налог рассчитан как процент от Итого Ozon.",
       "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются.",
       "Расчёт сохранён в историю; одна попытка списана (для активного безлимита — без списания).",
     ],
