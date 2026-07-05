@@ -837,6 +837,8 @@ type OzonProfitDraftResponse = {
     ozonOperationsTotal: number;
     matchedCostTotal: number;
     profitBeforeManualExpenses: number;
+    /** База налога API: выручка отчёта реализации за вычетом возвратов (в ₽). */
+    taxRevenueBase?: number;
   };
   // PR #18 — ручные расходы (echo, в БД не сохранены) + предварительная чистая прибыль.
   manualExpenses: {
@@ -8918,8 +8920,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           <span className="rl">
                             в т.ч. налог
                             {apiExpenses.tax
-                              ? ` (${apiExpenses.tax}% от Итого Ozon ${fmt(
-                                  profitResult.preliminary.ozonOperationsTotal
+                              ? ` (${apiExpenses.tax}% от выручки из реализации Ozon ${fmt(
+                                  profitResult.preliminary.taxRevenueBase ?? 0
                                 )} ₽)`
                               : ""}
                           </span>

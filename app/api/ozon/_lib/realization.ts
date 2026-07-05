@@ -165,6 +165,8 @@ export type RealizationDiagnostic = {
     deliveryAmount: number;
     /** Σ сумма возвратов (return amount). */
     returnAmount: number;
+    /** База налога API-расчёта: выручка реализации за вычетом возвратов (deliveryAmount − returnAmount). */
+    taxRevenueBase: number;
     /** Σ баллы за скидки (bonus, delivery+return). */
     bonus: number;
     /** Σ со-инвестирование банка (bank_coinvestment, delivery+return). */
@@ -418,6 +420,7 @@ export function buildRealizationDiagnostic(
         netQuantity: 0,
         deliveryAmount: 0,
         returnAmount: 0,
+        taxRevenueBase: 0,
         bonus: 0,
         bankCoinvestment: 0,
         stars: 0,
@@ -607,6 +610,7 @@ export function buildRealizationDiagnostic(
       netQuantity: round2(netQuantity),
       deliveryAmount: round2(deliveryAmount),
       returnAmount: round2(returnAmount),
+      taxRevenueBase: round2(deliveryAmount - returnAmount),
       bonus: round2(bonus),
       bankCoinvestment: round2(bankCoinvestment),
       stars: round2(stars),
