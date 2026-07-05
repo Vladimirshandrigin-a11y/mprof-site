@@ -620,3 +620,84 @@ alter table public.ozon_connections enable row level security;
 -- для anon/authenticated. Зашифрованный ключ не должен быть доступен браузеру даже
 -- на чтение. Доступ — только backend через service-role (мимо RLS).
 revoke all on public.ozon_connections from anon, authenticated;
+
+-- ============================================================================
+-- ozon_performance_connections — безопасное подключение Ozon PERFORMANCE API
+-- (реклама/продвижение). Добавлено в PR #43 (foundation).
+--
+-- >>> Применяется ВРУЧНУЮ (как весь этот файл). См. отдельный apply-файл:
+--     supabase/migrations/20260705_ozon_performance_connections.sql <<<
+--
+-- ОТДЕЛЬНАЯ таблица (НЕ ozon_connections), чтобы не рисковать Seller-подключением.
+-- Хранит ЗАШИФРОВАННЫЙ client_secret (AES-256-GCM, env OZON_KEYS_ENC_SECRET — тот
+-- же, что у Seller-ключа; см. app/api/ozon/_lib/crypto.ts) + last4 + Client ID +
+-- статус проверки токена. Реклама в расчёт прибыли пока НЕ добавляется.
+--
+-- БЕЗОПАСНОСТЬ — как у ozon_connections: RLS включён, клиентских policy НЕТ
+-- (deny-all для anon/authenticated) + REVOKE ALL. Доступ только backend через
+-- service-role (routes /api/ozon/performance/connection*). Секрет/токен НИКОГДА
+-- не уходят в браузер. Строже, чем select/insert-own: секрет не отдаём даже как
+-- шифротекст; на функциональность не влияет (routes ходят под service-role).
+-- ============================================================================
+create table if not exists public.ozon_performance_connections (
+  id                       uuid        primary key default gen_random_uuid(),
+  user_id                  uuid        not null references auth.users(id) on delete cascade,
+  client_id                text        not null,
+  client_secret_encrypted  text        not null,
+  secret_last4             text,
+  status                   text        not null default 'unknown'
+    check (status in ('unknown', 'active', 'invalid_key', 'forbidden', 'unavailable')),
+  last_checked_at          timestamptz,
+  last_error               text,
+  created_at               timestamptz not null default now(),
+  updated_at               timestamptz not null default now(),
+  unique (user_id)
+);
+
+alter table public.ozon_performance_connections add column if not exists secret_last4    text;
+alter table public.ozon_performance_connections add column if not exists status          text        not null default 'unknown';
+alter table public.ozon_performance_connections add column if not exists last_checked_at timestamptz;
+alter table public.ozon_performance_connections add column if not exists last_error      text;
+alter table public.ozon_performance_connections add column if not exists created_at      timestamptz not null default now();
+alter table public.ozon_performance_connections add column if not exists updated_at      timestamptz not null default now();
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'ozon_performance_connections_user_id_key'
+  ) then
+    alter table public.ozon_performance_connections
+      add constraint ozon_performance_connections_user_id_key unique (user_id);
+  end if;
+end $$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'ozon_performance_connections_status_check'
+  ) then
+    alter table public.ozon_performance_connections
+      add constraint ozon_performance_connections_status_check
+      check (status in ('unknown', 'active', 'invalid_key', 'forbidden', 'unavailable'));
+  end if;
+end $$;
+
+create or replace function public.touch_ozon_performance_connections_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_ozon_performance_connections_touch on public.ozon_performance_connections;
+create trigger trg_ozon_performance_connections_touch
+  before update on public.ozon_performance_connections
+  for each row execute function public.touch_ozon_performance_connections_updated_at();
+
+alter table public.ozon_performance_connections enable row level security;
+
+-- НАМЕРЕННО НЕТ ни одной policy: под включённым RLS отсутствие policy = deny-all.
+revoke all on public.ozon_performance_connections from anon, authenticated;
