@@ -234,8 +234,14 @@ function isStorageMarker(serviceName: string, operationType: string): boolean {
  *   • logistics  = Σ (delivery_charge + return_delivery_charge);
  *   • storage    = Σ services[].price, опознанных как складское хранение (эвристика);
  *   • services   = Σ остальных services[].price;
- *   • other      = Σ amount операций без единого распознанного компонента;
+ *   • other      = Σ (amount − сумма распознанных компонентов) по КАЖДОЙ операции —
+ *                  нераспознанный остаток amount (реклама, доставка, штрафы,
+ *                  корректировки, услуги партнёров и пр.). Для полностью
+ *                  нераспознанной операции componentSum=0 → это весь amount.
  *   • operationCount = всего операций.
+ * ИНВАРИАНТ: revenue + commission + logistics + services + storage + other === Σ amount
+ * (op.amount — источник истины net Ozon по операции; компоненты выше — только
+ * разбивка). Так «Операции Ozon» совпадают с «Итого» личного кабинета Ozon.
  * Если поле/структура отличается — не падаем, коалесцируем и добавляем warning.
  */
 export function aggregateDraft(
@@ -271,12 +277,13 @@ export function aggregateDraft(
     totals.logistics += deliv + retDeliv;
     if (isReturnOp(op)) totals.returns += accr;
 
-    let hasService = false;
+    // Сумма услуг этой операции — для разбивки storage/services И для residual ниже.
+    let serviceSum = 0;
     if (Array.isArray(op.services)) {
       for (const s of op.services) {
         const price = num(s?.price);
         if (price === 0) continue;
-        hasService = true;
+        serviceSum += price;
         servicesSeen = true;
         const name = typeof s?.name === "string" ? s.name : "";
         if (isStorageMarker(name, op.operation_type ?? "")) {
@@ -288,12 +295,18 @@ export function aggregateDraft(
       }
     }
 
-    // "Прочие операции": ни одного распознанного компонента, но ненулевой amount.
-    const recognized = accr !== 0 || comm !== 0 || deliv !== 0 || retDeliv !== 0 || hasService;
+    // op.amount — БОЕВОЙ net Ozon по операции (источник истины). Компоненты выше —
+    // только разбивка. Остаток amount, не разложенный в компоненты (реклама,
+    // доставка, штрафы, корректировки, услуги партнёров и пр.), НЕ теряем — относим
+    // в «Прочие». Для полностью нераспознанной операции componentSum=0 → residual
+    // равен всему amount (как в прежней логике). Инвариант: сумма всех бакетов
+    // (revenue+commission+logistics+services+storage+other) === Σ amount.
     const amount = num(op.amount);
-    if (!recognized && amount !== 0) {
-      totals.other += amount;
-      unclassifiedAmount += amount;
+    const componentSum = accr + comm + deliv + retDeliv + serviceSum;
+    const residual = amount - componentSum;
+    if (round2(residual) !== 0) {
+      totals.other += residual;
+      unclassifiedAmount += residual;
       if (op.operation_type) unknownTypes.add(op.operation_type);
     }
   }
