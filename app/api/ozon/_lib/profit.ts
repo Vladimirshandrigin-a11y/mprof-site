@@ -37,8 +37,12 @@ import {
 //                         (/v2/finance/realization → candidateCogs.bySaleQty:
 //                         Σ количество продаж × cost_price каталога по offer_id).
 //   profitBeforeManualExpenses = ozonOperationsTotal − productionCost
-//   taxAmount           = ozonOperationsTotal × tax% / 100  (налог задаётся
-//                         ПРОЦЕНТОМ от Итого Ozon = ozonOperationsTotal; в БД/
+//   realizationRevenueForTax = выручка ОТЧЁТА О РЕАЛИЗАЦИИ за вычетом возвратов
+//                         (/v2/finance/realization → sums.taxRevenueBase =
+//                         deliveryAmount − returnAmount), близка к строке
+//                         «Итого реализовано за вычетом возвратов» док-расчёта.
+//   taxAmount           = realizationRevenueForTax × tax% / 100  (налог задаётся
+//                         ПРОЦЕНТОМ от выручки реализации, НЕ от Итого Ozon; в БД/
 //                         историю/отчёты идёт сумма в ₽)
 //   manualExpensesTotal = taxAmount + packaging + warehouseDelivery + salary + other
 //   netProfit           = profitBeforeManualExpenses − manualExpensesTotal
@@ -60,7 +64,7 @@ const NO_STORE = { "Cache-Control": "no-store" } as const;
 
 // ---- ручные расходы (PR #18): optional, в БД сохраняем ТОЛЬКО при финале -----
 export type ManualExpenses = {
-  /** Налог: ПРОЦЕНТ от Итого Ozon (не ₽). Сумма в ₽ считается в computeApiProfit. */
+  /** Налог: ПРОЦЕНТ от выручки реализации (не ₽). Сумма в ₽ считается в computeApiProfit. */
   tax: number;
   packaging: number;
   warehouseDelivery: number;
@@ -152,6 +156,8 @@ export type ApiProfitComputed = {
   ozonOperationsTotal: number;
   matchedCostTotal: number;
   profitBeforeManualExpenses: number;
+  /** База налога: выручка отчёта реализации за вычетом возвратов (в ₽). */
+  taxRevenueBase: number;
   manualExpenses: {
     tax: number;
     packaging: number;
@@ -174,11 +180,16 @@ export type ApiProfitComputed = {
  * Полнота проверяется ДО вызова (resolveRealizationProductionCost →
  * loadAndComputeApiProfit): сюда productionCost приходит только когда всё
  * сопоставлено и себестоимость > 0, поэтому status здесь = complete_cost.
- * Налог считается ПРОЦЕНТОМ от Итого Ozon (ozonOperationsTotal).
+ *
+ * realizationRevenueForTax — БАЗА НАЛОГА: выручка отчёта реализации за вычетом
+ * возвратов (sums.taxRevenueBase = deliveryAmount − returnAmount), тоже уже
+ * провалидированная (> 0) вызывающим. Налог считается ПРОЦЕНТОМ от неё, а НЕ от
+ * Итого Ozon.
  */
 export function computeApiProfit(
   totals: OzonDraftTotals,
   productionCost: number,
+  realizationRevenueForTax: number,
   manualExpenses: ManualExpenses
 ): ApiProfitComputed {
   const ozonOperationsTotal = round2(
@@ -197,10 +208,16 @@ export function computeApiProfit(
       : 0;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
-  // Налог задаётся ПРОЦЕНТОМ от Итого Ozon (ozonOperationsTotal), а не суммой в ₽.
+  // База налога = выручка отчёта реализации за вычетом возвратов (НЕ Итого Ozon).
+  // Приходит уже провалидированной (> 0); защитно отбрасываем нечисло/≤0 в 0.
+  const taxRevenueBase =
+    Number.isFinite(realizationRevenueForTax) && realizationRevenueForTax > 0
+      ? round2(realizationRevenueForTax)
+      : 0;
+  // Налог задаётся ПРОЦЕНТОМ от выручки реализации, а не суммой в ₽.
   // В результат/историю/отчёты идёт уже рассчитанная сумма в ₽.
-  // Пример: Итого Ozon 376742, ставка 7 → 26371.94 ₽.
-  const meTax = round2(ozonOperationsTotal * (manualExpenses.tax / 100));
+  // Пример: выручка реализации 409404, ставка 7 → 28658.28 ₽.
+  const meTax = round2(taxRevenueBase * (manualExpenses.tax / 100));
   const mePackaging = round2(manualExpenses.packaging);
   const meWarehouseDelivery = round2(manualExpenses.warehouseDelivery);
   const meSalary = round2(manualExpenses.salary);
@@ -222,6 +239,7 @@ export function computeApiProfit(
     ozonOperationsTotal,
     matchedCostTotal,
     profitBeforeManualExpenses,
+    taxRevenueBase,
     manualExpenses: {
       tax: meTax,
       packaging: mePackaging,
@@ -248,7 +266,10 @@ export function computeApiProfit(
 //   • no_offer_id   — в строках нет offer_id → сопоставить с каталогом нельзя;
 //   • unmatched     — есть строки, не сопоставленные с каталогом;
 //   • no_cost       — есть сопоставленные строки без cost_price (0 ₽);
-//   • zero_cost     — bySaleQty ≤ 0 (нечего использовать как себестоимость).
+//   • zero_cost     — bySaleQty ≤ 0 (нечего использовать как себестоимость);
+//   • no_tax_revenue — sums.taxRevenueBase ≤ 0 (выручку реализации для БАЗЫ НАЛОГА
+//                      получить нельзя: нет delivery/return amount) → налог считать
+//                      не от чего, боевой расчёт останавливается.
 // unmatched/no_cost решаются пользователем в каталоге (заполнить себестоимость).
 // ---------------------------------------------------------------------------
 
@@ -258,10 +279,16 @@ export type RealizationCostErrorCode =
   | "no_offer_id"
   | "unmatched"
   | "no_cost"
-  | "zero_cost";
+  | "zero_cost"
+  | "no_tax_revenue";
 
 export type RealizationCostResolution =
-  | { ok: true; productionCost: number }
+  | {
+      ok: true;
+      productionCost: number;
+      /** База налога API: выручка реализации за вычетом возвратов (> 0). */
+      realizationRevenueForTax: number;
+    }
   | {
       ok: false;
       code: RealizationCostErrorCode;
@@ -275,7 +302,8 @@ export type RealizationCostResolution =
 
 /**
  * Провалидировать диагностику отчёта реализации и вернуть боевую себестоимость
- * (bySaleQty) ЛИБО причину, по которой её нельзя использовать. ЧИСТАЯ функция.
+ * (bySaleQty) + БАЗУ НАЛОГА (taxRevenueBase = выручка за вычетом возвратов) ЛИБО
+ * причину, по которой их нельзя использовать. ЧИСТАЯ функция.
  * byNetQty здесь НЕ используется (остаётся только в диагностике).
  */
 export function resolveRealizationProductionCost(
@@ -308,7 +336,13 @@ export function resolveRealizationProductionCost(
   if (!(productionCost > 0)) {
     return { ok: false, code: "zero_cost", unmatchedRows: 0, noCostRows: 0 };
   }
-  return { ok: true, productionCost };
+  // База налога: выручка реализации за вычетом возвратов. Если её нельзя получить
+  // (нет delivery/return amount → ≤ 0) — налог считать не от чего, останавливаемся.
+  const realizationRevenueForTax = round2(rz.sums.taxRevenueBase);
+  if (!(realizationRevenueForTax > 0)) {
+    return { ok: false, code: "no_tax_revenue", unmatchedRows: 0, noCostRows: 0 };
+  }
+  return { ok: true, productionCost, realizationRevenueForTax };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +385,8 @@ export type ApiProfitResponseBody = {
     ozonOperationsTotal: number;
     matchedCostTotal: number;
     profitBeforeManualExpenses: number;
+    /** База налога: выручка отчёта реализации за вычетом возвратов (в ₽). */
+    taxRevenueBase: number;
   };
   manualExpenses: ApiProfitComputed["manualExpenses"];
   netProfitPreview: { value: number; margin: number };
@@ -405,6 +441,7 @@ export function buildApiProfitResponseBody(params: {
       ozonOperationsTotal: computed.ozonOperationsTotal,
       matchedCostTotal: computed.matchedCostTotal,
       profitBeforeManualExpenses: computed.profitBeforeManualExpenses,
+      taxRevenueBase: computed.taxRevenueBase,
     },
     manualExpenses: computed.manualExpenses,
     netProfitPreview: { value: computed.netProfit, margin: computed.margin },
@@ -445,6 +482,8 @@ export type ApiProfitLoaded =
       realization: RealizationDiagnostic;
       /** Боевая себестоимость (bySaleQty) — уже провалидированная. */
       productionCost: number;
+      /** База налога: выручка реализации за вычетом возвратов — уже > 0. */
+      realizationRevenueForTax: number;
       computed: ApiProfitComputed;
     }
   | { ok: false; kind: "ozon"; code: OzonFinanceErrorCode }
@@ -506,6 +545,7 @@ export async function loadAndComputeApiProfit(
     return { ok: false, kind: "realization_cost", resolution };
   }
   const productionCost = resolution.productionCost;
+  const realizationRevenueForTax = resolution.realizationRevenueForTax;
 
   // 4) СПРАВОЧНАЯ себестоимость по отправлениям (postings) — best-effort. НЕ
   //    участвует в прибыли и НЕ гейтит расчёт: фатальная ошибка отправлений НЕ
@@ -518,8 +558,21 @@ export async function loadAndComputeApiProfit(
     catalogRows
   );
 
-  // 5) формула: себестоимость из реализации + налог от Итого Ozon.
-  const computed = computeApiProfit(draft.totals, productionCost, manualExpenses);
+  // 5) формула: себестоимость из реализации + налог от выручки реализации.
+  const computed = computeApiProfit(
+    draft.totals,
+    productionCost,
+    realizationRevenueForTax,
+    manualExpenses
+  );
 
-  return { ok: true, draft, cost, realization, productionCost, computed };
+  return {
+    ok: true,
+    draft,
+    cost,
+    realization,
+    productionCost,
+    realizationRevenueForTax,
+    computed,
+  };
 }

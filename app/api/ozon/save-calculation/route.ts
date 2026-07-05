@@ -19,13 +19,14 @@ import { type RealizationDiagnostic } from "../_lib/realization";
 //
 // Целевая формула API-расчёта:
 //   Чистая прибыль = Итого Ozon − Себестоимость из отчёта реализации Ozon
-//                    − Налог от Итого Ozon − Внешние расходы вручную.
+//                    − Налог от выручки реализации − Внешние расходы вручную.
 //   • Итого Ozon (ozonOperationsTotal) — из финопераций Ozon API;
 //   • Себестоимость (productionCost) — из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
 //     (/v2/finance/realization → candidateCogs.bySaleQty), сопоставленного с
 //     каталогом по item.offer_id; postings delivered-only COGS БОЛЬШЕ НЕ боевая
 //     (остаётся только справочной строкой postingsReferenceCost);
-//   • Налог = round2(ozonOperationsTotal × tax% / 100) — ПРОЦЕНТ от Итого Ozon;
+//   • Налог = round2(realizationRevenueForTax × tax% / 100) — ПРОЦЕНТ от выручки
+//     отчёта реализации за вычетом возвратов (sums.taxRevenueBase), НЕ от Итого Ozon;
 //   • Внешние расходы — вводит пользователь вручную.
 //
 // Поток (server-authoritative, бэкенд НЕ доверяет числам с фронтенда):
@@ -177,9 +178,10 @@ export async function POST(req: NextRequest) {
 
   // ---- 1) ЗАНОВО получаем данные Ozon + каталог и пересчитываем (общий модуль) ----
   // Боевая СЕБЕСТОИМОСТЬ берётся из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon (тот же источник, что и
-  // документальный расчёт), налог — от Итого Ozon. Полнота себестоимости из отчёта
-  // реализации проверяется ВНУТРИ loadAndComputeApiProfit ДО расчёта: при проблеме
-  // возвращается kind:"realization_cost" и прибыль НЕ считается.
+  // документальный расчёт), налог — от выручки реализации (за вычетом возвратов).
+  // Полнота себестоимости И наличие выручки-базы налога проверяются ВНУТРИ
+  // loadAndComputeApiProfit ДО расчёта: при проблеме возвращается
+  // kind:"realization_cost" и прибыль НЕ считается.
   const loaded = await loadAndComputeApiProfit({
     admin,
     userId,
@@ -228,6 +230,8 @@ export async function POST(req: NextRequest) {
         "В отчёте о реализации Ozon нет артикулов (offer_id) — сопоставить с каталогом нельзя. Расчёт не сделан, попытка не списана.",
       zero_cost:
         "Себестоимость из отчёта о реализации Ozon равна 0 — проверьте себестоимость товаров в каталоге. Расчёт не сделан, попытка не списана.",
+      no_tax_revenue:
+        "Не удалось определить выручку из отчёта о реализации Ozon для расчёта налога. Расчёт не сделан, попытка не списана.",
     };
     return NextResponse.json(
       {
@@ -335,6 +339,7 @@ export async function POST(req: NextRequest) {
       ozonOperationsTotal: c.ozonOperationsTotal,
       matchedCostTotal: c.matchedCostTotal,
       profitBeforeManualExpenses: c.profitBeforeManualExpenses,
+      taxRevenueBase: c.taxRevenueBase,
     },
     netProfit: c.netProfit,
     margin: c.margin,
@@ -414,7 +419,7 @@ export async function POST(req: NextRequest) {
     postingsReferenceCost: loaded.cost.matchedCostTotal,
     extraNotes: [
       "Себестоимость взята из отчёта о реализации Ozon (тот же источник, что и документальный расчёт); себестоимость по отправлениям показана справочно и в прибыль не входит.",
-      "Налог рассчитан как процент от Итого Ozon.",
+      "Налог рассчитан как процент от выручки из отчёта о реализации Ozon (за вычетом возвратов).",
       "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются.",
       "Расчёт сохранён в историю; одна попытка списана (для активного безлимита — без списания).",
     ],
