@@ -728,6 +728,31 @@ type OzonConnView = {
 // Ответ /api/ozon/connection*: безопасная проекция ИЛИ { error } при ошибке.
 type OzonConnResponse = Partial<OzonConnView> & { error?: string };
 
+// Ozon PERFORMANCE API (реклама/продвижение) — PR #43 (foundation). Отдельное
+// подключение: Client ID + Client Secret. Секрет в браузер НЕ приходит — фронт
+// видит только статус, маску Client ID и ••••last4. На этом этапе только проверка
+// токена, в расчёт прибыли реклама ещё НЕ добавляется.
+type PerfConnStatus =
+  | "not_connected"
+  | "unknown"
+  | "active"
+  | "invalid_key"
+  | "forbidden"
+  | "unavailable";
+
+type PerfConnView = {
+  connected: boolean;
+  status: PerfConnStatus;
+  clientIdMasked?: string;
+  secretLast4?: string | null;
+  lastCheckedAt?: string | null;
+  lastError?: string | null;
+  updatedAt?: string | null;
+};
+
+// Ответ /api/ozon/performance/connection*: безопасная проекция ИЛИ { error }.
+type PerfConnResponse = Partial<PerfConnView> & { error?: string };
+
 // Ответ /api/ozon/postings-match-diagnostic — read-only диагностика сопоставления
 // товаров Ozon (FBO+FBS) с каталогом себестоимости. Прибыль здесь НЕ считается.
 type OzonPostingsMatchResponse = {
@@ -1147,6 +1172,16 @@ export default function AppPage() {
   const [ozonConnLoading, setOzonConnLoading] = useState(false);
   const [ozonBusy, setOzonBusy] = useState<"idle" | "connecting" | "checking" | "deleting">("idle");
   const [ozonConnError, setOzonConnError] = useState("");
+
+  // Ozon Performance API (реклама/продвижение) — PR #43 foundation. Отдельное
+  // подключение и отдельная таблица; секрет в браузере не держим.
+  const [perfClientId, setPerfClientId] = useState("");
+  const [perfClientSecret, setPerfClientSecret] = useState("");
+  const [showPerfSecret, setShowPerfSecret] = useState(false);
+  const [perfConn, setPerfConn] = useState<PerfConnView | null>(null);
+  const [perfConnLoading, setPerfConnLoading] = useState(false);
+  const [perfBusy, setPerfBusy] = useState<"idle" | "connecting" | "checking" | "deleting">("idle");
+  const [perfConnError, setPerfConnError] = useState("");
 
   // Диагностика сопоставления товаров (PR #15) — read-only, ничего не сохраняет.
   const [matchMonth, setMatchMonth] = useState<string>(() => defaultDraftMonth());
@@ -3383,6 +3418,7 @@ export default function AppPage() {
     const loadUserData = (uid: string) => {
       loadHistory(uid).then((calcs) => {
         fetchOzonConnection();
+        fetchPerfConnection();
         loadUploadedReportsCloud(uid, calcs);
       });
     };
@@ -3919,6 +3955,160 @@ export default function AppPage() {
       setOzonConnError("Не удалось связаться с сервером");
     } finally {
       setOzonBusy("idle");
+    }
+  };
+
+  // ---- Ozon Performance API (реклама/продвижение) — PR #43 foundation ----
+  // Отдельное подключение (Client ID + Client Secret). Секрет в браузер НЕ
+  // возвращается; фронт видит только статус/маску/last4. Реклама в расчёт прибыли
+  // на этом этапе НЕ добавляется — только сохранение кредов и проверка токена.
+  const applyPerfView = (data: PerfConnResponse) => {
+    setPerfConn({
+      connected: !!data.connected,
+      status: (data.status as PerfConnStatus) ?? "not_connected",
+      clientIdMasked: data.clientIdMasked,
+      secretLast4: data.secretLast4 ?? null,
+      lastCheckedAt: data.lastCheckedAt ?? null,
+      lastError: data.lastError ?? null,
+      updatedAt: data.updatedAt ?? null,
+    });
+  };
+
+  // GET статус Performance-подключения (без секрета). Гостя/сбой — «не подключено».
+  const fetchPerfConnection = async () => {
+    setPerfConnLoading(true);
+    setPerfConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      if (!headers.Authorization) {
+        setPerfConn(null);
+        return;
+      }
+      const res = await fetch("/api/ozon/performance/connection", {
+        method: "GET",
+        headers,
+        cache: "no-store",
+      });
+      const data = (await res.json()) as PerfConnResponse;
+      if (!res.ok) {
+        setPerfConn(null);
+        return;
+      }
+      applyPerfView(data);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("fetchPerfConnection error:", e);
+      setPerfConn(null);
+    } finally {
+      setPerfConnLoading(false);
+    }
+  };
+
+  // POST подключить: {clientId, clientSecret} → сервер проверяет токен, шифрует и
+  // сохраняет секрет. Сырой секрет после успеха стираем из state и прячем глазок.
+  const connectPerformance = async () => {
+    if (!user?.id) {
+      setPerfConnError("Войдите в аккаунт, чтобы подключить Performance API");
+      return;
+    }
+    const clientId = perfClientId.trim();
+    const clientSecret = perfClientSecret.trim();
+    if (clientId.length < 3 || clientSecret.length < 20) {
+      setPerfConnError("Укажите корректные Client ID и Client Secret Performance API");
+      return;
+    }
+
+    setPerfBusy("connecting");
+    setPerfConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/performance/connection", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ clientId, clientSecret }),
+        cache: "no-store",
+      });
+      const data = (await res.json()) as PerfConnResponse;
+      if (!res.ok) {
+        setPerfConnError(data.error || "Не удалось подключить Performance API");
+        return;
+      }
+      applyPerfView(data);
+      // Сырой секрет в браузере больше не нужен — стираем.
+      setPerfClientSecret("");
+      setShowPerfSecret(false);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("connectPerformance error:", e);
+      setPerfConnError("Не удалось связаться с сервером");
+    } finally {
+      setPerfBusy("idle");
+    }
+  };
+
+  // POST перепроверка сохранённого секрета — сервер сам берёт его из БД, получает
+  // токен и НЕ сохраняет его.
+  const verifyPerformance = async () => {
+    if (!user?.id) return;
+    setPerfBusy("checking");
+    setPerfConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/performance/connection/verify", {
+        method: "POST",
+        headers,
+        cache: "no-store",
+      });
+      const data = (await res.json()) as PerfConnResponse;
+      if (!res.ok) {
+        setPerfConnError(data.error || "Не удалось проверить подключение");
+        if (data.status) {
+          setPerfConn((prev) =>
+            prev
+              ? { ...prev, status: data.status as PerfConnStatus, connected: false }
+              : prev
+          );
+        }
+        return;
+      }
+      applyPerfView(data);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("verifyPerformance error:", e);
+      setPerfConnError("Не удалось связаться с сервером");
+    } finally {
+      setPerfBusy("idle");
+    }
+  };
+
+  // DELETE отключить Performance (по подтверждению). Чистим локальные поля.
+  const deletePerformance = async () => {
+    if (!user?.id) return;
+    if (!confirm("Отключить Ozon Performance API? Сохранённый секрет будет удалён.")) return;
+    setPerfBusy("deleting");
+    setPerfConnError("");
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/performance/connection", {
+        method: "DELETE",
+        headers,
+        cache: "no-store",
+      });
+      const data = (await res.json()) as PerfConnResponse;
+      if (!res.ok) {
+        setPerfConnError(data.error || "Не удалось отключить Performance API");
+        return;
+      }
+      setPerfConn(null);
+      setPerfClientId("");
+      setPerfClientSecret("");
+      setShowPerfSecret(false);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("deletePerformance error:", e);
+      setPerfConnError("Не удалось связаться с сервером");
+    } finally {
+      setPerfBusy("idle");
     }
   };
 
@@ -11757,6 +11947,162 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     {ozonConnError && (
                       <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
                         {ozonConnError}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Ozon Performance API — реклама и продвижение — на всю ширину */}
+                  <div className="cab-card cab-card-wide">
+                    <div className="cab-card-head">
+                      <span className="cab-card-ico" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M3 10v4a1 1 0 0 0 1 1h3l5 4V5L7 9H4a1 1 0 0 0-1 1Z" />
+                          <path d="M16 9a4 4 0 0 1 0 6" />
+                        </svg>
+                      </span>
+                      <div className="cab-card-title">Ozon Performance API — реклама и продвижение</div>
+                    </div>
+                    <p className="cab-muted" style={{ marginBottom: "1rem" }}>
+                      Нужно для автоматического учёта расходов на рекламу Ozon. На
+                      этом этапе подключение только проверяется, в расчёт прибыли
+                      реклама ещё не добавляется. Client Secret хранится в
+                      зашифрованном виде и в браузер не возвращается — видны только
+                      статус и маска.
+                    </p>
+
+                    {perfConnLoading ? (
+                      <p className="api-pro-msg" style={{ marginTop: ".2rem" }}>
+                        Проверяем подключение…
+                      </p>
+                    ) : perfConn?.connected ? (
+                      <>
+                        <div className="api-conn-ok" role="status">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="12" cy="12" r="9" />
+                            <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                          </svg>
+                          <span>
+                            <b>Performance API подключён</b>
+                            <span className="api-conn-ok-meta">
+                              {perfConn.clientIdMasked ? ` · Client ID ${perfConn.clientIdMasked}` : ""}
+                              {perfConn.secretLast4 ? ` · секрет ••••${perfConn.secretLast4}` : ""}
+                            </span>
+                          </span>
+                        </div>
+                        <div className="api-pro-actions">
+                          <button
+                            type="button"
+                            className="api-pro-btn ghost"
+                            onClick={verifyPerformance}
+                            disabled={perfBusy !== "idle"}
+                          >
+                            {perfBusy === "checking" ? (
+                              <>
+                                <span className="spin" />
+                                Проверяем…
+                              </>
+                            ) : (
+                              "Проверить подключение"
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            className="api-pro-btn danger"
+                            onClick={deletePerformance}
+                            disabled={perfBusy !== "idle"}
+                          >
+                            {perfBusy === "deleting" ? "Отключаем…" : "Отключить"}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        {perfConn && perfConn.status !== "not_connected" && (
+                          <div className="api-alert err" role="alert">
+                            <span className="api-alert-ico">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="9" />
+                                <path d="M12 8v5" />
+                                <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
+                              </svg>
+                            </span>
+                            <span className="api-alert-text">
+                              {perfConn.status === "invalid_key"
+                                ? "Неверный Client ID или Client Secret — переподключите"
+                                : perfConn.status === "forbidden"
+                                ? "Недостаточно прав у кредов — проверьте доступ Performance API"
+                                : perfConn.status === "unavailable"
+                                ? "Performance API временно недоступен — попробуйте позже"
+                                : "Performance API не подключён"}
+                            </span>
+                          </div>
+                        )}
+
+                        <div className="api-pro-grid">
+                          <div className="api-fld">
+                            <label>Performance Client ID</label>
+                            <input
+                              className="api-input"
+                              type="text"
+                              placeholder="Например, 12345678-1234-…"
+                              value={perfClientId}
+                              onChange={(e) => setPerfClientId(e.target.value)}
+                              disabled={perfBusy !== "idle"}
+                              autoComplete="off"
+                              spellCheck={false}
+                            />
+                          </div>
+
+                          <div className="api-fld">
+                            <label>Performance Client Secret</label>
+                            <div className="api-secret">
+                              <input
+                                className="api-input"
+                                type={showPerfSecret ? "text" : "password"}
+                                placeholder="Вставьте Client Secret"
+                                value={perfClientSecret}
+                                onChange={(e) => setPerfClientSecret(e.target.value)}
+                                disabled={perfBusy !== "idle"}
+                                autoComplete="off"
+                                spellCheck={false}
+                              />
+                              <button
+                                type="button"
+                                className="api-eye"
+                                onClick={() => setShowPerfSecret((v) => !v)}
+                                disabled={perfBusy !== "idle"}
+                                aria-label={showPerfSecret ? "Скрыть секрет" : "Показать секрет"}
+                                title={showPerfSecret ? "Скрыть" : "Показать"}
+                              >
+                                {showPerfSecret ? eyeOffIcon : eyeIcon}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="api-pro-actions" style={{ gridTemplateColumns: "1fr", marginTop: "1rem" }}>
+                          <button
+                            type="button"
+                            className="api-pro-btn"
+                            onClick={connectPerformance}
+                            disabled={perfBusy !== "idle"}
+                          >
+                            {perfBusy === "connecting" ? (
+                              <>
+                                <span className="spin" />
+                                Подключаем…
+                              </>
+                            ) : (
+                              "Подключить Performance API"
+                            )}
+                          </button>
+                        </div>
+                      </>
+                    )}
+
+                    {perfConnError && (
+                      <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
+                        {perfConnError}
                       </p>
                     )}
                   </div>
