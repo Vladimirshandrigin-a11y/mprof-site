@@ -762,6 +762,16 @@ type AdsSpendStatus =
   | "not_connected"
   | "invalid_connection"
   | "unavailable";
+// Этап цепочки Performance API, на котором остановилась диагностика (без секретов).
+type AdsSpendStage = "token" | "campaigns" | "statistics" | "poll" | "report";
+// Человекочитаемые подписи этапов для мелкой диагностической строки под ошибкой.
+const ADS_STAGE_LABELS: Record<AdsSpendStage, string> = {
+  token: "получение токена",
+  campaigns: "список кампаний",
+  statistics: "заказ статистики",
+  poll: "готовность отчёта",
+  report: "загрузка отчёта",
+};
 type AdsSpendResult = {
   ok: boolean;
   month: string;
@@ -769,6 +779,10 @@ type AdsSpendResult = {
   campaignsCount: number;
   rowsCount: number;
   status: AdsSpendStatus;
+  // Диагностика (без секретов/токена): этап, HTTP-код Ozon, безопасное описание.
+  stage?: AdsSpendStage;
+  httpStatus?: number;
+  detail?: string;
   error?: string;
 };
 
@@ -5083,6 +5097,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .ads-diag-total b{color:var(--gold2);font-size:1.04rem}
 .ads-diag-note{margin:.7rem 0 0;font-family:var(--mono);font-size:.7rem;letter-spacing:.02em;color:var(--txt3)}
 .ads-diag-info{margin:.9rem 0 0;font-size:.82rem;line-height:1.5;color:var(--txt2)}
+.ads-diag-diag{margin:.5rem 0 0;font-family:var(--mono);font-size:.72rem;line-height:1.5;letter-spacing:.02em;color:var(--txt3)}
 @media (max-width:560px){
   .ads-diag-month{max-width:none;width:100%}
   .ads-diag-row .api-pro-btn{min-width:0;width:100%}
@@ -12195,9 +12210,24 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                                 API.
                               </p>
                             ) : (
-                              <p className="ads-diag-info">
-                                Performance API временно недоступен — попробуйте позже.
-                              </p>
+                              <>
+                                <p className="ads-diag-info">
+                                  Performance API временно недоступен — попробуйте
+                                  позже.
+                                </p>
+                                {adsResult.stage && (
+                                  <p className="ads-diag-diag">
+                                    Диагностика: этап «
+                                    {ADS_STAGE_LABELS[adsResult.stage]}»
+                                    {adsResult.httpStatus
+                                      ? `, код ${adsResult.httpStatus}`
+                                      : ""}
+                                    {adsResult.detail
+                                      ? ` — ${adsResult.detail}`
+                                      : ""}
+                                  </p>
+                                )}
+                              </>
                             ))}
 
                           {adsError && (

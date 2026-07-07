@@ -48,6 +48,14 @@ export type AdsSpendStatus =
   | "invalid_connection"
   | "unavailable";
 
+/** Этап конвейера, на котором остановились (диагностика). БЕЗ секретов/токена. */
+export type AdsSpendStage =
+  | "token"
+  | "campaigns"
+  | "statistics"
+  | "poll"
+  | "report";
+
 export type AdsSpendOutcome = {
   status: AdsSpendStatus;
   /** Итоговый расход рекламы за месяц (₽). 0, если не ok. */
@@ -58,6 +66,13 @@ export type AdsSpendOutcome = {
   rowsCount: number;
   /** Безопасная строка для UI (без секретов/токена). */
   detail?: string;
+  /** Этап, на котором цепочка остановилась (для unavailable). Диагностика. */
+  stage?: AdsSpendStage;
+  /**
+   * HTTP-код ответа Ozon на падающем этапе, если он был HTTP-ответом. Диагностика:
+   * это ТОЛЬКО числовой статус — НИ тела ответа, НИ client_secret, НИ access_token.
+   */
+  httpStatus?: number;
 };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -148,16 +163,27 @@ function readPollState(json: unknown): PollState {
  *   { report: { rows: [...] } }              (плоский)
  *   { report: { "<campId>": { rows: [...] } } } (по кампаниям)
  *   { rows: [...] } / { "<campId>": { rows: [...] } } (без обёртки report)
+ *
+ * recognized=true, если нашли ХОТЯ БЫ один ожидаемый rows-массив (даже пустой) —
+ * тогда сумма 0 ₽ валидна (у кампаний просто не было расхода). Если rows-массива
+ * нет вовсе (не-JSON тело, CSV/ZIP, иная схема) — recognized=false, и вызывающий
+ * НЕ выдаёт ложный «0 ₽ ok», а честно сообщает, что формат отчёта не распознан.
  */
-function sumReport(json: unknown): { spend: number; rows: number } {
+function sumReport(json: unknown): {
+  spend: number;
+  rows: number;
+  recognized: boolean;
+} {
   let spend = 0;
   let rows = 0;
-  if (!json || typeof json !== "object") return { spend, rows };
+  let recognized = false;
+  if (!json || typeof json !== "object") return { spend, rows, recognized };
 
   const collect = (node: unknown): void => {
     if (!node || typeof node !== "object") return;
     const arr = (node as { rows?: unknown }).rows;
     if (Array.isArray(arr)) {
+      recognized = true; // ожидаемый конверт отчёта найден (даже если строк 0)
       for (const r of arr) {
         if (r && typeof r === "object") {
           spend += parseMoney((r as { moneySpent?: unknown }).moneySpent);
@@ -168,7 +194,7 @@ function sumReport(json: unknown): { spend: number; rows: number } {
   };
 
   const root = (json as { report?: unknown }).report ?? json;
-  if (!root || typeof root !== "object") return { spend, rows };
+  if (!root || typeof root !== "object") return { spend, rows, recognized };
 
   if (Array.isArray((root as { rows?: unknown }).rows)) {
     collect(root);
@@ -177,7 +203,7 @@ function sumReport(json: unknown): { spend: number; rows: number } {
       collect((root as Record<string, unknown>)[key]);
     }
   }
-  return { spend, rows };
+  return { spend, rows, recognized };
 }
 
 /** «YYYY-MM» → { dateFrom: YYYY-MM-01, dateTo: YYYY-MM-<последний день> } (UTC). */
@@ -217,6 +243,8 @@ export async function fetchAdsSpendForMonth(
     return {
       status: tok.status === "invalid_key" ? "invalid_connection" : "unavailable",
       ...empty,
+      stage: "token",
+      httpStatus: tok.httpStatus,
       detail: tok.detail,
     };
   }
@@ -225,7 +253,13 @@ export async function fetchAdsSpendForMonth(
   // 2) список кампаний
   const campRes = await perfFetch(CAMPAIGN_URL, token);
   if (!campRes.ok) {
-    return { status: "unavailable", ...empty, detail: "Не удалось получить список кампаний" };
+    return {
+      status: "unavailable",
+      ...empty,
+      stage: "campaigns",
+      httpStatus: campRes.status || undefined,
+      detail: "Не удалось получить список кампаний",
+    };
   }
   const ids = extractCampaignIds(campRes.json);
   const campaignsCount = ids.length;
@@ -252,11 +286,25 @@ export async function fetchAdsSpendForMonth(
       body: { campaigns: batch, dateFrom, dateTo, groupBy: "DATE" },
     });
     if (!orderRes.ok) {
-      return { status: "unavailable", ...empty, campaignsCount, detail: "Не удалось заказать статистику" };
+      return {
+        status: "unavailable",
+        ...empty,
+        campaignsCount,
+        stage: "statistics",
+        httpStatus: orderRes.status || undefined,
+        detail: "Не удалось заказать статистику",
+      };
     }
     const uuid = extractUuid(orderRes.json);
     if (!uuid) {
-      return { status: "unavailable", ...empty, campaignsCount, detail: "Ozon не вернул идентификатор отчёта" };
+      return {
+        status: "unavailable",
+        ...empty,
+        campaignsCount,
+        stage: "statistics",
+        httpStatus: orderRes.status || undefined,
+        detail: "Ozon не вернул идентификатор отчёта",
+      };
     }
 
     // 4) опрос готовности (bounded общим дедлайном)
@@ -267,7 +315,14 @@ export async function fetchAdsSpendForMonth(
         state = readPollState(statusRes.json);
         if (state === "ready") break;
         if (state === "error") {
-          return { status: "unavailable", ...empty, campaignsCount, detail: "Ozon не смог сформировать отчёт" };
+          return {
+            status: "unavailable",
+            ...empty,
+            campaignsCount,
+            stage: "poll",
+            httpStatus: statusRes.status || undefined,
+            detail: "Ozon не смог сформировать отчёт",
+          };
         }
       }
       if (Date.now() + POLL_DELAY_MS >= deadline) break;
@@ -281,11 +336,30 @@ export async function fetchAdsSpendForMonth(
     // 5) скачать отчёт
     const reportRes = await perfFetch(REPORT_URL(uuid), token);
     if (!reportRes.ok) {
-      return { status: "unavailable", ...empty, campaignsCount, detail: "Не удалось скачать отчёт" };
+      return {
+        status: "unavailable",
+        ...empty,
+        campaignsCount,
+        stage: "report",
+        httpStatus: reportRes.status || undefined,
+        detail: "Не удалось скачать отчёт",
+      };
     }
 
     // 6) суммируем
-    const { spend, rows } = sumReport(reportRes.json);
+    const { spend, rows, recognized } = sumReport(reportRes.json);
+    if (!recognized) {
+      // HTTP 200, но тело не в ожидаемом JSON-формате (rows/moneySpent): не-JSON,
+      // CSV/ZIP или иная схема. НЕ выдаём ложный «0 ₽ ok» — сообщаем честно.
+      return {
+        status: "unavailable",
+        ...empty,
+        campaignsCount,
+        stage: "report",
+        httpStatus: reportRes.status || undefined,
+        detail: "Формат отчёта Performance API не распознан",
+      };
+    }
     totalSpend += spend;
     totalRows += rows;
   }
