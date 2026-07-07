@@ -753,6 +753,25 @@ type PerfConnView = {
 // Ответ /api/ozon/performance/connection*: безопасная проекция ИЛИ { error }.
 type PerfConnResponse = Partial<PerfConnView> & { error?: string };
 
+// Ответ /api/ozon/performance/ads-spend-diagnostic — СПРАВОЧНЫЙ расход рекламы
+// Performance API за месяц. Диагностика: в прибыль НЕ входит, никуда не сохраняется.
+type AdsSpendStatus =
+  | "ok"
+  | "no_campaigns"
+  | "pending"
+  | "not_connected"
+  | "invalid_connection"
+  | "unavailable";
+type AdsSpendResult = {
+  ok: boolean;
+  month: string;
+  adsSpend: number;
+  campaignsCount: number;
+  rowsCount: number;
+  status: AdsSpendStatus;
+  error?: string;
+};
+
 // Ответ /api/ozon/postings-match-diagnostic — read-only диагностика сопоставления
 // товаров Ozon (FBO+FBS) с каталогом себестоимости. Прибыль здесь НЕ считается.
 type OzonPostingsMatchResponse = {
@@ -1182,6 +1201,13 @@ export default function AppPage() {
   const [perfConnLoading, setPerfConnLoading] = useState(false);
   const [perfBusy, setPerfBusy] = useState<"idle" | "connecting" | "checking" | "deleting">("idle");
   const [perfConnError, setPerfConnError] = useState("");
+
+  // Справочный расход рекламы Performance API за месяц (PR #44) — read-only.
+  // В прибыль НЕ входит, никуда не сохраняется, ничего не списывает.
+  const [adsMonth, setAdsMonth] = useState<string>(() => defaultDraftMonth());
+  const [adsBusy, setAdsBusy] = useState(false);
+  const [adsResult, setAdsResult] = useState<AdsSpendResult | null>(null);
+  const [adsError, setAdsError] = useState("");
 
   // Диагностика сопоставления товаров (PR #15) — read-only, ничего не сохраняет.
   const [matchMonth, setMatchMonth] = useState<string>(() => defaultDraftMonth());
@@ -4112,6 +4138,45 @@ export default function AppPage() {
     }
   };
 
+  // POST /api/ozon/performance/ads-spend-diagnostic — СПРАВОЧНЫЙ расход рекламы
+  // Performance API за месяц. Read-only: сумма НЕ входит в прибыль, никуда не
+  // сохраняется, ничего не списывает. Отчёт Ozon готовится асинхронно — при
+  // status "pending" просим повторить позже (см. UI).
+  const checkAdsSpend = async () => {
+    if (!user?.id) {
+      setAdsError("Войдите в аккаунт, чтобы проверить расход рекламы");
+      return;
+    }
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(adsMonth)) {
+      setAdsError("Укажите месяц в формате ГГГГ-ММ");
+      return;
+    }
+    setAdsBusy(true);
+    setAdsError("");
+    setAdsResult(null);
+    try {
+      const headers = await ozonAuthHeaders();
+      const res = await fetch("/api/ozon/performance/ads-spend-diagnostic", {
+        method: "POST",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({ month: adsMonth }),
+        cache: "no-store",
+      });
+      const data = (await res.json()) as AdsSpendResult;
+      if (!res.ok) {
+        setAdsError(data.error || "Не удалось получить расход рекламы");
+        return;
+      }
+      setAdsResult(data);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error("checkAdsSpend error:", e);
+      setAdsError("Не удалось связаться с сервером");
+    } finally {
+      setAdsBusy(false);
+    }
+  };
+
   // POST /api/ozon/postings-match-diagnostic — read-only диагностика: какие товары
   // из Ozon postings (FBO+FBS) есть в каталоге себестоимости. НИЧЕГО не сохраняет,
   // не списывает расчёт и НЕ считает прибыль — только сопоставление по артикулу.
@@ -5002,6 +5067,26 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   border:2px solid rgba(0,0,0,.18);border-top-color:rgba(0,0,0,.55);
   animation:apiSpin .8s linear infinite;margin-right:2px}
 @keyframes apiSpin{to{transform:rotate(360deg)}}
+
+/* PR #44: справочный расход рекламы за месяц (read-only, в прибыль НЕ входит) */
+.ads-diag{margin-top:1.4rem;padding:1.1rem 1.15rem;border-radius:14px;
+  background:rgba(255,255,255,.03);border:1px solid var(--edge2)}
+.ads-diag-head{font-family:var(--sans);font-weight:700;font-size:.95rem;color:var(--txt);letter-spacing:.01em}
+.ads-diag-hint{margin:.4rem 0 0;font-size:.8rem;line-height:1.5;color:var(--txt3)}
+.ads-diag-row{display:flex;gap:.7rem;flex-wrap:wrap;align-items:center;margin-top:.9rem}
+.ads-diag-month{max-width:190px}
+.ads-diag-row .api-pro-btn{flex:0 1 auto;min-width:260px}
+.ads-diag-result{margin-top:1rem;padding-top:.9rem;border-top:1px solid var(--edge2)}
+.ads-diag-line{display:flex;justify-content:space-between;gap:1rem;align-items:baseline;
+  padding:.32rem 0;font-size:.86rem;color:var(--txt2)}
+.ads-diag-line b{font-family:var(--sans);color:var(--txt);font-weight:600}
+.ads-diag-total b{color:var(--gold2);font-size:1.04rem}
+.ads-diag-note{margin:.7rem 0 0;font-family:var(--mono);font-size:.7rem;letter-spacing:.02em;color:var(--txt3)}
+.ads-diag-info{margin:.9rem 0 0;font-size:.82rem;line-height:1.5;color:var(--txt2)}
+@media (max-width:560px){
+  .ads-diag-month{max-width:none;width:100%}
+  .ads-diag-row .api-pro-btn{min-width:0;width:100%}
+}
 
 .api-alert{margin-top:1.1rem;padding:.95rem 1.1rem;border-radius:12px;font-size:.85rem;
   line-height:1.5;display:flex;gap:.7rem;align-items:flex-start;
@@ -12013,6 +12098,116 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           >
                             {perfBusy === "deleting" ? "Отключаем…" : "Отключить"}
                           </button>
+                        </div>
+
+                        {/* PR #44: справочный расход рекламы за месяц — read-only.
+                            Сумма НЕ входит в прибыль и никуда не сохраняется. */}
+                        <div className="ads-diag">
+                          <div className="ads-diag-head">
+                            Расход рекламы за месяц (справочно)
+                          </div>
+                          <p className="ads-diag-hint">
+                            Покажем расход на рекламу Ozon Performance API за выбранный
+                            месяц. Справочно — в этом обновлении реклама ещё не
+                            вычитается из чистой прибыли.
+                          </p>
+                          <div className="ads-diag-row">
+                            <input
+                              className="api-input ads-diag-month"
+                              type="month"
+                              value={adsMonth}
+                              onChange={(e) => setAdsMonth(e.target.value)}
+                              disabled={adsBusy}
+                              aria-label="Месяц для проверки расхода рекламы"
+                            />
+                            <button
+                              type="button"
+                              className="api-pro-btn ghost"
+                              onClick={checkAdsSpend}
+                              disabled={adsBusy}
+                            >
+                              {adsBusy ? (
+                                <>
+                                  <span className="spin" />
+                                  Считаем…
+                                </>
+                              ) : (
+                                "Проверить расход рекламы за месяц"
+                              )}
+                            </button>
+                          </div>
+
+                          {adsResult &&
+                            (adsResult.status === "ok" ? (
+                              <div className="ads-diag-result">
+                                <div className="ads-diag-line">
+                                  <span>Месяц</span>
+                                  <b>{adsResult.month}</b>
+                                </div>
+                                <div className="ads-diag-line ads-diag-total">
+                                  <span>Расход рекламы (Performance API)</span>
+                                  <b>
+                                    {adsResult.adsSpend.toLocaleString("ru-RU", {
+                                      minimumFractionDigits: 2,
+                                      maximumFractionDigits: 2,
+                                    })}{" "}
+                                    ₽
+                                  </b>
+                                </div>
+                                <div className="ads-diag-line">
+                                  <span>Кампаний</span>
+                                  <b>{adsResult.campaignsCount}</b>
+                                </div>
+                                <div className="ads-diag-line">
+                                  <span>Строк отчёта</span>
+                                  <b>{adsResult.rowsCount}</b>
+                                </div>
+                                <p className="ads-diag-note">
+                                  Справочно. В этом PR реклама ещё не вычитается из
+                                  прибыли.
+                                </p>
+                              </div>
+                            ) : adsResult.status === "no_campaigns" ? (
+                              <div className="ads-diag-result">
+                                <div className="ads-diag-line ads-diag-total">
+                                  <span>Расход рекламы (Performance API)</span>
+                                  <b>0,00 ₽</b>
+                                </div>
+                                <p className="ads-diag-info">
+                                  Кампаний не найдено — расход рекламы за месяц 0 ₽.
+                                </p>
+                                <p className="ads-diag-note">
+                                  Справочно. В этом PR реклама ещё не вычитается из
+                                  прибыли.
+                                </p>
+                              </div>
+                            ) : adsResult.status === "pending" ? (
+                              <p className="ads-diag-info">
+                                Отчёт рекламы ещё формируется, попробуйте позже.
+                              </p>
+                            ) : adsResult.status === "not_connected" ? (
+                              <p className="ads-diag-info">
+                                Performance API не подключён.
+                              </p>
+                            ) : adsResult.status === "invalid_connection" ? (
+                              <p className="ads-diag-info">
+                                Не удалось получить токен — переподключите Performance
+                                API.
+                              </p>
+                            ) : (
+                              <p className="ads-diag-info">
+                                Performance API временно недоступен — попробуйте позже.
+                              </p>
+                            ))}
+
+                          {adsError && (
+                            <p
+                              className="api-pro-msg err"
+                              style={{ marginTop: ".6rem" }}
+                            >
+                              {adsError}
+                            </p>
+                          )}
                         </div>
                       </>
                     ) : (
