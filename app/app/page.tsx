@@ -786,6 +786,9 @@ type AdsSpendResult = {
   detail?: string;
   // Для rate_limited (HTTP 429): через сколько секунд безопасно повторить.
   retryAfterSec?: number;
+  // true → сервер продолжил ранее заказанный отчёт (reuse pending UUID), новый
+  // заказ statistics/json не создавался. Показываем мягкую подсказку на pending.
+  reused?: boolean;
   error?: string;
 };
 
@@ -12200,9 +12203,16 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                                 </p>
                               </div>
                             ) : adsResult.status === "pending" ? (
-                              <p className="ads-diag-info">
-                                Отчёт рекламы ещё формируется, попробуйте позже.
-                              </p>
+                              <>
+                                <p className="ads-diag-info">
+                                  Отчёт рекламы ещё формируется, попробуйте позже.
+                                </p>
+                                {adsResult.reused && (
+                                  <p className="ads-diag-diag">
+                                    Продолжаем ожидание ранее заказанного отчёта.
+                                  </p>
+                                )}
+                              </>
                             ) : adsResult.status === "not_connected" ? (
                               <p className="ads-diag-info">
                                 Performance API не подключён.
