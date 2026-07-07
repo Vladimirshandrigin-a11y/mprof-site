@@ -117,6 +117,12 @@ export type PerfTokenErr = {
   ok: false;
   status: "invalid_key" | "unavailable";
   detail?: string;
+  /**
+   * HTTP-код ответа токен-эндпоинта Ozon, если сбой был именно HTTP-ответом
+   * (400/401/403/429/5xx). Для сети/таймаута отсутствует. ДИАГНОСТИКА — здесь
+   * НЕТ ни client_secret, ни access_token, только числовой статус.
+   */
+  httpStatus?: number;
 };
 export type PerfTokenResult = PerfTokenOk | PerfTokenErr;
 
@@ -149,18 +155,38 @@ export async function getPerformanceAccessToken(
       try {
         json = (await res.json()) as PerfTokenResponse;
       } catch {
-        return { ok: false, status: "unavailable", detail: "Ozon вернул неожиданный ответ" };
+        return {
+          ok: false,
+          status: "unavailable",
+          detail: "Ozon вернул неожиданный ответ",
+          httpStatus: res.status,
+        };
       }
       const token = typeof json?.access_token === "string" ? json.access_token : "";
       if (token.length > 0) return { ok: true, token };
-      return { ok: false, status: "unavailable", detail: "Токен не получен — повторите позже" };
+      return {
+        ok: false,
+        status: "unavailable",
+        detail: "Токен не получен — повторите позже",
+        httpStatus: res.status,
+      };
     }
 
     if (res.status === 400 || res.status === 401) {
-      return { ok: false, status: "invalid_key", detail: "Неверный Client ID или Client Secret" };
+      return {
+        ok: false,
+        status: "invalid_key",
+        detail: "Неверный Client ID или Client Secret",
+        httpStatus: res.status,
+      };
     }
     // 403 (нет прав), 429 (лимит), 5xx — всё «временно/недоступно» для диагностики.
-    return { ok: false, status: "unavailable", detail: `Ozon ответил статусом ${res.status}` };
+    return {
+      ok: false,
+      status: "unavailable",
+      detail: `Ozon ответил статусом ${res.status}`,
+      httpStatus: res.status,
+    };
   } catch (e) {
     const aborted = e instanceof Error && e.name === "AbortError";
     return {
