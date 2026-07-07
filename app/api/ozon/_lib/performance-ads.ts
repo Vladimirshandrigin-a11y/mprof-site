@@ -28,7 +28,15 @@
 // безопасной подсказкой «повторите позже» (учитываем Retry-After, иначе 60–120с),
 // держим паузу между батчами и ОСТАНАВЛИВАЕМСЯ на первом 429 — не спамим Ozon.
 //
-// access_token и client_secret НИКОГДА не логируются.
+// Диагностика statistics-этапа (PR #47): к rate_limited/unavailable на этом этапе
+// добавляем БЕЗОПАСНЫЕ поля — сколько кампаний ушло в один запрос statistics/json,
+// номер батча и сколько батчей всего, elapsedMs от старта проверки, форма тела
+// (dateFrom/dateTo). Это помогает понять, реальный ли это лимит или мы шлём запрос
+// не так. ВНИМАНИЕ: UUID заказа НЕ кэшируется между HTTP-запросами — КАЖДЫЙ клик
+// создаёт новый заказ statistics/json (кэш в этом PR НЕ добавляем — только диагностика).
+//
+// access_token и client_secret НИКОГДА не логируются; полное тело ответа/запроса
+// НЕ логируется (диагностика — только числа, коды и константная форма тела).
 // ============================================================================
 
 import { getPerformanceAccessToken } from "./performance";
@@ -49,6 +57,8 @@ const BATCH_DELAY_MS = 1500; // пауза между заказами стат�
 const DEFAULT_RETRY_AFTER_SEC = 90; // подсказка «повторить через», если Retry-After нет (60–120с)
 const RATE_LIMIT_DETAIL =
   "Ozon ограничил частоту запросов. Попробуйте через 1–2 минуты.";
+// Форма тела заказа статистики (диагностика: какой набор дат-полей мы шлём).
+const STATISTICS_BODY_SHAPE = "dateFrom/dateTo";
 
 export type AdsSpendStatus =
   | "ok"
@@ -88,6 +98,17 @@ export type AdsSpendOutcome = {
    * из заголовка Retry-After Ozon, иначе консервативная подсказка. Только число.
    */
   retryAfterSec?: number;
+  /**
+   * Диагностика statistics-этапа (PR #47) — всё безопасно (числа/константа, без
+   * секретов/токена/тела): сколько кампаний ушло в один запрос statistics/json,
+   * номер батча (1-based) и сколько батчей всего, сколько мс прошло от старта
+   * проверки до сбоя, и форма тела запроса ("dateFrom/dateTo").
+   */
+  campaignsInRequest?: number;
+  batchIndex?: number;
+  batchesTotal?: number;
+  elapsedMs?: number;
+  requestBodyShape?: string;
 };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -271,15 +292,25 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
+/** Безопасные диагностические поля statistics-этапа (числа/константа). */
+type StatsDiag = {
+  campaignsInRequest?: number;
+  batchIndex?: number;
+  batchesTotal?: number;
+  elapsedMs?: number;
+  requestBodyShape?: string;
+};
+
 /**
  * Единый исход «Ozon ограничил частоту запросов» (HTTP 429) для любого этапа.
- * Безопасно: только этап, код 429 и число секунд подсказки — без тела/секретов.
- * Если Retry-After Ozon не прислал — даём консервативную подсказку (60–120с).
+ * Безопасно: только этап, код 429, число секунд подсказки и (опц.) диагностика
+ * батча — без тела/секретов. Если Retry-After нет — консервативная подсказка.
  */
 function rateLimited(
   stage: AdsSpendStage,
   campaignsCount: number,
-  retryAfterSec?: number
+  retryAfterSec?: number,
+  diag?: StatsDiag
 ): AdsSpendOutcome {
   return {
     status: "rate_limited",
@@ -290,6 +321,7 @@ function rateLimited(
     httpStatus: 429,
     retryAfterSec: retryAfterSec ?? DEFAULT_RETRY_AFTER_SEC,
     detail: RATE_LIMIT_DETAIL,
+    ...diag,
   };
 }
 
@@ -302,6 +334,7 @@ export async function fetchAdsSpendForMonth(
   clientSecret: string,
   month: string
 ): Promise<AdsSpendOutcome> {
+  const startedAt = Date.now(); // для elapsedMs в диагностике statistics-этапа
   const empty = { adsSpend: 0, campaignsCount: 0, rowsCount: 0 } as const;
 
   // 1) access_token
@@ -310,7 +343,9 @@ export async function fetchAdsSpendForMonth(
     // Rate limit уже на выдаче токена — не generic-недоступность (Retry-After
     // токен-хелпер не отдаёт, поэтому подсказка консервативная по умолчанию).
     if (tok.httpStatus === 429) {
-      return rateLimited("token", 0);
+      return rateLimited("token", 0, undefined, {
+        elapsedMs: Date.now() - startedAt,
+      });
     }
     // invalid_key → проблема с самим подключением; unavailable → временный сбой.
     return {
@@ -326,7 +361,9 @@ export async function fetchAdsSpendForMonth(
   // 2) список кампаний
   const campRes = await perfFetch(CAMPAIGN_URL, token);
   if (campRes.status === 429) {
-    return rateLimited("campaigns", 0, campRes.retryAfterSec);
+    return rateLimited("campaigns", 0, campRes.retryAfterSec, {
+      elapsedMs: Date.now() - startedAt,
+    });
   }
   if (!campRes.ok) {
     return {
@@ -366,6 +403,13 @@ export async function fetchAdsSpendForMonth(
       await sleep(BATCH_DELAY_MS);
     }
     const batch = batches[bi];
+    // Безопасная диагностика этого заказа статистики (только числа/константа).
+    const statsDiag: StatsDiag = {
+      campaignsInRequest: batch.length,
+      batchIndex: bi + 1,
+      batchesTotal: batches.length,
+      requestBodyShape: STATISTICS_BODY_SHAPE,
+    };
 
     // 3) заказать статистику → UUID
     const orderRes = await perfFetch(STATISTICS_URL, token, {
@@ -375,7 +419,10 @@ export async function fetchAdsSpendForMonth(
     // Rate limit на заказе статистики — самая частая точка 429. Останавливаемся
     // и возвращаем rate_limited (остальные батчи НЕ шлём — не усугубляем лимит).
     if (orderRes.status === 429) {
-      return rateLimited("statistics", campaignsCount, orderRes.retryAfterSec);
+      return rateLimited("statistics", campaignsCount, orderRes.retryAfterSec, {
+        ...statsDiag,
+        elapsedMs: Date.now() - startedAt,
+      });
     }
     if (!orderRes.ok) {
       return {
@@ -385,6 +432,8 @@ export async function fetchAdsSpendForMonth(
         stage: "statistics",
         httpStatus: orderRes.status || undefined,
         detail: "Не удалось заказать статистику",
+        ...statsDiag,
+        elapsedMs: Date.now() - startedAt,
       };
     }
     const uuid = extractUuid(orderRes.json);
@@ -396,6 +445,8 @@ export async function fetchAdsSpendForMonth(
         stage: "statistics",
         httpStatus: orderRes.status || undefined,
         detail: "Ozon не вернул идентификатор отчёта",
+        ...statsDiag,
+        elapsedMs: Date.now() - startedAt,
       };
     }
 
@@ -405,7 +456,10 @@ export async function fetchAdsSpendForMonth(
       const statusRes = await perfFetch(STATUS_URL(uuid), token);
       // Rate limit во время опроса готовности — прекращаем опрос, не долбим Ozon.
       if (statusRes.status === 429) {
-        return rateLimited("poll", campaignsCount, statusRes.retryAfterSec);
+        return rateLimited("poll", campaignsCount, statusRes.retryAfterSec, {
+          ...statsDiag,
+          elapsedMs: Date.now() - startedAt,
+        });
       }
       if (statusRes.ok) {
         state = readPollState(statusRes.json);
@@ -432,7 +486,10 @@ export async function fetchAdsSpendForMonth(
     // 5) скачать отчёт
     const reportRes = await perfFetch(REPORT_URL(uuid), token);
     if (reportRes.status === 429) {
-      return rateLimited("report", campaignsCount, reportRes.retryAfterSec);
+      return rateLimited("report", campaignsCount, reportRes.retryAfterSec, {
+        ...statsDiag,
+        elapsedMs: Date.now() - startedAt,
+      });
     }
     if (!reportRes.ok) {
       return {
