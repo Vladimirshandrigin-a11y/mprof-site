@@ -786,8 +786,34 @@ type AdsSpendResult = {
   detail?: string;
   // Для rate_limited (HTTP 429): через сколько секунд безопасно повторить.
   retryAfterSec?: number;
+  // Глубокая диагностика statistics-этапа (PR #47) — только числа/константа, без
+  // секретов/токена: сколько кампаний в одном запросе statistics/json, номер батча
+  // и всего батчей, мс от старта проверки, форма тела запроса ("dateFrom/dateTo").
+  campaignsInRequest?: number;
+  batchIndex?: number;
+  batchesTotal?: number;
+  elapsedMs?: number;
+  requestBodyShape?: string;
   error?: string;
 };
+
+// Мелкая безопасная строка диагностики statistics-этапа для UI (ТОЛЬКО при ошибке):
+// «batch 1/3, campaigns 10, elapsed 1200ms, retry after 90s». Собираем лишь из
+// присутствующих числовых полей — без секретов/токена. Пусто → строку не рисуем.
+function formatAdsBatchDiag(r: AdsSpendResult): string {
+  const parts: string[] = [];
+  if (typeof r.batchIndex === "number" && typeof r.batchesTotal === "number") {
+    parts.push(`batch ${r.batchIndex}/${r.batchesTotal}`);
+  }
+  if (typeof r.campaignsInRequest === "number") {
+    parts.push(`campaigns ${r.campaignsInRequest}`);
+  }
+  if (typeof r.elapsedMs === "number") parts.push(`elapsed ${r.elapsedMs}ms`);
+  if (typeof r.retryAfterSec === "number") {
+    parts.push(`retry after ${r.retryAfterSec}s`);
+  }
+  return parts.join(", ");
+}
 
 // Ответ /api/ozon/postings-match-diagnostic — read-only диагностика сопоставления
 // товаров Ozon (FBO+FBS) с каталогом себестоимости. Прибыль здесь НЕ считается.
@@ -12229,6 +12255,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                                       : ""}
                                   </p>
                                 )}
+                                {formatAdsBatchDiag(adsResult) && (
+                                  <p className="ads-diag-diag">
+                                    {formatAdsBatchDiag(adsResult)}
+                                  </p>
+                                )}
                               </>
                             ) : (
                               <>
@@ -12246,6 +12277,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                                     {adsResult.detail
                                       ? ` — ${adsResult.detail}`
                                       : ""}
+                                  </p>
+                                )}
+                                {formatAdsBatchDiag(adsResult) && (
+                                  <p className="ads-diag-diag">
+                                    {formatAdsBatchDiag(adsResult)}
                                   </p>
                                 )}
                               </>
