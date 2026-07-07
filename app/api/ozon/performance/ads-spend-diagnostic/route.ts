@@ -18,11 +18,12 @@ import { fetchAdsSpendForMonth } from "../../_lib/performance-ads";
 //   • формула чистой прибыли / налог / COGS / Seller API finance — не затронуты.
 //
 // Ответ (всегда с полем status; ok=true только для ok/no_campaigns):
-//   { ok, month, adsSpend, campaignsCount, rowsCount, status, stage?, httpStatus?, detail? }
-//   status ∈ ok | no_campaigns | pending | not_connected | invalid_connection | unavailable
+//   { ok, month, adsSpend, campaignsCount, rowsCount, status, stage?, httpStatus?, detail?, retryAfterSec? }
+//   status ∈ ok | no_campaigns | pending | not_connected | invalid_connection | rate_limited | unavailable
 //   stage?/httpStatus?/detail? — ДИАГНОСТИКА (без секретов/токена): этап цепочки
 //   (token|campaigns|statistics|poll|report), HTTP-код Ozon и короткое безопасное
-//   описание. Присутствуют в основном на unavailable, помогают понять, где падает.
+//   описание. Присутствуют на unavailable/rate_limited, помогают понять, где падает.
+//   retryAfterSec? — для rate_limited (HTTP 429 от Ozon): через сколько секунд повторить.
 //
 // HTTP-коды: доменные исходы (включая pending/unavailable) отдаём 200, чтобы UI
 // единообразно ветвился по status. Не-2xx только для инфраструктурных сбоев:
@@ -131,16 +132,21 @@ export async function POST(req: NextRequest) {
 
   const ok = result.status === "ok" || result.status === "no_campaigns";
 
-  // Диагностика: на unavailable пишем в лог ТОЛЬКО безопасные поля — этап цепочки,
-  // HTTP-код Ozon и короткий detail. НИКОГДА не логируем client_secret, access_token
-  // или тело ответа Ozon (в этих полях их нет — только этап/код/безопасный текст).
-  if (result.status === "unavailable") {
+  // Диагностика: на unavailable/rate_limited пишем в лог ТОЛЬКО безопасные поля —
+  // этап цепочки, HTTP-код Ozon, короткий detail и (для 429) секунды повтора.
+  // НИКОГДА не логируем client_secret, access_token или тело ответа Ozon (в этих
+  // полях их нет — только этап/код/безопасный текст/число секунд).
+  if (result.status === "unavailable" || result.status === "rate_limited") {
     // eslint-disable-next-line no-console
-    console.error("[api/ozon/performance/ads-spend-diagnostic] unavailable", {
-      stage: result.stage,
-      httpStatus: result.httpStatus,
-      detail: result.detail,
-    });
+    console.error(
+      `[api/ozon/performance/ads-spend-diagnostic] ${result.status}`,
+      {
+        stage: result.stage,
+        httpStatus: result.httpStatus,
+        detail: result.detail,
+        retryAfterSec: result.retryAfterSec,
+      }
+    );
   }
 
   return NextResponse.json(
@@ -154,6 +160,7 @@ export async function POST(req: NextRequest) {
       stage: result.stage,
       httpStatus: result.httpStatus,
       detail: result.detail,
+      retryAfterSec: result.retryAfterSec,
     },
     { headers: NO_STORE }
   );

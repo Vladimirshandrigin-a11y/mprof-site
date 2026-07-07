@@ -761,6 +761,7 @@ type AdsSpendStatus =
   | "pending"
   | "not_connected"
   | "invalid_connection"
+  | "rate_limited"
   | "unavailable";
 // Этап цепочки Performance API, на котором остановилась диагностика (без секретов).
 type AdsSpendStage = "token" | "campaigns" | "statistics" | "poll" | "report";
@@ -783,6 +784,8 @@ type AdsSpendResult = {
   stage?: AdsSpendStage;
   httpStatus?: number;
   detail?: string;
+  // Для rate_limited (HTTP 429): через сколько секунд безопасно повторить.
+  retryAfterSec?: number;
   error?: string;
 };
 
@@ -12209,6 +12212,24 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                                 Не удалось получить токен — переподключите Performance
                                 API.
                               </p>
+                            ) : adsResult.status === "rate_limited" ? (
+                              <>
+                                <p className="ads-diag-info">
+                                  Ozon ограничил частоту запросов. Попробуйте позже.
+                                </p>
+                                {adsResult.stage && (
+                                  <p className="ads-diag-diag">
+                                    Диагностика: этап «
+                                    {ADS_STAGE_LABELS[adsResult.stage]}»
+                                    {adsResult.httpStatus
+                                      ? `, код ${adsResult.httpStatus}`
+                                      : ""}
+                                    {typeof adsResult.retryAfterSec === "number"
+                                      ? ` — повтор через ~${adsResult.retryAfterSec} сек`
+                                      : ""}
+                                  </p>
+                                )}
+                              </>
                             ) : (
                               <>
                                 <p className="ads-diag-info">
