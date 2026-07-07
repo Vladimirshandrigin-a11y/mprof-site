@@ -100,6 +100,80 @@ export async function verifyPerformanceToken(
 }
 
 // ---------------------------------------------------------------------------
+// Получение bearer access_token для последующих Performance-запросов (PR #44).
+//
+// Та же client_credentials-логика, что и в verifyPerformanceToken, но ВОЗВРАЩАЕТ
+// сам токен вызывающему коду (диагностический fetch рекламных расходов). Токен
+// живёт ТОЛЬКО в памяти запроса: НЕ пишется в БД и НЕ логируется; client_secret
+// тоже НЕ логируется. Никогда не бросает — только дискриминированный результат.
+//
+// Статусы ошибки маппятся на контракт роутов:
+//   • invalid_key  → 400/401 (неверный Client ID/Secret) ИЛИ секрет нечитаем;
+//   • unavailable  → 403/429/5xx/timeout/сеть/не-JSON/пустой токен (повторить).
+// ---------------------------------------------------------------------------
+
+export type PerfTokenOk = { ok: true; token: string };
+export type PerfTokenErr = {
+  ok: false;
+  status: "invalid_key" | "unavailable";
+  detail?: string;
+};
+export type PerfTokenResult = PerfTokenOk | PerfTokenErr;
+
+/**
+ * Получить bearer access_token по client_credentials. Токен возвращается
+ * вызывающему, но НЕ сохраняется и НЕ логируется. Никогда не бросает.
+ */
+export async function getPerformanceAccessToken(
+  clientId: string,
+  clientSecret: string
+): Promise<PerfTokenResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const res = await fetch(PERF_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        client_id: clientId,
+        client_secret: clientSecret,
+        grant_type: "client_credentials",
+      }),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    if (res.ok) {
+      let json: PerfTokenResponse | null = null;
+      try {
+        json = (await res.json()) as PerfTokenResponse;
+      } catch {
+        return { ok: false, status: "unavailable", detail: "Ozon вернул неожиданный ответ" };
+      }
+      const token = typeof json?.access_token === "string" ? json.access_token : "";
+      if (token.length > 0) return { ok: true, token };
+      return { ok: false, status: "unavailable", detail: "Токен не получен — повторите позже" };
+    }
+
+    if (res.status === 400 || res.status === 401) {
+      return { ok: false, status: "invalid_key", detail: "Неверный Client ID или Client Secret" };
+    }
+    // 403 (нет прав), 429 (лимит), 5xx — всё «временно/недоступно» для диагностики.
+    return { ok: false, status: "unavailable", detail: `Ozon ответил статусом ${res.status}` };
+  } catch (e) {
+    const aborted = e instanceof Error && e.name === "AbortError";
+    return {
+      ok: false,
+      status: "unavailable",
+      detail: aborted ? "Ozon не ответил вовремя" : "Не удалось связаться с Ozon",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Безопасная проекция строки ozon_performance_connections для браузера.
 // НЕТ client_secret_encrypted и НЕТ полного client_id — только показуемое.
 // ---------------------------------------------------------------------------
