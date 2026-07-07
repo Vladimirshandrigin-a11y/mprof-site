@@ -17,13 +17,21 @@ import { fetchAdsSpendForMonth } from "../../_lib/performance-ads";
 //   • сумма НЕ сохраняется в историю расчётов и НЕ вычитается из прибыли;
 //   • формула чистой прибыли / налог / COGS / Seller API finance — не затронуты.
 //
+// Reuse pending UUID (анти-429): заказ статистики у Ozon асинхронный. userId (из
+// токена) передаётся в fetchAdsSpendForMonth ТОЛЬКО как часть ключа in-memory кэша
+// pending-UUID — повторный клик за тот же месяц продолжает уже заказанный отчёт, а
+// не создаёт новый (частая причина 429). Это кэш В ПАМЯТИ ПРОЦЕССА, НЕ БД: userId в
+// базу отсюда не пишется.
+//
 // Ответ (всегда с полем status; ok=true только для ok/no_campaigns):
-//   { ok, month, adsSpend, campaignsCount, rowsCount, status, stage?, httpStatus?, detail?, retryAfterSec? }
+//   { ok, month, adsSpend, campaignsCount, rowsCount, status, stage?, httpStatus?, detail?, retryAfterSec?, reused? }
 //   status ∈ ok | no_campaigns | pending | not_connected | invalid_connection | rate_limited | unavailable
 //   stage?/httpStatus?/detail? — ДИАГНОСТИКА (без секретов/токена): этап цепочки
 //   (token|campaigns|statistics|poll|report), HTTP-код Ozon и короткое безопасное
 //   описание. Присутствуют на unavailable/rate_limited, помогают понять, где падает.
 //   retryAfterSec? — для rate_limited (HTTP 429 от Ozon): через сколько секунд повторить.
+//   reused? — true, если запрос продолжил ранее заказанный отчёт (новый заказ не
+//   создавался). Для UI-подсказки на pending «продолжаем ожидание».
 //
 // HTTP-коды: доменные исходы (включая pending/unavailable) отдаём 200, чтобы UI
 // единообразно ветвился по status. Не-2xx только для инфраструктурных сбоев:
@@ -124,10 +132,14 @@ export async function POST(req: NextRequest) {
   }
 
   // --- сам справочный fetch расхода рекламы ---
+  // userId передаём ТОЛЬКО как часть ключа in-memory кэша pending-UUID (reuse
+  // pending report): повторный клик за тот же месяц продолжит уже заказанный отчёт,
+  // а не создаст новый (анти-429). userId в БД/лог отсюда не пишется.
   const result = await fetchAdsSpendForMonth(
     existing.client_id as string,
     clientSecret,
-    month
+    month,
+    userId
   );
 
   const ok = result.status === "ok" || result.status === "no_campaigns";
@@ -161,6 +173,9 @@ export async function POST(req: NextRequest) {
       httpStatus: result.httpStatus,
       detail: result.detail,
       retryAfterSec: result.retryAfterSec,
+      // true → этот запрос продолжил ранее заказанный отчёт (reuse pending UUID),
+      // новый заказ statistics/json не создавался. Для UI-подсказки на pending.
+      reused: result.reused,
     },
     { headers: NO_STORE }
   );

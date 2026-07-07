@@ -28,7 +28,16 @@
 // безопасной подсказкой «повторите позже» (учитываем Retry-After, иначе 60–120с),
 // держим паузу между батчами и ОСТАНАВЛИВАЕМСЯ на первом 429 — не спамим Ozon.
 //
-// access_token и client_secret НИКОГДА не логируются.
+// Reuse pending UUID (главный анти-429 фикс): Performance API асинхронный. Раньше
+// КАЖДЫЙ клик заново делал POST /statistics/json и создавал НОВЫЙ заказ отчёта →
+// Ozon отвечал 429. Теперь заказанный UUID кэшируется В ПАМЯТИ ПРОЦЕССА по ключу
+// userId+month+campaignsHash (TTL ~12 мин): повторный клик за тот же месяц НЕ
+// создаёт новый заказ, а продолжает poll/report по уже полученному UUID. После
+// успешного скачивания/ошибки заказа запись из кэша убирается. Это НЕ БД — при
+// рестарте/нескольких инстансах кэш теряется → безопасная деградация к заказу заново.
+//
+// access_token и client_secret НИКОГДА не логируются; UUID отчёта — не секрет, но
+// в кэш секреты/токен не попадают и в лог не пишутся.
 // ============================================================================
 
 import { getPerformanceAccessToken } from "./performance";
@@ -88,6 +97,12 @@ export type AdsSpendOutcome = {
    * из заголовка Retry-After Ozon, иначе консервативная подсказка. Только число.
    */
   retryAfterSec?: number;
+  /**
+   * true, если этот вызов продолжил ОЖИДАНИЕ ранее заказанного отчёта по
+   * закэшированному UUID (не создавал новый заказ statistics/json). Для UI-подсказки
+   * на pending «продолжаем ожидание ранее заказанного отчёта». Не секрет.
+   */
+  reused?: boolean;
 };
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -271,6 +286,97 @@ function chunk<T>(arr: T[], size: number): T[][] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// In-memory best-effort кэш pending-заказов статистики (reuse pending UUID).
+// ТОЛЬКО память процесса (Map уровня модуля) — это НЕ БД: UUID/month/userId в базу
+// НЕ пишутся. Serverless-оговорка: при рестарте/нескольких инстансах кэш теряется
+// → безопасная деградация к заказу отчёта заново. Секреты/токен сюда НЕ попадают.
+// ---------------------------------------------------------------------------
+
+const PENDING_TTL_MS = 12 * 60 * 1000; // 12 мин — окно жизни pending-UUID (10–15 мин)
+
+type PendingReport = {
+  month: string;
+  campaignsHash: string;
+  /** batchIndex → UUID уже заказанного (возможно ещё не готового) отчёта. */
+  uuids: Record<number, string>;
+  createdAt: number;
+  expiresAt: number;
+};
+
+/** userId+month+campaignsHash → pending-заказы. Живёт только в памяти процесса. */
+const pendingReports = new Map<string, PendingReport>();
+
+function pendingKey(userId: string, month: string, campaignsHash: string): string {
+  return `${userId}|${month}|${campaignsHash}`;
+}
+
+/** FNV-1a 32-bit хэш ОТСОРТИРОВАННОГО списка id кампаний (детерминированный ключ). */
+function hashCampaigns(ids: string[]): string {
+  const joined = [...ids].sort().join(",");
+  let h = 2166136261;
+  for (let i = 0; i < joined.length; i++) {
+    h ^= joined.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+/** Убрать протухшие записи (ограничиваем рост Map). */
+function prunePending(): void {
+  const now = Date.now();
+  for (const [k, v] of pendingReports) {
+    if (now >= v.expiresAt) pendingReports.delete(k);
+  }
+}
+
+/** Свежая запись кэша или undefined (протухшую удаляем). */
+function getPending(key: string): PendingReport | undefined {
+  const e = pendingReports.get(key);
+  if (!e) return undefined;
+  if (Date.now() >= e.expiresAt) {
+    pendingReports.delete(key);
+    return undefined;
+  }
+  return e;
+}
+
+/** Запомнить UUID заказанного отчёта для батча (создаёт/обновляет запись). */
+function rememberUuid(
+  key: string,
+  month: string,
+  campaignsHash: string,
+  batchIndex: number,
+  uuid: string
+): void {
+  const now = Date.now();
+  const e = getPending(key);
+  if (e) {
+    e.uuids[batchIndex] = uuid;
+  } else {
+    pendingReports.set(key, {
+      month,
+      campaignsHash,
+      uuids: { [batchIndex]: uuid },
+      createdAt: now,
+      expiresAt: now + PENDING_TTL_MS,
+    });
+  }
+}
+
+/** Забыть UUID одного батча (Ozon вернул error/fail по заказу). Пустую запись удаляем. */
+function forgetUuid(key: string, batchIndex: number): void {
+  const e = pendingReports.get(key);
+  if (!e) return;
+  delete e.uuids[batchIndex];
+  if (Object.keys(e.uuids).length === 0) pendingReports.delete(key);
+}
+
+/** Забыть весь заказ (успешно скачан целиком — переиспользовать больше нечего). */
+function forgetPending(key: string): void {
+  pendingReports.delete(key);
+}
+
 /**
  * Единый исход «Ozon ограничил частоту запросов» (HTTP 429) для любого этапа.
  * Безопасно: только этап, код 429 и число секунд подсказки — без тела/секретов.
@@ -295,12 +401,18 @@ function rateLimited(
 
 /**
  * Получить справочный расход рекламы за месяц. Никогда не бросает — только
- * дискриминированный результат. Ничего не сохраняет, ничего не логирует.
+ * дискриминированный результат. Ничего не сохраняет в БД, ничего не логирует.
+ *
+ * userId нужен ТОЛЬКО как часть ключа in-memory кэша pending-UUID
+ * (userId+month+campaignsHash) — чтобы повторный клик за тот же месяц продолжал
+ * poll/report по ранее заказанному отчёту, а не создавал новый (анти-429). userId
+ * в БД/лог не пишется.
  */
 export async function fetchAdsSpendForMonth(
   clientId: string,
   clientSecret: string,
-  month: string
+  month: string,
+  userId: string
 ): Promise<AdsSpendOutcome> {
   const empty = { adsSpend: 0, campaignsCount: 0, rowsCount: 0 } as const;
 
@@ -337,7 +449,9 @@ export async function fetchAdsSpendForMonth(
       detail: "Не удалось получить список кампаний",
     };
   }
-  const ids = extractCampaignIds(campRes.json);
+  // Детерминированный порядок → стабильные батчи и campaignsHash между кликами,
+  // чтобы закэшированный UUID батча всегда соответствовал тем же кампаниям.
+  const ids = extractCampaignIds(campRes.json).sort();
   const campaignsCount = ids.length;
   if (campaignsCount === 0) {
     // Нет кампаний — это валидный результат: расход рекламы 0.
@@ -347,56 +461,83 @@ export async function fetchAdsSpendForMonth(
   const { dateFrom, dateTo } = monthRange(month);
   const deadline = Date.now() + GLOBAL_DEADLINE_MS;
 
+  // Reuse pending UUID: ключ по userId+month+набору кампаний; если под ним уже есть
+  // заказанный ранее отчёт — продолжим poll/report по нему, НЕ создавая новый заказ.
+  const campaignsHash = hashCampaigns(ids);
+  const cacheKey = pendingKey(userId, month, campaignsHash);
+  prunePending();
+  const cached = getPending(cacheKey);
+
   let totalSpend = 0;
   let totalRows = 0;
+  let reusedAny = false; // хоть один батч продолжили по ранее заказанному UUID
+  let didOrderThisCall = false; // делали ли POST /statistics/json в этом вызове (пауза)
+
+  // pending-выход с флагом reused (UI покажет «продолжаем ожидание ранее заказанного»).
+  const pendingOutcome = (): AdsSpendOutcome => ({
+    status: "pending",
+    ...empty,
+    campaignsCount,
+    reused: reusedAny || undefined,
+  });
 
   // 3–6) последовательно по батчам (Ozon запрещает параллельные запросы). Между
-  // батчами держим паузу и НЕ продолжаем после первого 429 — не спамим Ozon.
+  // ЗАКАЗАМИ держим паузу и НЕ продолжаем после первого 429 — не спамим Ozon.
   const batches = chunk(ids, CAMPAIGN_BATCH);
   for (let bi = 0; bi < batches.length; bi++) {
-    if (Date.now() >= deadline) {
-      return { status: "pending", ...empty, campaignsCount };
-    }
-    // Пауза перед КАЖДЫМ следующим заказом статистики (не перед первым), чтобы
-    // снизить риск rate-limit. Если пауза не влезает в дедлайн — честный pending.
-    if (bi > 0) {
-      if (Date.now() + BATCH_DELAY_MS >= deadline) {
-        return { status: "pending", ...empty, campaignsCount };
-      }
-      await sleep(BATCH_DELAY_MS);
-    }
+    if (Date.now() >= deadline) return pendingOutcome();
     const batch = batches[bi];
 
-    // 3) заказать статистику → UUID
-    const orderRes = await perfFetch(STATISTICS_URL, token, {
-      method: "POST",
-      body: { campaigns: batch, dateFrom, dateTo, groupBy: "DATE" },
-    });
-    // Rate limit на заказе статистики — самая частая точка 429. Останавливаемся
-    // и возвращаем rate_limited (остальные батчи НЕ шлём — не усугубляем лимит).
-    if (orderRes.status === 429) {
-      return rateLimited("statistics", campaignsCount, orderRes.retryAfterSec);
-    }
-    if (!orderRes.ok) {
-      return {
-        status: "unavailable",
-        ...empty,
-        campaignsCount,
-        stage: "statistics",
-        httpStatus: orderRes.status || undefined,
-        detail: "Не удалось заказать статистику",
-      };
-    }
-    const uuid = extractUuid(orderRes.json);
-    if (!uuid) {
-      return {
-        status: "unavailable",
-        ...empty,
-        campaignsCount,
-        stage: "statistics",
-        httpStatus: orderRes.status || undefined,
-        detail: "Ozon не вернул идентификатор отчёта",
-      };
+    // Уже заказанный (в предыдущем клике) UUID этого батча — переиспользуем.
+    let uuid: string | null = cached?.uuids[bi] ?? null;
+
+    if (uuid) {
+      // ПОВТОРНЫЙ клик за тот же месяц: НЕ создаём новый заказ statistics/json,
+      // а сразу идём в poll/report по ранее полученному UUID (это и снижает 429).
+      reusedAny = true;
+    } else {
+      // Новый заказ. Пауза перед КАЖДЫМ заказом, кроме первого в этом вызове.
+      if (didOrderThisCall) {
+        if (Date.now() + BATCH_DELAY_MS >= deadline) return pendingOutcome();
+        await sleep(BATCH_DELAY_MS);
+      }
+
+      // 3) заказать статистику → UUID
+      const orderRes = await perfFetch(STATISTICS_URL, token, {
+        method: "POST",
+        body: { campaigns: batch, dateFrom, dateTo, groupBy: "DATE" },
+      });
+      didOrderThisCall = true;
+      // Rate limit на заказе статистики — самая частая точка 429. Останавливаемся
+      // и возвращаем rate_limited (остальные батчи НЕ шлём — не усугубляем лимит).
+      // Ранее закэшированные UUID (если были) остаются валидны для след. клика.
+      if (orderRes.status === 429) {
+        return rateLimited("statistics", campaignsCount, orderRes.retryAfterSec);
+      }
+      if (!orderRes.ok) {
+        return {
+          status: "unavailable",
+          ...empty,
+          campaignsCount,
+          stage: "statistics",
+          httpStatus: orderRes.status || undefined,
+          detail: "Не удалось заказать статистику",
+        };
+      }
+      uuid = extractUuid(orderRes.json);
+      if (!uuid) {
+        return {
+          status: "unavailable",
+          ...empty,
+          campaignsCount,
+          stage: "statistics",
+          httpStatus: orderRes.status || undefined,
+          detail: "Ozon не вернул идентификатор отчёта",
+        };
+      }
+      // Запоминаем pending-UUID: повторный клик продолжит poll/report по нему,
+      // не создавая новый заказ. Секреты/токен в кэш НЕ попадают.
+      rememberUuid(cacheKey, month, campaignsHash, bi, uuid);
     }
 
     // 4) опрос готовности (bounded общим дедлайном)
@@ -411,6 +552,9 @@ export async function fetchAdsSpendForMonth(
         state = readPollState(statusRes.json);
         if (state === "ready") break;
         if (state === "error") {
+          // Ozon не смог сформировать отчёт — этот UUID бесполезен: убираем из
+          // кэша, чтобы следующий клик заказал заново.
+          forgetUuid(cacheKey, bi);
           return {
             status: "unavailable",
             ...empty,
@@ -425,8 +569,9 @@ export async function fetchAdsSpendForMonth(
       await sleep(POLL_DELAY_MS);
     }
     if (state !== "ready") {
-      // Отчёт ещё формируется — честно сообщаем pending, не выдаём частичную сумму.
-      return { status: "pending", ...empty, campaignsCount };
+      // Отчёт ещё формируется — pending. UUID сохранён в кэше: следующий клик
+      // продолжит ожидание того же заказа, НЕ создавая новый.
+      return pendingOutcome();
     }
 
     // 5) скачать отчёт
@@ -462,6 +607,9 @@ export async function fetchAdsSpendForMonth(
     totalSpend += spend;
     totalRows += rows;
   }
+
+  // Все батчи скачаны и просуммированы — заказ полностью использован, чистим кэш.
+  forgetPending(cacheKey);
 
   return {
     status: "ok",
