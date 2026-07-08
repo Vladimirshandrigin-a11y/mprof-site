@@ -123,6 +123,16 @@ type HttpResult = {
   json: unknown;
   /** Для 429: разобранный заголовок Retry-After в секундах, если он был. */
   retryAfterSec?: number;
+  /**
+   * Значение заголовка Content-Type ответа (без параметров, напр. "application/json").
+   * Безопасная диагностика формата отчёта — НЕ тело, НЕ секрет.
+   */
+  contentType?: string;
+  /**
+   * true, если тело непустое, но НЕ распарсилось как JSON (CSV/ZIP/HTML/текст).
+   * Сам текст тела НЕ сохраняется и НЕ логируется — только этот флаг.
+   */
+  nonJson?: boolean;
 };
 
 /**
@@ -170,15 +180,29 @@ async function perfFetch(
       cache: "no-store",
       signal: controller.signal,
     });
+    // Content-Type без параметров (application/json; charset=... → application/json).
+    const contentType =
+      res.headers.get("content-type")?.split(";")[0]?.trim() || undefined;
+    // Читаем тело как ТЕКСТ и пытаемся распарсить JSON сами: так мы отличаем
+    // «пустое тело» от «не-JSON» (CSV/ZIP/HTML) для безопасной диагностики. Сам
+    // текст тела НЕ сохраняем и НЕ логируем — только флаг nonJson и content-type.
     let json: unknown = null;
+    let nonJson = false;
     try {
-      json = await res.json();
+      const text = await res.text();
+      if (text.length > 0) {
+        try {
+          json = JSON.parse(text);
+        } catch {
+          nonJson = true;
+        }
+      }
     } catch {
       json = null;
     }
     // Retry-After читаем только при 429 (rate limit) — иначе он не нужен.
     const retryAfterSec = res.status === 429 ? parseRetryAfter(res) : undefined;
-    return { ok: res.ok, status: res.status, json, retryAfterSec };
+    return { ok: res.ok, status: res.status, json, retryAfterSec, contentType, nonJson };
   } catch {
     return { ok: false, status: 0, json: null };
   } finally {
@@ -219,52 +243,128 @@ function readPollState(json: unknown): PollState {
   return "pending";
 }
 
+// ---------------------------------------------------------------------------
+// Разбор тела отчёта Performance API. Формат Ozon зависит от числа кампаний и
+// может класть строки на РАЗНОЙ глубине, например:
+//   { rows: [...] }                              (плоский)
+//   { report: { rows: [...] } }                  (обёртка report)
+//   { "<campId>": { rows: [...] } }              (по кампаниям)
+//   { "<campId>": { report: { rows: [...] } } }  (report внутри кампании)
+//   { result: { ... } }                          (обёртка result)
+//   [ {...}, {...} ]                              (голый массив строк сверху)
+// Поэтому вместо фиксированного обхода ищем массивы rows РЕКУРСИВНО, с пределом
+// глубины и бюджетом узлов (защита от слишком большого обхода).
+// ---------------------------------------------------------------------------
+
+const REPORT_MAX_DEPTH = 8; // предел глубины рекурсии по телу отчёта
+const REPORT_WALK_BUDGET = 100000; // предел числа посещённых узлов (защита от большого обхода)
+const REPORT_DIAG_MAX_KEYS = 8; // сколько имён верхнеуровневых ключей показываем в диагностике
+const REPORT_DIAG_MAX_KEY_LEN = 32; // предел длины одного имени ключа в диагностике
+
 /**
- * Просуммировать moneySpent по строкам отчёта. Терпим к форме конверта:
- *   { report: { rows: [...] } }              (плоский)
- *   { report: { "<campId>": { rows: [...] } } } (по кампаниям)
- *   { rows: [...] } / { "<campId>": { rows: [...] } } (без обёртки report)
+ * Просуммировать moneySpent по строкам отчёта, терпимо к форме конверта.
  *
- * recognized=true, если нашли ХОТЯ БЫ один ожидаемый rows-массив (даже пустой) —
- * тогда сумма 0 ₽ валидна (у кампаний просто не было расхода). Если rows-массива
- * нет вовсе (не-JSON тело, CSV/ZIP, иная схема) — recognized=false, и вызывающий
- * НЕ выдаёт ложный «0 ₽ ok», а честно сообщает, что формат отчёта не распознан.
+ * Рекурсивно (глубина ≤ REPORT_MAX_DEPTH, бюджет узлов REPORT_WALK_BUDGET) ищем
+ * массивы под ключом `rows` на любом уровне. Если явных rows нет — как запасной
+ * вариант берём row-подобный массив (все элементы — объекты с полем moneySpent):
+ * это покрывает голый массив строк сверху и { result: [ ... ] }. НЕ падаем на
+ * null / строках / числах / иных типах.
+ *
+ * recognized=true, если найден ХОТЯ БЫ один rows-массив (даже пустой) — тогда 0 ₽
+ * валидны (у кампаний не было расхода). Если ни одного — recognized=false, и
+ * вызывающий НЕ выдаёт ложный «0 ₽ ok», а честно сообщает «формат не распознан»
+ * (+ безопасная диагностика структуры).
  */
 function sumReport(json: unknown): {
   spend: number;
   rows: number;
   recognized: boolean;
+  /** Сколько rows-массивов реально найдено (диагностика; 0 → не распознан). */
+  rowsArrays: number;
 } {
-  let spend = 0;
-  let rows = 0;
-  let recognized = false;
-  if (!json || typeof json !== "object") return { spend, rows, recognized };
+  const explicit: unknown[][] = []; // массивы под ключом "rows"
+  const candidate: unknown[][] = []; // row-подобные массивы (элементы с moneySpent)
+  let budget = REPORT_WALK_BUDGET;
 
-  const collect = (node: unknown): void => {
+  // Массив считаем «строками», если он непустой и КАЖДЫЙ элемент — объект (не
+  // массив) с полем moneySpent. Это отсекает служебные массивы (напр. кампании).
+  const isRowLikeArray = (arr: unknown[]): boolean =>
+    arr.length > 0 &&
+    arr.every(
+      (e) =>
+        !!e &&
+        typeof e === "object" &&
+        !Array.isArray(e) &&
+        "moneySpent" in (e as Record<string, unknown>)
+    );
+
+  const walk = (node: unknown, depth: number): void => {
+    if (budget <= 0 || depth > REPORT_MAX_DEPTH) return;
     if (!node || typeof node !== "object") return;
-    const arr = (node as { rows?: unknown }).rows;
-    if (Array.isArray(arr)) {
-      recognized = true; // ожидаемый конверт отчёта найден (даже если строк 0)
-      for (const r of arr) {
-        if (r && typeof r === "object") {
-          spend += parseMoney((r as { moneySpent?: unknown }).moneySpent);
-          rows += 1;
-        }
+    budget -= 1;
+    if (Array.isArray(node)) {
+      if (isRowLikeArray(node)) candidate.push(node);
+      for (const el of node) walk(el, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(node as Record<string, unknown>)) {
+      const val = (node as Record<string, unknown>)[key];
+      if (key === "rows" && Array.isArray(val)) {
+        explicit.push(val); // строки — листья: внутрь не углубляемся
+      } else {
+        walk(val, depth + 1);
       }
     }
   };
 
-  const root = (json as { report?: unknown }).report ?? json;
-  if (!root || typeof root !== "object") return { spend, rows, recognized };
+  walk(json, 0);
 
-  if (Array.isArray((root as { rows?: unknown }).rows)) {
-    collect(root);
-  } else {
-    for (const key of Object.keys(root as Record<string, unknown>)) {
-      collect((root as Record<string, unknown>)[key]);
+  // Приоритет — явные rows; иначе запасной row-подобный массив (bare / result:[...]).
+  const chosen = explicit.length > 0 ? explicit : candidate;
+
+  let spend = 0;
+  let rows = 0;
+  for (const arr of chosen) {
+    for (const r of arr) {
+      if (r && typeof r === "object") {
+        spend += parseMoney((r as { moneySpent?: unknown }).moneySpent);
+        rows += 1;
+      }
     }
   }
-  return { spend, rows, recognized };
+  return { spend, rows, recognized: chosen.length > 0, rowsArrays: chosen.length };
+}
+
+/**
+ * Безопасное описание формы НЕраспознанного тела отчёта для диагностики. НЕ
+ * содержит значений строк / сумм / секретов / токена / UUID — только тип тела,
+ * content-type, ИМЕНА верхнеуровневых ключей (санитизированы, с лимитом) и число
+ * найденных rows-массивов; плюс метка non_json_body, если тело было не JSON.
+ */
+function describeReportShape(res: HttpResult, rowsArrays: number): string {
+  const json = res.json;
+  const parts: string[] = [`ct=${res.contentType ?? "?"}`];
+  const bodyType = Array.isArray(json)
+    ? "array"
+    : json === null
+      ? "null"
+      : typeof json;
+  parts.push(`body=${bodyType}`);
+  if (json && typeof json === "object" && !Array.isArray(json)) {
+    const allKeys = Object.keys(json as Record<string, unknown>);
+    const shown = allKeys.slice(0, REPORT_DIAG_MAX_KEYS).map((k) => {
+      const safe = k.replace(/[^\w.-]/g, "_"); // только буквы/цифры/._- (без значений/спецсимволов)
+      return safe.length > REPORT_DIAG_MAX_KEY_LEN
+        ? `${safe.slice(0, REPORT_DIAG_MAX_KEY_LEN)}*`
+        : safe;
+    });
+    const more =
+      allKeys.length > shown.length ? `+${allKeys.length - shown.length}` : "";
+    parts.push(`keys=[${shown.join(",")}${more}]`);
+  }
+  parts.push(`rowsArrays=${rowsArrays}`);
+  if (res.nonJson) parts.push("non_json_body");
+  return parts.join("; ");
 }
 
 /** «YYYY-MM» → { dateFrom: YYYY-MM-01, dateTo: YYYY-MM-<последний день> } (UTC). */
@@ -590,18 +690,23 @@ export async function fetchAdsSpendForMonth(
       };
     }
 
-    // 6) суммируем
-    const { spend, rows, recognized } = sumReport(reportRes.json);
+    // 6) суммируем (рекурсивный поиск rows-массивов, терпим к форме конверта)
+    const { spend, rows, recognized, rowsArrays } = sumReport(reportRes.json);
     if (!recognized) {
-      // HTTP 200, но тело не в ожидаемом JSON-формате (rows/moneySpent): не-JSON,
-      // CSV/ZIP или иная схема. НЕ выдаём ложный «0 ₽ ok» — сообщаем честно.
+      // HTTP 200, но ни одного rows-массива не нашли: не-JSON тело (CSV/ZIP) или
+      // неизвестная схема. НЕ выдаём ложный «0 ₽ ok» — сообщаем честно и прилагаем
+      // БЕЗОПАСНУЮ диагностику формы (тип/content-type/имена ключей/число rows),
+      // без значений строк/секретов/токена/UUID.
       return {
         status: "unavailable",
         ...empty,
         campaignsCount,
         stage: "report",
         httpStatus: reportRes.status || undefined,
-        detail: "Формат отчёта Performance API не распознан",
+        detail: `Формат отчёта Performance API не распознан (${describeReportShape(
+          reportRes,
+          rowsArrays
+        )})`,
       };
     }
     totalSpend += spend;
