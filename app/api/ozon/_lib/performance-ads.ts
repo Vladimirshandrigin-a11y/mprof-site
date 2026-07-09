@@ -58,6 +58,10 @@ const BATCH_DELAY_MS = 1500; // пауза между заказами стат�
 const DEFAULT_RETRY_AFTER_SEC = 90; // подсказка «повторить через», если Retry-After нет (60–120с)
 const RATE_LIMIT_DETAIL =
   "Ozon ограничил частоту запросов. Попробуйте через 1–2 минуты.";
+// Группировка статистики по дням. Значение НЕ меняется — это ровно тот же "DATE",
+// что отправлялся раньше; PR #50 лишь выносит его в именованную константу, чтобы
+// тело запроса и диагностика ссылались на ОДИН источник (без риска расхождения).
+const STATISTICS_GROUP_BY = "DATE";
 
 export type AdsSpendStatus =
   | "ok"
@@ -281,6 +285,10 @@ function sumReport(json: unknown): {
   recognized: boolean;
   /** Сколько rows-массивов реально найдено (диагностика; 0 → не распознан). */
   rowsArrays: number;
+  /** Сколько массивов под ключом "rows" (в т.ч. пустых). Диагностика. */
+  explicitArrays: number;
+  /** Сколько row-подобных массивов-кандидатов (bare / result:[...]). Диагностика. */
+  candidateArrays: number;
 } {
   const explicit: unknown[][] = []; // массивы под ключом "rows"
   const candidate: unknown[][] = []; // row-подобные массивы (элементы с moneySpent)
@@ -332,7 +340,14 @@ function sumReport(json: unknown): {
       }
     }
   }
-  return { spend, rows, recognized: chosen.length > 0, rowsArrays: chosen.length };
+  return {
+    spend,
+    rows,
+    recognized: chosen.length > 0,
+    rowsArrays: chosen.length,
+    explicitArrays: explicit.length,
+    candidateArrays: candidate.length,
+  };
 }
 
 /**
@@ -364,6 +379,42 @@ function describeReportShape(res: HttpResult, rowsArrays: number): string {
   }
   parts.push(`rowsArrays=${rowsArrays}`);
   if (res.nonJson) parts.push("non_json_body");
+  return parts.join("; ");
+}
+
+/**
+ * Безопасная диагностика для случая «отчёт РАСПОЗНАН, но строк 0» (status ok,
+ * rowsCount 0). Помогает отличить настоящий 0 ₽ от проблемы формы запроса (напр.
+ * пустой rows при неверных параметрах). НЕ содержит client_secret / access_token /
+ * UUID / полного списка кампаний / значений строк отчёта — только форма ответа
+ * (ct/тип тела/имена верхнеуровневых ключей с лимитом), счётчики найденных массивов
+ * и параметры ОТПРАВЛЕННОГО запроса (период / группировка / число кампаний и батчей
+ * / был ли переиспользован ранее заказанный отчёт).
+ */
+function describeEmptyReport(
+  res: HttpResult | null,
+  counts: { rowsArrays: number; explicitArrays: number; candidateArrays: number },
+  req: {
+    dateFrom: string;
+    dateTo: string;
+    groupBy: string;
+    campaignCount: number;
+    batchCount: number;
+    reused: boolean;
+  }
+): string {
+  const parts: string[] = [
+    res
+      ? describeReportShape(res, counts.rowsArrays)
+      : `rowsArrays=${counts.rowsArrays}`,
+    `explicit=${counts.explicitArrays}`,
+    `candidate=${counts.candidateArrays}`,
+    `period=${req.dateFrom}..${req.dateTo}`,
+    `groupBy=${req.groupBy}`,
+    `campaigns=${req.campaignCount}`,
+    `batches=${req.batchCount}`,
+    `reused=${req.reused ? "yes" : "no"}`,
+  ];
   return parts.join("; ");
 }
 
@@ -572,6 +623,13 @@ export async function fetchAdsSpendForMonth(
   let totalRows = 0;
   let reusedAny = false; // хоть один батч продолжили по ранее заказанному UUID
   let didOrderThisCall = false; // делали ли POST /statistics/json в этом вызове (пауза)
+  // Диагностика PR #50 — используется ТОЛЬКО если итог 0 строк (отличить настоящий
+  // 0 ₽ от проблемы формы запроса). Форма последнего отчёта + накопленные счётчики
+  // массивов. Секретов/токена/UUID тут нет.
+  let lastReportRes: HttpResult | null = null;
+  let diagRowsArrays = 0;
+  let diagExplicitArrays = 0;
+  let diagCandidateArrays = 0;
 
   // pending-выход с флагом reused (UI покажет «продолжаем ожидание ранее заказанного»).
   const pendingOutcome = (): AdsSpendOutcome => ({
@@ -605,7 +663,7 @@ export async function fetchAdsSpendForMonth(
       // 3) заказать статистику → UUID
       const orderRes = await perfFetch(STATISTICS_URL, token, {
         method: "POST",
-        body: { campaigns: batch, dateFrom, dateTo, groupBy: "DATE" },
+        body: { campaigns: batch, dateFrom, dateTo, groupBy: STATISTICS_GROUP_BY },
       });
       didOrderThisCall = true;
       // Rate limit на заказе статистики — самая частая точка 429. Останавливаемся
@@ -691,7 +749,8 @@ export async function fetchAdsSpendForMonth(
     }
 
     // 6) суммируем (рекурсивный поиск rows-массивов, терпим к форме конверта)
-    const { spend, rows, recognized, rowsArrays } = sumReport(reportRes.json);
+    const { spend, rows, recognized, rowsArrays, explicitArrays, candidateArrays } =
+      sumReport(reportRes.json);
     if (!recognized) {
       // HTTP 200, но ни одного rows-массива не нашли: не-JSON тело (CSV/ZIP) или
       // неизвестная схема. НЕ выдаём ложный «0 ₽ ok» — сообщаем честно и прилагаем
@@ -711,15 +770,51 @@ export async function fetchAdsSpendForMonth(
     }
     totalSpend += spend;
     totalRows += rows;
+    // Диагностика (PR #50): копим счётчики массивов и запоминаем форму последнего
+    // отчёта — пригодится ТОЛЬКО если суммарно вышло 0 строк.
+    lastReportRes = reportRes;
+    diagRowsArrays += rowsArrays;
+    diagExplicitArrays += explicitArrays;
+    diagCandidateArrays += candidateArrays;
   }
 
   // Все батчи скачаны и просуммированы — заказ полностью использован, чистим кэш.
   forgetPending(cacheKey);
+
+  // «Отчёт распознан, но 0 строк» → безопасная диагностика в detail, чтобы UI мог
+  // отличить настоящий 0 ₽ от проблемы формы запроса. БЕЗ секретов/токена/UUID.
+  const zeroRowsDetail =
+    totalRows === 0
+      ? describeEmptyReport(
+          lastReportRes,
+          {
+            rowsArrays: diagRowsArrays,
+            explicitArrays: diagExplicitArrays,
+            candidateArrays: diagCandidateArrays,
+          },
+          {
+            dateFrom,
+            dateTo,
+            groupBy: STATISTICS_GROUP_BY,
+            campaignCount: campaignsCount,
+            batchCount: batches.length,
+            reused: reusedAny,
+          }
+        )
+      : undefined;
 
   return {
     status: "ok",
     adsSpend: Math.round(totalSpend * 100) / 100,
     campaignsCount,
     rowsCount: totalRows,
+    // detail присутствует ТОЛЬКО при 0 строк — при реальных данных ветка чистая.
+    ...(zeroRowsDetail
+      ? {
+          detail: zeroRowsDetail,
+          stage: "report" as const,
+          httpStatus: lastReportRes?.status || undefined,
+        }
+      : {}),
   };
 }
