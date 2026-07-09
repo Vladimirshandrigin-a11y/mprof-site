@@ -351,10 +351,32 @@ function sumReport(json: unknown): {
 }
 
 /**
+ * Маска для потенциально чувствительного ИМЕНИ верхнеуровневого ключа ответа.
+ * Реальные ID кампаний/сущностей НЕ должны попадать в диагностику, поэтому:
+ *   • полностью числовой ключ                 → "<numeric_id>" (ID кампании — цифры);
+ *   • UUID / длинный hex / длинный токен-с-цифрой → "<id_like_key>".
+ * Обычные структурные текстовые ключи (report, result, rows, data, items и т.п.)
+ * возвращаются как есть (санитизация + лимит длины). Здесь только ИМЯ ключа — без
+ * его значения. Количество ключей сохраняется вызывающим через «+N».
+ */
+function maskDiagKey(raw: string): string {
+  if (/^\d+$/.test(raw)) return "<numeric_id>"; // ID кампании — только цифры
+  const isUuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw);
+  const isLongHex = /^[0-9a-f]{16,}$/i.test(raw);
+  const isLongOpaque = raw.length >= 24 && /\d/.test(raw); // длинный токен с цифрой
+  if (isUuid || isLongHex || isLongOpaque) return "<id_like_key>";
+  const safe = raw.replace(/[^\w.-]/g, "_"); // только буквы/цифры/._- (без значений/спецсимволов)
+  return safe.length > REPORT_DIAG_MAX_KEY_LEN
+    ? `${safe.slice(0, REPORT_DIAG_MAX_KEY_LEN)}*`
+    : safe;
+}
+
+/**
  * Безопасное описание формы НЕраспознанного тела отчёта для диагностики. НЕ
  * содержит значений строк / сумм / секретов / токена / UUID — только тип тела,
- * content-type, ИМЕНА верхнеуровневых ключей (санитизированы, с лимитом) и число
- * найденных rows-массивов; плюс метка non_json_body, если тело было не JSON.
+ * content-type, ИМЕНА верхнеуровневых ключей (ID-подобные маскируются, с лимитом)
+ * и число найденных rows-массивов; плюс метка non_json_body, если тело было не JSON.
  */
 function describeReportShape(res: HttpResult, rowsArrays: number): string {
   const json = res.json;
@@ -367,12 +389,9 @@ function describeReportShape(res: HttpResult, rowsArrays: number): string {
   parts.push(`body=${bodyType}`);
   if (json && typeof json === "object" && !Array.isArray(json)) {
     const allKeys = Object.keys(json as Record<string, unknown>);
-    const shown = allKeys.slice(0, REPORT_DIAG_MAX_KEYS).map((k) => {
-      const safe = k.replace(/[^\w.-]/g, "_"); // только буквы/цифры/._- (без значений/спецсимволов)
-      return safe.length > REPORT_DIAG_MAX_KEY_LEN
-        ? `${safe.slice(0, REPORT_DIAG_MAX_KEY_LEN)}*`
-        : safe;
-    });
+    // ID-подобные ключи (числовые/UUID/длинные токены) маскируются, чтобы реальные
+    // ID кампаний/сущностей не попали в диагностику; обычные текстовые ключи — как есть.
+    const shown = allKeys.slice(0, REPORT_DIAG_MAX_KEYS).map(maskDiagKey);
     const more =
       allKeys.length > shown.length ? `+${allKeys.length - shown.length}` : "";
     parts.push(`keys=[${shown.join(",")}${more}]`);
