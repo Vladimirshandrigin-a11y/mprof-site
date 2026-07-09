@@ -12187,6 +12187,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                                   Справочно. В этом PR реклама ещё не вычитается из
                                   прибыли.
                                 </p>
+                                {adsResult.rowsCount === 0 && adsResult.detail && (
+                                  <p className="ads-diag-diag">
+                                    Диагностика (0 строк): {adsResult.detail}
+                                  </p>
+                                )}
                               </div>
                             ) : adsResult.status === "no_campaigns" ? (
                               <div className="ads-diag-result">
