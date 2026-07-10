@@ -39,6 +39,20 @@ import {
 // Supabase client импортируется из lib/supabase-cloud (единый instance,
 // fallback на placeholder URL/key, browser-only warning при отсутствии env).
 
+// ---------------------------------------------------------------------------
+// Ozon Performance API — временно СКРЫТ из интерфейса (флаг = false).
+//
+// Почему скрыт: расходы «Продвижение и реклама» уже полностью учитываются через
+// Ozon Seller API / finance operations и уже уменьшают чистую прибыль (сидят в
+// бакетах other/services суммы операций). Performance API — это ОТДЕЛЬНЫЙ реестр
+// Ozon (справочный) и в расчёт прибыли НЕ входит. Для первых пользователей блок
+// путал: мог показывать 0 ₽, хотя рекламные списания уже есть в Seller finance.
+//
+// Скрыт ТОЛЬКО UI-блок в кабинете. Backend НЕ тронут: роуты /api/ozon/performance/*,
+// библиотеки Performance, сохранённые подключения и таблицы остаются как есть —
+// вернуть блок можно, поставив флаг обратно в true.
+const SHOW_PERFORMANCE_API_BLOCK = false;
+
 /** Локальный id для расчётов, которые не попали в облако (offline/DEV). */
 function makeLocalId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -12057,7 +12071,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     )}
                   </div>
 
-                  {/* Ozon Performance API — реклама и продвижение — на всю ширину */}
+                  {/* Ozon Performance API — реклама и продвижение — на всю ширину.
+                      Скрыт флагом SHOW_PERFORMANCE_API_BLOCK (см. верх файла):
+                      реклама уже учтена через Seller finance, отдельный справочный
+                      блок только путал. Backend/подключение/таблицы НЕ тронуты. */}
+                  {SHOW_PERFORMANCE_API_BLOCK && (
                   <div className="cab-card cab-card-wide">
                     <div className="cab-card-head">
                       <span className="cab-card-ico" aria-hidden="true">
@@ -12367,6 +12385,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       </p>
                     )}
                   </div>
+                  )}
 
                   {/* Быстрые действия — на всю ширину */}
                   <div className="cab-card cab-card-wide">
