@@ -53,6 +53,14 @@ import {
 // вернуть блок можно, поставив флаг обратно в true.
 const SHOW_PERFORMANCE_API_BLOCK = false;
 
+// Показ технической диагностики «Диагностика отчёта реализации Ozon» в кабинете.
+// Скрыт (false) перед рекламным запуском: это read-only справочная диагностика для
+// разработчика (сырой ответ отчёта о реализации, сверка идентификаторов, candidate
+// COGS и т.п.). Обычному пользователю она не нужна и только путала. Скрыт ТОЛЬКО
+// UI-блок — логика расчёта/сохранения/себестоимости не затронута; вернуть блок можно,
+// поставив флаг обратно в true.
+const SHOW_REALIZATION_DIAGNOSTIC = false;
+
 /** Локальный id для расчётов, которые не попали в облако (offline/DEV). */
 function makeLocalId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -9287,8 +9295,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 {/* СПРАВОЧНАЯ диагностика отчёта о реализации Ozon (read-only).
                     Приходит довеском к сохранённому расчёту. НЕ влияет на прибыль/
                     налог/себестоимость выше — candidate COGS показываем, чтобы сверить
-                    источник себестоимости с документальным расчётом. */}
-                {realizationDiag && apiSaved && profitResult && (
+                    источник себестоимости с документальным расчётом.
+                    Скрыт перед рекламным запуском флагом SHOW_REALIZATION_DIAGNOSTIC
+                    (см. верх файла): это техническая диагностика, обычному пользователю
+                    не нужна. Логика расчёта/сохранения НЕ тронута — вернуть = флаг в true. */}
+                {SHOW_REALIZATION_DIAGNOSTIC && realizationDiag && apiSaved && profitResult && (
                   <div
                     className="rz-diag"
                     role="region"
