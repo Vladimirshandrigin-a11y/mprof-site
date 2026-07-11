@@ -48,26 +48,28 @@ type ApiResponse = {
   retryable?: boolean;
 };
 
-/** Схема доставки — приходит готовой из родителя (AnalyticsBlock её определяет).
- *  Компонент показывает бейдж; если авто-определение дало "unknown" — даёт
- *  пользователю вручную выбрать схему (выбор уходит обратно в родителя, влияет
- *  ТОЛЬКО на AI-аналитику). Сам компонент схему не вычисляет. */
-type FulfillmentMode = "fbo" | "fbs" | "mixed" | "unknown";
-const FULFILLMENT_LABEL: Record<FulfillmentMode, string> = {
-  fbo: "Схема доставки: FBO",
-  fbs: "Схема доставки: FBS",
-  mixed: "Схема доставки: смешанная",
-  unknown: "Схема доставки: не определена",
-};
-/** Короткие подписи опций ручного выбора (значение → текст в селекторе). */
+/** Схема доставки — выбирается ПОЛЬЗОВАТЕЛЕМ вручную (обязательно, перед запуском
+ *  AI). Выбор уходит наверх в родителя → в payload. Автоопределения нет —
+ *  компонент лишь показывает селектор и передаёт выбор наверх. Влияет ТОЛЬКО на
+ *  AI-аналитику; формулы прибыли не затрагивает. */
+type FulfillmentMode = "fbo" | "fbs" | "realfbs" | "mixed" | "unknown";
+/** Короткие подписи опций ручного выбора (значение → текст в селекторе).
+ *  unknown = плейсхолдер «не выбрано» (обязательный выбор перед запуском AI). */
 const FULFILLMENT_OPTION: Record<FulfillmentMode, string> = {
-  unknown: "Не знаю",
+  unknown: "— выберите схему —",
   fbo: "FBO",
   fbs: "FBS",
+  realfbs: "realFBS",
   mixed: "Смешанная",
 };
 function isFulfillmentMode(v: string): v is FulfillmentMode {
-  return v === "fbo" || v === "fbs" || v === "mixed" || v === "unknown";
+  return (
+    v === "fbo" ||
+    v === "fbs" ||
+    v === "realfbs" ||
+    v === "mixed" ||
+    v === "unknown"
+  );
 }
 
 // Один тихий авто-повтор на клиенте — только если backend сам сообщил, что сбой
@@ -81,12 +83,7 @@ type Props = {
   hasPremium: boolean;
   /** Открыть окно покупки тарифа (для не-премиум состояния). */
   onOpenPremium?: () => void;
-  /** Авто-определённая схема. fbo/fbs/mixed → бейдж; "unknown" → ручной выбор;
-   *  не задана → ничего не показываем. */
-  fulfillmentMode?: FulfillmentMode;
-  /** Короткие причины определения схемы (подсказка при наведении на бейдж). */
-  fulfillmentEvidence?: string[];
-  /** Текущий ручной выбор схемы (актуален, только когда авто = "unknown"). */
+  /** Текущий ручной выбор схемы доставки (обязателен перед запуском AI). */
   fulfillmentManual?: FulfillmentMode;
   /** Сообщить родителю о ручном выборе схемы — он влияет на payload AI. */
   onFulfillmentManualChange?: (mode: FulfillmentMode) => void;
@@ -115,8 +112,6 @@ export function AiAnalyticsV1({
   payloadSig,
   hasPremium,
   onOpenPremium,
-  fulfillmentMode,
-  fulfillmentEvidence,
   fulfillmentManual,
   onFulfillmentManualChange,
 }: Props) {
@@ -133,8 +128,9 @@ export function AiAnalyticsV1({
   // и по кнопке «Повторить анализ». Зависит только от hasPremium/payloadSig.
   const loadAiAdvice = useCallback(
     async (opts?: { isAutoRetry?: boolean }) => {
-      // Без премиума или без данных запрос не уходит (сервер тоже проверяет).
-      if (!hasPremium || !payloadSig) {
+      // Без премиума, без данных ИЛИ пока схема доставки не выбрана — запрос не
+      // уходит (сервер тоже проверяет премиум/данные). "unknown" = «не выбрано».
+      if (!hasPremium || !payloadSig || fulfillmentManual === "unknown") {
         setStatus("idle");
         setDoc(null);
         return;
@@ -224,7 +220,7 @@ export function AiAnalyticsV1({
         if (isCurrent()) setStatus("error");
       }
     },
-    [hasPremium, payloadSig]
+    [hasPremium, payloadSig, fulfillmentManual]
   );
 
   // Первичная загрузка + перезапуск при смене премиума/данных. На размонтирование
@@ -272,6 +268,18 @@ export function AiAnalyticsV1({
         <p className="aiv1-state-title">Добавьте расчёт</p>
         <p className="aiv1-state-note">
           Загрузите отчёт и сделайте расчёт — AI разберёт вашу прибыль.
+        </p>
+      </div>
+    );
+  } else if (fulfillmentManual === "unknown") {
+    // Схема доставки обязательна и не выбрана → AI не запускаем, просим выбрать.
+    body = (
+      <div className="aiv1-state" role="status">
+        <SparkIcon />
+        <p className="aiv1-state-title">Выберите схему доставки</p>
+        <p className="aiv1-state-note">
+          Укажите схему доставки выше (FBO, FBS, realFBS или смешанная) — и AI
+          разберёт вашу прибыль с учётом вашей логистики.
         </p>
       </div>
     );
@@ -412,51 +420,42 @@ export function AiAnalyticsV1({
               <div className="aiv1-subtitle">
                 Персональный анализ на основе вашего отчёта
               </div>
-              {payloadSig && fulfillmentMode ? (
-                fulfillmentMode === "unknown" ? (
-                  // Авто-определение не нашло схему → даём выбрать вручную.
-                  // Выбор уходит в родителя → меняет payload → AI перезапросится
-                  // (через тот же loadAiAdvice/AbortController, без цикла).
-                  <div className="aiv1-fulfill-pick">
+              {hasPremium && payloadSig ? (
+                // Обязательный ручной выбор схемы доставки перед запуском AI.
+                // Автоопределения нет — это единственный источник значения. Выбор
+                // уходит в родителя → меняет payload → AI стартует (через тот же
+                // loadAiAdvice/AbortController, без цикла). Пока не выбрано — гейт.
+                <div className="aiv1-fulfill-pick">
+                  <label className="aiv1-fulfill-hint">
+                    Схема доставки
+                    <select
+                      className="aiv1-fulfill-select"
+                      aria-label="Схема доставки"
+                      value={fulfillmentManual ?? "unknown"}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        if (onFulfillmentManualChange && isFulfillmentMode(v)) {
+                          onFulfillmentManualChange(v);
+                        }
+                      }}
+                    >
+                      <option value="unknown">
+                        {FULFILLMENT_OPTION.unknown}
+                      </option>
+                      <option value="fbo">{FULFILLMENT_OPTION.fbo}</option>
+                      <option value="fbs">{FULFILLMENT_OPTION.fbs}</option>
+                      <option value="realfbs">
+                        {FULFILLMENT_OPTION.realfbs}
+                      </option>
+                      <option value="mixed">{FULFILLMENT_OPTION.mixed}</option>
+                    </select>
+                  </label>
+                  {fulfillmentManual === "unknown" ? (
                     <span className="aiv1-fulfill-note">
-                      Схема доставки не определена
+                      Выберите схему доставки, чтобы запустить анализ
                     </span>
-                    <label className="aiv1-fulfill-hint">
-                      Укажите, если знаете
-                      <select
-                        className="aiv1-fulfill-select"
-                        aria-label="Схема доставки"
-                        value={fulfillmentManual ?? "unknown"}
-                        onChange={(e) => {
-                          const v = e.target.value;
-                          if (onFulfillmentManualChange && isFulfillmentMode(v)) {
-                            onFulfillmentManualChange(v);
-                          }
-                        }}
-                      >
-                        <option value="unknown">
-                          {FULFILLMENT_OPTION.unknown}
-                        </option>
-                        <option value="fbo">{FULFILLMENT_OPTION.fbo}</option>
-                        <option value="fbs">{FULFILLMENT_OPTION.fbs}</option>
-                        <option value="mixed">
-                          {FULFILLMENT_OPTION.mixed}
-                        </option>
-                      </select>
-                    </label>
-                  </div>
-                ) : (
-                  <span
-                    className="aiv1-fulfillment"
-                    title={
-                      fulfillmentEvidence && fulfillmentEvidence.length > 0
-                        ? fulfillmentEvidence.join("; ")
-                        : undefined
-                    }
-                  >
-                    {FULFILLMENT_LABEL[fulfillmentMode]}
-                  </span>
-                )
+                  ) : null}
+                </div>
               ) : null}
             </div>
           </div>
