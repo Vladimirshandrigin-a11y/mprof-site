@@ -5163,6 +5163,19 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .api-conn-ok b{color:#9FEFC6;font-weight:600}
 .api-conn-ok-meta{color:var(--txt3);font-size:.8rem}
 .api-main-cta{width:100%;min-width:0;margin-top:.2rem;padding:16px 22px;font-size:1.04rem}
+/* Минимальный дизайн блока «Авторасчёт через Ozon API» (без шагов 1–4) */
+.api-connect-cta{display:flex;flex-direction:column;align-items:flex-start;gap:1rem;margin-top:.2rem}
+.api-connect-cta-text{font-size:.92rem;color:var(--txt2);line-height:1.6;margin:0;max-width:520px}
+.api-connect-cta .api-pro-btn{flex:none;min-width:0;width:auto}
+.api-conn-ok-bar{margin-top:.2rem;flex-wrap:wrap}
+.api-conn-manage{margin-left:auto;background:none;border:none;padding:0;cursor:pointer;
+  font-family:var(--sans);font-size:.82rem;font-weight:600;color:#7DEAB2;
+  text-decoration:underline;text-underline-offset:2px;transition:color .15s}
+.api-conn-manage:hover{color:#9FEFC6}
+.api-field-block{margin-top:1.3rem}
+.api-field-label{display:block;font-family:var(--display);font-size:.98rem;font-weight:600;
+  color:var(--txt);margin-bottom:.55rem}
+.api-field-hint{font-size:.8rem;color:var(--txt3);line-height:1.5;margin:0 0 .65rem 0}
 .api-costgap{margin-top:1.3rem;padding:1.1rem 1.2rem;border-radius:14px;
   background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.4)}
 .api-costgap-title{font-family:var(--display);font-size:1.02rem;font-weight:700;color:#F7C66B;
@@ -8880,112 +8893,57 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         {calcMode === "api" && (
         <div className="card api-pro-card">
           <div className="api-pro-head">
-            <div className="api-pro-title">Авторасчёт чистой прибыли Ozon</div>
-            <p className="api-pro-sub">
-              Подключите Ozon, выберите месяц и введите свои расходы — сайт сам
-              посчитает чистую прибыль по данным Ozon API и каталогу себестоимости
-              и сохранит результат в историю.
-            </p>
-          </div>
-
-          <div className="mode-note" role="note">
-            <div className="mode-note-title">Авторасчёт по операциям Ozon API</div>
-            <p className="mode-note-text">
-              Ozon автоматически подтягивает выручку, комиссии, логистику и
-              операции за выбранный месяц. Дополнительные расходы — налог,
-              упаковку, зарплату, доставку и прочее — вы добавляете вручную.
-              API-расчёт использует полную экономику Ozon и отчёт реализации,
-              поэтому он ближе к личному кабинету Ozon.
-              <span className="mode-note-sub">
-                Значения могут отличаться от расчёта по загруженным документам,
-                потому что документы и API отражают данные в разных разрезах.
-              </span>
-            </p>
+            <div className="api-pro-title">Авторасчёт через Ozon API</div>
           </div>
 
           <div className="api-pro-body">
-            {/* Тариф-нота (449₽). Тексты/цены не трогаем. */}
-            <div
-              className="api-alert"
-              role="note"
-              style={{
-                background: "rgba(201,168,76,.10)",
-                border: "1px solid rgba(201,168,76,.32)",
-                marginTop: 0,
-                marginBottom: "1.4rem",
-              }}
-            >
-              <span className="api-alert-text">
-                <strong>
-                  API-расчёты доступны в тарифе «Безлимит» — 449 ₽/месяц.
-                </strong>{" "}
-                Первый расчёт можно попробовать бесплатно, если пробный расчёт ещё
-                не использован. Разовый расчёт за 149 ₽ открывает только файловый
-                или ручной расчёт и не включает Ozon API.
-              </span>
-            </div>
-
-            {/* ШАГ 1 — подключение Ozon */}
-            <div className="api-step">
-              <div className="api-step-head">
-                <span className="api-step-num">1</span>
-                <span className="api-step-title">Подключение Ozon</span>
-              </div>
-
-              {!user ? (
-                <button type="button" className="api-pro-btn locked" disabled style={{ width: "100%" }}>
-                  Войдите в аккаунт для подключения Ozon
-                </button>
-              ) : ozonConnLoading ? (
-                <p className="api-pro-msg" style={{ marginTop: ".2rem" }}>
-                  Проверяем подключение…
+            {/* Подключение Ozon — только статус. Само подключение/ключи в «Личном
+                кабинете» (setMainTab("cabinet")). */}
+            {!user || (!ozonConnLoading && !ozonConn?.connected) ? (
+              /* Состояние 1 — Ozon API не подключён (гость или без подключения) */
+              <div className="api-connect-cta">
+                <p className="api-connect-cta-text">
+                  Подключите Ozon API в личном кабинете, чтобы рассчитывать
+                  чистую прибыль автоматически.
                 </p>
-              ) : ozonConn?.connected ? (
-                <div className="api-conn-ok" role="status">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="12" cy="12" r="9" />
-                    <path d="m8.5 12.5 2.5 2.5 4.5-5" />
-                  </svg>
-                  <span>
-                    <b>Ozon подключён</b>
-                    <span className="api-conn-ok-meta">
-                      {ozonConn.clientIdMasked ? ` · Client ID ${ozonConn.clientIdMasked}` : ""}
-                      {ozonConn.keyLast4 ? ` · ключ ••••${ozonConn.keyLast4}` : ""}
-                    </span>
-                  </span>
-                </div>
-              ) : (
-                <div className="api-conn-empty">
-                  <div className="api-conn-empty-row">
-                    <span className="api-conn-empty-dot" aria-hidden="true" />
-                    <span>Ozon API не подключён</span>
-                  </div>
-                  <p className="api-pro-msg" style={{ marginTop: 0 }}>
-                    Подключение Ozon API и управление ключами теперь в «Личном
-                    кабинете». Подключите кабинет — и авторасчёт по API станет
-                    доступен здесь.
-                  </p>
-                  <button
-                    type="button"
-                    className="api-pro-btn"
-                    onClick={() => setMainTab("cabinet")}
-                    style={{ width: "100%" }}
-                  >
-                    Перейти в Личный кабинет
-                  </button>
-                </div>
-              )}
-            </div>
+                <button
+                  type="button"
+                  className="api-pro-btn"
+                  onClick={() => setMainTab("cabinet")}
+                >
+                  Перейти в личный кабинет
+                </button>
+              </div>
+            ) : ozonConnLoading ? (
+              <p className="api-pro-msg" style={{ marginTop: ".2rem" }}>
+                Проверяем подключение…
+              </p>
+            ) : (
+              /* Состояние 2 (шапка) — Ozon подключён */
+              <div className="api-conn-ok api-conn-ok-bar" role="status">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+                </svg>
+                <b>Ozon подключён</b>
+                <button
+                  type="button"
+                  className="api-conn-manage"
+                  onClick={() => setMainTab("cabinet")}
+                >
+                  Управление подключением
+                </button>
+              </div>
+            )}
 
-            {/* ШАГИ 2–4 — доступны только после подключения Ozon */}
+            {/* Форма расчёта — доступна только после подключения Ozon */}
             {ozonConn?.connected && (
               <>
-                {/* ШАГ 2 — месяц */}
-                <div className="api-step">
-                  <div className="api-step-head">
-                    <span className="api-step-num">2</span>
-                    <span className="api-step-title">Выберите месяц</span>
-                  </div>
+                {/* Месяц расчёта */}
+                <div className="api-field-block">
+                  <label className="api-field-label" htmlFor="ozon-profit-month">
+                    Месяц расчёта
+                  </label>
                   <div className="api-fld" style={{ maxWidth: "320px" }}>
                     <input
                       id="ozon-profit-month"
@@ -9008,16 +8966,12 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   </div>
                 </div>
 
-                {/* ШАГ 3 — ручные расходы */}
-                <div className="api-step">
-                  <div className="api-step-head">
-                    <span className="api-step-num">3</span>
-                    <span className="api-step-title">Введите свои расходы</span>
-                  </div>
-                  <p className="api-step-hint">
-                    Налог укажите в процентах от выручки Ozon (например, 6) —
-                    сумму в рублях посчитаем сами. Упаковку, доставку до склада,
-                    зарплату и прочее вводите в рублях. Пустое поле считается как 0.
+                {/* Ваши расходы */}
+                <div className="api-field-block">
+                  <label className="api-field-label">Ваши расходы</label>
+                  <p className="api-field-hint">
+                    Налог — в процентах от выручки Ozon (например, 6), остальное
+                    в рублях. Пустое поле считается как 0.
                   </p>
                   <div
                     style={{
@@ -9061,12 +9015,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   </div>
                 </div>
 
-                {/* ШАГ 4 — главная кнопка */}
-                <div className="api-step">
-                  <div className="api-step-head">
-                    <span className="api-step-num">4</span>
-                    <span className="api-step-title">Рассчитайте чистую прибыль</span>
-                  </div>
+                {/* Главная кнопка — расчёт и сохранение */}
+                <div className="api-field-block">
                   <button
                     type="button"
                     className="api-pro-btn api-main-cta"
@@ -9076,7 +9026,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     {profitLoading ? (
                       <>
                         <span className="spin" />
-                        Считаем…
+                        Получаем данные из Ozon…
                       </>
                     ) : apiSaved ? (
                       "Рассчитано и сохранено ✓"
@@ -9467,20 +9417,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 )}
               </>
             )}
-
-            <div className="api-pro-hint">
-              <span className="api-pro-hint-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 8v5" />
-                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
-                </svg>
-              </span>
-              По кнопке сайт сам проверит доступ, пересчитает прибыль по Ozon API и
-              каталогу, проверит себестоимость, спишет одну попытку (для активного
-              безлимита — без списания) и сохранит расчёт в историю. Ключ хранится в
-              зашифрованном виде на сервере и не возвращается в браузер.
-            </div>
           </div>
         </div>
         )}
