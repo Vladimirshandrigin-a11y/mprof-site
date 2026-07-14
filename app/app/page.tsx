@@ -7069,6 +7069,12 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   background:rgba(255,255,255,.025);border:1px solid var(--edge);border-radius:12px;
   padding:1rem 1.1rem;min-width:0
 }
+/* «Финансовая сводка» чуть выше — визуальный баланс по высоте с блоком «Статистика».
+   Только вертикальные отступы, scoped на .fin-card (блок «Статистика» .fin-stats не затронут);
+   без height/min-height, без изменения ширины/сетки/JSX. */
+.fin-card{padding-top:1.5rem;padding-bottom:1.5rem}
+.fin-card .fin-row > th,
+.fin-card .fin-val{padding-top:.54rem;padding-bottom:.54rem}
 .fin-card-title{
   font-family:var(--mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
   color:var(--txt3);margin-bottom:.75rem
