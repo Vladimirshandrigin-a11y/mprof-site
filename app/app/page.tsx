@@ -7094,6 +7094,15 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .fin-stat-sub{font-family:var(--sans);font-size:.8rem;font-weight:500;color:var(--txt3)}
 .fin-stats .fin-val{white-space:normal}
 .fin-stats .fin-val .pos,.fin-stats .fin-val .neg{white-space:nowrap}
+/* Расширенный блок «Статистика»: разделители групп + текст/составные значения */
+.fin-stats .fin-row--group > th,
+.fin-stats .fin-row--group > .fin-val{border-top:1px solid var(--edge);padding-top:.62rem}
+.fin-stats .fin-val--text{
+  font-family:var(--sans);font-size:.82rem;font-weight:500;color:var(--txt2)
+}
+.fin-stats .fin-val--stacked{
+  display:flex;flex-direction:column;align-items:flex-end;gap:.1rem;line-height:1.25
+}
 /* Подытог «Все расходы» */
 .fin-row--subtotal > th{color:var(--txt);font-weight:600}
 .fin-row--subtotal > th,.fin-row--subtotal > .fin-val{
@@ -8360,47 +8369,157 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 
                 <div className="fin-stats">
                   <div className="fin-card-title">Статистика</div>
-                  <table className="fin-table" aria-label="Статистика">
-                    <tbody>
-                      <tr className="fin-row">
-                        <th scope="row">Количество расчётов</th>
-                        <td className="fin-val">{yearlySummary.count}</td>
-                      </tr>
+                  {(() => {
+                    // Все вычисления ниже — display-only и локальные: они НЕ
+                    // меняют yearlySummary / reportsMonthly / reportsFiltered /
+                    // историю / БД. Делитель средних — число МЕСЯЦЕВ с расчётами
+                    // (reportsMonthly.length), а не число отдельных расчётов.
+                    const months = reportsMonthly.length;
+                    const perMonth = (v: number) => (months > 0 ? v / months : 0);
+                    const avgProfit = perMonth(yearlySummary.profit);
+                    const avgRevenue = perMonth(yearlySummary.revenue);
+                    const avgExpenses = perMonth(yearlySummary.expenses);
+                    const profitableMonths = reportsMonthly.filter(
+                      (m) => m.profit > 0
+                    ).length;
+                    const losingMonths = reportsMonthly.filter(
+                      (m) => m.profit < 0
+                    ).length;
+                    const share = (n: number) =>
+                      months > 0 ? Math.round((n / months) * 100) : 0;
+                    const money = (v: number, signed: boolean) =>
+                      (signed ? (v >= 0 ? "+" : "−") : "") +
+                      fmt(Math.abs(Math.round(v))) +
+                      " ₽";
+                    // Диапазон периода из уже отсортированного reportsMonthly
+                    // (по возрастанию ключа 'YYYY-MM'). Без новой агрегации.
+                    const periodLabel =
+                      months === 0
+                        ? "—"
+                        : months === 1
+                        ? formatMonthLabel(reportsMonthly[0].key)
+                        : (() => {
+                            const a = reportsMonthly[0].key;
+                            const b = reportsMonthly[months - 1].key;
+                            const am = /^(\d{4})-(\d{2})$/.exec(a);
+                            const aName = am
+                              ? RU_MONTHS_NOM[Number(am[2]) - 1] ?? a
+                              : a;
+                            return a.slice(0, 4) === b.slice(0, 4)
+                              ? `${aName} — ${formatMonthLabel(b)}`
+                              : `${formatMonthLabel(a)} — ${formatMonthLabel(b)}`;
+                          })();
+                    return (
+                      <table className="fin-table" aria-label="Статистика">
+                        <tbody>
+                          <tr className="fin-row">
+                            <th scope="row">Количество расчётов</th>
+                            <td className="fin-val">{yearlySummary.count}</td>
+                          </tr>
+                          {months > 0 && (
+                            <tr className="fin-row">
+                              <th scope="row">Период</th>
+                              <td className="fin-val fin-val--text">
+                                {periodLabel}
+                              </td>
+                            </tr>
+                          )}
 
-                      {yearlySummary.best && (
-                        <tr className="fin-row">
-                          <th scope="row">Лучший месяц</th>
-                          <td className="fin-val">
-                            <span className="fin-stat-sub">
-                              {formatMonthLabel(yearlySummary.best.key)}
-                            </span>{" "}
-                            <span className="pos">
-                              +{fmt(Math.round(yearlySummary.best.profit))} ₽
-                            </span>
-                          </td>
-                        </tr>
-                      )}
+                          {months > 0 && (
+                            <>
+                              <tr className="fin-row fin-row--group">
+                                <th scope="row">Средняя прибыль</th>
+                                <td
+                                  className={
+                                    "fin-val " +
+                                    (avgProfit >= 0 ? "pos" : "neg")
+                                  }
+                                >
+                                  {money(avgProfit, true)}
+                                </td>
+                              </tr>
+                              <tr className="fin-row">
+                                <th scope="row">Средняя выручка</th>
+                                <td className="fin-val">
+                                  {money(avgRevenue, false)}
+                                </td>
+                              </tr>
+                              <tr className="fin-row">
+                                <th scope="row">Средние расходы</th>
+                                <td className="fin-val">
+                                  {money(avgExpenses, false)}
+                                </td>
+                              </tr>
 
-                      {yearlySummary.worst && (
-                        <tr className="fin-row">
-                          <th scope="row">Худший месяц</th>
-                          <td className="fin-val">
-                            <span className="fin-stat-sub">
-                              {formatMonthLabel(yearlySummary.worst.key)}
-                            </span>{" "}
-                            <span
-                              className={
-                                yearlySummary.worst.profit >= 0 ? "pos" : "neg"
-                              }
-                            >
-                              {yearlySummary.worst.profit >= 0 ? "+" : "−"}
-                              {fmt(Math.abs(Math.round(yearlySummary.worst.profit)))} ₽
-                            </span>
-                          </td>
-                        </tr>
-                      )}
-                    </tbody>
-                  </table>
+                              <tr className="fin-row fin-row--group">
+                                <th scope="row">Прибыльных месяцев</th>
+                                <td className="fin-val">
+                                  <span
+                                    className={
+                                      profitableMonths > 0 ? "pos" : undefined
+                                    }
+                                  >
+                                    {profitableMonths} из {months} ·{" "}
+                                    {share(profitableMonths)}%
+                                  </span>
+                                </td>
+                              </tr>
+                              <tr className="fin-row">
+                                <th scope="row">Убыточных месяцев</th>
+                                <td className="fin-val">
+                                  <span
+                                    className={
+                                      losingMonths > 0 ? "neg" : undefined
+                                    }
+                                  >
+                                    {losingMonths} из {months} ·{" "}
+                                    {share(losingMonths)}%
+                                  </span>
+                                </td>
+                              </tr>
+                            </>
+                          )}
+
+                          {yearlySummary.best && (
+                            <tr className="fin-row fin-row--group">
+                              <th scope="row">Лучший месяц</th>
+                              <td className="fin-val fin-val--stacked">
+                                <span className="fin-stat-sub">
+                                  {formatMonthLabel(yearlySummary.best.key)}
+                                </span>
+                                <span className="pos">
+                                  +{fmt(Math.round(yearlySummary.best.profit))} ₽
+                                </span>
+                              </td>
+                            </tr>
+                          )}
+                          {yearlySummary.worst && (
+                            <tr className="fin-row">
+                              <th scope="row">Худший месяц</th>
+                              <td className="fin-val fin-val--stacked">
+                                <span className="fin-stat-sub">
+                                  {formatMonthLabel(yearlySummary.worst.key)}
+                                </span>
+                                <span
+                                  className={
+                                    yearlySummary.worst.profit >= 0
+                                      ? "pos"
+                                      : "neg"
+                                  }
+                                >
+                                  {yearlySummary.worst.profit >= 0 ? "+" : "−"}
+                                  {fmt(
+                                    Math.abs(Math.round(yearlySummary.worst.profit))
+                                  )}{" "}
+                                  ₽
+                                </span>
+                              </td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    );
+                  })()}
                 </div>
               </div>
 
