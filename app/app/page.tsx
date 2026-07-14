@@ -7060,6 +7060,58 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   .reports-filters{gap:1rem 1.4rem}
   .reports-bars{height:120px}
 }
+/* === ВКЛАДКА «ОТЧЁТЫ»: финансовая таблица (fin-*) === */
+.reports-summary{
+  display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);
+  gap:.75rem;align-items:start
+}
+.fin-card,.fin-stats{
+  background:rgba(255,255,255,.025);border:1px solid var(--edge);border-radius:12px;
+  padding:1rem 1.1rem;min-width:0
+}
+.fin-card-title{
+  font-family:var(--mono);font-size:.62rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--txt3);margin-bottom:.75rem
+}
+.fin-table{width:100%;border-collapse:collapse;font-family:var(--sans)}
+.fin-table thead th{
+  font-family:var(--mono);font-size:.55rem;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--txt3);font-weight:600;text-align:left;padding:0 0 .55rem;
+  border-bottom:1px solid var(--edge)
+}
+.fin-table thead th:last-child{text-align:right}
+.fin-row > th{
+  font-family:var(--sans);font-size:.86rem;font-weight:500;color:var(--txt2);
+  text-align:left;padding:.5rem 0;vertical-align:baseline
+}
+.fin-val{
+  font-family:var(--display);font-size:.98rem;font-weight:600;color:var(--txt);
+  text-align:right;padding:.5rem 0;white-space:nowrap;
+  font-variant-numeric:tabular-nums;vertical-align:baseline
+}
+.fin-val.pos,.fin-val .pos{color:var(--green)}
+.fin-val.neg,.fin-val .neg{color:var(--red)}
+.fin-stat-sub{font-family:var(--sans);font-size:.8rem;font-weight:500;color:var(--txt3)}
+.fin-stats .fin-val{white-space:normal}
+.fin-stats .fin-val .pos,.fin-stats .fin-val .neg{white-space:nowrap}
+/* Подытог «Все расходы» */
+.fin-row--subtotal > th{color:var(--txt);font-weight:600}
+.fin-row--subtotal > th,.fin-row--subtotal > .fin-val{
+  border-top:1px solid var(--edge);padding-top:.62rem
+}
+/* Чистая прибыль — главный визуальный акцент */
+.fin-row--net > th{color:var(--txt);font-weight:700}
+.fin-row--net > th,.fin-row--net > .fin-val{
+  border-top:1px solid rgba(201,168,76,.32);padding-top:.72rem;
+  background:rgba(201,168,76,.05)
+}
+.fin-row--net > .fin-val{font-size:1.5rem;letter-spacing:-.01em}
+.fin-row--margin > th{color:var(--txt2)}
+.fin-row--margin > .fin-val{font-size:1rem}
+@media(max-width:760px){
+  .reports-summary{grid-template-columns:1fr}
+  .fin-row--net > .fin-val{font-size:1.3rem}
+}
 .filter-bar{
   background:var(--glass);border:1px solid var(--edge);border-radius:12px;
   margin-bottom:.55rem;overflow:hidden;
@@ -8203,124 +8255,154 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             </div>
           ) : (
             <>
-              <div className="reports-summary-grid">
-                <div
-                  className={
-                    "reports-card hero " +
-                    (yearlySummary.profit >= 0 ? "pos" : "neg")
-                  }
-                >
-                  <div className="reports-card-label">
-                    Чистая прибыль
-                    {reportsYear !== "all" ? ` за ${reportsYear}` : ""}
+              <div className="reports-summary">
+                <div className="fin-card">
+                  <div className="fin-card-title">
+                    Финансовая сводка
+                    {reportsYear !== "all" ? ` · ${reportsYear}` : ""}
                   </div>
-                  <div className="reports-card-value">
-                    {yearlySummary.profit >= 0 ? "+" : "−"}
-                    {fmt(Math.abs(Math.round(yearlySummary.profit)))} ₽
-                  </div>
+                  <table className="fin-table" aria-label="Финансовая сводка">
+                    <thead>
+                      <tr>
+                        <th scope="col">Показатель</th>
+                        <th scope="col">Значение</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr className="fin-row">
+                        <th scope="row">Выручка</th>
+                        <td className="fin-val">
+                          {fmt(Math.round(yearlySummary.revenue))} ₽
+                        </td>
+                      </tr>
+
+                      {yearlySummary.cost > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Себестоимость</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.cost))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {yearlySummary.ozonFees > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Комиссии и логистика Ozon</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.ozonFees))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {yearlySummary.ads > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Реклама</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.ads))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {yearlySummary.other > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Прочие расходы</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.other))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {yearlySummary.tax > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Налог</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.tax))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {yearlySummary.expenses > 0 && (
+                        <tr className="fin-row fin-row--subtotal">
+                          <th scope="row">Все расходы</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.expenses))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      <tr className="fin-row fin-row--net">
+                        <th scope="row">Чистая прибыль</th>
+                        <td
+                          className={
+                            "fin-val " +
+                            (yearlySummary.profit >= 0 ? "pos" : "neg")
+                          }
+                        >
+                          {yearlySummary.profit >= 0 ? "+" : "−"}
+                          {fmt(Math.abs(Math.round(yearlySummary.profit)))} ₽
+                        </td>
+                      </tr>
+
+                      <tr className="fin-row fin-row--margin">
+                        <th scope="row">Маржинальность</th>
+                        <td
+                          className={
+                            "fin-val " +
+                            (yearlySummary.avgMargin >= 0 ? "pos" : "neg")
+                          }
+                        >
+                          {yearlySummary.avgMargin.toFixed(1)}%
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
 
-                <div className="reports-card">
-                  <div className="reports-card-label">Выручка</div>
-                  <div className="reports-card-value">
-                    {fmt(Math.round(yearlySummary.revenue))} ₽
-                  </div>
+                <div className="fin-stats">
+                  <div className="fin-card-title">Статистика</div>
+                  <table className="fin-table" aria-label="Статистика">
+                    <tbody>
+                      <tr className="fin-row">
+                        <th scope="row">Количество расчётов</th>
+                        <td className="fin-val">{yearlySummary.count}</td>
+                      </tr>
+
+                      {yearlySummary.best && (
+                        <tr className="fin-row">
+                          <th scope="row">Лучший месяц</th>
+                          <td className="fin-val">
+                            <span className="fin-stat-sub">
+                              {formatMonthLabel(yearlySummary.best.key)}
+                            </span>{" "}
+                            <span className="pos">
+                              +{fmt(Math.round(yearlySummary.best.profit))} ₽
+                            </span>
+                          </td>
+                        </tr>
+                      )}
+
+                      {yearlySummary.worst && (
+                        <tr className="fin-row">
+                          <th scope="row">Худший месяц</th>
+                          <td className="fin-val">
+                            <span className="fin-stat-sub">
+                              {formatMonthLabel(yearlySummary.worst.key)}
+                            </span>{" "}
+                            <span
+                              className={
+                                yearlySummary.worst.profit >= 0 ? "pos" : "neg"
+                              }
+                            >
+                              {yearlySummary.worst.profit >= 0 ? "+" : "−"}
+                              {fmt(Math.abs(Math.round(yearlySummary.worst.profit)))} ₽
+                            </span>
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
-
-                <div className="reports-card">
-                  <div className="reports-card-label">Средняя маржинальность</div>
-                  <div className="reports-card-value">
-                    {yearlySummary.avgMargin.toFixed(1)}%
-                  </div>
-                </div>
-
-                <div className="reports-card">
-                  <div className="reports-card-label">Расчётов за период</div>
-                  <div className="reports-card-value">{yearlySummary.count}</div>
-                </div>
-
-                {yearlySummary.cost > 0 && (
-                  <div className="reports-card">
-                    <div className="reports-card-label">Себестоимость</div>
-                    <div className="reports-card-value">
-                      {fmt(Math.round(yearlySummary.cost))} ₽
-                    </div>
-                  </div>
-                )}
-
-                {yearlySummary.ozonFees > 0 && (
-                  <div className="reports-card">
-                    <div className="reports-card-label">Комиссии и логистика Ozon</div>
-                    <div className="reports-card-value">
-                      {fmt(Math.round(yearlySummary.ozonFees))} ₽
-                    </div>
-                  </div>
-                )}
-
-                {yearlySummary.ads > 0 && (
-                  <div className="reports-card">
-                    <div className="reports-card-label">Реклама</div>
-                    <div className="reports-card-value">
-                      {fmt(Math.round(yearlySummary.ads))} ₽
-                    </div>
-                  </div>
-                )}
-
-                {yearlySummary.tax > 0 && (
-                  <div className="reports-card">
-                    <div className="reports-card-label">Налог</div>
-                    <div className="reports-card-value">
-                      {fmt(Math.round(yearlySummary.tax))} ₽
-                    </div>
-                  </div>
-                )}
-
-                {yearlySummary.other > 0 && (
-                  <div className="reports-card">
-                    <div className="reports-card-label">Прочие расходы</div>
-                    <div className="reports-card-value">
-                      {fmt(Math.round(yearlySummary.other))} ₽
-                    </div>
-                  </div>
-                )}
-
-                {yearlySummary.expenses > 0 && (
-                  <div className="reports-card">
-                    <div className="reports-card-label">Все расходы</div>
-                    <div className="reports-card-value">
-                      {fmt(Math.round(yearlySummary.expenses))} ₽
-                    </div>
-                  </div>
-                )}
               </div>
-
-              {(yearlySummary.best || yearlySummary.worst) && (
-                <div className="reports-bestworst">
-                  {yearlySummary.best && (
-                    <div className="reports-bw-item pos">
-                      <span className="reports-bw-cap">Лучший месяц</span>
-                      <span className="reports-bw-month">
-                        {formatMonthLabel(yearlySummary.best.key)}
-                      </span>
-                      <span className="reports-bw-val">
-                        +{fmt(Math.round(yearlySummary.best.profit))} ₽
-                      </span>
-                    </div>
-                  )}
-                  {yearlySummary.worst && (
-                    <div className="reports-bw-item neg">
-                      <span className="reports-bw-cap">Худший месяц</span>
-                      <span className="reports-bw-month">
-                        {formatMonthLabel(yearlySummary.worst.key)}
-                      </span>
-                      <span className="reports-bw-val">
-                        {yearlySummary.worst.profit >= 0 ? "+" : "−"}
-                        {fmt(Math.abs(Math.round(yearlySummary.worst.profit)))} ₽
-                      </span>
-                    </div>
-                  )}
-                </div>
-              )}
 
               {reportsMonthly.length > 0 && (
                 <div className="reports-chart">
