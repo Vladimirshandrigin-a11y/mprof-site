@@ -7492,6 +7492,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 
 .dash-grid{display:grid;grid-template-columns:1.4fr 1fr;gap:.7rem;align-items:start;margin-top:.3rem}
 .dash-right-col{display:flex;flex-direction:column;gap:.7rem;min-width:0}
+/* Ручной калькулятор: правая колонка динамически растягивается до высоты «Параметров» (desktop) */
+.mcalc-layout-grid{align-items:stretch}
+.mcalc-layout-grid .result-card{flex:1 1 auto}
 
 /* ====== QUICK SUMMARY (правая колонка под Результатом) ====== */
 .quick-summary{
@@ -7777,6 +7780,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   .dash-status{font-size:.6rem;padding:5px 12px}
   .dash-wrap{padding:1.5rem 1.2rem 4rem}
   .dash-grid{grid-template-columns:1fr}
+  .mcalc-layout-grid{align-items:start}
+  .mcalc-layout-grid .result-card{flex:none}
   .dash-user-email{display:none}
 }
 @media(max-width:480px){
@@ -8850,7 +8855,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         )}
 
         {calcMode === "manual" && (
-        <div className="dash-grid">
+        <div className="dash-grid mcalc-layout-grid">
           <div className={"card" + (isCalculating ? " calc-loading" : "")}>
             <div className="card-body">
               <div className="mcalc-params-head">Параметры расчёта</div>
