@@ -7581,11 +7581,16 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .btn-ghost:hover{border-color:var(--gold);color:var(--gold2)}
 
 /* ====== MANUAL CALC — premium redesign (UI-only) ====== */
-.mcalc-head{margin:1.1rem 0 1rem}
+/* верхняя информационная карточка (переиспользует премиальный .onboard-card) */
+.mcalc-info{flex-direction:column;align-items:stretch;justify-content:flex-start;gap:.85rem}
+.mcalc-head{margin:0}
 .mcalc-title{font-family:var(--display);font-size:1.55rem;font-weight:700;
   letter-spacing:-.01em;color:var(--txt);margin:0 0 .45rem}
 .mcalc-sub{font-family:var(--sans);font-size:.9rem;font-weight:300;line-height:1.55;
   color:var(--txt2);margin:0;max-width:54ch}
+/* заголовок левой карточки «Параметры расчёта» */
+.mcalc-params-head{font-family:var(--display);font-size:1.15rem;font-weight:700;
+  letter-spacing:-.01em;color:var(--txt);margin:0 0 1.3rem}
 
 /* компактный переключатель маркетплейса (пилюли) */
 .mcalc-mp{margin-bottom:1.5rem;gap:8px;flex-wrap:wrap}
@@ -7608,16 +7613,19 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .mcalc-grid .fld label{font-size:.64rem;letter-spacing:.09em;color:var(--txt2)}
 .mcalc-grid .in-wrap input{padding:13px 34px 13px 14px;font-size:.95rem;border-radius:10px}
 
-/* действия: большая кнопка-акцент + «Очистить форму» под ней */
-.mcalc-actions{flex-direction:column;gap:.7rem;margin-top:1.7rem}
-.mcalc-actions .mcalc-calc{width:100%;padding:16px;font-size:1rem;border-radius:12px;
+/* действия: большая кнопка-акцент + «Очистить форму» в одну строку (desktop) */
+.mcalc-actions{flex-direction:row;align-items:stretch;gap:.7rem;margin-top:1.7rem}
+.mcalc-actions .mcalc-calc{flex:2 1 0;min-width:0;padding:16px;font-size:1rem;border-radius:12px;
   box-shadow:0 12px 34px rgba(201,168,76,.34)}
 .mcalc-actions .mcalc-calc:hover{box-shadow:0 18px 46px rgba(201,168,76,.44)}
-.mcalc-actions .mcalc-clear{width:100%;padding:12px;border-radius:11px}
+.mcalc-actions .mcalc-clear{flex:1 1 0;min-width:0;padding:12px 16px;border-radius:11px;white-space:nowrap}
 
 @media(max-width:560px){
   .mcalc-title{font-size:1.3rem}
   .mcalc-grid{grid-template-columns:1fr}
+  .mcalc-actions{flex-direction:column}
+  .mcalc-actions .mcalc-calc,
+  .mcalc-actions .mcalc-clear{flex:0 0 auto;width:100%}
 }
 
 .result-card{background:linear-gradient(135deg,var(--panel) 0%,rgba(201,168,76,.05) 100%);
@@ -8814,12 +8822,30 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         </div>
 
         {calcMode === "manual" && (
-          <div className="mcalc-head">
-            <h2 className="mcalc-title">Ручной расчёт прибыли</h2>
-            <p className="mcalc-sub">
-              Введите показатели вашего маркетплейса, и M-PROF автоматически
-              рассчитает чистую прибыль.
-            </p>
+          <div className="onboard-card mcalc-info">
+            <div className="mcalc-head">
+              <h2 className="mcalc-title">Ручной калькулятор</h2>
+              <p className="mcalc-sub">
+                Быстрый расчёт: вы сами вводите все показатели — без
+                подключения Ozon API и без загрузки документов.
+              </p>
+            </div>
+            <div className="onboard-steps">
+              <div className="onboard-step">
+                <span className="onboard-num">1</span>
+                <span className="onboard-text">Введите выручку</span>
+              </div>
+              <span className="onboard-arrow" aria-hidden="true">→</span>
+              <div className="onboard-step">
+                <span className="onboard-num">2</span>
+                <span className="onboard-text">Укажите комиссию</span>
+              </div>
+              <span className="onboard-arrow" aria-hidden="true">→</span>
+              <div className="onboard-step">
+                <span className="onboard-num">3</span>
+                <span className="onboard-text">Нажмите «Рассчитать»</span>
+              </div>
+            </div>
           </div>
         )}
 
@@ -8827,6 +8853,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         <div className="dash-grid">
           <div className={"card" + (isCalculating ? " calc-loading" : "")}>
             <div className="card-body">
+              <div className="mcalc-params-head">Параметры расчёта</div>
+
               <div className="mp-row mcalc-mp" aria-label="Маркетплейс">
                 <div
                   className={"mp-tab" + (marketplace === "ozon" ? " act-ozon" : "")}
@@ -8848,56 +8876,24 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 </div>
               </div>
 
-              <div className="mcalc-group">
-                <div className="mcalc-group-label">
-                  <span className="mcalc-group-dot income" aria-hidden="true" />
-                  Доход
-                </div>
-                <div className="mcalc-grid income">
-                  {FIELDS.filter((f) => f.key === "revenue").map((f) => (
-                    <div className="fld" key={f.key}>
-                      <label>{f.label}</label>
-                      <div className="in-wrap">
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          placeholder="0"
-                          value={form[f.key]}
-                          onChange={(e) => handleField(f.key, e.target.value)}
-                          disabled={isCalculating}
-                        />
-                        <span className="in-cur">₽</span>
-                      </div>
-                      {f.hint && <span className="fld-hint">{f.hint}</span>}
+              <div className="mcalc-grid">
+                {FIELDS.map((f) => (
+                  <div className="fld" key={f.key}>
+                    <label>{f.label}</label>
+                    <div className="in-wrap">
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        placeholder="0"
+                        value={form[f.key]}
+                        onChange={(e) => handleField(f.key, e.target.value)}
+                        disabled={isCalculating}
+                      />
+                      <span className="in-cur">₽</span>
                     </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="mcalc-group">
-                <div className="mcalc-group-label">
-                  <span className="mcalc-group-dot expense" aria-hidden="true" />
-                  Расходы
-                </div>
-                <div className="mcalc-grid">
-                  {FIELDS.filter((f) => f.key !== "revenue").map((f) => (
-                    <div className="fld" key={f.key}>
-                      <label>{f.label}</label>
-                      <div className="in-wrap">
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          placeholder="0"
-                          value={form[f.key]}
-                          onChange={(e) => handleField(f.key, e.target.value)}
-                          disabled={isCalculating}
-                        />
-                        <span className="in-cur">₽</span>
-                      </div>
-                      {f.hint && <span className="fld-hint">{f.hint}</span>}
-                    </div>
-                  ))}
-                </div>
+                    {f.hint && <span className="fld-hint">{f.hint}</span>}
+                  </div>
+                ))}
               </div>
 
               {canCalculate || !entitlementsLoaded ? (
