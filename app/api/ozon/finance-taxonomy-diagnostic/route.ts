@@ -15,18 +15,25 @@ import { monthToRange, type OzonOperation } from "../_lib/finance";
 //
 // Это НЕ расчёт прибыли и НЕ классификация. Ничего не сохраняется
 // (ни calculations, ни report_history), consume_api_calculation НЕ вызывается,
-// формулы/бакеты/история не меняются. candidateMatches — ТОЛЬКО подсказка
-// глазами человека («candidate_only»), она НЕ вычитается и НЕ складывается
-// в currentBuckets.
+// формулы/бакеты/история не меняются.
+//
+// ДОСТУП — ТОЛЬКО активный безлимит 449₽. Endpoint отдаёт ту же финансовую
+// разбивку Ozon, что и платный API-расчёт (currentBuckets в сумме = это
+// ozonOperationsTotal из profit.ts). Без этого гейта любой бесплатный
+// пользователь получал бы платный результат в обход consume_api_calculation() —
+// то есть обход монетизации. Гейт намеренно read-only: он НИЧЕГО не списывает,
+// поэтому пробный бесплатный расчёт им не тратится. Пробный расчёт и тариф
+// 149₽ доступа СЮДА НЕ дают (149₽ не открывает API и в самой RPC).
 //
 // БЕЗОПАСНОСТЬ:
 //   • user_id берём ТОЛЬКО из проверенного токена (authenticateRequest);
 //     из query/body идентификатор пользователя НЕ принимается вообще.
-//   • service-role ОБХОДИТ RLS → фильтр .eq("user_id", userId) обязателен.
+//   • service-role ОБХОДИТ RLS → фильтры .eq("id"/"user_id", userId) обязательны.
 //   • Ключ расшифровывается только в памяти процесса; ни ключ, ни client_id,
 //     ни сырой ответ Ozon, ни upstream-заголовки НЕ логируются и НЕ возвращаются.
 //   • Наружу не уходят posting_number/order_id/SKU/offer_id/product_id/ФИО —
 //     только агрегаты по типам операций и именам услуг.
+//   • Страницы агрегируются на лету: массив всех операций в памяти НЕ копится.
 //
 // ВРЕМЕННЫЙ: после снятия диагностики удаляется отдельным cleanup-PR.
 // ============================================================================
@@ -46,6 +53,32 @@ const DIAG_MONTH = "2026-06";
 const PAGE_SIZE = 1000; // как в production finance.ts
 const MAX_PAGES = 100; // жёсткий потолок: никакого бесконечного цикла
 const TIMEOUT_MS = 20000; // таймаут на КАЖДУЮ страницу, как в production
+/** Потолок уникальных категорий: защита памяти/размера ответа. */
+const MAX_TAXONOMY_ENTRIES = 1000;
+/** Минимальная пауза между запусками для одного пользователя. */
+const COOLDOWN_MS = 60_000;
+
+// ---------------------------------------------------------------------------
+// Best-effort защита от параллельных/частых вызовов.
+//
+// ЧЕСТНО: это in-memory защита В ПРЕДЕЛАХ ОДНОГО ЭКЗЕМПЛЯРА. Timeweb/serverless
+// может держать несколько инстансов, и тогда лимит обходится запросом в другой
+// инстанс. Полноценный лимит требовал бы DB/Redis, а писать в БД здесь запрещено
+// (диагностика строго read-only). Этого достаточно, потому что endpoint
+// дополнительно закрыт активным тарифом 449₽ и одним фиксированным месяцем.
+//
+// Храним ТОЛЬКО userId и метку времени. Ни токена, ни ключа, ни connection,
+// ни финансового ответа здесь нет — ответ не кешируется.
+// ---------------------------------------------------------------------------
+const inFlight = new Set<string>();
+const lastStartedAt = new Map<string, number>();
+
+/** Убрать протухшие метки cooldown, чтобы Map не рос бесконечно. */
+function pruneCooldowns(now: number): void {
+  for (const [uid, ts] of lastStartedAt) {
+    if (now - ts > COOLDOWN_MS) lastStartedAt.delete(uid);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Деньги: копейки целыми числами.
@@ -156,7 +189,6 @@ type ServiceAcc = {
 };
 
 type CandidateAcc = {
-  source: "operation" | "service";
   exactName: string;
   matchedMarker: string;
   count: number;
@@ -174,35 +206,21 @@ type Buckets = {
   amountTotal: number;
 };
 
-/**
- * Безопасная upstream-ошибка: никакого сырого body/headers Ozon.
- * Свой HTTP всегда 502 (сбой вышестоящего сервиса), а фактический статус Ozon
- * едет отдельным полем httpStatus — так 429 виден, но не путается с нашим лимитом.
- */
-function upstreamError(
-  stage: string,
-  httpStatus: number | null,
-  errorCode: string,
-  message: string,
-  period: unknown
-): NextResponse {
-  return json(
-    {
-      ok: false,
-      diagnosticOnly: true,
-      stage,
-      httpStatus,
-      errorCode,
-      message,
-      sourceEndpoint: OZON_TX_URL,
-      period,
-      calculationConsumed: false,
-      savedToDatabase: false,
-      rawOperationsReturned: false,
-    },
-    502
-  );
-}
+type CandidateGroup = {
+  /** Ключ — exactName. Отдельные Map для operation и service: составной ключ
+   *  (а значит и небезопасный разделитель) не нужен в принципе. */
+  operation: Map<string, CandidateAcc>;
+  service: Map<string, CandidateAcc>;
+};
+
+const newGroup = (): CandidateGroup => ({
+  operation: new Map(),
+  service: new Map(),
+});
+
+// ---------------------------------------------------------------------------
+// Ответы
+// ---------------------------------------------------------------------------
 
 /** Форматированный UTF-8 JSON, удобный для копирования из браузера. */
 function json(body: unknown, status: number): NextResponse {
@@ -210,6 +228,30 @@ function json(body: unknown, status: number): NextResponse {
     status,
     headers: NO_STORE,
   });
+}
+
+/** Общая безопасная форма ошибки. Никаких секретов и сырого body Ozon. */
+function fail(
+  status: number,
+  stage: string,
+  errorCode: string,
+  message: string,
+  extra: Record<string, unknown> = {}
+): NextResponse {
+  return json(
+    {
+      ok: false,
+      diagnosticOnly: true,
+      stage,
+      errorCode,
+      message,
+      calculationConsumed: false,
+      savedToDatabase: false,
+      rawOperationsReturned: false,
+      ...extra,
+    },
+    status
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -222,367 +264,435 @@ export async function GET(req: NextRequest) {
   if (!auth.ok) return auth.response; // 401/503, без утечек
   const { admin, userId } = auth;
 
-  if (!isEncryptionConfigured()) {
-    return json(
-      {
-        ok: false,
-        diagnosticOnly: true,
-        stage: "encryption",
-        errorCode: "encryption_misconfigured",
-        message: "Шифрование ключей не настроено на сервере",
-      },
-      503
-    );
-  }
-
-  // ---- 2) период: жёстко июнь 2026, тем же кодом, что и production ----
-  const range = monthToRange(DIAG_MONTH);
-  if (!range) {
-    return json(
-      {
-        ok: false,
-        diagnosticOnly: true,
-        stage: "period",
-        errorCode: "bad_period",
-        message: "Не удалось построить период диагностики",
-      },
-      500
-    );
-  }
-  const period = {
-    month: DIAG_MONTH,
-    dateFrom: range.dateFrom,
-    dateTo: range.dateTo,
-  };
-
-  // ---- 3) подключение Ozon СТРОГО текущего пользователя ----
-  // service-role обходит RLS → .eq("user_id", userId) обязателен.
-  const { data: conn, error: connErr } = await admin
-    .from("ozon_connections")
-    .select("client_id, api_key_encrypted, status")
-    .eq("user_id", userId)
+  // ---- 2) ГЕЙТ ДОСТУПА: только активный безлимит 449₽ ----
+  // Read-only: SELECT двух полей, никаких INSERT/UPDATE/RPC. Предикат зеркалит
+  // ветку «безлимит» обеих RPC (schema.sql: consume_calculation и
+  // consume_api_calculation): plan='unlimited' AND premium_until IS NOT NULL
+  // AND premium_until > now(). Всё остальное (нет профиля / free / single(149₽) /
+  // неиспользованный пробный / истёкший безлимит / кривая дата) → 403.
+  const { data: profile, error: profErr } = await admin
+    .from("profiles")
+    .select("plan, premium_until")
+    .eq("id", userId)
     .maybeSingle();
 
-  if (connErr) {
-    // Логируем ТОЛЬКО факт ошибки чтения, без строки подключения.
-    // eslint-disable-next-line no-console
-    console.error("[ozon/finance-taxonomy-diagnostic] connection select failed");
-    return json(
-      {
-        ok: false,
-        diagnosticOnly: true,
-        stage: "connection",
-        errorCode: "connection_read_failed",
-        message: "Ошибка чтения подключения",
-      },
-      502
-    );
+  if (profErr) {
+    // Логируем только факт — без строки профиля и без ошибки Supabase наружу.
+    console.error("[ozon/finance-taxonomy-diagnostic] profile select failed");
+    return fail(502, "access", "profile_read_failed", "Ошибка чтения профиля");
   }
-  if (!conn || !conn.client_id || !conn.api_key_encrypted) {
-    return json(
-      {
-        ok: false,
-        diagnosticOnly: true,
-        stage: "connection",
-        errorCode: "not_connected",
-        message: "Подключение Ozon не найдено",
-      },
-      400
-    );
-  }
-  if (conn.status !== "connected") {
-    return json(
-      {
-        ok: false,
-        diagnosticOnly: true,
-        stage: "connection",
-        errorCode: "not_connected",
-        message:
-          "Подключение Ozon не в статусе «подключено». Проверьте его в Личном кабинете.",
-      },
-      400
+
+  const premiumUntilMs = profile?.premium_until
+    ? Date.parse(String(profile.premium_until))
+    : NaN;
+  const hasActiveUnlimited =
+    profile?.plan === "unlimited" &&
+    Number.isFinite(premiumUntilMs) &&
+    premiumUntilMs > Date.now();
+
+  if (!hasActiveUnlimited) {
+    // Ни plan, ни premium_until, ни userId наружу не отдаём.
+    return fail(
+      403,
+      "access",
+      "unlimited_required",
+      "Диагностика доступна только при активном тарифе 449 ₽."
     );
   }
 
-  // ---- 4) расшифровка ключа: ТОЛЬКО в памяти процесса ----
-  let apiKey: string;
+  // ---- 3) best-effort лимит: параллельные вызовы и cooldown ----
+  const now = Date.now();
+  pruneCooldowns(now);
+
+  if (inFlight.has(userId)) {
+    return fail(
+      429,
+      "rate_limit",
+      "diagnostic_in_progress",
+      "Диагностика уже выполняется. Дождитесь завершения."
+    );
+  }
+  const prev = lastStartedAt.get(userId);
+  if (prev !== undefined && now - prev < COOLDOWN_MS) {
+    const retryAfterSec = Math.ceil((COOLDOWN_MS - (now - prev)) / 1000);
+    return fail(
+      429,
+      "rate_limit",
+      "diagnostic_cooldown",
+      `Диагностику можно запускать не чаще раза в минуту. Повторите через ${retryAfterSec} с.`,
+      { retryAfterSeconds: retryAfterSec }
+    );
+  }
+
+  inFlight.add(userId);
+  lastStartedAt.set(userId, now);
+
   try {
-    apiKey = decryptOzonApiKey(conn.api_key_encrypted as string);
-  } catch {
-    return json(
-      {
-        ok: false,
-        diagnosticOnly: true,
-        stage: "connection",
-        errorCode: "decrypt_failed",
-        message: "Ключ Ozon нужно переподключить",
-      },
-      400
-    );
-  }
-  const clientId = conn.client_id as string;
-
-  // ---- 5) страницы Ozon: тот же контракт, что и production finance.ts ----
-  const operations: OzonOperation[] = [];
-  let pageCount = 1;
-  let partial = false;
-
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    let res: Response;
-    try {
-      res = await fetch(OZON_TX_URL, {
-        method: "POST",
-        headers: {
-          "Client-Id": clientId,
-          "Api-Key": apiKey,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          filter: {
-            date: { from: range.dateFrom, to: range.dateTo },
-            transaction_type: "all",
-          },
-          page,
-          page_size: PAGE_SIZE,
-        }),
-        cache: "no-store",
-        signal: controller.signal,
-      });
-    } catch (e) {
-      const aborted = e instanceof Error && e.name === "AbortError";
-      return upstreamError(
-        "ozon_fetch",
-        null,
-        aborted ? "timeout" : "unavailable",
-        aborted ? "Ozon не ответил вовремя" : "Ozon временно недоступен",
-        period
-      );
-    } finally {
-      clearTimeout(timer);
-    }
-
-    // Никаких retry: при 429 честно отдаём статус и останавливаемся.
-    if (!res.ok) {
-      const code =
-        res.status === 401
-          ? "invalid_key"
-          : res.status === 403
-            ? "forbidden"
-            : res.status === 429
-              ? "rate_limited"
-              : res.status === 404 || res.status === 410
-                ? "deprecated_or_gone"
-                : "unavailable";
-      return upstreamError(
-        "ozon_fetch",
-        res.status,
-        code,
-        "Ozon вернул ошибку на запрос финансовых операций",
-        period
+    if (!isEncryptionConfigured()) {
+      return fail(
+        503,
+        "encryption",
+        "encryption_misconfigured",
+        "Шифрование ключей не настроено на сервере"
       );
     }
 
-    let data: {
-      result?: { operations?: OzonOperation[]; page_count?: number };
+    // ---- 4) период: жёстко июнь 2026, тем же кодом, что и production ----
+    const range = monthToRange(DIAG_MONTH);
+    if (!range) {
+      return fail(500, "period", "bad_period", "Не удалось построить период диагностики");
+    }
+    const period = {
+      month: DIAG_MONTH,
+      dateFrom: range.dateFrom,
+      dateTo: range.dateTo,
     };
-    try {
-      data = await res.json();
-    } catch {
-      return upstreamError(
-        "ozon_parse",
-        res.status,
-        "bad_response",
-        "Ozon вернул неожиданный ответ",
-        period
+
+    // ---- 5) подключение Ozon СТРОГО текущего пользователя ----
+    // service-role обходит RLS → .eq("user_id", userId) обязателен.
+    const { data: conn, error: connErr } = await admin
+      .from("ozon_connections")
+      .select("client_id, api_key_encrypted, status")
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (connErr) {
+      console.error("[ozon/finance-taxonomy-diagnostic] connection select failed");
+      return fail(502, "connection", "connection_read_failed", "Ошибка чтения подключения");
+    }
+    if (!conn || !conn.client_id || !conn.api_key_encrypted) {
+      return fail(400, "connection", "not_connected", "Подключение Ozon не найдено");
+    }
+    if (conn.status !== "connected") {
+      return fail(
+        400,
+        "connection",
+        "not_connected",
+        "Подключение Ozon не в статусе «подключено». Проверьте его в Личном кабинете."
       );
     }
 
-    const result = data.result ?? {};
-    const ops = Array.isArray(result.operations) ? result.operations : [];
-    operations.push(...ops);
-    pageCount = typeof result.page_count === "number" ? result.page_count : page;
-
-    if (page >= pageCount || ops.length === 0) break;
-    if (page === MAX_PAGES) partial = true;
-  }
-
-  // ---- 6) агрегация (всё в копейках) ----
-  const b: Buckets = {
-    revenue: 0,
-    returns: 0,
-    commission: 0,
-    logistics: 0,
-    services: 0,
-    storage: 0,
-    other: 0,
-    amountTotal: 0,
-  };
-
-  const types = new Map<string, TypeAcc>();
-  const serviceNames = new Map<string, ServiceAcc>();
-  const cand = {
-    ads: new Map<string, CandidateAcc>(),
-    logistics: new Map<string, CandidateAcc>(),
-    storage: new Map<string, CandidateAcc>(),
-  };
-
-  const addCandidate = (
-    group: keyof typeof cand,
-    source: "operation" | "service",
-    exactName: string,
-    matchedMarker: string,
-    totalKop: number
-  ) => {
-    const key = `${source} ${exactName}`;
-    const cur = cand[group].get(key);
-    if (cur) {
-      cur.count += 1;
-      cur.total += totalKop;
-    } else {
-      cand[group].set(key, {
-        source,
-        exactName,
-        matchedMarker,
-        count: 1,
-        total: totalKop,
-      });
+    // ---- 6) расшифровка ключа: ТОЛЬКО в памяти процесса ----
+    let apiKey: string;
+    try {
+      apiKey = decryptOzonApiKey(conn.api_key_encrypted as string);
+    } catch {
+      return fail(400, "connection", "decrypt_failed", "Ключ Ozon нужно переподключить");
     }
-  };
+    const clientId = conn.client_id as string;
 
-  for (const op of operations) {
-    const opType = op.operation_type ?? "";
-    const opTypeName =
-      typeof op.operation_type_name === "string" && op.operation_type_name
-        ? op.operation_type_name
-        : null;
+    // ---- 7) аккумуляторы ----
+    const b: Buckets = {
+      revenue: 0,
+      returns: 0,
+      commission: 0,
+      logistics: 0,
+      services: 0,
+      storage: 0,
+      other: 0,
+      amountTotal: 0,
+    };
+    const types = new Map<string, TypeAcc>();
+    const serviceNames = new Map<string, ServiceAcc>();
+    const cand: Record<"ads" | "logistics" | "storage", CandidateGroup> = {
+      ads: newGroup(),
+      logistics: newGroup(),
+      storage: newGroup(),
+    };
 
-    const amount = toKop(op.amount);
-    const accr = toKop(op.accruals_for_sale);
-    const comm = toKop(op.sale_commission);
-    const deliv = toKop(op.delivery_charge);
-    const retDeliv = toKop(op.return_delivery_charge);
+    /** Один exactName внутри одной группы+source агрегируется ровно один раз. */
+    const addCandidate = (
+      group: "ads" | "logistics" | "storage",
+      source: "operation" | "service",
+      exactName: string,
+      matchedMarker: string,
+      totalKop: number
+    ) => {
+      const m = cand[group][source];
+      const cur = m.get(exactName);
+      if (cur) {
+        cur.count += 1;
+        cur.total += totalKop;
+      } else {
+        m.set(exactName, { exactName, matchedMarker, count: 1, total: totalKop });
+      }
+    };
 
-    // ---- бакеты как в текущем finance.ts ----
-    b.revenue += accr;
-    b.commission += comm;
-    b.logistics += deliv + retDeliv;
-    b.amountTotal += amount;
-    if (isReturnOp(op)) b.returns += accr;
+    let operationCount = 0;
+    let pagesRead = 0;
+    let pageCount = 1;
+    let limitExceeded = false;
 
-    let serviceSum = 0;
-    if (Array.isArray(op.services)) {
-      for (const s of op.services) {
-        const price = toKop(s?.price);
-        if (price === 0) continue; // как в finance.ts: нулевые услуги пропускаем
-        serviceSum += price;
-        const name = typeof s?.name === "string" ? s.name : "";
+    // ---- 8) страницы Ozon: тот же контракт, что и production finance.ts ----
+    // Каждая страница агрегируется СРАЗУ; массив всех операций не копится.
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+      let res: Response;
+      try {
+        res = await fetch(OZON_TX_URL, {
+          method: "POST",
+          headers: {
+            "Client-Id": clientId,
+            "Api-Key": apiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            filter: {
+              date: { from: range.dateFrom, to: range.dateTo },
+              transaction_type: "all",
+            },
+            page,
+            page_size: PAGE_SIZE,
+          }),
+          cache: "no-store",
+          signal: controller.signal,
+        });
+      } catch (e) {
+        const aborted = e instanceof Error && e.name === "AbortError";
+        return fail(
+          502,
+          "ozon_fetch",
+          aborted ? "timeout" : "unavailable",
+          aborted ? "Ozon не ответил вовремя" : "Ozon временно недоступен",
+          { httpStatus: null, sourceEndpoint: OZON_TX_URL, period }
+        );
+      } finally {
+        clearTimeout(timer);
+      }
 
-        if (isStorageMarker(name, opType)) b.storage += price;
-        else b.services += price;
+      // Никаких retry: при 429 честно отдаём статус и останавливаемся.
+      if (!res.ok) {
+        const code =
+          res.status === 401
+            ? "invalid_key"
+            : res.status === 403
+              ? "forbidden"
+              : res.status === 429
+                ? "rate_limited"
+                : res.status === 404 || res.status === 410
+                  ? "deprecated_or_gone"
+                  : "unavailable";
+        return fail(
+          502,
+          "ozon_fetch",
+          code,
+          "Ozon вернул ошибку на запрос финансовых операций",
+          { httpStatus: res.status, sourceEndpoint: OZON_TX_URL, period }
+        );
+      }
 
-        // таблица по точным именам услуг
-        const sv = serviceNames.get(name);
-        if (sv) {
-          sv.count += 1;
-          sv.total += price;
-          if (opType) sv.operationTypes.add(opType);
+      let data: { result?: { operations?: OzonOperation[]; page_count?: number } };
+      try {
+        data = await res.json();
+      } catch {
+        return fail(502, "ozon_parse", "bad_response", "Ozon вернул неожиданный ответ", {
+          httpStatus: res.status,
+          sourceEndpoint: OZON_TX_URL,
+          period,
+        });
+      }
+
+      const result = data.result ?? {};
+      const ops = Array.isArray(result.operations) ? result.operations : [];
+      pageCount = typeof result.page_count === "number" ? result.page_count : page;
+      pagesRead = page;
+
+      // ---- агрегация ЭТОЙ страницы ----
+      for (const op of ops) {
+        operationCount += 1;
+        const opType = op.operation_type ?? "";
+        const opTypeName =
+          typeof op.operation_type_name === "string" && op.operation_type_name
+            ? op.operation_type_name
+            : null;
+
+        const amount = toKop(op.amount);
+        const accr = toKop(op.accruals_for_sale);
+        const comm = toKop(op.sale_commission);
+        const deliv = toKop(op.delivery_charge);
+        const retDeliv = toKop(op.return_delivery_charge);
+
+        // ---- бакеты как в текущем finance.ts ----
+        b.revenue += accr;
+        b.commission += comm;
+        b.logistics += deliv + retDeliv;
+        b.amountTotal += amount;
+        if (isReturnOp(op)) b.returns += accr;
+
+        let serviceSum = 0;
+        if (Array.isArray(op.services)) {
+          for (const s of op.services) {
+            const price = toKop(s?.price);
+            if (price === 0) continue; // как в finance.ts: нулевые услуги пропускаем
+            serviceSum += price;
+            const name = typeof s?.name === "string" ? s.name : "";
+
+            if (isStorageMarker(name, opType)) b.storage += price;
+            else b.services += price;
+
+            const sv = serviceNames.get(name);
+            if (sv) {
+              sv.count += 1;
+              sv.total += price;
+              if (opType) sv.operationTypes.add(opType);
+            } else {
+              if (serviceNames.size >= MAX_TAXONOMY_ENTRIES) {
+                limitExceeded = true;
+                break;
+              }
+              serviceNames.set(name, {
+                name,
+                count: 1,
+                total: price,
+                operationTypes: new Set(opType ? [opType] : []),
+              });
+            }
+
+            const a = firstMarker(name, ADS_MARKERS);
+            if (a) addCandidate("ads", "service", name, a, price);
+            const l = firstMarker(name, LOGISTICS_MARKERS);
+            if (l) addCandidate("logistics", "service", name, l, price);
+            const st = firstMarker(name, STORAGE_MARKERS);
+            if (st) addCandidate("storage", "service", name, st, price);
+          }
+        }
+        if (limitExceeded) break;
+
+        const residual = amount - (accr + comm + deliv + retDeliv + serviceSum);
+        if (residual !== 0) b.other += residual;
+
+        const t = types.get(opType);
+        if (t) {
+          t.count += 1;
+          t.amount += amount;
+          t.accrualsForSale += accr;
+          t.saleCommission += comm;
+          t.deliveryCharge += deliv;
+          t.returnDeliveryCharge += retDeliv;
+          t.servicesTotal += serviceSum;
+          t.residualTotal += residual;
+          if (!t.operationTypeName && opTypeName) t.operationTypeName = opTypeName;
         } else {
-          serviceNames.set(name, {
-            name,
+          if (types.size >= MAX_TAXONOMY_ENTRIES) {
+            limitExceeded = true;
+            break;
+          }
+          types.set(opType, {
+            operationType: opType,
+            operationTypeName: opTypeName,
             count: 1,
-            total: price,
-            operationTypes: new Set(opType ? [opType] : []),
+            amount,
+            accrualsForSale: accr,
+            saleCommission: comm,
+            deliveryCharge: deliv,
+            returnDeliveryCharge: retDeliv,
+            servicesTotal: serviceSum,
+            residualTotal: residual,
           });
         }
 
-        // кандидаты по имени услуги
-        const a = firstMarker(name, ADS_MARKERS);
-        if (a) addCandidate("ads", "service", name, a, price);
-        const l = firstMarker(name, LOGISTICS_MARKERS);
-        if (l) addCandidate("logistics", "service", name, l, price);
-        const st = firstMarker(name, STORAGE_MARKERS);
-        if (st) addCandidate("storage", "service", name, st, price);
+        // кандидаты по типу операции: и по коду, и по имени (если оно есть)
+        const hay = `${opType} ${opTypeName ?? ""}`;
+        const label = opTypeName ? `${opType} — ${opTypeName}` : opType;
+        const a = firstMarker(hay, ADS_MARKERS);
+        if (a) addCandidate("ads", "operation", label, a, amount);
+        const l = firstMarker(hay, LOGISTICS_MARKERS);
+        if (l) addCandidate("logistics", "operation", label, l, amount);
+        const st = firstMarker(hay, STORAGE_MARKERS);
+        if (st) addCandidate("storage", "operation", label, st, amount);
       }
+
+      // Лимит таксономии: молча НЕ обрезаем — честно останавливаемся без сумм.
+      if (limitExceeded) {
+        return fail(
+          422,
+          "aggregation",
+          "taxonomy_limit_exceeded",
+          `Диагностика остановлена: уникальных категорий больше ${MAX_TAXONOMY_ENTRIES}. Финансовые суммы не возвращаются.`,
+          { pagesRead, operationCount, sourceEndpoint: OZON_TX_URL, period }
+        );
+      }
+
+      // Достигли последней страницы (или Ozon отдал пусто) → полный результат.
+      if (page >= pageCount || ops.length === 0) break;
+
+      // Дошли до потолка страниц, а данные ещё есть → результат НЕПОЛНЫЙ.
+      // Финансовые суммы в этом случае НЕ отдаём вообще, чтобы неполный июнь
+      // нельзя было принять за итоговый.
+      if (page === MAX_PAGES) {
+        return fail(
+          422,
+          "pagination",
+          "page_limit_exceeded",
+          "Диагностика остановлена: превышен безопасный лимит страниц. Финансовые суммы неполные и не должны использоваться.",
+          {
+            partial: true,
+            pagesRead,
+            operationCount,
+            sourceEndpoint: OZON_TX_URL,
+            period,
+          }
+        );
+      }
+      // ops выходит из области видимости на следующей итерации — страницу не держим.
     }
 
-    const residual = amount - (accr + comm + deliv + retDeliv + serviceSum);
-    if (residual !== 0) b.other += residual;
+    // ---- 9) тождество учёта (НЕ проверка данных Ozon) ----
+    const knownPlusResidual =
+      b.revenue + b.commission + b.logistics + b.services + b.storage + b.other;
+    const deltaKop = b.amountTotal - knownPlusResidual;
 
-    // ---- таблица по типам операций ----
-    const t = types.get(opType);
-    if (t) {
-      t.count += 1;
-      t.amount += amount;
-      t.accrualsForSale += accr;
-      t.saleCommission += comm;
-      t.deliveryCharge += deliv;
-      t.returnDeliveryCharge += retDeliv;
-      t.servicesTotal += serviceSum;
-      t.residualTotal += residual;
-      if (!t.operationTypeName && opTypeName) t.operationTypeName = opTypeName;
-    } else {
-      types.set(opType, {
-        operationType: opType,
-        operationTypeName: opTypeName,
-        count: 1,
-        amount,
-        accrualsForSale: accr,
-        saleCommission: comm,
-        deliveryCharge: deliv,
-        returnDeliveryCharge: retDeliv,
-        servicesTotal: serviceSum,
-        residualTotal: residual,
-      });
-    }
+    // ---- 10) сортировка: самые крупные суммы наверх ----
+    const byAbsDesc = <T,>(arr: T[], pick: (x: T) => number): T[] =>
+      arr.sort((x, y) => Math.abs(pick(y)) - Math.abs(pick(x)));
 
-    // кандидаты по типу операции: и по коду, и по имени (если оно есть)
-    const hay = `${opType} ${opTypeName ?? ""}`;
-    const label = opTypeName ? `${opType} — ${opTypeName}` : opType;
-    const a = firstMarker(hay, ADS_MARKERS);
-    if (a) addCandidate("ads", "operation", label, a, amount);
-    const l = firstMarker(hay, LOGISTICS_MARKERS);
-    if (l) addCandidate("logistics", "operation", label, l, amount);
-    const st = firstMarker(hay, STORAGE_MARKERS);
-    if (st) addCandidate("storage", "operation", label, st, amount);
-  }
+    const mapCand = (m: Map<string, CandidateAcc>, source: "operation" | "service") =>
+      byAbsDesc(Array.from(m.values()), (c) => c.total).map((c) => ({
+        source,
+        exactName: c.exactName,
+        matchedMarker: c.matchedMarker,
+        count: c.count,
+        total: toRub(c.total),
+        classification: "candidate_only" as const,
+      }));
 
-  // ---- 7) инвариант: всё в копейках, без искусственной балансировки ----
-  const componentTotalKop =
-    b.revenue + b.commission + b.logistics + b.services + b.storage + b.other;
-  const deltaKop = b.amountTotal - componentTotalKop;
+    const OVERLAP_WARNING =
+      "operationCandidates содержат полный amount операции, а serviceCandidates — price услуги внутри операции. Эти массивы могут пересекаться, их суммы нельзя складывать.";
 
-  // ---- 8) сортировка: самые крупные суммы наверх ----
-  const byAbsDesc = <T,>(arr: T[], pick: (x: T) => number): T[] =>
-    arr.sort((x, y) => Math.abs(pick(y)) - Math.abs(pick(x)));
+    const group = (g: CandidateGroup) => ({
+      warning: OVERLAP_WARNING,
+      mayOverlap: true as const,
+      operationCandidates: mapCand(g.operation, "operation"),
+      serviceCandidates: mapCand(g.service, "service"),
+    });
 
-  const body = {
-    ok: true,
-    diagnosticOnly: true as const,
-    sourceEndpoint: OZON_TX_URL,
-    period,
-    pageCount,
-    operationCount: operations.length,
-    partial,
-    calculationConsumed: false as const,
-    savedToDatabase: false as const,
-    rawOperationsReturned: false as const,
+    const body = {
+      ok: true,
+      diagnosticOnly: true as const,
+      sourceEndpoint: OZON_TX_URL,
+      period,
+      pageCount,
+      pagesRead,
+      operationCount,
+      partial: false as const,
+      calculationConsumed: false as const,
+      savedToDatabase: false as const,
+      rawOperationsReturned: false as const,
 
-    // Текущие бакеты M-PROF — по правилам production finance.ts как есть.
-    currentBuckets: {
-      revenue: toRub(b.revenue),
-      returns: toRub(b.returns),
-      commission: toRub(b.commission),
-      logistics: toRub(b.logistics),
-      services: toRub(b.services),
-      storage: toRub(b.storage),
-      other: toRub(b.other),
-      amountTotal: toRub(b.amountTotal),
-    },
+      // Текущие бакеты M-PROF — по правилам production finance.ts как есть.
+      currentBuckets: {
+        revenue: toRub(b.revenue),
+        returns: toRub(b.returns),
+        commission: toRub(b.commission),
+        logistics: toRub(b.logistics),
+        services: toRub(b.services),
+        storage: toRub(b.storage),
+        other: toRub(b.other),
+        amountTotal: toRub(b.amountTotal),
+      },
 
-    operationTypes: byAbsDesc(Array.from(types.values()), (t) => t.amount).map(
-      (t) => ({
+      operationTypes: byAbsDesc(Array.from(types.values()), (t) => t.amount).map((t) => ({
         operationType: t.operationType,
         ...(t.operationTypeName ? { operationTypeName: t.operationTypeName } : {}),
         count: t.count,
@@ -593,59 +703,43 @@ export async function GET(req: NextRequest) {
         returnDeliveryCharge: toRub(t.returnDeliveryCharge),
         servicesTotal: toRub(t.servicesTotal),
         residualTotal: toRub(t.residualTotal),
-      })
-    ),
-
-    serviceNames: byAbsDesc(Array.from(serviceNames.values()), (s) => s.total).map(
-      (s) => ({
-        name: s.name,
-        count: s.count,
-        total: toRub(s.total),
-        operationTypes: Array.from(s.operationTypes).sort(),
-      })
-    ),
-
-    // ТОЛЬКО подсказка человеку. Не вычитается, не складывается, не сохраняется.
-    candidateMatches: {
-      note: "Diagnostic hint only. NOT a financial classification. These totals are already inside currentBuckets (services/other) and must NOT be added on top.",
-      ads: byAbsDesc(Array.from(cand.ads.values()), (c) => c.total).map((c) => ({
-        source: c.source,
-        exactName: c.exactName,
-        matchedMarker: c.matchedMarker,
-        count: c.count,
-        total: toRub(c.total),
-        classification: "candidate_only" as const,
       })),
-      logistics: byAbsDesc(Array.from(cand.logistics.values()), (c) => c.total).map(
-        (c) => ({
-          source: c.source,
-          exactName: c.exactName,
-          matchedMarker: c.matchedMarker,
-          count: c.count,
-          total: toRub(c.total),
-          classification: "candidate_only" as const,
+
+      serviceNames: byAbsDesc(Array.from(serviceNames.values()), (s) => s.total).map(
+        (s) => ({
+          name: s.name,
+          count: s.count,
+          total: toRub(s.total),
+          operationTypes: Array.from(s.operationTypes).sort(),
         })
       ),
-      storage: byAbsDesc(Array.from(cand.storage.values()), (c) => c.total).map(
-        (c) => ({
-          source: c.source,
-          exactName: c.exactName,
-          matchedMarker: c.matchedMarker,
-          count: c.count,
-          total: toRub(c.total),
-          classification: "candidate_only" as const,
-        })
-      ),
-    },
 
-    invariant: {
-      amountTotal: toRub(b.amountTotal),
-      componentTotal: toRub(componentTotalKop),
-      delta: toRub(deltaKop),
-      deltaKopecks: deltaKop,
-      balanced: deltaKop === 0,
-    },
-  };
+      // ТОЛЬКО подсказка человеку. Не вычитается, не складывается, не сохраняется.
+      candidateMatches: {
+        diagnosticOnly: true as const,
+        doNotSumCandidates: true as const,
+        note: "Diagnostic hint only, NOT a financial classification. Эти суммы уже внутри currentBuckets (services/other) — поверх них ничего добавлять нельзя. Группы ads/logistics/storage тоже могут пересекаться между собой, пока таксономия не подтверждена вручную.",
+        ads: group(cand.ads),
+        logistics: group(cand.logistics),
+        storage: group(cand.storage),
+      },
 
-  return json(body, 200);
+      // Тождество ПО ПОСТРОЕНИЮ, а не независимая проверка данных Ozon.
+      accountingIdentity: {
+        amountTotal: toRub(b.amountTotal),
+        knownComponentsPlusResidual: toRub(knownPlusResidual),
+        delta: toRub(deltaKop),
+        deltaKopecks: deltaKop,
+        identityByConstruction: true as const,
+        meaning:
+          "Residual определяется как amount минус известные компоненты. Нулевая delta подтверждает только отсутствие внутренней потери при агрегации, но не правильность классификации рекламы или логистики.",
+      },
+    };
+
+    return json(body, 200);
+  } finally {
+    // Снимаем in-flight ВСЕГДА: и при ошибке Ozon, и при таймауте, и при throw.
+    // Иначе пользователь остался бы заблокирован до перезапуска инстанса.
+    inFlight.delete(userId);
+  }
 }
