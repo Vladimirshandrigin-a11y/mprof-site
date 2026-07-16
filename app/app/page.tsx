@@ -13,6 +13,11 @@ import {
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
 import {
+  parseOzonFinanceTaxonomy,
+  type FlatContext as OzonTaxonomyFlatContext,
+  type OzonTaxonomyView,
+} from "./lib/ozon-finance-taxonomy-view"
+import {
   supabase,
   saveCalculationToCloud,
   updateCalculationInCloud,
@@ -239,6 +244,64 @@ type HistDetailRow = {
  *     расходы скрываются). Старые записи без части полей не ломаются: парсер
  *     уже коалесцирует отсутствующие числа в 0.
  */
+/**
+ * Честная taxonomy-разбивка API-расчёта из ai_insights.financeTaxonomy (PR B).
+ * Только для mode==="api" и только если снапшот валиден и сходится со stored
+ * total_expenses. Иначе null → вызывающий использует старый flat-fallback.
+ * Ничего не пересчитывает и не мутирует запись.
+ */
+function ozonTaxonomyView(h: CalcResult): OzonTaxonomyView | null {
+  if (h.mode !== "api") return null;
+  const flat: OzonTaxonomyFlatContext = {
+    commission: Number(h.commission) || 0,
+    logistics: Number(h.logistics) || 0,
+    ads: Number(h.ads) || 0,
+    storage: Number(h.storage) || 0,
+    other: Number(h.other) || 0,
+    cost: Number(h.cost) || 0,
+    tax: Number(h.tax) || 0,
+    totalExpenses: Number(h.expenses) || 0,
+  };
+  return parseOzonFinanceTaxonomy(h.aiInsights, flat);
+}
+
+/**
+ * Годовые агрегаты для честной taxonomy-модели отчётов (PR B). Чистая функция:
+ * для каждой записи берёт gross charges/income из валидной financeTaxonomy, иначе
+ * flat. Без double count. Вынесена из useMemo, чтобы не раздувать render-компонент.
+ */
+function aggregateReportsTaxonomy(items: CalcResult[]): {
+  logisticsCharges: number;
+  adsCharges: number;
+  otherCharges: number;
+  ozonIncome: number;
+} {
+  const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+  let lc = 0;
+  let ac = 0;
+  let oc = 0;
+  let inc = 0;
+  for (const h of items) {
+    const tv = ozonTaxonomyView(h);
+    if (tv) {
+      lc += tv.logisticsCharges;
+      ac += tv.adsCharges;
+      oc += tv.otherCharges;
+      inc += tv.ozonIncome;
+    } else {
+      lc += Number(h.logistics) || 0;
+      ac += Number(h.ads) || 0;
+      oc += Number(h.other) || 0;
+    }
+  }
+  return {
+    logisticsCharges: round2(lc),
+    adsCharges: round2(ac),
+    otherCharges: round2(oc),
+    ozonIncome: round2(inc),
+  };
+}
+
 function buildHistDetailRows(
   h: CalcResult,
   breakdown: NetProfitBreakdown | null
@@ -287,6 +350,35 @@ function buildHistDetailRows(
       { label: "Итоговая чистая прибыль", value: h.profit, kind: "total" },
     ];
   }
+  // API-расчёт с валидной taxonomy (PR B): честная gross-разбивка расходов +
+  // отдельная зелёная строка доходов-компенсаций. Не показываем сырой
+  // отрицательный other; итог берём из stored profit (ничего не пересчитываем).
+  const tv = ozonTaxonomyView(h);
+  if (tv) {
+    const trows: HistDetailRow[] = [
+      { label: "Выручка", value: h.revenue, kind: "income" },
+    ];
+    const pushExp = (label: string, value: number) => {
+      if (value > 0) trows.push({ label, value, kind: "expense" });
+    };
+    pushExp("Комиссия маркетплейса", h.commission);
+    pushExp("Логистика", tv.logisticsCharges);
+    pushExp("Реклама и продвижение", tv.adsCharges);
+    pushExp("Хранение", tv.storage);
+    pushExp("Прочие расходы Ozon", tv.otherCharges);
+    pushExp("Себестоимость", h.cost);
+    pushExp("Налог", h.tax);
+    if (tv.ozonIncome > 0) {
+      trows.push({
+        label: "Корректировки и компенсации Ozon",
+        value: tv.ozonIncome,
+        kind: "income",
+      });
+    }
+    trows.push({ label: "Чистая прибыль", value: h.profit, kind: "total" });
+    return trows;
+  }
+
   // Ручной расчёт: доход + ненулевые расходы + итог.
   const rows: HistDetailRow[] = [
     { label: "Выручка", value: h.revenue, kind: "income" },
@@ -2327,6 +2419,18 @@ export default function AppPage() {
    * увидел подставленный расчёт.
    */
   const loadCalcIntoCalculator = (item: CalcResult) => {
+    // PR B guard (mode-crossing): API-расчёт с валидной taxonomy содержит отдельные
+    // корректировки/компенсации и отрицательный reconciliation-остаток other. Его
+    // нельзя безопасно загрузить в поле «Прочие расходы» ручного калькулятора и
+    // редактировать. Смотреть в истории можно, редактировать как ручной — нельзя.
+    // Guard стоит ВНУТРИ функции, поэтому её нельзя вызвать обходным путём.
+    if (ozonTaxonomyView(item)) {
+      showToast(
+        "Этот расчёт получен через Ozon API и содержит отдельные корректировки и компенсации. Его можно просмотреть в истории, но нельзя безопасно редактировать как ручной расчёт.",
+        "warn"
+      );
+      return;
+    }
     // Клик мог прийти со вкладки «Отчёты» — возвращаем пользователя к
     // калькулятору, где восстанавливается выбранный расчёт.
     setMainTab("calc");
@@ -3426,6 +3530,20 @@ export default function AppPage() {
     const other = sum((h) => h.other);
     // Комиссии и логистика Ozon = комиссия + логистика + хранение.
     const ozonFees = commission + logistics + storage;
+
+    // PR B: taxonomy-aware gross-разбивка для честного отчёта (чистая функция
+    // модульного уровня). Для записей с валидной financeTaxonomy — gross charges
+    // и отдельный доход-компенсации; для старых — flat без выдуманного дохода.
+    // Без double count: расходы берут charges, доход вычитается один раз, итог =
+    // stored total_expenses.
+    const taxAgg = aggregateReportsTaxonomy(items);
+    const logisticsCharges = taxAgg.logisticsCharges;
+    const adsCharges = taxAgg.adsCharges;
+    const otherCharges = taxAgg.otherCharges;
+    const ozonIncome = taxAgg.ozonIncome;
+    // «Комиссии и логистика Ozon» для честной модели — на gross-логистике.
+    const ozonFeesCharges =
+      Math.round((commission + logisticsCharges + storage) * 100) / 100;
     // Средняя маржинальность: по выручке, если она есть; иначе среднее по margin.
     const avgMargin =
       revenue > 0
@@ -3455,6 +3573,12 @@ export default function AppPage() {
       tax,
       other,
       ozonFees,
+      // PR B: honest taxonomy-aware поля (аддитивно; старые поля не тронуты).
+      logisticsCharges,
+      adsCharges,
+      otherCharges,
+      ozonIncome,
+      ozonFeesCharges,
       avgMargin,
       best,
       worst,
@@ -8313,29 +8437,40 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         </tr>
                       )}
 
-                      {yearlySummary.ozonFees > 0 && (
+                      {yearlySummary.ozonFeesCharges > 0 && (
                         <tr className="fin-row">
                           <th scope="row">Комиссии и логистика Ozon</th>
                           <td className="fin-val">
-                            {fmt(Math.round(yearlySummary.ozonFees))} ₽
+                            {fmt(Math.round(yearlySummary.ozonFeesCharges))} ₽
                           </td>
                         </tr>
                       )}
 
-                      {yearlySummary.ads > 0 && (
+                      {yearlySummary.adsCharges > 0 && (
                         <tr className="fin-row">
-                          <th scope="row">Реклама</th>
+                          <th scope="row">Реклама и продвижение</th>
                           <td className="fin-val">
-                            {fmt(Math.round(yearlySummary.ads))} ₽
+                            {fmt(Math.round(yearlySummary.adsCharges))} ₽
                           </td>
                         </tr>
                       )}
 
-                      {yearlySummary.other > 0 && (
+                      {yearlySummary.otherCharges > 0 && (
                         <tr className="fin-row">
                           <th scope="row">Прочие расходы</th>
                           <td className="fin-val">
-                            {fmt(Math.round(yearlySummary.other))} ₽
+                            {fmt(Math.round(yearlySummary.otherCharges))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {/* PR B: отдельная зелёная строка доходов-компенсаций Ozon.
+                          Вычитается из расходов; итог = stored total_expenses. */}
+                      {yearlySummary.ozonIncome > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Корректировки и компенсации Ozon</th>
+                          <td className="fin-val pos">
+                            +{fmt(Math.round(yearlySummary.ozonIncome))} ₽
                           </td>
                         </tr>
                       )}
