@@ -14,6 +14,7 @@ import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
 import {
   parseOzonFinanceTaxonomy,
+  hasFinanceTaxonomyObject,
   type FlatContext as OzonTaxonomyFlatContext,
   type OzonTaxonomyView,
 } from "./lib/ozon-finance-taxonomy-view"
@@ -266,6 +267,24 @@ function ozonTaxonomyView(h: CalcResult): OzonTaxonomyView | null {
 }
 
 /**
+ * fail-closed guard: можно ли этот расчёт безопасно загрузить/редактировать как
+ * РУЧНОЙ? НЕ зависит от reconciliation view (та может быть null из-за ручных
+ * доп-расходов). Блокируем:
+ *   • любой API-расчёт с объектом financeTaxonomy — валидным, неизвестной версии
+ *     или повреждённым (fail-closed): в нём есть отдельные корректировки/
+ *     компенсации, ручной калькулятор их не представит;
+ *   • старый API-расчёт без taxonomy, но с отрицательным other (net-компенсации
+ *     нельзя показать положительным ручным расходом).
+ * Manual/upload и старый API с неотрицательным other загружаются как раньше.
+ */
+function isApiCalcUneditableAsManual(h: CalcResult): boolean {
+  if (h.mode !== "api") return false;
+  if (hasFinanceTaxonomyObject(h.aiInsights)) return true;
+  if ((Number(h.other) || 0) < 0) return true;
+  return false;
+}
+
+/**
  * Годовые агрегаты для честной taxonomy-модели отчётов (PR B). Чистая функция:
  * для каждой записи берёт gross charges/income из валидной financeTaxonomy, иначе
  * flat. Без double count. Вынесена из useMemo, чтобы не раздувать render-компонент.
@@ -274,12 +293,14 @@ function aggregateReportsTaxonomy(items: CalcResult[]): {
   logisticsCharges: number;
   adsCharges: number;
   otherCharges: number;
+  manualExtraExpenses: number;
   ozonIncome: number;
 } {
   const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
   let lc = 0;
   let ac = 0;
   let oc = 0;
+  let me = 0;
   let inc = 0;
   for (const h of items) {
     const tv = ozonTaxonomyView(h);
@@ -287,8 +308,11 @@ function aggregateReportsTaxonomy(items: CalcResult[]): {
       lc += tv.logisticsCharges;
       ac += tv.adsCharges;
       oc += tv.otherCharges;
+      me += tv.manualExtraExpenses;
       inc += tv.ozonIncome;
     } else {
+      // Старая запись без валидной taxonomy: flat один раз, без выдуманного дохода
+      // и без выдуманных ручных доп-расходов.
       lc += Number(h.logistics) || 0;
       ac += Number(h.ads) || 0;
       oc += Number(h.other) || 0;
@@ -298,6 +322,7 @@ function aggregateReportsTaxonomy(items: CalcResult[]): {
     logisticsCharges: round2(lc),
     adsCharges: round2(ac),
     otherCharges: round2(oc),
+    manualExtraExpenses: round2(me),
     ozonIncome: round2(inc),
   };
 }
@@ -366,6 +391,9 @@ function buildHistDetailRows(
     pushExp("Реклама и продвижение", tv.adsCharges);
     pushExp("Хранение", tv.storage);
     pushExp("Прочие расходы Ozon", tv.otherCharges);
+    // Дополнительные ручные расходы (packaging/warehouse/salary/manual other),
+    // сидящие в flat other. Отдельная строка — не мешать с «Прочие расходы Ozon».
+    pushExp("Дополнительные расходы", tv.manualExtraExpenses);
     pushExp("Себестоимость", h.cost);
     pushExp("Налог", h.tax);
     if (tv.ozonIncome > 0) {
@@ -2419,12 +2447,12 @@ export default function AppPage() {
    * увидел подставленный расчёт.
    */
   const loadCalcIntoCalculator = (item: CalcResult) => {
-    // PR B guard (mode-crossing): API-расчёт с валидной taxonomy содержит отдельные
-    // корректировки/компенсации и отрицательный reconciliation-остаток other. Его
-    // нельзя безопасно загрузить в поле «Прочие расходы» ручного калькулятора и
-    // редактировать. Смотреть в истории можно, редактировать как ручной — нельзя.
-    // Guard стоит ВНУТРИ функции, поэтому её нельзя вызвать обходным путём.
-    if (ozonTaxonomyView(item)) {
+    // PR B guard (mode-crossing), fail-closed: API-расчёт с taxonomy-снапшотом (или
+    // отрицательным other) содержит отдельные корректировки/компенсации и не
+    // представим полем «Прочие расходы» ручного калькулятора. Смотреть в истории
+    // можно, редактировать как ручной — нельзя. Guard НЕ зависит от reconciliation
+    // (не отключается ручными доп-расходами) и стоит ВНУТРИ функции — обойти нельзя.
+    if (isApiCalcUneditableAsManual(item)) {
       showToast(
         "Этот расчёт получен через Ozon API и содержит отдельные корректировки и компенсации. Его можно просмотреть в истории, но нельзя безопасно редактировать как ручной расчёт.",
         "warn"
@@ -3225,8 +3253,13 @@ export default function AppPage() {
     { id: number; message: string; type: ToastType } | null
   >(null);
 
+  // Монотонный счётчик id тоста через ref (вместо Date.now(): уникально в сессии,
+  // не может коллизнуть при двух тостах в одну мс, и не тянет impure Date.now в
+  // анализ React-компилятора). Поведение UX не меняется — id только React-key.
+  const toastIdRef = useRef(0);
   const showToast = (message: string, type: ToastType = "ok") => {
-    setToast({ id: Date.now(), message, type });
+    toastIdRef.current += 1;
+    setToast({ id: toastIdRef.current, message, type });
   };
 
   useEffect(() => {
@@ -3540,6 +3573,7 @@ export default function AppPage() {
     const logisticsCharges = taxAgg.logisticsCharges;
     const adsCharges = taxAgg.adsCharges;
     const otherCharges = taxAgg.otherCharges;
+    const manualExtraExpenses = taxAgg.manualExtraExpenses;
     const ozonIncome = taxAgg.ozonIncome;
     // «Комиссии и логистика Ozon» для честной модели — на gross-логистике.
     const ozonFeesCharges =
@@ -3577,6 +3611,7 @@ export default function AppPage() {
       logisticsCharges,
       adsCharges,
       otherCharges,
+      manualExtraExpenses,
       ozonIncome,
       ozonFeesCharges,
       avgMargin,
@@ -8460,6 +8495,17 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           <th scope="row">Прочие расходы</th>
                           <td className="fin-val">
                             {fmt(Math.round(yearlySummary.otherCharges))} ₽
+                          </td>
+                        </tr>
+                      )}
+
+                      {/* PR B: дополнительные ручные расходы API-расчётов
+                          (packaging/warehouse/salary/manual other), отдельно. */}
+                      {yearlySummary.manualExtraExpenses > 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Дополнительные расходы</th>
+                          <td className="fin-val">
+                            {fmt(Math.round(yearlySummary.manualExtraExpenses))} ₽
                           </td>
                         </tr>
                       )}

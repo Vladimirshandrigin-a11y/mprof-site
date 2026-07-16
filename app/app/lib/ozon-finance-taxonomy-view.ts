@@ -4,13 +4,20 @@
 // Классификатор бэкенда (PR A, taxonomy.ts) кладёт в ai_insights.financeTaxonomy
 // signed-разбивку операций Ozon (логистика/реклама/корректировки) + gross
 // charges/credits. Этот модуль ТОЛЬКО читает и валидирует снапшот, чтобы история/
-// отчёты честно показали расходы и отдельную строку доходов-компенсаций, НИЧЕГО
-// не пересчитывая: единственный источник итогов — stored total_expenses/profit.
+// отчёты честно показали расходы, отдельную строку доходов-компенсаций и
+// дополнительные ручные расходы, НИЧЕГО не пересчитывая: единственный источник
+// итогов — stored total_expenses/profit.
+//
+// Разделение обязанностей (для fail-closed guard и тестируемости):
+//   • hasFinanceTaxonomyObject — есть ли объект financeTaxonomy (любой версии);
+//   • parseFinanceTaxonomySnapshot — СТРУКТУРНАЯ проверка (shape/version/finite/
+//     signedTotal/logistics identity), БЕЗ flat-reconciliation;
+//   • buildOzonFinanceTaxonomyView — считает gross-строки, доход, taxonomyNet,
+//     ДОПОЛНИТЕЛЬНЫЕ РУЧНЫЕ РАСХОДЫ (packaging/warehouse/salary/manual other,
+//     сидящие в flat other) и сверяет со stored total_expenses.
 //
 // БЕЗОПАСНОСТЬ: не доверяет произвольному JSON, не бросает исключений, не мутирует
-// вход, не делает fetch/DB, не импортирует server-only модули. Любая проблема →
-// null → вызывающий использует старый flat-fallback. Старые/неизвестные версии
-// классификатора → null.
+// вход, не делает fetch/DB, не импортирует server-only модули.
 // ============================================================================
 
 /** Единственная поддерживаемая версия классификатора (PR A). */
@@ -43,54 +50,41 @@ function parseBreakdown(o: unknown): Breakdown | null {
   return { signedTotal, charges, credits };
 }
 
-/** Flat-колонки записи (положительные расходы) + stored total_expenses — для сверки. */
-export type FlatContext = {
-  commission: number;
-  logistics: number;
-  ads: number;
-  storage: number;
-  other: number;
-  cost: number;
-  tax: number;
-  totalExpenses: number;
-};
-
-/** Провалидированная честная разбивка для UI (всё в ₽, расходы положительные). */
-export type OzonTaxonomyView = {
-  /** Логистика (gross charges). */
-  logisticsCharges: number;
-  /** Реклама и продвижение (gross charges). */
-  adsCharges: number;
-  /** Прочие расходы Ozon = charges(adjustments + remainingServices + remainingOther). */
-  otherCharges: number;
-  /** Хранение (flat storage). */
-  storage: number;
-  /** Корректировки и компенсации Ozon = сумма credits всех пяти категорий (доход). */
-  ozonIncome: number;
-  /** Чистые расходы Ozon по taxonomy: charges(log+ads+other)+storage − income. */
-  taxonomyNetOzonExpenses: number;
+/** Пять gross-блоков снапшота (после структурной валидации). */
+export type ParsedFinanceTaxonomy = {
+  logistics: Breakdown;
+  ads: Breakdown;
+  adjustments: Breakdown;
+  remainingServices: Breakdown;
+  remainingOther: Breakdown;
 };
 
 /**
- * Разобрать и провалидировать ai_insights.financeTaxonomy. Возвращает null при
- * любой проблеме (нет снапшота / чужая версия / нечисло / нарушен инвариант /
- * не сходится сверка) — вызывающий тогда использует старый flat-fallback.
- *
- * Сверка (обе стороны обязаны совпасть в пределах допуска):
- *   taxonomyNetOzonExpenses ≈ flat(logistics + ads + storage + other)
- *   commission + taxonomyNetOzonExpenses + cost + tax ≈ stored total_expenses
+ * Есть ли в ai_insights объект financeTaxonomy (ЛЮБОЙ версии/валидности)?
+ * Для fail-closed guard: наличие снапшота у API-расчёта = его нельзя безопасно
+ * редактировать как ручной, независимо от reconciliation.
  */
-export function parseOzonFinanceTaxonomy(
-  aiInsights: unknown,
-  flat: FlatContext
-): OzonTaxonomyView | null {
-  if (!aiInsights || typeof aiInsights !== "object") return null;
-  const ins = aiInsights as Record<string, unknown>;
-  const ft = ins.financeTaxonomy;
-  if (!ft || typeof ft !== "object") return null;
-  const f = ft as Record<string, unknown>;
+export function hasFinanceTaxonomyObject(aiInsights: unknown): boolean {
+  if (!aiInsights || typeof aiInsights !== "object") return false;
+  const ft = (aiInsights as Record<string, unknown>).financeTaxonomy;
+  return !!ft && typeof ft === "object" && !Array.isArray(ft);
+}
 
-  // Только поддерживаемая версия — иначе безопасный flat-fallback.
+/**
+ * СТРУКТУРНАЯ проверка снапшота — БЕЗ сверки с flat-колонками. Возвращает пять
+ * gross-блоков или null (нет объекта / чужая версия / нечисло / нарушен инвариант
+ * shape). НЕ зависит от manual extra expenses.
+ */
+export function parseFinanceTaxonomySnapshot(
+  aiInsights: unknown
+): ParsedFinanceTaxonomy | null {
+  if (!hasFinanceTaxonomyObject(aiInsights)) return null;
+  const f = (aiInsights as Record<string, unknown>).financeTaxonomy as Record<
+    string,
+    unknown
+  >;
+
+  // Только поддерживаемая версия — иначе безопасный flat-fallback для ОТОБРАЖЕНИЯ.
   if (f.classifierVersion !== SUPPORTED_TAXONOMY_VERSION) return null;
 
   // combined logistics === logisticsLegacy + logisticsServices.
@@ -114,31 +108,109 @@ export function parseOzonFinanceTaxonomy(
   const bRO = parseBreakdown(b.remainingOther);
   if (!bLog || !bAds || !bAdj || !bRS || !bRO) return null;
 
-  const logisticsCharges = bLog.charges;
-  const adsCharges = bAds.charges;
-  const otherCharges = round2(bAdj.charges + bRS.charges + bRO.charges);
-  // Доход — сумма credits ВСЕХ пяти категорий (в т.ч. возможные рефанды логистики/
-  // рекламы), чтобы при вычитании сойтись с flat-логистикой/рекламой (которые уже
-  // нетто). Двойного счёта нет: расходные строки берут charges, а не flat-нетто.
+  return {
+    logistics: bLog,
+    ads: bAds,
+    adjustments: bAdj,
+    remainingServices: bRS,
+    remainingOther: bRO,
+  };
+}
+
+/** Flat-колонки записи (положительные расходы) + stored total_expenses — для сверки. */
+export type FlatContext = {
+  commission: number;
+  logistics: number;
+  ads: number;
+  storage: number;
+  other: number;
+  cost: number;
+  tax: number;
+  totalExpenses: number;
+};
+
+/** Провалидированная честная разбивка для UI (всё в ₽, расходы положительные). */
+export type OzonTaxonomyView = {
+  /** Логистика (gross charges). */
+  logisticsCharges: number;
+  /** Реклама и продвижение (gross charges). */
+  adsCharges: number;
+  /** Прочие расходы Ozon = charges(adjustments + remainingServices + remainingOther). */
+  otherCharges: number;
+  /** Хранение (flat storage). */
+  storage: number;
+  /** Дополнительные расходы (packaging/warehouse/salary/manual other из flat other). */
+  manualExtraExpenses: number;
+  /** Корректировки и компенсации Ozon = сумма credits всех пяти категорий (доход). */
+  ozonIncome: number;
+  /** Чистые расходы Ozon по taxonomy: charges(log+ads+other)+storage − income. */
+  taxonomyNetOzonExpenses: number;
+};
+
+/**
+ * Построить провалидированную view из СТРУКТУРНО разобранного снапшота + flat.
+ * Возвращает null, если снапшот несовместим с flat-данными.
+ *
+ * ВАЖНО: flat `other` в API-расчёте содержит НЕ ТОЛЬКО остаток Ozon, но и
+ * ДОПОЛНИТЕЛЬНЫЕ РУЧНЫЕ РАСХОДЫ (packaging/warehouseDelivery/salary/manual other),
+ * которые save-calculation вычитает через netProfit → они оседают в otherExpensesCol.
+ * Поэтому:
+ *   manualExtraRaw = flat(logistics+ads+storage+other) − taxonomyNetOzonExpenses
+ *   • manualExtraRaw ∈ [−0.05, 0]  → нормализуем в 0 (округление);
+ *   • manualExtraRaw < −0.05       → taxonomy net > flat → снапшот несовместим → null;
+ *   • manualExtraRaw ≥ 0           → это ручные доп-расходы, показываем отдельной строкой.
+ * Полная сверка: commission + taxonomyNet + manualExtra + cost + tax ≈ total_expenses.
+ */
+export function buildOzonFinanceTaxonomyView(
+  snapshot: ParsedFinanceTaxonomy,
+  flat: FlatContext
+): OzonTaxonomyView | null {
+  const logisticsCharges = snapshot.logistics.charges;
+  const adsCharges = snapshot.ads.charges;
+  const otherCharges = round2(
+    snapshot.adjustments.charges +
+      snapshot.remainingServices.charges +
+      snapshot.remainingOther.charges
+  );
+  // Доход — сумма credits ВСЕХ пяти категорий (в т.ч. рефанды логистики/рекламы),
+  // чтобы при вычитании сойтись с flat-логистикой/рекламой (уже нетто). Двойного
+  // счёта нет: расходные строки берут charges, а не flat-нетто.
   const ozonIncome = round2(
-    bLog.credits + bAds.credits + bAdj.credits + bRS.credits + bRO.credits
+    snapshot.logistics.credits +
+      snapshot.ads.credits +
+      snapshot.adjustments.credits +
+      snapshot.remainingServices.credits +
+      snapshot.remainingOther.credits
   );
   const storage = flat.storage;
   const taxonomyNetOzonExpenses = round2(
     logisticsCharges + adsCharges + otherCharges + storage - ozonIncome
   );
 
-  // Сверка 1: taxonomy net == flat Ozon-классификация (logistics+ads+storage+other).
-  const flatOzonExpenses = round2(
+  // Разница flat vs taxonomy net = дополнительные ручные расходы, сидящие в flat other.
+  const flatOzonAndManual = round2(
     flat.logistics + flat.ads + flat.storage + flat.other
   );
-  if (Math.abs(taxonomyNetOzonExpenses - flatOzonExpenses) > RECON_TOLERANCE) {
+  const manualExtraRaw = round2(flatOzonAndManual - taxonomyNetOzonExpenses);
+
+  let manualExtraExpenses: number;
+  if (manualExtraRaw < -RECON_TOLERANCE) {
+    // taxonomy net превышает flat → снапшот несовместим с данными → flat fallback.
     return null;
+  } else if (manualExtraRaw <= 0) {
+    manualExtraExpenses = 0; // нормализуем маленький отрицательный (округление) в 0.
+  } else {
+    manualExtraExpenses = round2(manualExtraRaw);
   }
 
-  // Сверка 2: commission + taxonomyNet + cost + tax == stored total_expenses.
+  // Полная сверка: расходы (Ozon net + ручные доп) + себестоимость + налог + комиссия
+  // == stored total_expenses. Ловит рассинхрон flat-колонок и stored total.
   const reconTotal = round2(
-    flat.commission + taxonomyNetOzonExpenses + flat.cost + flat.tax
+    flat.commission +
+      taxonomyNetOzonExpenses +
+      manualExtraExpenses +
+      flat.cost +
+      flat.tax
   );
   if (Math.abs(reconTotal - flat.totalExpenses) > RECON_TOLERANCE) {
     return null;
@@ -149,7 +221,22 @@ export function parseOzonFinanceTaxonomy(
     adsCharges,
     otherCharges,
     storage,
+    manualExtraExpenses,
     ozonIncome,
     taxonomyNetOzonExpenses,
   };
+}
+
+/**
+ * Удобная обёртка: структурный разбор + построение view. Возвращает view или null.
+ * (Для guard используйте hasFinanceTaxonomyObject/parseFinanceTaxonomySnapshot
+ * отдельно — guard НЕ должен зависеть от reconciliation.)
+ */
+export function parseOzonFinanceTaxonomy(
+  aiInsights: unknown,
+  flat: FlatContext
+): OzonTaxonomyView | null {
+  const snapshot = parseFinanceTaxonomySnapshot(aiInsights);
+  if (!snapshot) return null;
+  return buildOzonFinanceTaxonomyView(snapshot, flat);
 }
