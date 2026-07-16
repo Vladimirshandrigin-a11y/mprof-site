@@ -13,6 +13,14 @@
 // services[].price, type, operation_type, amount; result.page_count/row_count).
 // ============================================================================
 
+import {
+  OZON_TAXONOMY_VERSION,
+  accumulateSigned,
+  classifyOperationResidual,
+  emptyChargeCredit,
+  isLogisticsServiceName,
+} from "./taxonomy";
+
 const OZON_TX_URL = "https://api-seller.ozon.ru/v3/finance/transaction/list";
 const PAGE_SIZE = 1000; // максимум Ozon для этого метода
 const MAX_PAGES = 20; // защита: максимум 20×1000 = 20000 операций за вызов
@@ -72,15 +80,45 @@ export type OzonDraftTotals = {
   revenue: number;
   returns: number;
   commission: number;
+  /** Combined signed logistics = logisticsLegacy + logisticsServices. */
   logistics: number;
+  /** Signed delivery_charge + return_delivery_charge (legacy Ozon fields). */
+  logisticsLegacy: number;
+  /** Signed exact logistics service prices (services[].name из LOGISTICS set). */
+  logisticsServices: number;
   storage: number;
+  /** Remaining signed services (без storage и без logistics-services). */
   services: number;
+  /** Signed ads/promotion residual (operation_type из ADS set). */
+  ads: number;
+  /** Signed adjustment/compensation residual (operation_type из ADJUSTMENT set). */
+  adjustments: number;
+  /** Remaining signed residual (неизвестные операции). */
   other: number;
   operationCount: number;
 };
 
+/** Gross-разбивка одной корзины: signedTotal === credits − charges (§8). */
+export type SignedBreakdown = {
+  signedTotal: number;
+  charges: number;
+  credits: number;
+};
+
+/** Signed gross-разбивка по корзинам (для честного будущего UI; UI пока НЕ читает). */
+export type OzonTaxonomyBreakdown = {
+  classifierVersion: string;
+  logistics: SignedBreakdown;
+  ads: SignedBreakdown;
+  adjustments: SignedBreakdown;
+  remainingServices: SignedBreakdown;
+  remainingOther: SignedBreakdown;
+};
+
 export type OzonDraftAggregate = {
   totals: OzonDraftTotals;
+  /** Точная gross-разбивка (charges/credits) по классифицированным корзинам. */
+  taxonomy: OzonTaxonomyBreakdown;
   warnings: string[];
   notes: string[];
 };
@@ -253,13 +291,25 @@ export function aggregateDraft(
     returns: 0,
     commission: 0,
     logistics: 0,
+    logisticsLegacy: 0,
+    logisticsServices: 0,
     storage: 0,
     services: 0,
+    ads: 0,
+    adjustments: 0,
     other: 0,
     operationCount: operations.length,
   };
   const warnings: string[] = [];
   const notes: string[] = [];
+
+  // Gross charges/credits по классифицированным корзинам — накапливаем из
+  // ОТДЕЛЬНЫХ signed-значений (не восстанавливаем из netted итога).
+  const ccLogistics = emptyChargeCredit();
+  const ccAds = emptyChargeCredit();
+  const ccAdjustments = emptyChargeCredit();
+  const ccServices = emptyChargeCredit();
+  const ccOther = emptyChargeCredit();
 
   let storageDetected = false;
   let servicesSeen = false;
@@ -274,10 +324,15 @@ export function aggregateDraft(
 
     totals.revenue += accr;
     totals.commission += comm;
-    totals.logistics += deliv + retDeliv;
+    // Legacy-логистика (поля delivery). Для июня 0, но семантику сохраняем.
+    totals.logisticsLegacy += deliv + retDeliv;
+    accumulateSigned(ccLogistics, deliv);
+    accumulateSigned(ccLogistics, retDeliv);
     if (isReturnOp(op)) totals.returns += accr;
 
-    // Сумма услуг этой операции — для разбивки storage/services И для residual ниже.
+    // Сумма услуг этой операции — для разбивки storage/logistics/services И для
+    // residual ниже. Порядок: storage (существующий маркер, НЕ сужаем) →
+    // точная logistics-строка (exact name) → остальное в services.
     let serviceSum = 0;
     if (Array.isArray(op.services)) {
       for (const s of op.services) {
@@ -289,36 +344,74 @@ export function aggregateDraft(
         if (isStorageMarker(name, op.operation_type ?? "")) {
           totals.storage += price;
           storageDetected = true;
+        } else if (isLogisticsServiceName(name)) {
+          // Точная логистическая service-строка → logisticsServices (НЕ в services).
+          totals.logisticsServices += price;
+          accumulateSigned(ccLogistics, price);
         } else {
           totals.services += price;
+          accumulateSigned(ccServices, price);
         }
       }
     }
 
     // op.amount — БОЕВОЙ net Ozon по операции (источник истины). Компоненты выше —
-    // только разбивка. Остаток amount, не разложенный в компоненты (реклама,
-    // доставка, штрафы, корректировки, услуги партнёров и пр.), НЕ теряем — относим
-    // в «Прочие». Для полностью нераспознанной операции componentSum=0 → residual
-    // равен всему amount (как в прежней логике). Инвариант: сумма всех бакетов
-    // (revenue+commission+logistics+services+storage+other) === Σ amount.
+    // только разбивка. Классифицируем ТОЛЬКО residual (amount − распознанные
+    // компоненты), НИКОГДА не переносим полный amount, если операция содержит
+    // выручку/комиссию/service-компоненты. Точная классификация residual по
+    // operation_type: реклама → ads, корректировка → adjustments, иначе → «Прочие».
+    // Инвариант суммы бакетов сохраняется: ads+adjustments+other == прежний other.
     const amount = num(op.amount);
     const componentSum = accr + comm + deliv + retDeliv + serviceSum;
     const residual = amount - componentSum;
     if (round2(residual) !== 0) {
-      totals.other += residual;
-      unclassifiedAmount += residual;
-      if (op.operation_type) unknownTypes.add(op.operation_type);
+      const kind = classifyOperationResidual(op.operation_type ?? "");
+      if (kind === "ads") {
+        totals.ads += residual;
+        accumulateSigned(ccAds, residual);
+      } else if (kind === "adjustment") {
+        totals.adjustments += residual;
+        accumulateSigned(ccAdjustments, residual);
+      } else {
+        totals.other += residual;
+        accumulateSigned(ccOther, residual);
+        unclassifiedAmount += residual;
+        if (op.operation_type) unknownTypes.add(op.operation_type);
+      }
     }
   }
+
+  // Combined logistics = legacy + services (breakdown внутри logistics).
+  totals.logistics = totals.logisticsLegacy + totals.logisticsServices;
 
   // Округляем денежные суммы до копеек (operationCount не трогаем).
   totals.revenue = round2(totals.revenue);
   totals.returns = round2(totals.returns);
   totals.commission = round2(totals.commission);
   totals.logistics = round2(totals.logistics);
+  totals.logisticsLegacy = round2(totals.logisticsLegacy);
+  totals.logisticsServices = round2(totals.logisticsServices);
   totals.storage = round2(totals.storage);
   totals.services = round2(totals.services);
+  totals.ads = round2(totals.ads);
+  totals.adjustments = round2(totals.adjustments);
   totals.other = round2(totals.other);
+
+  // Signed gross-разбивка: charges/credits округляем, signedTotal := credits − charges
+  // (по построению === соответствующему bucket-итогу до копейки).
+  const mkBreakdown = (acc: { charges: number; credits: number }): SignedBreakdown => {
+    const charges = round2(acc.charges);
+    const credits = round2(acc.credits);
+    return { signedTotal: round2(credits - charges), charges, credits };
+  };
+  const taxonomy: OzonTaxonomyBreakdown = {
+    classifierVersion: OZON_TAXONOMY_VERSION,
+    logistics: mkBreakdown(ccLogistics),
+    ads: mkBreakdown(ccAds),
+    adjustments: mkBreakdown(ccAdjustments),
+    remainingServices: mkBreakdown(ccServices),
+    remainingOther: mkBreakdown(ccOther),
+  };
 
   // ---- предупреждения / пояснения ----
   if (partial) {
@@ -351,5 +444,5 @@ export function aggregateDraft(
     }
   }
 
-  return { totals, warnings, notes };
+  return { totals, taxonomy, warnings, notes };
 }
