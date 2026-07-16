@@ -303,9 +303,13 @@ export async function POST(req: NextRequest) {
   // в ai_insights (тот же приём, что у файлового net-profit расчёта).
   const revenue = round2(t.revenue);
   const commissionCol = round2(Math.max(0, -t.commission));
+  // logisticsCol теперь использует COMBINED signed logistics (legacy delivery-поля
+  // + точные logistics-services из классификатора PR A) — оба в t.logistics.
   const logisticsCol = round2(Math.max(0, -t.logistics));
   const storageCol = round2(Math.max(0, -t.storage));
-  const adsCol = 0;
+  // ads больше НЕ хардкод-ноль: берём из signed ads-бакета классификатора
+  // (реклама/продвижение — списание, т.е. t.ads ≤ 0 → -t.ads ≥ 0).
+  const adsCol = round2(Math.max(0, -t.ads));
   const costCol = round2(c.matchedCostTotal);
   const taxCol = c.manualExpenses.tax;
   const otherExpensesCol = round2(
@@ -314,6 +318,32 @@ export async function POST(req: NextRequest) {
   const totalExpensesCol = round2(
     commissionCol + logisticsCol + storageCol + adsCol + costCol + taxCol + otherExpensesCol
   );
+
+  // Точная signed-разбивка классификатора PR A. Только безопасные агрегаты
+  // (никаких raw operations / order / SKU / offer_id / product_id / ключей).
+  const tx = loaded.draft.taxonomy;
+  const financeTaxonomy = {
+    classifierVersion: tx.classifierVersion,
+    sourceEndpoint: "https://api-seller.ozon.ru/v3/finance/transaction/list",
+    operationCount: t.operationCount,
+    // signed итоги по корзинам
+    logistics: t.logistics,
+    logisticsLegacy: t.logisticsLegacy,
+    logisticsServices: t.logisticsServices,
+    ads: t.ads,
+    adjustments: t.adjustments,
+    remainingServices: t.services,
+    storage: t.storage,
+    remainingOther: t.other,
+    // gross-разбивка (signedTotal === credits − charges), накоплена из отдельных строк
+    breakdown: {
+      logistics: tx.logistics,
+      ads: tx.ads,
+      adjustments: tx.adjustments,
+      remainingServices: tx.remainingServices,
+      remainingOther: tx.remainingOther,
+    },
+  };
 
   const snapshot = {
     kind: "ozon-api-v1",
@@ -324,11 +354,16 @@ export async function POST(req: NextRequest) {
       returns: t.returns,
       commission: t.commission,
       logistics: t.logistics,
+      logisticsLegacy: t.logisticsLegacy,
+      logisticsServices: t.logisticsServices,
       services: t.services,
+      ads: t.ads,
+      adjustments: t.adjustments,
       storage: t.storage,
       other: t.other,
       operationCount: t.operationCount,
     },
+    financeTaxonomy,
     productCoverage: loaded.cost.coverage,
     cost: {
       matchedCostTotal: c.matchedCostTotal,

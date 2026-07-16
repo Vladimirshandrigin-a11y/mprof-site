@@ -192,12 +192,19 @@ export function computeApiProfit(
   realizationRevenueForTax: number,
   manualExpenses: ManualExpenses
 ): ApiProfitComputed {
+  // Ads и adjustments раньше были частью other (residual). Классификатор PR A
+  // ВЫДЕЛИЛ их в отдельные signed-бакеты, поэтому теперь суммируем их явно —
+  // сумма идентична прежней (ads+adjustments+other == прежний other), значит
+  // ozonOperationsTotal и netProfit не меняются ни на копейку. logisticsLegacy/
+  // logisticsServices — breakdown ВНУТРИ logistics, второй раз НЕ прибавляем.
   const ozonOperationsTotal = round2(
     totals.revenue +
       totals.commission +
       totals.logistics +
       totals.services +
       totals.storage +
+      totals.ads +
+      totals.adjustments +
       totals.other
   );
   // Боевая себестоимость = из отчёта о реализации Ozon (bySaleQty), НЕ из
@@ -369,7 +376,11 @@ export type ApiProfitResponseBody = {
     returns: number;
     commission: number;
     logistics: number;
+    logisticsLegacy: number;
+    logisticsServices: number;
     services: number;
+    ads: number;
+    adjustments: number;
     storage: number;
     other: number;
     operationCount: number;
@@ -425,7 +436,11 @@ export function buildApiProfitResponseBody(params: {
       returns: t.returns,
       commission: t.commission,
       logistics: t.logistics,
+      logisticsLegacy: t.logisticsLegacy,
+      logisticsServices: t.logisticsServices,
       services: t.services,
+      ads: t.ads,
+      adjustments: t.adjustments,
       storage: t.storage,
       other: t.other,
       operationCount: t.operationCount,
