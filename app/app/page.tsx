@@ -7825,6 +7825,58 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   .mcalc-actions .mcalc-clear{flex:0 0 auto;width:100%}
 }
 
+/* view-only: премиальная карточка дохода-компенсаций Ozon (открытый API-расчёт) */
+.api-comp-card{
+  margin-top:1.4rem;padding:1rem 1.1rem 1.05rem;border-radius:14px;
+  border:1px solid rgba(46,204,138,.28);
+  background:
+    radial-gradient(120% 140% at 100% 0%, rgba(46,204,138,.10), transparent 60%),
+    linear-gradient(160deg, rgba(46,204,138,.07), rgba(13,16,32,.62));
+  box-shadow:0 10px 30px rgba(0,0,0,.26), 0 0 30px rgba(46,204,138,.06)
+}
+.api-comp-top{display:flex;align-items:center;justify-content:space-between;
+  gap:.6rem;flex-wrap:wrap;margin-bottom:.7rem}
+.api-comp-eyebrow{display:inline-flex;align-items:center;gap:.5rem;min-width:0;
+  font-family:var(--mono);font-size:.62rem;font-weight:600;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--green)}
+.api-comp-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;
+  background:var(--green);box-shadow:0 0 10px rgba(46,204,138,.5)}
+.api-comp-badge{display:inline-flex;align-items:center;white-space:nowrap;
+  font-family:var(--sans);font-size:.62rem;font-weight:600;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--green);padding:3px 9px;border-radius:100px;
+  background:rgba(46,204,138,.10);border:1px solid rgba(46,204,138,.3)}
+.api-comp-main{display:flex;align-items:baseline;justify-content:space-between;
+  gap:.7rem 1rem;flex-wrap:wrap}
+.api-comp-title{flex:1 1 auto;min-width:0;font-family:var(--sans);
+  font-size:1rem;font-weight:600;color:var(--txt);overflow-wrap:anywhere}
+.api-comp-value{flex:0 0 auto;font-family:var(--display);
+  font-size:clamp(1.4rem,4.6vw,1.75rem);font-weight:700;letter-spacing:-.02em;
+  color:var(--green);white-space:nowrap}
+.api-comp-description{margin:.55rem 0 0;font-family:var(--sans);font-size:.8rem;
+  font-weight:300;line-height:1.5;color:var(--txt2);overflow-wrap:anywhere}
+.api-comp-footnote{margin:.4rem 0 0;font-family:var(--sans);font-size:.74rem;
+  font-weight:400;line-height:1.45;color:var(--green);opacity:.9;overflow-wrap:anywhere}
+@media(max-width:560px){
+  .api-comp-main{flex-direction:column;align-items:flex-start;gap:.25rem}
+}
+
+/* view-only: компактная двухстрочная подсказка режима просмотра */
+.api-view-actions{align-items:center}
+.api-view-actions .mcalc-clear{flex:0 0 auto}
+.api-view-notice{flex:1 1 auto;min-width:0;display:flex;align-items:flex-start;gap:.6rem;
+  padding:.7rem .9rem;border-radius:12px;
+  background:linear-gradient(160deg,rgba(201,168,76,.07),rgba(13,16,32,.6));
+  border:1px solid rgba(201,168,76,.2)}
+.api-view-notice-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:.35rem;
+  background:var(--gold);box-shadow:0 0 10px rgba(201,168,76,.5)}
+.api-view-notice-body{display:flex;flex-direction:column;gap:.15rem;min-width:0}
+.api-view-notice-title{font-family:var(--sans);font-size:.82rem;font-weight:600;color:var(--txt)}
+.api-view-notice-text{font-family:var(--sans);font-size:.76rem;font-weight:300;line-height:1.45;
+  color:var(--txt2);white-space:normal;overflow-wrap:anywhere}
+@media(max-width:560px){
+  .api-view-actions{align-items:stretch}
+}
+
 .result-card{background:linear-gradient(135deg,var(--panel) 0%,rgba(201,168,76,.05) 100%);
   border:1px solid rgba(201,168,76,.3);border-radius:14px;overflow:hidden;
   box-shadow:0 24px 60px rgba(0,0,0,.35),0 0 50px rgba(201,168,76,.06)}
@@ -7839,12 +7891,17 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .res-margin.pos{color:var(--green);border-color:rgba(46,204,138,.3);background:rgba(46,204,138,.08)}
 .res-margin.neg{color:var(--red);border-color:rgba(224,85,102,.3);background:rgba(224,85,102,.08)}
 .res-rows{padding:1.2rem 1.5rem}
-.res-row{display:flex;justify-content:space-between;align-items:center;padding:.6rem 0;
+.res-row{display:flex;justify-content:space-between;align-items:center;gap:.75rem;padding:.6rem 0;
   border-bottom:1px solid var(--edge);font-size:.85rem}
 .res-row:last-child{border-bottom:none}
-.res-row .rl{color:var(--txt2)}
-.res-row .rv{font-family:var(--mono);font-weight:500;color:var(--txt)}
+.res-row .rl{color:var(--txt2);min-width:0}
+.res-row .rv{font-family:var(--mono);font-weight:500;color:var(--txt);flex-shrink:0;white-space:nowrap}
 .res-row .rv.neg{color:var(--red)}
+.res-row .rv.income{color:var(--green)}
+.res-row .rl-tag{display:inline-block;margin-left:.4rem;font-family:var(--mono);font-size:.58rem;
+  font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--green);
+  padding:1px 6px;border-radius:100px;background:rgba(46,204,138,.1);
+  border:1px solid rgba(46,204,138,.28);vertical-align:middle}
 
 .empty-res{padding:3rem 1.5rem;text-align:center;color:var(--txt3)}
 .empty-icon{font-size:2rem;opacity:.4;margin-bottom:.7rem;display:block}
@@ -9120,34 +9177,44 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               </div>
 
               {loadedApiView && loadedApiView.compensations > 0 && (
-                <div className="mcalc-group income" aria-label="Корректировки и компенсации Ozon">
-                  <div className="mcalc-group-label">
-                    <span className="mcalc-group-dot income" aria-hidden="true" />
-                    Корректировки и компенсации Ozon
-                  </div>
-                  <div className="fld">
-                    <div className="in-wrap">
-                      <input
-                        type="text"
-                        readOnly
-                        aria-readonly="true"
-                        value={"+" + fmt(Math.round(loadedApiView.compensations)) + " ₽"}
-                      />
-                    </div>
-                    <span className="fld-hint">
-                      Доход из отчёта Ozon (учтён в сохранённой прибыли). Прибавляется к прибыли, не вычитается.
+                <div className="api-comp-card">
+                  <div className="api-comp-top">
+                    <span className="api-comp-eyebrow">
+                      <span className="api-comp-dot" aria-hidden="true" />
+                      Доход от Ozon
                     </span>
+                    <span className="api-comp-badge">Учтено в прибыли</span>
                   </div>
+                  <div className="api-comp-main">
+                    <span className="api-comp-title">Корректировки и компенсации</span>
+                    <output
+                      className="api-comp-value"
+                      aria-label={
+                        "Корректировки и компенсации Ozon: доход плюс " +
+                        fmt(Math.round(loadedApiView.compensations)) +
+                        " рублей, уже учтён в сохранённой чистой прибыли"
+                      }
+                    >
+                      +{fmt(Math.round(loadedApiView.compensations))} ₽
+                    </output>
+                  </div>
+                  <p className="api-comp-description">
+                    Возмещения по спорам, потерям и положительные корректировки Ozon.
+                  </p>
+                  <p className="api-comp-footnote">
+                    Эта сумма уже прибавлена к сохранённой чистой прибыли.
+                  </p>
                 </div>
               )}
 
               {loadedApiView ? (
-                <div className="btn-row mcalc-actions">
-                  <div className="upgrade-hint" role="region" aria-label="Сохранённый расчёт из Ozon API">
-                    <div className="upgrade-hint-left">
-                      <span className="upgrade-hint-dot" aria-hidden="true" />
-                      <span className="upgrade-hint-text">
-                        Это сохранённый расчёт из Ozon API — открыт для просмотра. Редактирование и пересчёт добавим следующим шагом.
+                <div className="btn-row mcalc-actions api-view-actions">
+                  <div className="api-view-notice" role="region" aria-label="Сохранённый расчёт Ozon API">
+                    <span className="api-view-notice-dot" aria-hidden="true" />
+                    <div className="api-view-notice-body">
+                      <span className="api-view-notice-title">Сохранённый расчёт Ozon API</span>
+                      <span className="api-view-notice-text">
+                        Открыт для просмотра. Чтобы вернуться к обычному калькулятору, очистите форму.
                       </span>
                     </div>
                   </div>
@@ -9302,10 +9369,30 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     <span className="rl">Выручка</span>
                     <span className="rv">{fmt(result.revenue)} ₽</span>
                   </div>
-                  <div className="res-row">
-                    <span className="rl">Сумма расходов</span>
-                    <span className="rv neg">− {fmt(result.expenses)} ₽</span>
-                  </div>
+                  {loadedApiView && loadedApiView.compensations > 0 ? (
+                    <>
+                      <div className="res-row">
+                        <span className="rl">Расходы до компенсаций</span>
+                        <span className="rv neg">
+                          − {fmt(result.expenses + loadedApiView.compensations)} ₽
+                        </span>
+                      </div>
+                      <div className="res-row">
+                        <span className="rl">
+                          Корректировки Ozon
+                          <span className="rl-tag">доход</span>
+                        </span>
+                        <span className="rv income">
+                          + {fmt(Math.round(loadedApiView.compensations))} ₽
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="res-row">
+                      <span className="rl">Сумма расходов</span>
+                      <span className="rv neg">− {fmt(result.expenses)} ₽</span>
+                    </div>
+                  )}
                   <div className="res-row">
                     <span className="rl">Чистая прибыль</span>
                     <span className="rv">
