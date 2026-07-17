@@ -267,21 +267,19 @@ function ozonTaxonomyView(h: CalcResult): OzonTaxonomyView | null {
 }
 
 /**
- * fail-closed guard: можно ли этот расчёт безопасно загрузить/редактировать как
- * РУЧНОЙ? НЕ зависит от reconciliation view (та может быть null из-за ручных
- * доп-расходов). Блокируем:
- *   • любой API-расчёт с объектом financeTaxonomy — валидным, неизвестной версии
- *     или повреждённым (fail-closed): в нём есть отдельные корректировки/
- *     компенсации, ручной калькулятор их не представит;
- *   • старый API-расчёт без taxonomy, но с отрицательным other (net-компенсации
+ * fail-closed guard: расчёт НЕЛЬЗЯ безопасно открыть в калькуляторе? Блокируем
+ * (показ warning, форма не меняется) ТОЛЬКО реально небезопасные API-случаи:
+ *   • есть объект financeTaxonomy, но провалидированная view не строится
+ *     (битый/несводимый снапшот) — доверять такому нельзя;
+ *   • снапшота нет, но flat other < 0 (старый API с нетто-компенсациями, который
  *     нельзя показать положительным ручным расходом).
+ * Валидный API-taxonomy расчёт (view строится) открывается в режиме просмотра.
  * Manual/upload и старый API с неотрицательным other загружаются как раньше.
  */
-function isApiCalcUneditableAsManual(h: CalcResult): boolean {
+function isApiCalcUnsafeToLoad(h: CalcResult): boolean {
   if (h.mode !== "api") return false;
-  if (hasFinanceTaxonomyObject(h.aiInsights)) return true;
-  if ((Number(h.other) || 0) < 0) return true;
-  return false;
+  if (hasFinanceTaxonomyObject(h.aiInsights)) return ozonTaxonomyView(h) === null;
+  return (Number(h.other) || 0) < 0;
 }
 
 /**
@@ -1425,6 +1423,10 @@ export default function AppPage() {
   const [importError, setImportError] = useState("");
   const [importResult, setImportResult] = useState<OzonImportMissingResponse | null>(null);
   const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("upload");
+  // Открыт сохранённый Ozon API-расчёт ТОЛЬКО для просмотра (view-only): поля
+  // заполнены и read-only, кнопка «Рассчитать» скрыта. null → обычный
+  // редактируемый ручной калькулятор. Выход из просмотра — «Очистить форму».
+  const [loadedApiView, setLoadedApiView] = useState<{ compensations: number } | null>(null);
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
   // когда user отсутствует, и тогда всегда показываем калькулятор.
@@ -2447,14 +2449,12 @@ export default function AppPage() {
    * увидел подставленный расчёт.
    */
   const loadCalcIntoCalculator = (item: CalcResult) => {
-    // PR B guard (mode-crossing), fail-closed: API-расчёт с taxonomy-снапшотом (или
-    // отрицательным other) содержит отдельные корректировки/компенсации и не
-    // представим полем «Прочие расходы» ручного калькулятора. Смотреть в истории
-    // можно, редактировать как ручной — нельзя. Guard НЕ зависит от reconciliation
-    // (не отключается ручными доп-расходами) и стоит ВНУТРИ функции — обойти нельзя.
-    if (isApiCalcUneditableAsManual(item)) {
+    // fail-closed: реально небезопасные API-расчёты (битый/несводимый taxonomy-
+    // снапшот, либо старый API без снапшота с отрицательным other) открыть в
+    // калькуляторе нельзя — только warning, форма не меняется.
+    if (isApiCalcUnsafeToLoad(item)) {
       showToast(
-        "Этот расчёт получен через Ozon API и содержит отдельные корректировки и компенсации. Его можно просмотреть в истории, но нельзя безопасно редактировать как ручной расчёт.",
+        "Этот расчёт получен через Ozon API, но его финансовый снапшот повреждён или не сводится, поэтому его нельзя открыть в калькуляторе. Данные видны в истории.",
         "warn"
       );
       return;
@@ -2462,13 +2462,45 @@ export default function AppPage() {
     // Клик мог прийти со вкладки «Отчёты» — возвращаем пользователя к
     // калькулятору, где восстанавливается выбранный расчёт.
     setMainTab("calc");
+
+    // Валидный Ozon API-расчёт с financeTaxonomy → открываем в ручном калькуляторе
+    // ТОЛЬКО для просмотра (view-only). Поля заполняем через taxonomy-view: логистика
+    // и реклама отдельными строками, other = прочие Ozon + ручные доп-расходы,
+    // компенсации — отдельной зелёной доходной строкой (loadedApiView). Итог берём из
+    // сохранённого result. Ничего не пересчитываем и в БД не пишем (только setState).
+    const apiView = item.mode === "api" ? ozonTaxonomyView(item) : null;
+    if (apiView) {
+      const s = (n: number) => String(Math.round(n));
+      setCalcMode("manual");
+      setMarketplace(item.marketplace);
+      setForm({
+        revenue: s(item.revenue),
+        commission: s(item.commission),
+        logistics: s(apiView.logisticsCharges),
+        storage: s(apiView.storage),
+        ads: s(apiView.adsCharges),
+        cost: s(item.cost),
+        tax: s(item.tax),
+        other: s(apiView.otherCharges + apiView.manualExtraExpenses),
+      });
+      setLoadedApiView({ compensations: apiView.ozonIncome });
+      setResult(item);
+      setShowProfitForm(false);
+      setSelectedId(item.id);
+      setPendingCalcScroll(true);
+      return;
+    }
+
     const breakdown = asNetProfitBreakdown(item.aiInsights);
     if (breakdown) {
       // Upload-расчёт: вся логика восстановления уже в restoreUploadCalc.
+      setLoadedApiView(null);
       restoreUploadCalc(item);
     } else {
-      // Ручной расчёт: восстанавливаем форму параметров и итоговый результат.
+      // Ручной расчёт (или старый API с неотрицательным other): восстанавливаем
+      // форму и итог, режим — обычный редактируемый (view-only снимаем).
       const s = (n: number) => String(Math.round(n));
+      setLoadedApiView(null);
       setCalcMode("manual");
       setMarketplace(item.marketplace);
       setForm({
@@ -4787,6 +4819,8 @@ export default function AppPage() {
   };
 
   const handleField = (key: string, value: string) => {
+    // В режиме просмотра сохранённого API-расчёта (view-only) поля не редактируются.
+    if (loadedApiView) return;
     if (value !== "" && !/^-?\d*[.,]?\d*$/.test(value)) return;
     setForm((prev) => ({ ...prev, [key]: value }));
   };
@@ -4991,6 +5025,7 @@ export default function AppPage() {
   const clearForm = () => {
     setForm({ ...EMPTY });
     setResult(null);
+    setLoadedApiView(null);
 
     window.scrollTo({
       top: 0,
@@ -9074,6 +9109,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         value={form[f.key]}
                         onChange={(e) => handleField(f.key, e.target.value)}
                         disabled={isCalculating}
+                        readOnly={loadedApiView !== null}
+                        aria-readonly={loadedApiView !== null || undefined}
                       />
                       <span className="in-cur">₽</span>
                     </div>
@@ -9082,7 +9119,47 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 ))}
               </div>
 
-              {canCalculate || !entitlementsLoaded ? (
+              {loadedApiView && loadedApiView.compensations > 0 && (
+                <div className="mcalc-group income" aria-label="Корректировки и компенсации Ozon">
+                  <div className="mcalc-group-label">
+                    <span className="mcalc-group-dot income" aria-hidden="true" />
+                    Корректировки и компенсации Ozon
+                  </div>
+                  <div className="fld">
+                    <div className="in-wrap">
+                      <input
+                        type="text"
+                        readOnly
+                        aria-readonly="true"
+                        value={"+" + fmt(Math.round(loadedApiView.compensations)) + " ₽"}
+                      />
+                    </div>
+                    <span className="fld-hint">
+                      Доход из отчёта Ozon (учтён в сохранённой прибыли). Прибавляется к прибыли, не вычитается.
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {loadedApiView ? (
+                <div className="btn-row mcalc-actions">
+                  <div className="upgrade-hint" role="region" aria-label="Сохранённый расчёт из Ozon API">
+                    <div className="upgrade-hint-left">
+                      <span className="upgrade-hint-dot" aria-hidden="true" />
+                      <span className="upgrade-hint-text">
+                        Это сохранённый расчёт из Ozon API — открыт для просмотра. Редактирование и пересчёт добавим следующим шагом.
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    className="btn-ghost mcalc-clear"
+                    onClick={clearForm}
+                    disabled={isCalculating}
+                  >
+                    Очистить форму
+                  </button>
+                </div>
+              ) : canCalculate || !entitlementsLoaded ? (
                 <div className="btn-row mcalc-actions">
                   <button
                     className="btn-gold mcalc-calc"
