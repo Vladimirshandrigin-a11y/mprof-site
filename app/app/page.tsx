@@ -7825,40 +7825,19 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   .mcalc-actions .mcalc-clear{flex:0 0 auto;width:100%}
 }
 
-/* view-only: премиальная карточка дохода-компенсаций Ozon (открытый API-расчёт) */
-.api-comp-card{
-  margin-top:1.4rem;padding:1rem 1.1rem 1.05rem;border-radius:14px;
-  border:1px solid rgba(46,204,138,.28);
-  background:
-    radial-gradient(120% 140% at 100% 0%, rgba(46,204,138,.10), transparent 60%),
-    linear-gradient(160deg, rgba(46,204,138,.07), rgba(13,16,32,.62));
-  box-shadow:0 10px 30px rgba(0,0,0,.26), 0 0 30px rgba(46,204,138,.06)
-}
-.api-comp-top{display:flex;align-items:center;justify-content:space-between;
-  gap:.6rem;flex-wrap:wrap;margin-bottom:.7rem}
-.api-comp-eyebrow{display:inline-flex;align-items:center;gap:.5rem;min-width:0;
-  font-family:var(--mono);font-size:.62rem;font-weight:600;letter-spacing:.16em;
-  text-transform:uppercase;color:var(--green)}
-.api-comp-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;
-  background:var(--green);box-shadow:0 0 10px rgba(46,204,138,.5)}
-.api-comp-badge{display:inline-flex;align-items:center;white-space:nowrap;
-  font-family:var(--sans);font-size:.62rem;font-weight:600;letter-spacing:.05em;
-  text-transform:uppercase;color:var(--green);padding:3px 9px;border-radius:100px;
-  background:rgba(46,204,138,.10);border:1px solid rgba(46,204,138,.3)}
-.api-comp-main{display:flex;align-items:baseline;justify-content:space-between;
-  gap:.7rem 1rem;flex-wrap:wrap}
-.api-comp-title{flex:1 1 auto;min-width:0;font-family:var(--sans);
-  font-size:1rem;font-weight:600;color:var(--txt);overflow-wrap:anywhere}
-.api-comp-value{flex:0 0 auto;font-family:var(--display);
-  font-size:clamp(1.4rem,4.6vw,1.75rem);font-weight:700;letter-spacing:-.02em;
-  color:var(--green);white-space:nowrap}
-.api-comp-description{margin:.55rem 0 0;font-family:var(--sans);font-size:.8rem;
-  font-weight:300;line-height:1.5;color:var(--txt2);overflow-wrap:anywhere}
-.api-comp-footnote{margin:.4rem 0 0;font-family:var(--sans);font-size:.74rem;
-  font-weight:400;line-height:1.45;color:var(--green);opacity:.9;overflow-wrap:anywhere}
-@media(max-width:560px){
-  .api-comp-main{flex-direction:column;align-items:flex-start;gap:.25rem}
-}
+/* view-only: компактный full-width пункт «Дополнительный доход» (компенсации Ozon) */
+.api-additional-income{grid-column:1 / -1;display:flex;flex-direction:column;gap:6px;margin-top:.2rem}
+.api-additional-income-label{display:flex;flex-direction:column;gap:1px;min-width:0}
+.api-additional-income-label span{font-family:var(--mono);font-size:.6rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--txt2);white-space:normal;overflow-wrap:anywhere}
+.api-additional-income-label small{font-family:var(--sans);font-size:.66rem;font-weight:300;
+  color:var(--txt3);line-height:1.35;white-space:normal;overflow-wrap:anywhere}
+.api-additional-income-box{display:flex;align-items:center;justify-content:center;width:100%;
+  background:rgba(255,255,255,.04);border:1px solid var(--edge2);border-radius:10px;
+  padding:12px 14px;min-width:0}
+.api-additional-income-value{font-family:var(--display);font-size:1.2rem;font-weight:700;
+  letter-spacing:-.01em;color:var(--green);white-space:nowrap;text-align:center}
+.api-additional-income-hint{font-size:.62rem;font-weight:300;color:var(--txt3);overflow-wrap:anywhere}
 
 /* view-only: компактная двухстрочная подсказка режима просмотра */
 .api-view-actions{align-items:center}
@@ -7898,10 +7877,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .res-row .rv{font-family:var(--mono);font-weight:500;color:var(--txt);flex-shrink:0;white-space:nowrap}
 .res-row .rv.neg{color:var(--red)}
 .res-row .rv.income{color:var(--green)}
-.res-row .rl-tag{display:inline-block;margin-left:.4rem;font-family:var(--mono);font-size:.58rem;
-  font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--green);
-  padding:1px 6px;border-radius:100px;background:rgba(46,204,138,.1);
-  border:1px solid rgba(46,204,138,.28);vertical-align:middle}
 
 .empty-res{padding:3rem 1.5rem;text-align:center;color:var(--txt3)}
 .empty-icon{font-size:2rem;opacity:.4;margin-bottom:.7rem;display:block}
@@ -9174,38 +9149,33 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     {f.hint && <span className="fld-hint">{f.hint}</span>}
                   </div>
                 ))}
+                {loadedApiView && loadedApiView.compensations > 0 && (
+                  <div
+                    className="api-additional-income"
+                    aria-label="Дополнительный доход — корректировки и компенсации Ozon"
+                  >
+                    <div className="api-additional-income-label">
+                      <span>Дополнительный доход</span>
+                      <small>(корректировки и компенсации Ozon)</small>
+                    </div>
+                    <div className="api-additional-income-box">
+                      <output
+                        className="api-additional-income-value"
+                        aria-label={
+                          "Дополнительный доход: " +
+                          fmt(Math.round(loadedApiView.compensations)) +
+                          " рублей, уже учтён в чистой прибыли"
+                        }
+                      >
+                        +{fmt(Math.round(loadedApiView.compensations))} ₽
+                      </output>
+                    </div>
+                    <div className="api-additional-income-hint">
+                      Уже учтён в чистой прибыли.
+                    </div>
+                  </div>
+                )}
               </div>
-
-              {loadedApiView && loadedApiView.compensations > 0 && (
-                <div className="api-comp-card">
-                  <div className="api-comp-top">
-                    <span className="api-comp-eyebrow">
-                      <span className="api-comp-dot" aria-hidden="true" />
-                      Доход от Ozon
-                    </span>
-                    <span className="api-comp-badge">Учтено в прибыли</span>
-                  </div>
-                  <div className="api-comp-main">
-                    <span className="api-comp-title">Корректировки и компенсации</span>
-                    <output
-                      className="api-comp-value"
-                      aria-label={
-                        "Корректировки и компенсации Ozon: доход плюс " +
-                        fmt(Math.round(loadedApiView.compensations)) +
-                        " рублей, уже учтён в сохранённой чистой прибыли"
-                      }
-                    >
-                      +{fmt(Math.round(loadedApiView.compensations))} ₽
-                    </output>
-                  </div>
-                  <p className="api-comp-description">
-                    Возмещения по спорам, потерям и положительные корректировки Ozon.
-                  </p>
-                  <p className="api-comp-footnote">
-                    Эта сумма уже прибавлена к сохранённой чистой прибыли.
-                  </p>
-                </div>
-              )}
 
               {loadedApiView ? (
                 <div className="btn-row mcalc-actions api-view-actions">
@@ -9378,10 +9348,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         </span>
                       </div>
                       <div className="res-row">
-                        <span className="rl">
-                          Корректировки Ozon
-                          <span className="rl-tag">доход</span>
-                        </span>
+                        <span className="rl">Корректировки Ozon</span>
                         <span className="rv income">
                           + {fmt(Math.round(loadedApiView.compensations))} ₽
                         </span>
