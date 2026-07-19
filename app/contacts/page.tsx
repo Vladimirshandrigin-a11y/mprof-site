@@ -36,7 +36,7 @@ export default function ContactsPage() {
       <h2>О сервисе</h2>
       <p>
         M-Prof — сервис автоматического расчета чистой прибыли для продавцов
-        маркетплейсов Ozon и Wildberries.
+        маркетплейса Ozon.
       </p>
     </LegalPage>
   );
