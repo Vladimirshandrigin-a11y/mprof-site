@@ -7250,7 +7250,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 /* === ВКЛАДКА «ОТЧЁТЫ»: финансовая таблица (fin-*) === */
 .reports-summary{
   display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);
-  gap:.75rem;align-items:start
+  /* stretch: обе карточки в одной grid-строке (desktop/tablet) выравниваются по
+     высоте самой высокой — верх/низ совпадают, без фиксированной высоты и обрезки.
+     На mobile (1 колонка, ниже) каждая карточка в своей строке → высота по контенту. */
+  gap:.75rem;align-items:stretch
 }
 .fin-card,.fin-stats{
   background:rgba(255,255,255,.025);border:1px solid var(--edge);border-radius:12px;
