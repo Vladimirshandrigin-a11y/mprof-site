@@ -7291,8 +7291,13 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 .fin-stats .fin-val{white-space:normal}
 .fin-stats .fin-val .pos,.fin-stats .fin-val .neg{white-space:nowrap}
 /* Расширенный блок «Статистика»: разделители групп + текст/составные значения */
+/* Разделитель группы — непрерывная линия на всю ширину строки: border на самой
+   строке <tr> (у .fin-table border-collapse:collapse), а НЕ на отдельных ячейках.
+   Иначе flex-ячейка .fin-val--stacked выпадает из табличной модели и её border-top
+   встаёт на другой высоте, чем у <th> → ступенька/разрыв. Цвет/толщина/отступы те же. */
+.fin-stats .fin-row--group{border-top:1px solid var(--edge)}
 .fin-stats .fin-row--group > th,
-.fin-stats .fin-row--group > .fin-val{border-top:1px solid var(--edge);padding-top:.62rem}
+.fin-stats .fin-row--group > .fin-val{padding-top:.62rem}
 .fin-stats .fin-val--text{
   font-family:var(--sans);font-size:.82rem;font-weight:500;color:var(--txt2)
 }
