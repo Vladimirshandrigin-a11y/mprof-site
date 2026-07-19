@@ -1422,7 +1422,10 @@ export default function AppPage() {
   const [importLoading, setImportLoading] = useState(false);
   const [importError, setImportError] = useState("");
   const [importResult, setImportResult] = useState<OzonImportMissingResponse | null>(null);
-  const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("upload");
+  // Дефолт при первом открытии /app — вкладка «Авторасчёт Ozon API». Это только
+  // активная вкладка/рендер: расчёт сам НЕ запускается (calculateAndSaveApi —
+  // только по клику), consume/save/Ozon-запрос при mount не выполняются.
+  const [calcMode, setCalcMode] = useState<"manual" | "api" | "upload">("api");
   // Открыт сохранённый Ozon API-расчёт ТОЛЬКО для просмотра (view-only): поля
   // заполнены и read-only, кнопка «Рассчитать» скрыта. null → обычный
   // редактируемый ручной калькулятор. Выход из просмотра — «Очистить форму».
