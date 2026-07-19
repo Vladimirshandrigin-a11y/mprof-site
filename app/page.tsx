@@ -10,8 +10,8 @@ const FAQS: { q: string; a: string }[] = [
     a: "Нет, первый расчёт можно сделать вручную без подключения API.",
   },
   {
-    q: "Работает ли сервис с Ozon и Wildberries?",
-    a: "Да, M‑Prof рассчитан для продавцов Ozon и Wildberries.",
+    q: "Работает ли сервис с Ozon?",
+    a: "Да, M‑Prof рассчитан для продавцов Ozon.",
   },
   {
     q: "Чем отличается разовый расчёт от безлимита?",
@@ -660,16 +660,16 @@ a{color:inherit;text-decoration:none}
           <div className="ln-hero-inner">
             <div className="ln-eyebrow">
               <span className="dot" />
-              Для продавцов Ozon и Wildberries
+              Для продавцов Ozon
             </div>
 
             <h1 className="ln-h1">
-              Считай <em>чистую прибыль</em> Ozon и Wildberries за 30 секунд
+              Считай <em>чистую прибыль</em> на Ozon за 30 секунд
             </h1>
 
             <p className="ln-lead">
-              M&#8209;Prof автоматически помогает продавцам маркетплейсов понимать
-              реальную прибыль, маржу и расходы — без таблиц, формул и догадок.
+              M&#8209;Prof собирает данные из Ozon API и показывает реальную
+              прибыль, маржу и расходы — без таблиц, сложных формул и догадок.
             </p>
 
             <div className="ln-cta-row">
@@ -688,12 +688,12 @@ a{color:inherit;text-decoration:none}
                 <div className="ln-stat-l">Один расчёт</div>
               </div>
               <div className="ln-stat">
-                <div className="ln-stat-v"><HeroCount to={2} suffix=" млн ₽" /></div>
-                <div className="ln-stat-l">Средние обороты</div>
+                <div className="ln-stat-v">Ozon API</div>
+                <div className="ln-stat-l">Автоматическая загрузка данных</div>
               </div>
               <div className="ln-stat">
                 <div className="ln-stat-v"><HeroCount to={0} suffix=" ₽" /></div>
-                <div className="ln-stat-l">Старт</div>
+                <div className="ln-stat-l">Для старта</div>
               </div>
             </div>
           </div>
@@ -750,7 +750,7 @@ a{color:inherit;text-decoration:none}
               </div>
               <div className="ln-feat-title">API-интеграция</div>
               <div className="ln-feat-text">
-                Подключите Ozon и Wildberries по API-ключам в личном кабинете и подтягивайте данные автоматически.
+                Подключите Ozon по API-ключам в личном кабинете и подтягивайте данные автоматически.
               </div>
             </div>
 
@@ -775,9 +775,9 @@ a{color:inherit;text-decoration:none}
                   <path d="M9 9v4a3 3 0 0 0 6 0V9" />
                 </svg>
               </div>
-              <div className="ln-feat-title">Поддержка Ozon и Wildberries</div>
+              <div className="ln-feat-title">Заточено под Ozon</div>
               <div className="ln-feat-text">
-                Учитываем особенности каждой площадки: комиссии, логистику, хранение, рекламу и возвраты.
+                Учитываем особенности площадки: комиссии, логистику, хранение, рекламу и возвраты.
               </div>
             </div>
 

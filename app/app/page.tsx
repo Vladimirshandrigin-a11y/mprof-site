@@ -3330,7 +3330,9 @@ export default function AppPage() {
   // loss — убыток (profit < 0).
   type HistProfitFilter = "all" | "net" | "before" | "loss";
   const [filterPeriod, setFilterPeriod] = useState<FilterPeriod>("all");
-  const [filterMp, setFilterMp] = useState<FilterMp>("all");
+  // Ozon-only: маркетплейс-фильтр убран из UI, значение зафиксировано на "all"
+  // (фильтрация по площадке не нужна; тип/значения сохранены для совместимости).
+  const [filterMp] = useState<FilterMp>("all");
   const [filterResult, setFilterResult] = useState<FilterResult>("all");
   const [filtersOpen, setFiltersOpen] = useState(false);
   // Поиск (по периоду отчёта / дате создания / типу расчёта) и быстрый фильтр
@@ -3379,12 +3381,6 @@ export default function AppPage() {
 
   const filterPeriodLabel =
     filterPeriod === "all" ? "всё время" : `${filterPeriod} дней`;
-  const filterMpLabel =
-    filterMp === "all"
-      ? "все маркетплейсы"
-      : filterMp === "ozon"
-      ? "Ozon"
-      : "Wildberries";
   const filterResultLabel =
     filterResult === "all"
       ? "все результаты"
@@ -7053,18 +7049,12 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   background:linear-gradient(135deg, rgba(61,123,255,.18) 0%, rgba(61,123,255,.05) 100%);
   box-shadow:0 0 26px rgba(61,123,255,.18), inset 0 1px 0 rgba(255,255,255,.07)
 }
-.mp-tab.act-wb{
-  border-color:rgba(203,17,171,.55);color:#f0a4e6;
-  background:linear-gradient(135deg, rgba(203,17,171,.18) 0%, rgba(203,17,171,.05) 100%);
-  box-shadow:0 0 26px rgba(203,17,171,.18), inset 0 1px 0 rgba(255,255,255,.07)
-}
+/* Ozon-only: статичный индикатор маркетплейса (не кнопка) */
+.mp-tab.mp-static{cursor:default;pointer-events:none}
 .mp-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;
   background:var(--smoke);transition:all .22s ease}
 .mp-dot-ozon{background:#3d7bff}
-.mp-dot-wb{background:#cb11ab}
 .mp-tab.act-ozon .mp-dot-ozon{box-shadow:0 0 12px #3d7bff, 0 0 24px rgba(61,123,255,.4);
-  animation:mpDotPulse 2.4s ease-in-out infinite}
-.mp-tab.act-wb .mp-dot-wb{box-shadow:0 0 12px #cb11ab, 0 0 24px rgba(203,17,171,.4);
   animation:mpDotPulse 2.4s ease-in-out infinite}
 @keyframes mpDotPulse{0%,100%{filter:brightness(1)}50%{filter:brightness(1.3)}}
 
@@ -7672,7 +7662,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   .result-card.success-pulse .res-margin,
   .result-card.success-pulse .res-hero::before,
   .mp-tab.act-ozon .mp-dot-ozon,
-  .mp-tab.act-wb .mp-dot-wb,
   .onboard-card,
   .mp-toast,
   .hist-del-spin{animation:none !important}
@@ -7753,7 +7742,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
   color:var(--txt2);transition:all .18s;text-align:center}
 .mp-tab:hover{border-color:var(--smoke);color:var(--txt)}
 .mp-tab.act-ozon{border-color:#3d7bff;color:#7fb0ff;background:rgba(61,123,255,.1)}
-.mp-tab.act-wb{border-color:#cb11ab;color:#e878d6;background:rgba(203,17,171,.1)}
 
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem}
 .fld{display:flex;flex-direction:column;gap:5px}
@@ -8890,15 +8878,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 </span>
                 <span
                   className={
-                    "filter-bdg" + (filterMp !== "all" ? " active" : "")
-                  }
-                >
-                  <span className="filter-bdg-dot" />
-                  <span className="filter-bdg-l">Маркетплейсы:</span>
-                  <span className="filter-bdg-v">{filterMpLabel}</span>
-                </span>
-                <span
-                  className={
                     "filter-bdg" + (filterResult !== "all" ? " active" : "")
                   }
                 >
@@ -8909,7 +8888,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               </span>
             ) : (
               <span className="filter-toggle-hint">
-                Настройте аналитику по периоду, маркетплейсу и результату
+                Настройте аналитику по периоду и результату
               </span>
             )}
 
@@ -8936,31 +8915,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   aria-pressed={filterPeriod === v}
                 >
                   {v === "all" ? "Всё время" : v + " дней"}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="filter-divider" aria-hidden="true" />
-
-          <div className="filter-group">
-            <div className="filter-label">Маркетплейс</div>
-            <div className="filter-pills">
-              {(
-                [
-                  ["all", "Все"],
-                  ["ozon", "Ozon"],
-                  ["wb", "Wildberries"],
-                ] as [FilterMp, string][]
-              ).map(([v, label]) => (
-                <button
-                  type="button"
-                  key={v}
-                  className={"filter-pill" + (filterMp === v ? " active" : "")}
-                  onClick={() => setFilterMp(v)}
-                  aria-pressed={filterMp === v}
-                >
-                  {label}
                 </button>
               ))}
             </div>
@@ -9109,23 +9063,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               <div className="mcalc-params-head">Параметры расчёта</div>
 
               <div className="mp-row mcalc-mp" aria-label="Маркетплейс">
-                <div
-                  className={"mp-tab" + (marketplace === "ozon" ? " act-ozon" : "")}
-                  onClick={() => !isCalculating && setMarketplace("ozon")}
-                  role="button"
-                  aria-pressed={marketplace === "ozon"}
-                >
+                <div className="mp-tab act-ozon mp-static" aria-current="true">
                   <span className="mp-dot mp-dot-ozon" aria-hidden="true" />
                   Ozon
-                </div>
-                <div
-                  className={"mp-tab" + (marketplace === "wb" ? " act-wb" : "")}
-                  onClick={() => !isCalculating && setMarketplace("wb")}
-                  role="button"
-                  aria-pressed={marketplace === "wb"}
-                >
-                  <span className="mp-dot mp-dot-wb" aria-hidden="true" />
-                  Wildberries
                 </div>
               </div>
 

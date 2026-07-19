@@ -87,9 +87,9 @@ interface DemoRecent {
 
 const DEMO_RECENT: DemoRecent[] = [
   { product: "Куртка зимняя унисекс", marketplace: "ozon", profit: 24580, margin: 22.4, date: "сегодня",     profitLabel: "Чистая прибыль" },
-  { product: "Кроссовки беговые",     marketplace: "wb",   profit: 18920, margin: 19.8, date: "вчера",       profitLabel: "Чистая прибыль" },
+  { product: "Кроссовки беговые",     marketplace: "ozon", profit: 18920, margin: 19.8, date: "вчера",       profitLabel: "Чистая прибыль" },
   { product: "Платье летнее",         marketplace: "ozon", profit: 12450, margin: 17.2, date: "2 дня назад", profitLabel: "Чистая прибыль" },
-  { product: "Рюкзак городской",      marketplace: "wb",   profit:  9870, margin: 21.0, date: "3 дня назад", profitLabel: "Чистая прибыль" },
+  { product: "Рюкзак городской",      marketplace: "ozon", profit:  9870, margin: 21.0, date: "3 дня назад", profitLabel: "Чистая прибыль" },
 ];
 
 /* ---------- ICONS ---------- */
@@ -791,7 +791,7 @@ function buildEaters(f: AiFinancials): string[] {
     return pad3([], [
       "Расходы в расчёте не детализированы — данных недостаточно, проверьте в отчёте себестоимость, комиссию и логистику.",
       "Без разбивки затрат точную утечку прибыли показать нельзя.",
-      "Загрузите полный отчёт Ozon/WB, чтобы увидеть структуру расходов.",
+      "Загрузите полный отчёт Ozon, чтобы увидеть структуру расходов.",
     ]);
   }
   // короткое объяснение к каждой статье: почему она важна и что проверить
@@ -828,7 +828,7 @@ function buildEaters(f: AiFinancials): string[] {
 function buildSkuProblems(f: AiFinancials): string[] {
   const s = scoreProblems(f);
   const out: string[] = [];
-  out.push("В этом расчёте нет разбивки по товарам — загрузите отчёт Ozon/WB с детализацией по SKU, чтобы видеть прибыль и маржу по каждой позиции.");
+  out.push("В этом расчёте нет разбивки по товарам — загрузите отчёт Ozon с детализацией по SKU, чтобы видеть прибыль и маржу по каждой позиции.");
   if (f.lossCount > 0)
     out.push(`В истории есть убыточные расчёты (${f.lossCount}) — по ним в первую очередь нужна разбивка по SKU, чтобы найти конкретные товары в минусе.`);
   if (s.noCost)
