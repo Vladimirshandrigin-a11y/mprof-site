@@ -1352,6 +1352,11 @@ export default function AppPage() {
   const [ozonConnLoading, setOzonConnLoading] = useState(false);
   const [ozonBusy, setOzonBusy] = useState<"idle" | "connecting" | "checking" | "deleting">("idle");
   const [ozonConnError, setOzonConnError] = useState("");
+  // ВРЕМЕННАЯ диагностика миграции Ozon accrual API (read-only, ТОЛЬКО по кнопке).
+  const [accrualDiagMonth, setAccrualDiagMonth] = useState("2026-06");
+  const [accrualDiagLoading, setAccrualDiagLoading] = useState(false);
+  const [accrualDiagResult, setAccrualDiagResult] = useState<unknown | null>(null);
+  const [accrualDiagError, setAccrualDiagError] = useState("");
 
   // Ozon Performance API (реклама/продвижение) — PR #43 foundation. Отдельное
   // подключение и отдельная таблица; секрет в браузере не держим.
@@ -4063,6 +4068,39 @@ export default function AppPage() {
     const { data } = await supabase.auth.getSession();
     const token = data.session?.access_token;
     return token ? { Authorization: `Bearer ${token}` } : {};
+  };
+
+  // ВРЕМЕННАЯ диагностика новых методов Ozon (accrual + posting v3/v4). ТОЛЬКО по
+  // кнопке. Ничего не сохраняет/не списывает/не меняет прибыль. Ответ сервера —
+  // только безопасная схема (имена ключей + типы) и агрегаты, без идентификаторов.
+  const runAccrualDiagnostic = async () => {
+    if (accrualDiagLoading) return;
+    setAccrualDiagLoading(true);
+    setAccrualDiagError("");
+    setAccrualDiagResult(null);
+    try {
+      const authHeaders = await ozonAuthHeaders();
+      if (!authHeaders.Authorization) {
+        setAccrualDiagError("Нужно войти в аккаунт");
+        return;
+      }
+      const res = await fetch("/api/ozon/accrual-migration-diagnostic", {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ month: accrualDiagMonth }),
+        cache: "no-store",
+      });
+      const json = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) {
+        setAccrualDiagError(json?.error || `Ошибка ${res.status}`);
+        return;
+      }
+      setAccrualDiagResult(json);
+    } catch {
+      setAccrualDiagError("Сеть недоступна. Попробуйте ещё раз.");
+    } finally {
+      setAccrualDiagLoading(false);
+    }
   };
 
   // Строка БД → локальный безопасный вид (без ключа). Один маппинг на все ответы.
@@ -9418,6 +9456,50 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           })()}
           </div>
         </div>
+        )}
+
+        {calcMode === "api" && (
+          <div className="card" style={{ marginBottom: "1rem", padding: "1rem 1.1rem" }}>
+            <div style={{ fontFamily: "var(--display)", fontWeight: 700, fontSize: "1rem", marginBottom: ".25rem" }}>
+              Диагностика нового Ozon API
+            </div>
+            <div style={{ fontSize: ".76rem", color: "var(--txt3)", marginBottom: ".85rem", lineHeight: 1.5 }}>
+              Read-only проверка новых методов (accrual + posting v3/v4). Диагностика
+              ничего не сохраняет, не списывает расчёт и не изменяет прибыль.
+            </div>
+            <div style={{ display: "flex", gap: ".55rem", flexWrap: "wrap", alignItems: "center", marginBottom: ".8rem" }}>
+              <label style={{ fontSize: ".72rem", color: "var(--txt2)" }}>Месяц (YYYY-MM)</label>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={accrualDiagMonth}
+                onChange={(e) => setAccrualDiagMonth(e.target.value)}
+                placeholder="2026-06"
+                disabled={accrualDiagLoading}
+                style={{ width: "110px", padding: "9px 11px", borderRadius: "8px", background: "rgba(255,255,255,.04)", border: "1px solid var(--edge2)", color: "var(--txt)", fontFamily: "var(--mono)", fontSize: ".85rem" }}
+              />
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={runAccrualDiagnostic}
+                disabled={accrualDiagLoading}
+                style={{ padding: "9px 16px", borderRadius: "9px", whiteSpace: "nowrap" }}
+              >
+                {accrualDiagLoading ? "Проверяем…" : "Проверить новые методы Ozon"}
+              </button>
+            </div>
+            {accrualDiagError && (
+              <div style={{ fontSize: ".8rem", color: "var(--red)", marginBottom: ".6rem" }}>{accrualDiagError}</div>
+            )}
+            {accrualDiagResult !== null && (
+              <pre
+                aria-label="Результат диагностики (безопасная схема)"
+                style={{ maxHeight: "460px", overflow: "auto", fontSize: ".7rem", lineHeight: 1.55, background: "rgba(0,0,0,.28)", border: "1px solid var(--edge)", borderRadius: "8px", padding: ".85rem", color: "var(--txt2)", whiteSpace: "pre-wrap", wordBreak: "break-word", margin: 0 }}
+              >
+                {JSON.stringify(accrualDiagResult, null, 2)}
+              </pre>
+            )}
+          </div>
         )}
 
         {calcMode === "api" && (
