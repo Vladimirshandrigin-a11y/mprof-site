@@ -1,0 +1,564 @@
+// ============================================================================
+// ВРЕМЕННАЯ read-only диагностика миграции Ozon Seller API (accrual + posting v3/v4).
+//
+// Цель: по кнопке сравнить старые и новые методы Ozon за выбранный месяц и вернуть
+// ТОЛЬКО безопасную схему (имена ключей + типы), агрегаты и статусы — БЕЗ секретов,
+// БЕЗ идентификаторов (Api-Key/Client-Id/posting_number/operation_id/SKU/offer_id/
+// названий товаров), БЕЗ raw-ответов. Ничего не сохраняет, не списывает, не меняет
+// прибыль. НЕ выполняет финансовую классификацию — только диагностика схемы.
+//
+// Безопасность: user_id ТОЛЬКО из токена (authenticateRequest); ключ Ozon берётся
+// из ozon_connections текущего пользователя и расшифровывается ТОЛЬКО на сервере.
+// Запросы последовательные (без параллельного шторма), с timeout, hard-limit
+// пагинации и остановкой на 429. Никаких DB writes / consume / save-calculation.
+// ============================================================================
+
+import { NextRequest, NextResponse } from "next/server";
+import { authenticateRequest } from "../../cloud/_lib/auth";
+import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
+import { monthToRange, fetchOzonTransactions } from "../_lib/finance";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const NO_STORE = { "Cache-Control": "no-store" } as const;
+
+const SELLER = "https://api-seller.ozon.ru";
+const TIMEOUT_MS = 15000;
+// Hard-лимиты, чтобы диагностика оставалась лёгкой и не устраивала шторм.
+const FBO_MAX_PAGES = 3;
+const FBS_MAX_PAGES = 3;
+const POST_LIMIT = 100;
+const MAX_POSTING_NUMBERS = 200; // 1 батч для accrual/postings (макс. 200 по схеме)
+const BY_DAY_MAX_PAGES_PER_DAY = 5;
+// Доказуемый общий предел исходящих Ozon-запросов за один запуск:
+//   новые методы (через ozonPost) ≤ NEW_API_MAX_REQUESTS,
+//   старый fetchOzonTransactions ≤ LEGACY_MAX_REQUESTS (finance.ts: MAX_PAGES=20),
+//   worst-case суммарно ≤ TOTAL_MAX_REQUESTS = 130 + 20 = 150.
+const TOTAL_MAX_REQUESTS = 150;
+const LEGACY_MAX_REQUESTS = 20; // fetchOzonTransactions: макс. 20 внутренних страниц
+const NEW_API_MAX_REQUESTS = TOTAL_MAX_REQUESTS - LEGACY_MAX_REQUESTS; // 130
+
+type OzonHeaders = { "Client-Id": string; "Api-Key": string; "Content-Type": string };
+
+type FetchOut =
+  | { ok: true; status: number; json: unknown }
+  | { ok: false; status: number; code: "invalid_key" | "forbidden" | "rate_limited" | "timeout" | "bad_response" | "unavailable" };
+
+// ---- один безопасный POST к Ozon (никогда не бросает) ----
+async function ozonPost(
+  url: string,
+  headers: OzonHeaders,
+  body: unknown,
+  budget: { used: number }
+): Promise<FetchOut> {
+  if (budget.used >= NEW_API_MAX_REQUESTS) {
+    return { ok: false, status: 0, code: "unavailable" };
+  }
+  budget.used += 1;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      if (res.status === 401) return { ok: false, status: 401, code: "invalid_key" };
+      if (res.status === 403) return { ok: false, status: 403, code: "forbidden" };
+      if (res.status === 429) return { ok: false, status: 429, code: "rate_limited" };
+      return { ok: false, status: res.status, code: "unavailable" };
+    }
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch {
+      return { ok: false, status: res.status, code: "bad_response" };
+    }
+    return { ok: true, status: res.status, json };
+  } catch (e) {
+    const aborted = e instanceof Error && e.name === "AbortError";
+    return { ok: false, status: 0, code: aborted ? "timeout" : "unavailable" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ---- утилиты формы (ТОЛЬКО имена ключей + типы, никаких значений) ----
+function typeName(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) {
+    const first = v.length > 0 ? v[0] : undefined;
+    return `array<${first === undefined ? "unknown" : typeName(first)}>`;
+  }
+  return typeof v; // string | number | boolean | object | undefined
+}
+
+/** Карта {ключ: тип} на 1 уровень (значения НЕ раскрываются). Для вложенных
+ *  объектов/массивов рекурсивно — но с ограничением глубины. */
+function keySchema(value: unknown, depth: number): unknown {
+  if (depth <= 0) return typeName(value);
+  if (Array.isArray(value)) {
+    return value.length > 0 ? [keySchema(value[0], depth - 1)] : "array<empty>";
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = v && typeof v === "object" ? keySchema(v, depth - 1) : typeName(v);
+    }
+    return out;
+  }
+  return typeName(value);
+}
+
+const asObj = (v: unknown): Record<string, unknown> =>
+  v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+const asArr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+const numOr0 = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+// Дни выбранного месяца в формате YYYY-MM-DD (для accrual/by-day).
+function daysOfMonth(month: string): string[] {
+  const [y, m] = month.split("-").map((s) => parseInt(s, 10));
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const days: string[] = [];
+  for (let d = 1; d <= last; d++) {
+    days.push(`${month}-${String(d).padStart(2, "0")}`);
+  }
+  return days;
+}
+
+// ---- owner-only allowlist из server-only env (fail-closed) ----
+// Формат OZON_ACCRUAL_DIAGNOSTIC_USER_IDS: Supabase user UUID через запятую.
+// Нет env / пусто / userId не в списке → доступа нет. UUID/env НЕ логируются.
+function isDiagnosticOwner(userId: string): boolean {
+  const raw = process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS;
+  if (!raw) return false;
+  const allow = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return allow.length > 0 && allow.includes(userId);
+}
+
+// Единый fail-closed ответ «не найдено» — не раскрывает существование route.
+const notFound = () =>
+  NextResponse.json({ error: "Not found" }, { status: 404, headers: NO_STORE });
+
+// ---- GET: лёгкий owner-check для UI. Только auth + allowlist. ----
+// НЕ читает ozon_connections, НЕ расшифровывает ключ, НЕ ходит в Ozon.
+export async function GET(req: NextRequest) {
+  const auth = await authenticateRequest(req);
+  if (!auth.ok) return auth.response;
+  if (!isDiagnosticOwner(auth.userId)) return notFound();
+  return NextResponse.json({ allowed: true }, { status: 200, headers: NO_STORE });
+}
+
+export async function POST(req: NextRequest) {
+  const auth = await authenticateRequest(req);
+  if (!auth.ok) return auth.response;
+  const { admin, userId } = auth;
+
+  // Owner-only: fail-closed ДО чтения ozon_connections/decrypt/любых Ozon-запросов.
+  // Клиентскому GET-чеку НЕ доверяем — POST перепроверяет allowlist сам.
+  if (!isDiagnosticOwner(userId)) return notFound();
+
+  if (!isEncryptionConfigured()) {
+    return NextResponse.json(
+      { error: "Шифрование ключей не настроено", code: "encryption_misconfigured" },
+      { status: 503, headers: NO_STORE }
+    );
+  }
+
+  // ---- месяц из body (единственный вход; никаких ключей/user_id из body) ----
+  let month = "2026-06";
+  try {
+    const body = (await req.json()) as { month?: unknown };
+    if (typeof body?.month === "string" && /^\d{4}-\d{2}$/.test(body.month)) {
+      month = body.month;
+    }
+  } catch {
+    /* пустое/битое тело → дефолтный месяц */
+  }
+  const range = monthToRange(month);
+  if (!range) {
+    return NextResponse.json(
+      { error: "Некорректный месяц", code: "bad_month" },
+      { status: 400, headers: NO_STORE }
+    );
+  }
+
+  // ---- подключение Ozon текущего пользователя (ключ ТОЛЬКО отсюда) ----
+  const { data: conn, error: connErr } = await admin
+    .from("ozon_connections")
+    .select("client_id, api_key_encrypted")
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (connErr) {
+    return NextResponse.json(
+      { error: "Ошибка чтения подключения" },
+      { status: 502, headers: NO_STORE }
+    );
+  }
+  if (!conn || !conn.client_id || !conn.api_key_encrypted) {
+    return NextResponse.json(
+      { error: "Подключение Ozon не найдено", code: "not_connected" },
+      { status: 400, headers: NO_STORE }
+    );
+  }
+  let apiKey: string;
+  try {
+    apiKey = decryptOzonApiKey(conn.api_key_encrypted as string);
+  } catch {
+    return NextResponse.json(
+      { error: "Ключ Ozon нужно переподключить", code: "decrypt_failed" },
+      { status: 400, headers: NO_STORE }
+    );
+  }
+  const clientId = conn.client_id as string;
+  const headers: OzonHeaders = {
+    "Client-Id": clientId,
+    "Api-Key": apiKey,
+    "Content-Type": "application/json",
+  };
+
+  const budget = { used: 0 };
+  let rateLimited = false;
+  const methods: Record<string, unknown> = {};
+  const postingNumbers: string[] = [];
+
+  // safe-код ошибки метода (без raw)
+  const errCode = (r: FetchOut): string => (r.ok ? "ok" : r.code);
+
+  // ======================= 1) FBO /v3/posting/fbo/list =======================
+  {
+    let cursor = "";
+    let pages = 0;
+    let records = 0;
+    let truncated = false;
+    let status = 0;
+    let schema: unknown = null;
+    let lastErr = "ok";
+    for (let p = 0; p < FBO_MAX_PAGES; p++) {
+      const r = await ozonPost(
+        `${SELLER}/v3/posting/fbo/list`,
+        headers,
+        { cursor, filter: { since: range.dateFrom, to: range.dateTo, statuses: ["delivered"] }, limit: POST_LIMIT, sort_dir: "ASC" },
+        budget
+      );
+      status = r.status;
+      lastErr = errCode(r);
+      if (!r.ok) {
+        if (r.code === "rate_limited") rateLimited = true;
+        break;
+      }
+      const result = asObj(asObj(r.json).result);
+      // v3 fbo: ответ может быть result.postings[] ИЛИ result[] — берём мягко.
+      const items = result.postings !== undefined ? asArr(result.postings) : asArr(asObj(r.json).result);
+      if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
+      records += items.length;
+      for (const it of items) {
+        const pn = asObj(it).posting_number;
+        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
+      }
+      pages += 1;
+      const hasNext = result.has_next === true;
+      cursor = typeof result.cursor === "string" ? result.cursor : "";
+      if (!hasNext || cursor === "" || items.length === 0) break;
+      if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
+    }
+    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, truncated, error: lastErr };
+  }
+
+  // ======================= 2) FBS /v4/posting/fbs/list =======================
+  if (!rateLimited) {
+    let cursor = "";
+    let pages = 0;
+    let records = 0;
+    let truncated = false;
+    let status = 0;
+    let schema: unknown = null;
+    let lastErr = "ok";
+    for (let p = 0; p < FBS_MAX_PAGES; p++) {
+      const r = await ozonPost(
+        `${SELLER}/v4/posting/fbs/list`,
+        headers,
+        { cursor, filter: { since: range.dateFrom, to: range.dateTo, statuses: ["delivered"] }, limit: POST_LIMIT, sort_dir: "ASC" },
+        budget
+      );
+      status = r.status;
+      lastErr = errCode(r);
+      if (!r.ok) {
+        if (r.code === "rate_limited") rateLimited = true;
+        break;
+      }
+      const result = asObj(asObj(r.json).result);
+      const items = asArr(result.postings);
+      if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
+      records += items.length;
+      for (const it of items) {
+        const pn = asObj(it).posting_number;
+        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
+      }
+      pages += 1;
+      const hasNext = result.has_next === true;
+      cursor = typeof result.cursor === "string" ? result.cursor : "";
+      if (!hasNext || cursor === "" || items.length === 0) break;
+      if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
+    }
+    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, truncated, error: lastErr };
+  }
+
+  // ======================= 3) accrual/types (без тела) =======================
+  if (!rateLimited) {
+    const r = await ozonPost(`${SELLER}/v1/finance/accrual/types`, headers, undefined, budget);
+    if (!r.ok && r.code === "rate_limited") rateLimited = true;
+    let count = 0;
+    let dictionary: Array<{ accrual_id: unknown; name: unknown; description: unknown }> = [];
+    let schema: unknown = null;
+    if (r.ok) {
+      // типы могут лежать в result[] / types[] / accrual_types[] — берём мягко.
+      const root = asObj(r.json);
+      const arr =
+        asArr(root.result).length > 0 ? asArr(root.result)
+        : asArr(root.types).length > 0 ? asArr(root.types)
+        : asArr(root.accrual_types);
+      if (arr.length > 0) schema = keySchema(arr[0], 3);
+      count = arr.length;
+      // Справочник типов — глобальная классификация (не персональные данные) → показываем.
+      dictionary = arr.slice(0, 300).map((t) => {
+        const o = asObj(t);
+        return {
+          accrual_id: o.accrual_id ?? o.type_id ?? o.id ?? null,
+          name: o.name ?? o.title ?? null,
+          description: o.description ?? o.desc ?? null,
+        };
+      });
+    }
+    methods.accrual_types = { endpoint: "/v1/finance/accrual/types", status: r.status, count, dictionary, schema, error: errCode(r) };
+  }
+
+  // ======================= 4) accrual/by-day (по дням месяца) =================
+  if (!rateLimited) {
+    const days = daysOfMonth(month);
+    let daysQueried = 0;
+    let pages = 0;
+    let records = 0;
+    let sumTotalAmount = 0;
+    let containerFeesSum = 0;
+    let containerFeesSeen = false;
+    let truncated = false;
+    let status = 0;
+    let schema: unknown = null;
+    let lastErr = "ok";
+    const categories = new Set<string>();
+    for (const day of days) {
+      if (rateLimited) break;
+      let lastId = "";
+      for (let p = 0; p < BY_DAY_MAX_PAGES_PER_DAY; p++) {
+        const r = await ozonPost(`${SELLER}/v1/finance/accrual/by-day`, headers, { date: day, last_id: lastId }, budget);
+        status = r.status;
+        lastErr = errCode(r);
+        if (!r.ok) {
+          if (r.code === "rate_limited") rateLimited = true;
+          break;
+        }
+        const root = asObj(r.json);
+        const result = asObj(root.result);
+        // записи могут лежать в result.details[]/result.rows[]/result[]/root.details[] — мягко.
+        const items =
+          asArr(result.details).length > 0 ? asArr(result.details)
+          : asArr(result.rows).length > 0 ? asArr(result.rows)
+          : asArr(root.details).length > 0 ? asArr(root.details)
+          : asArr(root.result);
+        if (schema === null && items.length > 0) schema = keySchema(items[0], 3);
+        records += items.length;
+        for (const it of items) {
+          const o = asObj(it);
+          // Σ total_amount.amount (по задаче). Мягко: total_amount может быть числом/объектом.
+          const ta = o.total_amount;
+          if (typeof ta === "number") sumTotalAmount += numOr0(ta);
+          else sumTotalAmount += numOr0(asObj(ta).amount);
+          // container_fees — если есть
+          if (o.container_fees !== undefined) {
+            containerFeesSeen = true;
+            const cf = o.container_fees;
+            if (typeof cf === "number") containerFeesSum += numOr0(cf);
+            else containerFeesSum += numOr0(asObj(cf).amount);
+          }
+          const cat = o.accrued_category ?? asObj(o.accruals).accrued_category;
+          if (typeof cat === "string") categories.add(cat);
+        }
+        pages += 1;
+        // пагинация by-day: last_id из ответа, пусто → конец дня.
+        const nextId =
+          typeof root.last_id === "string" ? root.last_id
+          : typeof result.last_id === "string" ? result.last_id
+          : "";
+        lastId = nextId;
+        if (lastId === "" || items.length === 0) break;
+        if (p === BY_DAY_MAX_PAGES_PER_DAY - 1 && lastId !== "") truncated = true;
+      }
+      daysQueried += 1;
+    }
+    methods.accrual_by_day = {
+      endpoint: "/v1/finance/accrual/by-day",
+      status,
+      days: daysQueried,
+      pages,
+      records,
+      sumTotalAmount: Math.round(sumTotalAmount * 100) / 100,
+      containerFeesSum: containerFeesSeen ? Math.round(containerFeesSum * 100) / 100 : null,
+      accruedCategories: Array.from(categories).sort(),
+      schema,
+      truncated,
+      error: lastErr,
+    };
+  }
+
+  // ======================= 5) accrual/postings (1 батч ≤200) =================
+  if (!rateLimited && postingNumbers.length > 0) {
+    const batch = postingNumbers.slice(0, MAX_POSTING_NUMBERS);
+    const r = await ozonPost(`${SELLER}/v1/finance/accrual/postings`, headers, { posting_numbers: batch }, budget);
+    if (!r.ok && r.code === "rate_limited") rateLimited = true;
+    let records = 0;
+    let schema: unknown = null;
+    const categories = new Set<string>();
+    if (r.ok) {
+      const root = asObj(r.json);
+      const items =
+        asArr(root.result).length > 0 ? asArr(root.result)
+        : asArr(root.postings).length > 0 ? asArr(root.postings)
+        : asArr(asObj(root.result).postings);
+      if (items.length > 0) schema = keySchema(items[0], 3);
+      records = items.length;
+      for (const it of items) {
+        const cat = asObj(it).accrued_category;
+        if (typeof cat === "string") categories.add(cat);
+      }
+    }
+    methods.accrual_postings = {
+      endpoint: "/v1/finance/accrual/postings",
+      status: r.status,
+      batches: 1,
+      postingsQueried: batch.length,
+      records,
+      accruedCategories: Array.from(categories).sort(),
+      schema,
+      error: errCode(r),
+    };
+  } else if (!rateLimited) {
+    methods.accrual_postings = {
+      endpoint: "/v1/finance/accrual/postings",
+      status: 0,
+      batches: 0,
+      postingsQueried: 0,
+      records: 0,
+      schema: null,
+      error: "no_posting_numbers",
+      note: "FBO/FBS не вернули отправлений за месяц — нечего запрашивать.",
+    };
+  }
+
+  // ============ 6) СТАРЫЙ finance-агрегатор (read-only) для old total ==========
+  // Переиспользуем существующий модуль без изменений: Σ amount по операциям.
+  let legacy: Record<string, unknown> = { endpoint: "/v3/finance/transaction/list", status: rateLimited ? 0 : null, skipped: rateLimited };
+  let oldTotal: number | null = null;
+  let legacyRan = false;
+  // legacy запускаем ТОЛЬКО если не было 429. Его страницы (≤LEGACY_MAX_REQUESTS)
+  // зарезервированы ВНЕ budget новых методов → суммарный потолок доказуемо ≤150.
+  if (!rateLimited) {
+    legacyRan = true;
+    const tx = await fetchOzonTransactions(clientId, apiKey, range);
+    if (tx.ok) {
+      let sum = 0;
+      for (const op of tx.operations) sum += numOr0(op.amount);
+      oldTotal = Math.round(sum * 100) / 100;
+      legacy = {
+        endpoint: "/v3/finance/transaction/list",
+        status: 200,
+        operations: tx.operations.length,
+        pages: tx.pageCount,
+        partial: tx.partial,
+        sumAmount: oldTotal,
+      };
+    } else {
+      legacy = { endpoint: "/v3/finance/transaction/list", status: null, error: tx.code };
+    }
+  }
+
+  // ---- достигнут ли потолок новых запросов (для честного truncated) ----
+  const newApiLimitReached = budget.used >= NEW_API_MAX_REQUESTS;
+  const anyMethodTruncated = Object.values(methods).some(
+    (m) => asObj(m).truncated === true
+  );
+  // Достигнут лимит новых запросов ИЛИ метод обрезан → результат НЕ полный.
+  const truncated = newApiLimitReached || anyMethodTruncated;
+
+  // ---- сравнение old vs new (диагностика; НЕ утверждение об эквивалентности) ----
+  const byDay = asObj(methods.accrual_by_day);
+  const newTotal = typeof byDay.sumTotalAmount === "number" ? byDay.sumTotalAmount : null;
+  const legacyObj = asObj(legacy);
+  // delta считаем ТОЛЬКО когда и new, и legacy завершены полностью: без 429, без
+  // общего лимита, без per-method error/truncated и без legacy.partial.
+  const newComplete =
+    !rateLimited && !newApiLimitReached && byDay.error === "ok" && byDay.truncated === false && newTotal !== null;
+  const legacyComplete =
+    legacyRan && legacyObj.status === 200 && legacyObj.partial === false && oldTotal !== null;
+  const comparisonOk = newComplete && legacyComplete;
+  const comparison = {
+    oldTotal,
+    newTotal,
+    delta:
+      comparisonOk && newTotal !== null && oldTotal !== null
+        ? Math.round((newTotal - oldTotal) * 100) / 100
+        : null,
+    ...(comparisonOk ? {} : { reason: "comparison_unavailable" as const }),
+    note: comparisonOk
+      ? "Сравнение сумм — только диагностика. НЕ означает эквивалентность классификации."
+      : "Дельта не вычислена: new/legacy неполны (error/partial/truncated/лимит/429).",
+  };
+
+  // ---- наличие нужных полей (по извлечённым схемам, без значений) ----
+  const schemaHasKey = (schema: unknown, keys: string[]): boolean => {
+    const o = asObj(schema);
+    return keys.some((k) => Object.prototype.hasOwnProperty.call(o, k));
+  };
+  const byDaySchema = asObj(methods.accrual_by_day).schema;
+  const postingsSchema = asObj(methods.accrual_postings).schema;
+  const fieldPresence = {
+    amount_or_net: schemaHasKey(byDaySchema, ["total_amount", "amount", "net"]) || schemaHasKey(postingsSchema, ["amount", "total_amount"]),
+    accrual_id: schemaHasKey(byDaySchema, ["accrual_id", "type_id"]) || schemaHasKey(postingsSchema, ["accrual_id", "type_id"]),
+    accrued_category: schemaHasKey(byDaySchema, ["accrued_category"]) || schemaHasKey(postingsSchema, ["accrued_category"]),
+    services: schemaHasKey(byDaySchema, ["services"]) || schemaHasKey(postingsSchema, ["services"]),
+    commission: schemaHasKey(postingsSchema, ["sale_commission", "commission"]),
+    logistics: schemaHasKey(postingsSchema, ["delivery_charge", "return_delivery_charge", "logistics"]),
+    returns: schemaHasKey(postingsSchema, ["returns", "return"]) || schemaHasKey(byDaySchema, ["returns"]),
+    posting_link: schemaHasKey(postingsSchema, ["posting_number", "posting"]),
+    pagination_dedup_id: schemaHasKey(byDaySchema, ["last_id", "operation_id", "id"]) || schemaHasKey(postingsSchema, ["operation_id", "id"]),
+    container_fees: schemaHasKey(byDaySchema, ["container_fees"]) || schemaHasKey(postingsSchema, ["container_fees"]),
+  };
+
+  return NextResponse.json(
+    {
+      ok: true,
+      month,
+      range: { since: range.dateFrom, to: range.dateTo },
+      rateLimited,
+      truncated,
+      newApiRequestsUsed: budget.used,
+      ...(legacyRan ? { legacyRequestsMax: LEGACY_MAX_REQUESTS } : {}),
+      totalRequestsUpperBound: budget.used + (legacyRan ? LEGACY_MAX_REQUESTS : 0),
+      totalRequestLimit: TOTAL_MAX_REQUESTS,
+      methods,
+      legacy,
+      comparison,
+      fieldPresence,
+      safety:
+        "Диагностика ничего не сохраняет, не списывает расчёт и не изменяет прибыль. Идентификаторы (posting_number/operation_id/SKU/offer_id/названия) не возвращаются — только имена ключей, типы и агрегаты.",
+    },
+    { status: 200, headers: NO_STORE }
+  );
+}
