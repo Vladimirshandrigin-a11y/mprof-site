@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
+import appLoaderStyles from "./app-loader.module.css"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { ProductCatalog } from "./components/ProductCatalog"
 import {
@@ -5031,6 +5032,28 @@ export default function AppPage() {
       behavior: "smooth",
     });
   };
+
+  // FOUC-фикс: пока идёт начальная проверка сессии (authLoading), показываем ТОЛЬКО
+  // фирменный лоадер, стили которого server-rendered (CSS-модуль, а не условный
+  // styled-jsx). Полный /app рендерится лишь после инициализации — к этому моменту
+  // styled-jsx уже вставил основную app-CSS, поэтому вспышки голого HTML нет.
+  if (authLoading) {
+    return (
+      <div
+        className={appLoaderStyles.wrap}
+        role="status"
+        aria-live="polite"
+        aria-label="Загружаем кабинет"
+      >
+        <div className={appLoaderStyles.logo}>
+          <span className={appLoaderStyles.dot} aria-hidden="true" />
+          M-PROF
+        </div>
+        <div className={appLoaderStyles.spinner} aria-hidden="true" />
+        <div className={appLoaderStyles.text}>Загружаем кабинет…</div>
+      </div>
+    );
+  }
 
   return (
     <>
