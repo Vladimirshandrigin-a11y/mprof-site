@@ -1357,6 +1357,8 @@ export default function AppPage() {
   const [accrualDiagLoading, setAccrualDiagLoading] = useState(false);
   const [accrualDiagResult, setAccrualDiagResult] = useState<unknown | null>(null);
   const [accrualDiagError, setAccrualDiagError] = useState("");
+  // Owner-only: карточка диагностики видна лишь после успешного серверного GET-чека.
+  const [accrualDiagAllowed, setAccrualDiagAllowed] = useState(false);
 
   // Ozon Performance API (реклама/продвижение) — PR #43 foundation. Отдельное
   // подключение и отдельная таблица; секрет в браузере не держим.
@@ -4102,6 +4104,42 @@ export default function AppPage() {
       setAccrualDiagLoading(false);
     }
   };
+
+  // Owner-only доступ к временной диагностике: серверный GET-чек allowlist.
+  // Без Ozon/consume/DB-writes. Карточка скрыта, пока не придёт { allowed: true };
+  // при 401/403/404 / выходе остаётся скрытой. POST на сервере всё равно
+  // перепроверяет — клиентскому чеку не доверяем. Все setState — только после
+  // await (не синхронно в теле эффекта).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await supabase.auth.getSession();
+        const token = user ? data.session?.access_token : null;
+        if (!token) {
+          if (!cancelled) setAccrualDiagAllowed(false);
+          return;
+        }
+        const res = await fetch("/api/ozon/accrual-migration-diagnostic", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          setAccrualDiagAllowed(false); // 401/403/404 → карточка скрыта
+          return;
+        }
+        const json = (await res.json().catch(() => null)) as { allowed?: boolean } | null;
+        if (!cancelled) setAccrualDiagAllowed(json?.allowed === true);
+      } catch {
+        if (!cancelled) setAccrualDiagAllowed(false); // сеть/ошибка → скрыто
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
 
   // Строка БД → локальный безопасный вид (без ключа). Один маппинг на все ответы.
   const applyOzonView = (data: OzonConnResponse) => {
@@ -9458,7 +9496,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         </div>
         )}
 
-        {calcMode === "api" && (
+        {calcMode === "api" && accrualDiagAllowed && (
           <div className="card" style={{ marginBottom: "1rem", padding: "1rem 1.1rem" }}>
             <div style={{ fontFamily: "var(--display)", fontWeight: 700, fontSize: "1rem", marginBottom: ".25rem" }}>
               Диагностика нового Ozon API

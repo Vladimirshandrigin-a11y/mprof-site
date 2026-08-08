@@ -31,7 +31,13 @@ const FBS_MAX_PAGES = 3;
 const POST_LIMIT = 100;
 const MAX_POSTING_NUMBERS = 200; // 1 батч для accrual/postings (макс. 200 по схеме)
 const BY_DAY_MAX_PAGES_PER_DAY = 5;
-const GLOBAL_MAX_REQUESTS = 150; // общий предохранитель
+// Доказуемый общий предел исходящих Ozon-запросов за один запуск:
+//   новые методы (через ozonPost) ≤ NEW_API_MAX_REQUESTS,
+//   старый fetchOzonTransactions ≤ LEGACY_MAX_REQUESTS (finance.ts: MAX_PAGES=20),
+//   worst-case суммарно ≤ TOTAL_MAX_REQUESTS = 130 + 20 = 150.
+const TOTAL_MAX_REQUESTS = 150;
+const LEGACY_MAX_REQUESTS = 20; // fetchOzonTransactions: макс. 20 внутренних страниц
+const NEW_API_MAX_REQUESTS = TOTAL_MAX_REQUESTS - LEGACY_MAX_REQUESTS; // 130
 
 type OzonHeaders = { "Client-Id": string; "Api-Key": string; "Content-Type": string };
 
@@ -46,7 +52,7 @@ async function ozonPost(
   body: unknown,
   budget: { used: number }
 ): Promise<FetchOut> {
-  if (budget.used >= GLOBAL_MAX_REQUESTS) {
+  if (budget.used >= NEW_API_MAX_REQUESTS) {
     return { ok: false, status: 0, code: "unavailable" };
   }
   budget.used += 1;
@@ -124,10 +130,40 @@ function daysOfMonth(month: string): string[] {
   return days;
 }
 
+// ---- owner-only allowlist из server-only env (fail-closed) ----
+// Формат OZON_ACCRUAL_DIAGNOSTIC_USER_IDS: Supabase user UUID через запятую.
+// Нет env / пусто / userId не в списке → доступа нет. UUID/env НЕ логируются.
+function isDiagnosticOwner(userId: string): boolean {
+  const raw = process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS;
+  if (!raw) return false;
+  const allow = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return allow.length > 0 && allow.includes(userId);
+}
+
+// Единый fail-closed ответ «не найдено» — не раскрывает существование route.
+const notFound = () =>
+  NextResponse.json({ error: "Not found" }, { status: 404, headers: NO_STORE });
+
+// ---- GET: лёгкий owner-check для UI. Только auth + allowlist. ----
+// НЕ читает ozon_connections, НЕ расшифровывает ключ, НЕ ходит в Ozon.
+export async function GET(req: NextRequest) {
+  const auth = await authenticateRequest(req);
+  if (!auth.ok) return auth.response;
+  if (!isDiagnosticOwner(auth.userId)) return notFound();
+  return NextResponse.json({ allowed: true }, { status: 200, headers: NO_STORE });
+}
+
 export async function POST(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
   const { admin, userId } = auth;
+
+  // Owner-only: fail-closed ДО чтения ozon_connections/decrypt/любых Ozon-запросов.
+  // Клиентскому GET-чеку НЕ доверяем — POST перепроверяет allowlist сам.
+  if (!isDiagnosticOwner(userId)) return notFound();
 
   if (!isEncryptionConfigured()) {
     return NextResponse.json(
@@ -430,7 +466,11 @@ export async function POST(req: NextRequest) {
   // Переиспользуем существующий модуль без изменений: Σ amount по операциям.
   let legacy: Record<string, unknown> = { endpoint: "/v3/finance/transaction/list", status: rateLimited ? 0 : null, skipped: rateLimited };
   let oldTotal: number | null = null;
-  if (!rateLimited && budget.used < GLOBAL_MAX_REQUESTS) {
+  let legacyRan = false;
+  // legacy запускаем ТОЛЬКО если не было 429. Его страницы (≤LEGACY_MAX_REQUESTS)
+  // зарезервированы ВНЕ budget новых методов → суммарный потолок доказуемо ≤150.
+  if (!rateLimited) {
+    legacyRan = true;
     const tx = await fetchOzonTransactions(clientId, apiKey, range);
     if (tx.ok) {
       let sum = 0;
@@ -449,14 +489,36 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // ---- достигнут ли потолок новых запросов (для честного truncated) ----
+  const newApiLimitReached = budget.used >= NEW_API_MAX_REQUESTS;
+  const anyMethodTruncated = Object.values(methods).some(
+    (m) => asObj(m).truncated === true
+  );
+  // Достигнут лимит новых запросов ИЛИ метод обрезан → результат НЕ полный.
+  const truncated = newApiLimitReached || anyMethodTruncated;
+
   // ---- сравнение old vs new (диагностика; НЕ утверждение об эквивалентности) ----
   const byDay = asObj(methods.accrual_by_day);
   const newTotal = typeof byDay.sumTotalAmount === "number" ? byDay.sumTotalAmount : null;
+  const legacyObj = asObj(legacy);
+  // delta считаем ТОЛЬКО когда и new, и legacy завершены полностью: без 429, без
+  // общего лимита, без per-method error/truncated и без legacy.partial.
+  const newComplete =
+    !rateLimited && !newApiLimitReached && byDay.error === "ok" && byDay.truncated === false && newTotal !== null;
+  const legacyComplete =
+    legacyRan && legacyObj.status === 200 && legacyObj.partial === false && oldTotal !== null;
+  const comparisonOk = newComplete && legacyComplete;
   const comparison = {
     oldTotal,
     newTotal,
-    delta: oldTotal !== null && newTotal !== null ? Math.round((newTotal - oldTotal) * 100) / 100 : null,
-    note: "Сравнение сумм — только диагностика. НЕ означает эквивалентность классификации.",
+    delta:
+      comparisonOk && newTotal !== null && oldTotal !== null
+        ? Math.round((newTotal - oldTotal) * 100) / 100
+        : null,
+    ...(comparisonOk ? {} : { reason: "comparison_unavailable" as const }),
+    note: comparisonOk
+      ? "Сравнение сумм — только диагностика. НЕ означает эквивалентность классификации."
+      : "Дельта не вычислена: new/legacy неполны (error/partial/truncated/лимит/429).",
   };
 
   // ---- наличие нужных полей (по извлечённым схемам, без значений) ----
@@ -485,7 +547,11 @@ export async function POST(req: NextRequest) {
       month,
       range: { since: range.dateFrom, to: range.dateTo },
       rateLimited,
-      requestsUsed: budget.used,
+      truncated,
+      newApiRequestsUsed: budget.used,
+      ...(legacyRan ? { legacyRequestsMax: LEGACY_MAX_REQUESTS } : {}),
+      totalRequestsUpperBound: budget.used + (legacyRan ? LEGACY_MAX_REQUESTS : 0),
+      totalRequestLimit: TOTAL_MAX_REQUESTS,
       methods,
       legacy,
       comparison,
