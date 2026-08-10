@@ -181,6 +181,23 @@ const numOr0 = (v: unknown): number => (typeof v === "number" && Number.isFinite
 // непустой массив → форма ПЕРВОГО элемента (ключи+типы). Значения НЕ раскрываются.
 const SHAPE_MAX_DEPTH = 4;
 const SHAPE_MAX_NODES = 200;
+
+// Маскирование ключей: Ozon может вернуть объект-карту, где идентификатор
+// (posting_number/UUID/operation_id/числовой/hex ID) лежит в ИМЕНИ КЛЮЧА — тогда он
+// утёк бы как динамическое имя, хотя значения и так скрыты. Поэтому показываем ТОЛЬКО
+// «статические» имена полей: lowercase ASCII, первый символ [a-z_], далее [a-z0-9_],
+// длина ≤64, не длинная hex-последовательность, не prototype-sensitive. Всё остальное
+// (UUID/числовые/hex/произвольные ключи) → единый плейсхолдер SHAPE_DYNAMIC_KEY.
+const SHAPE_DYNAMIC_KEY = "<dynamic_key>";
+const SHAPE_FORBIDDEN_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+function safeShapeKey(key: string): string {
+  const looksStatic =
+    /^[a-z_][a-z0-9_]{0,63}$/.test(key) &&
+    !/^[0-9a-f]{8,}$/i.test(key) &&
+    !SHAPE_FORBIDDEN_KEYS.has(key);
+  return looksStatic ? key : SHAPE_DYNAMIC_KEY;
+}
+
 function responseShape(value: unknown): unknown {
   const budget = { nodes: 0 };
   const walk = (v: unknown, depth: number): unknown => {
@@ -199,7 +216,13 @@ function responseShape(value: unknown): unknown {
           out["__truncated__"] = "nodes_limit";
           break;
         }
-        out[k] = walk(val, depth - 1);
+        const safeK = safeShapeKey(k);
+        // Динамические (ID-подобные) ключи схлопываем в ОДНОГО представителя —
+        // идентификаторы не перечисляются и узлы не раздуваются.
+        if (safeK === SHAPE_DYNAMIC_KEY && Object.prototype.hasOwnProperty.call(out, SHAPE_DYNAMIC_KEY)) {
+          continue;
+        }
+        out[safeK] = walk(val, depth - 1);
       }
       return out;
     }
