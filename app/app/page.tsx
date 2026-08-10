@@ -1359,6 +1359,8 @@ export default function AppPage() {
   const [accrualDiagError, setAccrualDiagError] = useState("");
   // Owner-only: карточка диагностики видна лишь после успешного серверного GET-чека.
   const [accrualDiagAllowed, setAccrualDiagAllowed] = useState(false);
+  // Пропускать повторный запрос справочника типов (уже собран). Default = checked.
+  const [accrualDiagSkipTypes, setAccrualDiagSkipTypes] = useState(true);
 
   // Ozon Performance API (реклама/продвижение) — PR #43 foundation. Отдельное
   // подключение и отдельная таблица; секрет в браузере не держим.
@@ -4089,7 +4091,7 @@ export default function AppPage() {
       const res = await fetch("/api/ozon/accrual-migration-diagnostic", {
         method: "POST",
         headers: { ...authHeaders, "Content-Type": "application/json" },
-        body: JSON.stringify({ month: accrualDiagMonth }),
+        body: JSON.stringify({ month: accrualDiagMonth, skipTypes: accrualDiagSkipTypes }),
         cache: "no-store",
       });
       const json = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -9526,6 +9528,15 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 {accrualDiagLoading ? "Проверяем…" : "Проверить новые методы Ozon"}
               </button>
             </div>
+            <label style={{ display: "flex", alignItems: "center", gap: ".4rem", fontSize: ".72rem", color: "var(--txt2)", marginBottom: ".8rem", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={accrualDiagSkipTypes}
+                onChange={(e) => setAccrualDiagSkipTypes(e.target.checked)}
+                disabled={accrualDiagLoading}
+              />
+              Не запрашивать справочник типов — уже получен
+            </label>
             {accrualDiagError && (
               <div style={{ fontSize: ".8rem", color: "var(--red)", marginBottom: ".6rem" }}>{accrualDiagError}</div>
             )}

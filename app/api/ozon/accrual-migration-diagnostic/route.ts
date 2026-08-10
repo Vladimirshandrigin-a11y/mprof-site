@@ -173,6 +173,41 @@ const asObj = (v: unknown): Record<string, unknown> =>
 const asArr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const numOr0 = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
+// ---- безопасная ФОРМА ответа (ТОЛЬКО имена ключей + типы, БЕЗ значений) ----
+// Тот же value-free принцип, что и keySchema, но с hard-limit на число узлов
+// (защита от раздувания ответа). Захватывается ДО текущего парсинга, чтобы при
+// HTTP 200 + records=0 стало видно, где реально лежит массив. Скаляр → только тип
+// ("string"/"number"/"boolean"/…); null → "null"; пустой массив → "array";
+// непустой массив → форма ПЕРВОГО элемента (ключи+типы). Значения НЕ раскрываются.
+const SHAPE_MAX_DEPTH = 4;
+const SHAPE_MAX_NODES = 200;
+function responseShape(value: unknown): unknown {
+  const budget = { nodes: 0 };
+  const walk = (v: unknown, depth: number): unknown => {
+    budget.nodes += 1;
+    if (budget.nodes > SHAPE_MAX_NODES) return "…nodes_truncated";
+    if (v === null) return "null";
+    if (Array.isArray(v)) {
+      if (v.length === 0 || depth <= 1) return "array";
+      return [walk(v[0], depth - 1)]; // форма первого элемента, без значений
+    }
+    if (typeof v === "object") {
+      if (depth <= 1) return "object";
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        if (budget.nodes >= SHAPE_MAX_NODES) {
+          out["__truncated__"] = "nodes_limit";
+          break;
+        }
+        out[k] = walk(val, depth - 1);
+      }
+      return out;
+    }
+    return typeof v; // только имя типа скаляра, НЕ значение
+  };
+  return walk(value, SHAPE_MAX_DEPTH);
+}
+
 // Дни выбранного месяца в формате YYYY-MM-DD (для accrual/by-day).
 function daysOfMonth(month: string): string[] {
   const [y, m] = month.split("-").map((s) => parseInt(s, 10));
@@ -240,15 +275,24 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // ---- месяц из body (единственный вход; никаких ключей/user_id из body) ----
+  // ---- body: month + skipTypes (единственный вход; никаких ключей/user_id из body) ----
   let month = "2026-06";
+  let skipTypes = false; // отсутствует → обратная совместимость (types вызывается)
   try {
-    const body = (await req.json()) as { month?: unknown };
+    const body = (await req.json()) as { month?: unknown; skipTypes?: unknown };
     if (typeof body?.month === "string" && /^\d{4}-\d{2}$/.test(body.month)) {
       month = body.month;
     }
+    // skipTypes строго boolean: присутствует и не boolean → 400 (безопасный код).
+    if (body?.skipTypes !== undefined && typeof body.skipTypes !== "boolean") {
+      return NextResponse.json(
+        { error: "skipTypes должен быть boolean", code: "bad_skip_types" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
+    if (typeof body?.skipTypes === "boolean") skipTypes = body.skipTypes;
   } catch {
-    /* пустое/битое тело → дефолтный месяц */
+    /* пустое/битое тело → дефолты: month=2026-06, skipTypes=false */
   }
   const range = monthToRange(month);
   if (!range) {
@@ -318,8 +362,19 @@ export async function POST(req: NextRequest) {
     error: "rate_limited" as const,
   });
 
-  // ============== 1) accrual/types — ПЕРВЫЙ Ozon-запрос (finance-first) ==============
-  if (!rateLimited) {
+  // ============== 1) accrual/types — ПЕРВЫЙ Ozon-запрос (finance-first), ==============
+  // ============== ЕСЛИ владелец не пропустил (справочник 119 типов уже собран). =======
+  if (skipTypes) {
+    // Явный owner-пропуск: types НЕ вызывается, budget не растёт, rateLimited/truncated
+    // НЕ выставляются. Первым РЕАЛЬНЫМ Ozon-запросом станет by-day. Пропуск (reason
+    // already_collected) намеренный → не считается незавершённостью плана.
+    methods.accrual_types = {
+      endpoint: "/v1/finance/accrual/types",
+      status: 0,
+      skipped: true,
+      reason: "already_collected",
+    };
+  } else if (!rateLimited) {
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/types`, headers, undefined, budget);
     noteRateLimit(r);
     let count = 0;
@@ -362,6 +417,7 @@ export async function POST(req: NextRequest) {
     let status = 0;
     let schema: unknown = null;
     let lastErr = "ok";
+    let bydayShape: unknown = null; // безопасная форма первого 200-ответа by-day
     const categories = new Set<string>();
     for (const day of days) {
       if (rateLimited || Date.now() >= budget.deadline) break;
@@ -374,6 +430,8 @@ export async function POST(req: NextRequest) {
           noteRateLimit(r);
           break;
         }
+        // Безопасная форма первого 200-ответа — ДО парсинга (ключи+типы, без значений).
+        if (bydayShape === null) bydayShape = responseShape(r.json);
         const root = asObj(r.json);
         const result = asObj(root.result);
         // записи могут лежать в result.details[]/result.rows[]/result[]/root.details[] — мягко.
@@ -422,6 +480,7 @@ export async function POST(req: NextRequest) {
       containerFeesSum: containerFeesSeen ? Math.round(containerFeesSum * 100) / 100 : null,
       accruedCategories: Array.from(categories).sort(),
       schema,
+      responseShape: bydayShape,
       truncated,
       error: lastErr,
     };
@@ -438,6 +497,7 @@ export async function POST(req: NextRequest) {
     let status = 0;
     let schema: unknown = null;
     let lastErr = "ok";
+    let fboShape: unknown = null; // безопасная форма первого 200-ответа FBO
     for (let p = 0; p < FBO_MAX_PAGES; p++) {
       const r = await ozonPost(
         `${SELLER}/v3/posting/fbo/list`,
@@ -451,6 +511,7 @@ export async function POST(req: NextRequest) {
         noteRateLimit(r);
         break;
       }
+      if (fboShape === null) fboShape = responseShape(r.json); // ДО парсинга, без значений
       const result = asObj(asObj(r.json).result);
       // v3 fbo: ответ может быть result.postings[] ИЛИ result[] — берём мягко.
       const items = result.postings !== undefined ? asArr(result.postings) : asArr(asObj(r.json).result);
@@ -466,7 +527,7 @@ export async function POST(req: NextRequest) {
       if (!hasNext || cursor === "" || items.length === 0) break;
       if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
     }
-    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, truncated, error: lastErr };
+    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, responseShape: fboShape, truncated, error: lastErr };
   } else {
     methods.fbo_v3 = skippedMethod("/v3/posting/fbo/list");
   }
@@ -480,6 +541,7 @@ export async function POST(req: NextRequest) {
     let status = 0;
     let schema: unknown = null;
     let lastErr = "ok";
+    let fbsShape: unknown = null; // безопасная форма первого 200-ответа FBS
     for (let p = 0; p < FBS_MAX_PAGES; p++) {
       const r = await ozonPost(
         `${SELLER}/v4/posting/fbs/list`,
@@ -493,6 +555,7 @@ export async function POST(req: NextRequest) {
         noteRateLimit(r);
         break;
       }
+      if (fbsShape === null) fbsShape = responseShape(r.json); // ДО парсинга, без значений
       const result = asObj(asObj(r.json).result);
       const items = asArr(result.postings);
       if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
@@ -507,7 +570,7 @@ export async function POST(req: NextRequest) {
       if (!hasNext || cursor === "" || items.length === 0) break;
       if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
     }
-    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, truncated, error: lastErr };
+    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, responseShape: fbsShape, truncated, error: lastErr };
   } else {
     methods.fbs_v4 = skippedMethod("/v4/posting/fbs/list");
   }
@@ -521,8 +584,10 @@ export async function POST(req: NextRequest) {
     noteRateLimit(r);
     let records = 0;
     let schema: unknown = null;
+    let postShape: unknown = null; // безопасная форма 200-ответа postings (метод реально вызван)
     const categories = new Set<string>();
     if (r.ok) {
+      postShape = responseShape(r.json); // ДО парсинга, без значений
       const root = asObj(r.json);
       const items =
         asArr(root.result).length > 0 ? asArr(root.result)
@@ -543,6 +608,7 @@ export async function POST(req: NextRequest) {
       records,
       accruedCategories: Array.from(categories).sort(),
       schema,
+      responseShape: postShape,
       error: errCode(r),
     };
   } else {
@@ -563,7 +629,8 @@ export async function POST(req: NextRequest) {
   const NEW_METHOD_KEYS = ["accrual_types", "accrual_by_day", "fbo_v3", "fbs_v4", "accrual_postings"] as const;
   const newMethodsClean = NEW_METHOD_KEYS.every((k) => {
     const m = asObj(methods[k]);
-    if (m.skipped === true) return false;
+    // Намеренный owner-пропуск справочника типов (already_collected) — НЕ незавершённость.
+    if (m.skipped === true && m.reason !== "already_collected") return false;
     if (m.truncated === true) return false;
     const e = m.error;
     // "ok" и "no_posting_numbers" (нет отправлений) — не ошибки; остальное — незавершённость.
@@ -606,7 +673,11 @@ export async function POST(req: NextRequest) {
 
   // ---- честная полнота: остановились ли раньше полного плана ----
   const anyMethodTruncated = Object.values(methods).some((m) => asObj(m).truncated === true);
-  const anyMethodSkipped = Object.values(methods).some((m) => asObj(m).skipped === true);
+  const anyMethodSkipped = Object.values(methods).some((m) => {
+    const o = asObj(m);
+    // already_collected — намеренный owner-пропуск types, НЕ признак обрезки плана.
+    return o.skipped === true && o.reason !== "already_collected";
+  });
   const anyMethodErrored = Object.values(methods).some((m) => {
     const e = asObj(m).error;
     // "rate_limited" помечает skipped-фазу (учтено выше), "no_posting_numbers" — не ошибка.
