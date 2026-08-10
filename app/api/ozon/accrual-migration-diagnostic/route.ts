@@ -133,14 +133,28 @@ function daysOfMonth(month: string): string[] {
 // ---- owner-only allowlist из server-only env (fail-closed) ----
 // Формат OZON_ACCRUAL_DIAGNOSTIC_USER_IDS: Supabase user UUID через запятую.
 // Нет env / пусто / userId не в списке → доступа нет. UUID/env НЕ логируются.
+//
+// Нормализация значения: веб-панель (Timeweb) часто сохраняет env в кавычках или
+// со скрытыми символами (BOM), а UUID регистронезависим. Поэтому обе стороны
+// приводим к канону: убираем пробелы/переводы строк, BOM, окружающие кавычки и
+// регистр. Fail-closed СОХРАНЯЕТСЯ: пустое после нормализации → не совпадёт;
+// разные UUID не коллидируют (lower-case не делает разные значения равными).
+function normId(s: string): string {
+  return s
+    .trim()
+    .replace(/^["']+|["']+$/g, "") // окружающие кавычки
+    .replace(/\uFEFF/g, "") // BOM (в UUID не встречается)
+    .trim()
+    .toLowerCase();
+}
+
 function isDiagnosticOwner(userId: string): boolean {
   const raw = process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS;
   if (!raw) return false;
-  const allow = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  return allow.length > 0 && allow.includes(userId);
+  const target = normId(userId);
+  if (!target) return false; // без валидного userId — доступа нет
+  const allow = raw.split(",").map(normId).filter((s) => s.length > 0);
+  return allow.includes(target);
 }
 
 // Единый fail-closed ответ «не найдено» — не раскрывает существование route.
