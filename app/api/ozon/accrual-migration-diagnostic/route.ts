@@ -7,6 +7,12 @@
 // названий товаров), БЕЗ raw-ответов. Ничего не сохраняет, не списывает, не меняет
 // прибыль. НЕ выполняет финансовую классификацию — только диагностика схемы.
 //
+// Порядок фаз — FINANCE-FIRST: сначала критичные finance-методы (types → by-day),
+// затем справочные posting-методы (fbo/fbs → accrual/postings), в конце legacy —
+// только если новые данные полны. Все новые запросы идут через один
+// последовательный pacer (≥MIN_REQUEST_INTERVAL_MS между стартами), поэтому
+// Ozon-rate-limit не срабатывает на «шторме» первых запросов.
+//
 // Безопасность: user_id ТОЛЬКО из токена (authenticateRequest); ключ Ozon берётся
 // из ozon_connections текущего пользователя и расшифровывается ТОЛЬКО на сервере.
 // Запросы последовательные (без параллельного шторма), с timeout, hard-limit
@@ -31,6 +37,14 @@ const FBS_MAX_PAGES = 3;
 const POST_LIMIT = 100;
 const MAX_POSTING_NUMBERS = 200; // 1 батч для accrual/postings (макс. 200 по схеме)
 const BY_DAY_MAX_PAGES_PER_DAY = 5;
+// Последовательный pacer: минимум MIN_REQUEST_INTERVAL_MS между СТАРТАМИ соседних
+// реальных Ozon-запросов (первый — сразу). Ozon rate-limit на seller-эндпоинтах
+// срабатывал на 3-м мгновенном запросе; ~1 запрос / 1.1 c держит нас ниже лимита.
+const MIN_REQUEST_INTERVAL_MS = 1100;
+// Мягкий общий дедлайн: после него НЕ стартуем новых Ozon-запросов (finance-first
+// схема к этому моменту уже собрана) и помечаем truncated. Гарантирует ответ до
+// таймаута прокси. Дедлайн-проверка — не fetch: budget не трогает, запросом не считается.
+const DIAG_DEADLINE_MS = 40000;
 // Доказуемый общий предел исходящих Ozon-запросов за один запуск:
 //   новые методы (через ozonPost) ≤ NEW_API_MAX_REQUESTS,
 //   старый fetchOzonTransactions ≤ LEGACY_MAX_REQUESTS (finance.ts: MAX_PAGES=20),
@@ -41,20 +55,45 @@ const NEW_API_MAX_REQUESTS = TOTAL_MAX_REQUESTS - LEGACY_MAX_REQUESTS; // 130
 
 type OzonHeaders = { "Client-Id": string; "Api-Key": string; "Content-Type": string };
 
+// Состояние на ОДИН вызов POST (не глобальное — чтобы параллельные запросы разных
+// пользователей не влияли друг на друга). used — счётчик реальных fetch; lastStart —
+// таймстамп старта предыдущего реального запроса (для pacer); deadline — абсолютная
+// точка, после которой новые запросы не стартуют.
+type Budget = { used: number; lastStart: number; deadline: number };
+
 type FetchOut =
   | { ok: true; status: number; json: unknown }
-  | { ok: false; status: number; code: "invalid_key" | "forbidden" | "rate_limited" | "timeout" | "bad_response" | "unavailable" };
+  | {
+      ok: false;
+      status: number;
+      code: "invalid_key" | "forbidden" | "rate_limited" | "timeout" | "bad_response" | "unavailable" | "deadline";
+      retryAfter?: number | null;
+    };
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ---- один безопасный POST к Ozon (никогда не бросает) ----
+// Проходит через единый pacer/budget/deadline: параллельных запросов нет.
 async function ozonPost(
   url: string,
   headers: OzonHeaders,
   body: unknown,
-  budget: { used: number }
+  budget: Budget
 ): Promise<FetchOut> {
   if (budget.used >= NEW_API_MAX_REQUESTS) {
     return { ok: false, status: 0, code: "unavailable" };
   }
+  // Мягкий дедлайн: не стартуем новых запросов (не fetch → budget не трогаем).
+  if (Date.now() >= budget.deadline) {
+    return { ok: false, status: 0, code: "deadline" };
+  }
+  // Pacer: выдерживаем MIN_REQUEST_INTERVAL_MS от старта предыдущего РЕАЛЬНОГО запроса.
+  // Первый запрос (lastStart===0) — сразу. Ожидание НЕ считается запросом и НЕ трогает budget.
+  if (budget.lastStart !== 0) {
+    const waitMs = MIN_REQUEST_INTERVAL_MS - (Date.now() - budget.lastStart);
+    if (waitMs > 0) await sleep(waitMs);
+  }
+  budget.lastStart = Date.now();
   budget.used += 1;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
@@ -69,7 +108,17 @@ async function ozonPost(
     if (!res.ok) {
       if (res.status === 401) return { ok: false, status: 401, code: "invalid_key" };
       if (res.status === 403) return { ok: false, status: 403, code: "forbidden" };
-      if (res.status === 429) return { ok: false, status: 429, code: "rate_limited" };
+      if (res.status === 429) {
+        // Retry-After берём ТОЛЬКО если заголовок реально присутствует и это
+        // неотрицательное число секунд. Никаких других заголовков/тела наружу.
+        const ra = res.headers.get("retry-after");
+        let retryAfter: number | null = null;
+        if (ra !== null) {
+          const n = Number.parseInt(ra.trim(), 10);
+          if (Number.isFinite(n) && n >= 0) retryAfter = n;
+        }
+        return { ok: false, status: 429, code: "rate_limited", retryAfter };
+      }
       return { ok: false, status: res.status, code: "unavailable" };
     }
     let json: unknown;
@@ -238,97 +287,36 @@ export async function POST(req: NextRequest) {
     "Content-Type": "application/json",
   };
 
-  const budget = { used: 0 };
+  const budget: Budget = { used: 0, lastStart: 0, deadline: Date.now() + DIAG_DEADLINE_MS };
   let rateLimited = false;
+  let retryAfterSeconds: number | null = null;
   const methods: Record<string, unknown> = {};
   const postingNumbers: string[] = [];
 
   // safe-код ошибки метода (без raw)
   const errCode = (r: FetchOut): string => (r.ok ? "ok" : r.code);
-
-  // ======================= 1) FBO /v3/posting/fbo/list =======================
-  {
-    let cursor = "";
-    let pages = 0;
-    let records = 0;
-    let truncated = false;
-    let status = 0;
-    let schema: unknown = null;
-    let lastErr = "ok";
-    for (let p = 0; p < FBO_MAX_PAGES; p++) {
-      const r = await ozonPost(
-        `${SELLER}/v3/posting/fbo/list`,
-        headers,
-        { cursor, filter: { since: range.dateFrom, to: range.dateTo, statuses: ["delivered"] }, limit: POST_LIMIT, sort_dir: "ASC" },
-        budget
-      );
-      status = r.status;
-      lastErr = errCode(r);
-      if (!r.ok) {
-        if (r.code === "rate_limited") rateLimited = true;
-        break;
+  // Централизованная фиксация 429: ставим rateLimited и (один раз) retryAfterSeconds.
+  // После этого все следующие фазы и legacy НЕ выполняются.
+  const noteRateLimit = (r: FetchOut) => {
+    if (!r.ok && r.code === "rate_limited") {
+      rateLimited = true;
+      if (retryAfterSeconds === null && typeof r.retryAfter === "number") {
+        retryAfterSeconds = r.retryAfter;
       }
-      const result = asObj(asObj(r.json).result);
-      // v3 fbo: ответ может быть result.postings[] ИЛИ result[] — берём мягко.
-      const items = result.postings !== undefined ? asArr(result.postings) : asArr(asObj(r.json).result);
-      if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
-      records += items.length;
-      for (const it of items) {
-        const pn = asObj(it).posting_number;
-        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
-      }
-      pages += 1;
-      const hasNext = result.has_next === true;
-      cursor = typeof result.cursor === "string" ? result.cursor : "";
-      if (!hasNext || cursor === "" || items.length === 0) break;
-      if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
     }
-    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, truncated, error: lastErr };
-  }
+  };
+  // Явный маркер фазы, пропущенной из-за уже случившегося 429.
+  const skippedMethod = (endpoint: string) => ({
+    endpoint,
+    status: 0,
+    skipped: true,
+    error: "rate_limited" as const,
+  });
 
-  // ======================= 2) FBS /v4/posting/fbs/list =======================
-  if (!rateLimited) {
-    let cursor = "";
-    let pages = 0;
-    let records = 0;
-    let truncated = false;
-    let status = 0;
-    let schema: unknown = null;
-    let lastErr = "ok";
-    for (let p = 0; p < FBS_MAX_PAGES; p++) {
-      const r = await ozonPost(
-        `${SELLER}/v4/posting/fbs/list`,
-        headers,
-        { cursor, filter: { since: range.dateFrom, to: range.dateTo, statuses: ["delivered"] }, limit: POST_LIMIT, sort_dir: "ASC" },
-        budget
-      );
-      status = r.status;
-      lastErr = errCode(r);
-      if (!r.ok) {
-        if (r.code === "rate_limited") rateLimited = true;
-        break;
-      }
-      const result = asObj(asObj(r.json).result);
-      const items = asArr(result.postings);
-      if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
-      records += items.length;
-      for (const it of items) {
-        const pn = asObj(it).posting_number;
-        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
-      }
-      pages += 1;
-      const hasNext = result.has_next === true;
-      cursor = typeof result.cursor === "string" ? result.cursor : "";
-      if (!hasNext || cursor === "" || items.length === 0) break;
-      if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
-    }
-    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, truncated, error: lastErr };
-  }
-
-  // ======================= 3) accrual/types (без тела) =======================
+  // ============== 1) accrual/types — ПЕРВЫЙ Ozon-запрос (finance-first) ==============
   if (!rateLimited) {
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/types`, headers, undefined, budget);
-    if (!r.ok && r.code === "rate_limited") rateLimited = true;
+    noteRateLimit(r);
     let count = 0;
     let dictionary: Array<{ accrual_id: unknown; name: unknown; description: unknown }> = [];
     let schema: unknown = null;
@@ -352,9 +340,11 @@ export async function POST(req: NextRequest) {
       });
     }
     methods.accrual_types = { endpoint: "/v1/finance/accrual/types", status: r.status, count, dictionary, schema, error: errCode(r) };
+  } else {
+    methods.accrual_types = skippedMethod("/v1/finance/accrual/types");
   }
 
-  // ======================= 4) accrual/by-day (по дням месяца) =================
+  // ================= 2) accrual/by-day (finance-фаза, по дням месяца) =================
   if (!rateLimited) {
     const days = daysOfMonth(month);
     let daysQueried = 0;
@@ -369,14 +359,14 @@ export async function POST(req: NextRequest) {
     let lastErr = "ok";
     const categories = new Set<string>();
     for (const day of days) {
-      if (rateLimited) break;
+      if (rateLimited || Date.now() >= budget.deadline) break;
       let lastId = "";
       for (let p = 0; p < BY_DAY_MAX_PAGES_PER_DAY; p++) {
         const r = await ozonPost(`${SELLER}/v1/finance/accrual/by-day`, headers, { date: day, last_id: lastId }, budget);
         status = r.status;
         lastErr = errCode(r);
         if (!r.ok) {
-          if (r.code === "rate_limited") rateLimited = true;
+          noteRateLimit(r);
           break;
         }
         const root = asObj(r.json);
@@ -430,13 +420,100 @@ export async function POST(req: NextRequest) {
       truncated,
       error: lastErr,
     };
+  } else {
+    methods.accrual_by_day = skippedMethod("/v1/finance/accrual/by-day");
   }
 
-  // ======================= 5) accrual/postings (1 батч ≤200) =================
-  if (!rateLimited && postingNumbers.length > 0) {
+  // ===================== 3) FBO /v3/posting/fbo/list (справочный) =====================
+  if (!rateLimited) {
+    let cursor = "";
+    let pages = 0;
+    let records = 0;
+    let truncated = false;
+    let status = 0;
+    let schema: unknown = null;
+    let lastErr = "ok";
+    for (let p = 0; p < FBO_MAX_PAGES; p++) {
+      const r = await ozonPost(
+        `${SELLER}/v3/posting/fbo/list`,
+        headers,
+        { cursor, filter: { since: range.dateFrom, to: range.dateTo, statuses: ["delivered"] }, limit: POST_LIMIT, sort_dir: "ASC" },
+        budget
+      );
+      status = r.status;
+      lastErr = errCode(r);
+      if (!r.ok) {
+        noteRateLimit(r);
+        break;
+      }
+      const result = asObj(asObj(r.json).result);
+      // v3 fbo: ответ может быть result.postings[] ИЛИ result[] — берём мягко.
+      const items = result.postings !== undefined ? asArr(result.postings) : asArr(asObj(r.json).result);
+      if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
+      records += items.length;
+      for (const it of items) {
+        const pn = asObj(it).posting_number;
+        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
+      }
+      pages += 1;
+      const hasNext = result.has_next === true;
+      cursor = typeof result.cursor === "string" ? result.cursor : "";
+      if (!hasNext || cursor === "" || items.length === 0) break;
+      if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
+    }
+    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, truncated, error: lastErr };
+  } else {
+    methods.fbo_v3 = skippedMethod("/v3/posting/fbo/list");
+  }
+
+  // ===================== 4) FBS /v4/posting/fbs/list (справочный) =====================
+  if (!rateLimited) {
+    let cursor = "";
+    let pages = 0;
+    let records = 0;
+    let truncated = false;
+    let status = 0;
+    let schema: unknown = null;
+    let lastErr = "ok";
+    for (let p = 0; p < FBS_MAX_PAGES; p++) {
+      const r = await ozonPost(
+        `${SELLER}/v4/posting/fbs/list`,
+        headers,
+        { cursor, filter: { since: range.dateFrom, to: range.dateTo, statuses: ["delivered"] }, limit: POST_LIMIT, sort_dir: "ASC" },
+        budget
+      );
+      status = r.status;
+      lastErr = errCode(r);
+      if (!r.ok) {
+        noteRateLimit(r);
+        break;
+      }
+      const result = asObj(asObj(r.json).result);
+      const items = asArr(result.postings);
+      if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
+      records += items.length;
+      for (const it of items) {
+        const pn = asObj(it).posting_number;
+        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
+      }
+      pages += 1;
+      const hasNext = result.has_next === true;
+      cursor = typeof result.cursor === "string" ? result.cursor : "";
+      if (!hasNext || cursor === "" || items.length === 0) break;
+      if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
+    }
+    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, truncated, error: lastErr };
+  } else {
+    methods.fbs_v4 = skippedMethod("/v4/posting/fbs/list");
+  }
+
+  // ========= 5) accrual/postings — только после posting_numbers из FBO/FBS ===========
+  if (rateLimited) {
+    methods.accrual_postings = skippedMethod("/v1/finance/accrual/postings");
+  } else if (postingNumbers.length > 0) {
     const batch = postingNumbers.slice(0, MAX_POSTING_NUMBERS);
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/postings`, headers, { posting_numbers: batch }, budget);
-    if (!r.ok && r.code === "rate_limited") rateLimited = true;
+    noteRateLimit(r);
     let records = 0;
     let schema: unknown = null;
     const categories = new Set<string>();
@@ -463,7 +540,7 @@ export async function POST(req: NextRequest) {
       schema,
       error: errCode(r),
     };
-  } else if (!rateLimited) {
+  } else {
     methods.accrual_postings = {
       endpoint: "/v1/finance/accrual/postings",
       status: 0,
@@ -476,14 +553,33 @@ export async function POST(req: NextRequest) {
     };
   }
 
-  // ============ 6) СТАРЫЙ finance-агрегатор (read-only) для old total ==========
+  // ---- полны ли новые методы (нужно для gate legacy и честного truncated) ----
+  const newApiLimitReached = budget.used >= NEW_API_MAX_REQUESTS;
+  const NEW_METHOD_KEYS = ["accrual_types", "accrual_by_day", "fbo_v3", "fbs_v4", "accrual_postings"] as const;
+  const newMethodsClean = NEW_METHOD_KEYS.every((k) => {
+    const m = asObj(methods[k]);
+    if (m.skipped === true) return false;
+    if (m.truncated === true) return false;
+    const e = m.error;
+    // "ok" и "no_posting_numbers" (нет отправлений) — не ошибки; остальное — незавершённость.
+    return !(typeof e === "string" && e !== "ok" && e !== "no_posting_numbers");
+  });
+  const newApiComplete = !rateLimited && !newApiLimitReached && newMethodsClean;
+
+  // ======= 6) СТАРЫЙ finance-агрегатор — ПОСЛЕДНИМ, только если new завершены =========
   // Переиспользуем существующий модуль без изменений: Σ amount по операциям.
-  let legacy: Record<string, unknown> = { endpoint: "/v3/finance/transaction/list", status: rateLimited ? 0 : null, skipped: rateLimited };
+  let legacy: Record<string, unknown> = {
+    endpoint: "/v3/finance/transaction/list",
+    status: null,
+    skipped: true,
+    reason: rateLimited ? "rate_limited" : "new_api_incomplete",
+  };
   let oldTotal: number | null = null;
   let legacyRan = false;
-  // legacy запускаем ТОЛЬКО если не было 429. Его страницы (≤LEGACY_MAX_REQUESTS)
-  // зарезервированы ВНЕ budget новых методов → суммарный потолок доказуемо ≤150.
-  if (!rateLimited) {
+  // legacy — только если новые данные полны (без 429/лимита/ошибки/обрезки). Его
+  // страницы (≤LEGACY_MAX_REQUESTS) зарезервированы ВНЕ budget новых методов →
+  // суммарный потолок доказуемо ≤150.
+  if (newApiComplete) {
     legacyRan = true;
     const tx = await fetchOzonTransactions(clientId, apiKey, range);
     if (tx.ok) {
@@ -503,25 +599,31 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ---- достигнут ли потолок новых запросов (для честного truncated) ----
-  const newApiLimitReached = budget.used >= NEW_API_MAX_REQUESTS;
-  const anyMethodTruncated = Object.values(methods).some(
-    (m) => asObj(m).truncated === true
-  );
-  // Достигнут лимит новых запросов ИЛИ метод обрезан → результат НЕ полный.
-  const truncated = newApiLimitReached || anyMethodTruncated;
+  // ---- честная полнота: остановились ли раньше полного плана ----
+  const anyMethodTruncated = Object.values(methods).some((m) => asObj(m).truncated === true);
+  const anyMethodSkipped = Object.values(methods).some((m) => asObj(m).skipped === true);
+  const anyMethodErrored = Object.values(methods).some((m) => {
+    const e = asObj(m).error;
+    // "rate_limited" помечает skipped-фазу (учтено выше), "no_posting_numbers" — не ошибка.
+    return typeof e === "string" && e !== "ok" && e !== "no_posting_numbers" && e !== "rate_limited";
+  });
+  // truncated=true, если план не отработал полностью: 429 / budget / pagination cap /
+  // deadline|timeout|прочая ошибка метода / пропущенные фазы.
+  const truncated =
+    rateLimited || newApiLimitReached || anyMethodTruncated || anyMethodSkipped || anyMethodErrored;
 
   // ---- сравнение old vs new (диагностика; НЕ утверждение об эквивалентности) ----
   const byDay = asObj(methods.accrual_by_day);
   const newTotal = typeof byDay.sumTotalAmount === "number" ? byDay.sumTotalAmount : null;
   const legacyObj = asObj(legacy);
   // delta считаем ТОЛЬКО когда и new, и legacy завершены полностью: без 429, без
-  // общего лимита, без per-method error/truncated и без legacy.partial.
+  // общего лимита, без per-method error/truncated и без legacy.partial. Дополнительно
+  // требуем !truncated — delta невозможна при любой частичности.
   const newComplete =
     !rateLimited && !newApiLimitReached && byDay.error === "ok" && byDay.truncated === false && newTotal !== null;
   const legacyComplete =
     legacyRan && legacyObj.status === 200 && legacyObj.partial === false && oldTotal !== null;
-  const comparisonOk = newComplete && legacyComplete;
+  const comparisonOk = newComplete && legacyComplete && !truncated;
   const comparison = {
     oldTotal,
     newTotal,
@@ -554,6 +656,14 @@ export async function POST(req: NextRequest) {
     pagination_dedup_id: schemaHasKey(byDaySchema, ["last_id", "operation_id", "id"]) || schemaHasKey(postingsSchema, ["operation_id", "id"]),
     container_fees: schemaHasKey(byDaySchema, ["container_fees"]) || schemaHasKey(postingsSchema, ["container_fees"]),
   };
+  // fieldPresence авторитетен ТОЛЬКО когда обе finance-схемы (by-day и postings)
+  // реально получены без 429/лимита/обрезки. Иначе false в fieldPresence — НЕ
+  // доказательство отсутствия полей (просто finance-метод не завершился).
+  const byDayFin = asObj(methods.accrual_by_day);
+  const postFin = asObj(methods.accrual_postings);
+  const byDayFinOk = byDayFin.error === "ok" && byDayFin.truncated !== true && byDayFin.schema != null;
+  const postFinOk = postFin.error === "ok" && postFin.schema != null;
+  const fieldPresenceComplete = !rateLimited && !newApiLimitReached && byDayFinOk && postFinOk;
 
   return NextResponse.json(
     {
@@ -561,7 +671,9 @@ export async function POST(req: NextRequest) {
       month,
       range: { since: range.dateFrom, to: range.dateTo },
       rateLimited,
+      retryAfterSeconds,
       truncated,
+      fieldPresenceComplete,
       newApiRequestsUsed: budget.used,
       ...(legacyRan ? { legacyRequestsMax: LEGACY_MAX_REQUESTS } : {}),
       totalRequestsUpperBound: budget.used + (legacyRan ? LEGACY_MAX_REQUESTS : 0),
