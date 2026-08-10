@@ -93,6 +93,11 @@ async function ozonPost(
     const waitMs = MIN_REQUEST_INTERVAL_MS - (Date.now() - budget.lastStart);
     if (waitMs > 0) await sleep(waitMs);
   }
+  // Повторная проверка дедлайна ПОСЛЕ сна и ДО fetch: sleep мог перенести старт за
+  // deadline. Без этого запрос стартовал бы после мягкого дедлайна (не fetch → budget не трогаем).
+  if (Date.now() >= budget.deadline) {
+    return { ok: false, status: 0, code: "deadline" };
+  }
   budget.lastStart = Date.now();
   budget.used += 1;
   const controller = new AbortController();
