@@ -4127,16 +4127,12 @@ export default function AppPage() {
         });
         if (cancelled) return;
         if (!res.ok) {
-          // Безопасная диагностика владельцу: ТОЛЬКО HTTP-статус (без токена/UUID/
-          // тела). 404 → env allowlist не совпал; 401 → сессия; 5xx → сервер.
-          console.info("[accrual-diag] owner-check http status:", res.status);
           setAccrualDiagAllowed(false); // 401/403/404 → карточка скрыта
           return;
         }
         const json = (await res.json().catch(() => null)) as { allowed?: boolean } | null;
         if (!cancelled) setAccrualDiagAllowed(json?.allowed === true);
       } catch {
-        console.info("[accrual-diag] owner-check network error");
         if (!cancelled) setAccrualDiagAllowed(false); // сеть/ошибка → скрыто
       }
     })();
