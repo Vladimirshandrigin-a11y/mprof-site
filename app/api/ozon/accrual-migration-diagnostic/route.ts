@@ -198,6 +198,117 @@ function safeAccrualId(v: unknown): number | null {
   return v;
 }
 
+// ---- Evidence-классификатор верхнеуровневого accrual_id (value-free) ----
+// Возвращает имя ВЗАИМОИСКЛЮЧАЮЩЕГО bucket. Классификация ПОЛНАЯ: любое значение попадает
+// ровно в один bucket, поэтому сумма всех bucket-счётчиков == числу by-day records. Само
+// значение ID наружу НЕ выходит — только имя bucket. Диапазоны не пересекаются.
+function accrualIdBucket(v: unknown): string {
+  if (v === undefined || v === null) return "missingOrNull";
+  if (typeof v === "string") return "string";
+  if (typeof v !== "number") return "otherType";
+  if (!Number.isFinite(v) || !Number.isInteger(v)) return "numberNonFiniteOrFractional";
+  if (v < 0) return "integerNegative";
+  if (v === 0) return "integerZero";
+  if (v <= 119) return "integerKnownRange1To119"; // 1..119
+  if (v <= 1_000_000_000) return "integer120To1e9"; // 120..1e9 (граница 1e9 включительно)
+  return "integerAbove1e9"; // > 1e9
+}
+const ACCRUAL_ID_BUCKET_KEYS = [
+  "missingOrNull",
+  "string",
+  "otherType",
+  "numberNonFiniteOrFractional",
+  "integerNegative",
+  "integerZero",
+  "integerKnownRange1To119",
+  "integer120To1e9",
+  "integerAbove1e9",
+] as const;
+function emptyAccrualIdBuckets(): Record<string, number> {
+  const o: Record<string, number> = {};
+  for (const k of ACCRUAL_ID_BUCKET_KEYS) o[k] = 0;
+  return o;
+}
+
+// ---- Evidence-классификатор taxonomy type_id (value-free) ----
+// type_id РАЗРЕШЕНО раскрывать ТОЛЬКО как целое 1..119 (глобальный справочник типов).
+// Всё прочее — только счётчик bucket, без значения. Классификация полная (сумма bucket-
+// счётчиков == числу учтённых records источника).
+function typeIdBucket(v: unknown): string {
+  if (v === undefined || v === null) return "missingOrNull";
+  if (typeof v === "string") return "string";
+  if (typeof v !== "number") return "otherType";
+  if (!Number.isFinite(v) || !Number.isInteger(v)) return "numberNonFiniteOrFractional";
+  if (v >= 1 && v <= 119) return "integerInRange1To119";
+  return "integerOutOfRange";
+}
+const TYPE_ID_BUCKET_KEYS = [
+  "missingOrNull",
+  "string",
+  "otherType",
+  "numberNonFiniteOrFractional",
+  "integerInRange1To119",
+  "integerOutOfRange",
+] as const;
+function emptyTypeIdBuckets(): Record<string, number> {
+  const o: Record<string, number> = {};
+  for (const k of TYPE_ID_BUCKET_KEYS) o[k] = 0;
+  return o;
+}
+// known type_id → целое 1..119, иначе null (значение не раскрываем).
+function knownTypeId(v: unknown): number | null {
+  if (typeof v !== "number" || !Number.isInteger(v) || !Number.isFinite(v)) return null;
+  return v >= 1 && v <= 119 ? v : null;
+}
+
+// ---- Аккумулятор taxonomy-evidence по ОДНОМУ источнику (NON_ITEM by-day ИЛИ posting nested) ----
+// records — знаменатель (сколько записей источника учтено); buckets — исчерпывающая
+// классификация type_id; byType — агрегаты ТОЛЬКО по известным 1..119. Денежные суммы
+// здесь — ТОЛЬКО classification evidence; в net-итог/comparison они НЕ входят.
+type TaxonomyEvidence = {
+  records: number;
+  buckets: Record<string, number>;
+  byType: Map<number, { records: number; parsed: number; unparsed: number; sum: number }>;
+};
+function newTaxonomyEvidence(): TaxonomyEvidence {
+  return { records: 0, buckets: emptyTypeIdBuckets(), byType: new Map() };
+}
+function addTaxonomyEvidence(ev: TaxonomyEvidence, typeIdRaw: unknown, amountRaw: unknown): void {
+  ev.records += 1;
+  ev.buckets[typeIdBucket(typeIdRaw)] += 1;
+  const id = knownTypeId(typeIdRaw);
+  if (id === null) return; // out-of-range / unknown → только bucket, без значения и без суммы
+  let g = ev.byType.get(id);
+  if (!g) {
+    g = { records: 0, parsed: 0, unparsed: 0, sum: 0 };
+    ev.byType.set(id, g);
+  }
+  g.records += 1;
+  const amt = parseMoneyAmount(amountRaw); // строгий парсер (тот же, что для net)
+  if (amt === null) g.unparsed += 1;
+  else {
+    g.parsed += 1;
+    g.sum += amt;
+  }
+}
+function finalizeTaxonomyEvidence(ev: TaxonomyEvidence): {
+  records: number;
+  typeIdEvidence: Record<string, number>;
+  byTypeId: Array<{ type_id: number; records: number; parsedAmounts: number; unparsedAmounts: number; totalAmount: number | null }>;
+} {
+  const byTypeId = Array.from(ev.byType.entries())
+    .map(([type_id, g]) => ({
+      type_id,
+      records: g.records,
+      parsedAmounts: g.parsed,
+      unparsedAmounts: g.unparsed,
+      // totalAmount группы — ТОЛЬКО при полном парсинге (все amounts распознаны), иначе null.
+      totalAmount: g.unparsed === 0 ? round2(g.sum) : null,
+    }))
+    .sort((a, b) => a.type_id - b.type_id);
+  return { records: ev.records, typeIdEvidence: ev.buckets, byTypeId };
+}
+
 // accrued_category → безопасная нормализация. Известные из live-ответа: ITEM/NON_ITEM/
 // POSTING; всё прочее → "OTHER". Категория хранится как ЗНАЧЕНИЕ поля массива (НЕ ключ).
 const KNOWN_ACCRUED_CATEGORIES = new Set(["ITEM", "NON_ITEM", "POSTING"]);
@@ -486,6 +597,12 @@ export async function POST(req: NextRequest) {
     // type-only schema-семпл по каждой accrued_category.
     const catSchemas = new Map<string, { records: number; schema: unknown }>();
     const categories = new Set<string>();
+    // ---- evidence-аккумуляторы (value-free; в net-итог НЕ входят) ----
+    const accrualIdBuckets = emptyAccrualIdBuckets(); // A: bucket-классы верхнеуровневого accrual_id
+    const nonItemEvidence = newTaxonomyEvidence(); // B: taxonomy по non_item_fee.type_id
+    let deepShapeItemFee: unknown = null; // D: форма item_fees.fees[0]
+    let deepShapePostingProduct: unknown = null; // D: форма posting.products[0]
+    let deepShapeContainerFee: unknown = null; // D: форма первого non-null container_fees
     for (const day of days) {
       if (rateLimited || Date.now() >= budget.deadline) break;
       let lastId = "";
@@ -556,6 +673,25 @@ export async function POST(req: NextRequest) {
           }
           const cs = catSchemas.get(cat);
           if (cs) cs.records += 1;
+          // ---- Evidence A: bucket верхнеуровневого accrual_id (ровно 1 на запись; значение не раскрываем) ----
+          accrualIdBuckets[accrualIdBucket(o.accrual_id)] += 1;
+          // ---- Evidence B: NON_ITEM taxonomy по доказанному пути non_item_fee.type_id + .accrued.amount ----
+          if (cat === "NON_ITEM") {
+            const nif = asObj(o.non_item_fee);
+            addTaxonomyEvidence(nonItemEvidence, nif.type_id, asObj(nif.accrued).amount);
+          }
+          // ---- Evidence D: глубокие type-only формы (responseShape, без scalar-значений) ----
+          if (deepShapeItemFee === null) {
+            const fees = asArr(asObj(o.item_fees).fees);
+            if (fees.length > 0) deepShapeItemFee = responseShape(fees[0]);
+          }
+          if (deepShapePostingProduct === null) {
+            const products = asArr(asObj(o.posting).products);
+            if (products.length > 0) deepShapePostingProduct = responseShape(products[0]);
+          }
+          if (deepShapeContainerFee === null && o.container_fees !== undefined && o.container_fees !== null) {
+            deepShapeContainerFee = responseShape(o.container_fees);
+          }
         }
         pages += 1;
         // пагинация by-day: last_id приоритетно из root.last_id (доказано), пусто → конец дня.
@@ -592,6 +728,8 @@ export async function POST(req: NextRequest) {
     const schemasByAccruedCategory = Array.from(catSchemas.entries())
       .map(([accrued_category, v]) => ({ accrued_category, records: v.records, schema: v.schema }))
       .sort((x, y) => (x.accrued_category < y.accrued_category ? -1 : x.accrued_category > y.accrued_category ? 1 : 0));
+    // evidence-финализация (все суммы — только classification, вне net-итога)
+    const nonItemTaxonomy = finalizeTaxonomyEvidence(nonItemEvidence);
     methods.accrual_by_day = {
       endpoint: "/v1/finance/accrual/by-day",
       status,
@@ -603,6 +741,20 @@ export async function POST(req: NextRequest) {
       accrualAggregates,
       accrualAggregatesTruncated: aggTruncated,
       schemasByAccruedCategory,
+      // A: исчерпывающие bucket-классы верхнеуровневого accrual_id (Σ == records; значения ID не раскрыты).
+      accrualIdEvidence: accrualIdBuckets,
+      // B: NON_ITEM taxonomy по non_item_fee.type_id (+ .accrued.amount как classification-сумма).
+      nonItemTaxonomy: {
+        records: nonItemTaxonomy.records,
+        typeIdEvidence: nonItemTaxonomy.typeIdEvidence,
+        byTypeId: nonItemTaxonomy.byTypeId,
+      },
+      // D: глубокие type-only формы (без scalar-значений; отсутствуют → null).
+      deepShapes: {
+        item_fees_fee: deepShapeItemFee,
+        posting_product: deepShapePostingProduct,
+        container_fees: deepShapeContainerFee,
+      },
       containerFeesSum: containerFeesSeen ? round2(containerFeesSum) : null,
       accruedCategories: Array.from(categories).sort(),
       schema,
@@ -743,6 +895,8 @@ export async function POST(req: NextRequest) {
     let postingLinkedRecords = 0;
     const categories = new Set<string>();
     const postCatSchemas = new Map<string, { records: number; schema: unknown }>();
+    // C: taxonomy-evidence по доказанному пути posting_accruals[].accruals[].type_id (value-free суммы).
+    const postingEvidence = newTaxonomyEvidence();
     if (r.ok) {
       postShape = responseShape(r.json); // ДО парсинга, без значений
       const root = asObj(r.json);
@@ -761,6 +915,8 @@ export async function POST(req: NextRequest) {
             const o = asObj(it);
             if (schema === null) schema = keySchema(o, 3); // первый реальный nested accrual (type-only)
             records += 1;
+            // C: taxonomy-evidence по nested type_id + .accrued.amount (доказанный путь; в net не входит).
+            addTaxonomyEvidence(postingEvidence, o.type_id, asObj(o.accrued).amount);
             if (linked) postingLinkedRecords += 1;
             const rawCat = o.accrued_category;
             if (typeof rawCat === "string") categories.add(rawCat);
@@ -786,6 +942,7 @@ export async function POST(req: NextRequest) {
         }
       }
     }
+    const postingTaxonomy = finalizeTaxonomyEvidence(postingEvidence);
     methods.accrual_postings = {
       endpoint: "/v1/finance/accrual/postings",
       status: r.status,
@@ -795,6 +952,12 @@ export async function POST(req: NextRequest) {
       groupsWithAccruals,
       records,
       postingLinkedRecords,
+      // C: taxonomy по posting_accruals[].accruals[].type_id (Σ buckets == учтённые nested records).
+      postingTaxonomy: {
+        records: postingTaxonomy.records,
+        typeIdEvidence: postingTaxonomy.typeIdEvidence,
+        byTypeId: postingTaxonomy.byTypeId,
+      },
       accruedCategories: Array.from(categories).sort(),
       schemasByAccruedCategory: Array.from(postCatSchemas.entries())
         .map(([accrued_category, v]) => ({ accrued_category, records: v.records, schema: v.schema }))
