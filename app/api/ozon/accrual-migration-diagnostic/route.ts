@@ -364,6 +364,7 @@ export async function POST(req: NextRequest) {
   let retryAfterSeconds: number | null = null;
   const methods: Record<string, unknown> = {};
   const postingNumbers: string[] = [];
+  const postingNumbersSeen = new Set<string>(); // дедуп posting_number FBO+FBS (наружу не отдаём)
 
   // safe-код ошибки метода (без raw)
   const errCode = (r: FetchOut): string => (r.ok ? "ok" : r.code);
@@ -457,9 +458,11 @@ export async function POST(req: NextRequest) {
         if (bydayShape === null) bydayShape = responseShape(r.json);
         const root = asObj(r.json);
         const result = asObj(root.result);
-        // записи могут лежать в result.details[]/result.rows[]/result[]/root.details[] — мягко.
+        // ДОКАЗАНО (live shape авг-2026): by-day → root.accruals[]. Приоритет root.accruals,
+        // затем прежние fallback-пути (обратная совместимость). Новых ключей не угадываем.
         const items =
-          asArr(result.details).length > 0 ? asArr(result.details)
+          asArr(root.accruals).length > 0 ? asArr(root.accruals)
+          : asArr(result.details).length > 0 ? asArr(result.details)
           : asArr(result.rows).length > 0 ? asArr(result.rows)
           : asArr(root.details).length > 0 ? asArr(root.details)
           : asArr(root.result);
@@ -482,14 +485,16 @@ export async function POST(req: NextRequest) {
           if (typeof cat === "string") categories.add(cat);
         }
         pages += 1;
-        // пагинация by-day: last_id из ответа, пусто → конец дня.
+        // пагинация by-day: last_id приоритетно из root.last_id (доказано), пусто → конец дня.
+        const prevLastId = lastId;
         const nextId =
           typeof root.last_id === "string" ? root.last_id
           : typeof result.last_id === "string" ? result.last_id
           : "";
         lastId = nextId;
-        if (lastId === "" || items.length === 0) break;
-        if (p === BY_DAY_MAX_PAGES_PER_DAY - 1 && lastId !== "") truncated = true;
+        // stop: пусто / не изменился (защита от зацикливания) / нет записей.
+        if (nextId === "" || nextId === prevLastId || items.length === 0) break;
+        if (p === BY_DAY_MAX_PAGES_PER_DAY - 1 && nextId !== "") truncated = true;
       }
       daysQueried += 1;
     }
@@ -535,19 +540,34 @@ export async function POST(req: NextRequest) {
         break;
       }
       if (fboShape === null) fboShape = responseShape(r.json); // ДО парсинга, без значений
-      const result = asObj(asObj(r.json).result);
-      // v3 fbo: ответ может быть result.postings[] ИЛИ result[] — берём мягко.
-      const items = result.postings !== undefined ? asArr(result.postings) : asArr(asObj(r.json).result);
+      const root = asObj(r.json);
+      const result = asObj(root.result);
+      // ДОКАЗАНО (live): FBO v3 → root.postings[] + top-level root.has_next/root.cursor.
+      // Приоритет root, затем прежние fallback (result.postings / result[]).
+      const items =
+        asArr(root.postings).length > 0 ? asArr(root.postings)
+        : result.postings !== undefined ? asArr(result.postings)
+        : asArr(root.result);
       if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
       records += items.length;
       for (const it of items) {
         const pn = asObj(it).posting_number;
-        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
+        // posting_number ТОЛЬКО внутренне (для /accrual/postings), с дедупом, наружу не отдаём.
+        if (typeof pn === "string" && !postingNumbersSeen.has(pn) && postingNumbers.length < MAX_POSTING_NUMBERS) {
+          postingNumbersSeen.add(pn);
+          postingNumbers.push(pn);
+        }
       }
       pages += 1;
-      const hasNext = result.has_next === true;
-      cursor = typeof result.cursor === "string" ? result.cursor : "";
-      if (!hasNext || cursor === "" || items.length === 0) break;
+      const prevCursor = cursor;
+      const hasNext = typeof root.has_next === "boolean" ? root.has_next : result.has_next === true;
+      const nextCursor =
+        typeof root.cursor === "string" ? root.cursor
+        : typeof result.cursor === "string" ? result.cursor
+        : "";
+      cursor = nextCursor;
+      // stop: !has_next / пустой cursor / cursor не изменился (анти-loop) / нет записей.
+      if (!hasNext || nextCursor === "" || nextCursor === prevCursor || items.length === 0) break;
       if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
     }
     methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, responseShape: fboShape, truncated, error: lastErr };
@@ -579,18 +599,30 @@ export async function POST(req: NextRequest) {
         break;
       }
       if (fbsShape === null) fbsShape = responseShape(r.json); // ДО парсинга, без значений
-      const result = asObj(asObj(r.json).result);
-      const items = asArr(result.postings);
+      const root = asObj(r.json);
+      const result = asObj(root.result);
+      // ДОКАЗАНО (live): FBS v4 → root.postings[] + top-level root.has_next/root.cursor.
+      const items = asArr(root.postings).length > 0 ? asArr(root.postings) : asArr(result.postings);
       if (p === 0 && items.length > 0) schema = keySchema(items[0], 3);
       records += items.length;
       for (const it of items) {
         const pn = asObj(it).posting_number;
-        if (typeof pn === "string" && postingNumbers.length < MAX_POSTING_NUMBERS) postingNumbers.push(pn);
+        // posting_number ТОЛЬКО внутренне, дедуп общий с FBO, наружу не отдаём.
+        if (typeof pn === "string" && !postingNumbersSeen.has(pn) && postingNumbers.length < MAX_POSTING_NUMBERS) {
+          postingNumbersSeen.add(pn);
+          postingNumbers.push(pn);
+        }
       }
       pages += 1;
-      const hasNext = result.has_next === true;
-      cursor = typeof result.cursor === "string" ? result.cursor : "";
-      if (!hasNext || cursor === "" || items.length === 0) break;
+      const prevCursor = cursor;
+      const hasNext = typeof root.has_next === "boolean" ? root.has_next : result.has_next === true;
+      const nextCursor =
+        typeof root.cursor === "string" ? root.cursor
+        : typeof result.cursor === "string" ? result.cursor
+        : "";
+      cursor = nextCursor;
+      // stop: !has_next / пустой cursor / cursor не изменился (анти-loop) / нет записей.
+      if (!hasNext || nextCursor === "" || nextCursor === prevCursor || items.length === 0) break;
       if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
     }
     methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, responseShape: fbsShape, truncated, error: lastErr };
