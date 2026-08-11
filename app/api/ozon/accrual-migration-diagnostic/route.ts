@@ -173,6 +173,42 @@ const asObj = (v: unknown): Record<string, unknown> =>
 const asArr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const numOr0 = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 
+// ---- строгий парсер денежной строки новых accrual-методов ----
+// ДОКАЗАНО (live): total_amount.amount приходит как decimal STRING. Принимаем finite
+// number ИЛИ строгую десятичную строку (опц. знак, цифры, опц. дробная часть). НЕ
+// parseFloat-prefix, без exponent, без "1,25"/"1abc"/пустой/"NaN"/"Infinity"/объектов.
+// Возвращает number | null. Исходную строку НЕ возвращаем и НЕ логируем. numOr0 для
+// прочих данных не расширяем.
+const MONEY_RE = /^[+-]?\d+(\.\d+)?$/;
+function parseMoneyAmount(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+  const s = value.trim();
+  if (s === "" || !MONEY_RE.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+// accrual_id — глобальный идентификатор ТИПА начисления (не posting/order). Принимаем
+// только конечное целое в разумном диапазоне; иначе null (в агрегате — безопасный count).
+function safeAccrualId(v: unknown): number | null {
+  if (typeof v !== "number" || !Number.isInteger(v) || !Number.isFinite(v)) return null;
+  if (v < 0 || v > 1_000_000_000) return null;
+  return v;
+}
+
+// accrued_category → безопасная нормализация. Известные из live-ответа: ITEM/NON_ITEM/
+// POSTING; всё прочее → "OTHER". Категория хранится как ЗНАЧЕНИЕ поля массива (НЕ ключ).
+const KNOWN_ACCRUED_CATEGORIES = new Set(["ITEM", "NON_ITEM", "POSTING"]);
+function normAccruedCategory(v: unknown): string {
+  return typeof v === "string" && KNOWN_ACCRUED_CATEGORIES.has(v) ? v : "OTHER";
+}
+
+// Hard-cap диагностических агрегатов (защита от раздувания ответа).
+const ACCRUAL_AGG_CAP = 200; // макс. групп accrual_id×category
+const CAT_SCHEMA_CAP = 10; // макс. schema-семплов по accrued_category
+
 // ---- безопасная ФОРМА ответа (ТОЛЬКО имена ключей + типы, БЕЗ значений) ----
 // Тот же value-free принцип, что и keySchema, но с hard-limit на число узлов
 // (защита от раздувания ответа). Захватывается ДО текущего парсинга, чтобы при
@@ -442,6 +478,13 @@ export async function POST(req: NextRequest) {
     let schema: unknown = null;
     let lastErr = "ok";
     let bydayShape: unknown = null; // безопасная форма первого 200-ответа by-day
+    let parsedAmounts = 0;
+    let unparsedAmounts = 0;
+    let aggTruncated = false;
+    // агрегаты по (accrual_id, accrued_category) — evidence для taxonomy; без идентификаторов заказов.
+    const aggMap = new Map<string, { accrual_id: number | null; accrued_category: string; records: number; parsed: number; unparsed: number; sum: number }>();
+    // type-only schema-семпл по каждой accrued_category.
+    const catSchemas = new Map<string, { records: number; schema: unknown }>();
     const categories = new Set<string>();
     for (const day of days) {
       if (rateLimited || Date.now() >= budget.deadline) break;
@@ -470,19 +513,49 @@ export async function POST(req: NextRequest) {
         records += items.length;
         for (const it of items) {
           const o = asObj(it);
-          // Σ total_amount.amount (по задаче). Мягко: total_amount может быть числом/объектом.
-          const ta = o.total_amount;
-          if (typeof ta === "number") sumTotalAmount += numOr0(ta);
-          else sumTotalAmount += numOr0(asObj(ta).amount);
-          // container_fees — если есть
+          // ДОКАЗАНО: сумма записи = total_amount.amount (decimal STRING) — строгий парсер.
+          const amt = parseMoneyAmount(asObj(o.total_amount).amount);
+          if (amt === null) unparsedAmounts += 1;
+          else {
+            parsedAmounts += 1;
+            sumTotalAmount += amt;
+          }
+          // container_fees — прежний справочный агрегат (путь не менялся).
           if (o.container_fees !== undefined) {
             containerFeesSeen = true;
             const cf = o.container_fees;
             if (typeof cf === "number") containerFeesSum += numOr0(cf);
             else containerFeesSum += numOr0(asObj(cf).amount);
           }
-          const cat = o.accrued_category ?? asObj(o.accruals).accrued_category;
-          if (typeof cat === "string") categories.add(cat);
+          const rawCat = o.accrued_category ?? asObj(o.accruals).accrued_category;
+          if (typeof rawCat === "string") categories.add(rawCat);
+          const cat = normAccruedCategory(rawCat);
+          const aid = safeAccrualId(o.accrual_id);
+          // агрегат по (accrual_id, category); accrual_id "null" при невалидном → безопасный count.
+          const key = `${aid === null ? "null" : aid}|${cat}`;
+          let agg = aggMap.get(key);
+          if (!agg) {
+            if (aggMap.size >= ACCRUAL_AGG_CAP) {
+              aggTruncated = true;
+            } else {
+              agg = { accrual_id: aid, accrued_category: cat, records: 0, parsed: 0, unparsed: 0, sum: 0 };
+              aggMap.set(key, agg);
+            }
+          }
+          if (agg) {
+            agg.records += 1;
+            if (amt === null) agg.unparsed += 1;
+            else {
+              agg.parsed += 1;
+              agg.sum += amt;
+            }
+          }
+          // schema-семпл по категории (первый item категории, type-only, ≤ CAT_SCHEMA_CAP).
+          if (!catSchemas.has(cat) && catSchemas.size < CAT_SCHEMA_CAP) {
+            catSchemas.set(cat, { records: 0, schema: keySchema(o, 3) });
+          }
+          const cs = catSchemas.get(cat);
+          if (cs) cs.records += 1;
         }
         pages += 1;
         // пагинация by-day: last_id приоритетно из root.last_id (доказано), пусто → конец дня.
@@ -498,14 +571,39 @@ export async function POST(req: NextRequest) {
       }
       daysQueried += 1;
     }
+    // Полнота парсинга денежных значений: сумму отдаём ТОЛЬКО если ВСЕ amounts распознаны.
+    const byDayAmountComplete = unparsedAmounts === 0;
+    const accrualAggregates = Array.from(aggMap.values())
+      .map((a) => ({
+        accrual_id: a.accrual_id,
+        accrued_category: a.accrued_category,
+        records: a.records,
+        parsedAmounts: a.parsed,
+        unparsedAmounts: a.unparsed,
+        // totalAmount группы — только если ВСЕ её amounts распознаны, иначе null.
+        totalAmount: a.unparsed === 0 ? round2(a.sum) : null,
+      }))
+      .sort((x, y) => {
+        const ax = x.accrual_id === null ? Number.MAX_SAFE_INTEGER : x.accrual_id;
+        const ay = y.accrual_id === null ? Number.MAX_SAFE_INTEGER : y.accrual_id;
+        if (ax !== ay) return ax - ay;
+        return x.accrued_category < y.accrued_category ? -1 : x.accrued_category > y.accrued_category ? 1 : 0;
+      });
+    const schemasByAccruedCategory = Array.from(catSchemas.entries())
+      .map(([accrued_category, v]) => ({ accrued_category, records: v.records, schema: v.schema }))
+      .sort((x, y) => (x.accrued_category < y.accrued_category ? -1 : x.accrued_category > y.accrued_category ? 1 : 0));
     methods.accrual_by_day = {
       endpoint: "/v1/finance/accrual/by-day",
       status,
       days: daysQueried,
       pages,
       records,
-      sumTotalAmount: Math.round(sumTotalAmount * 100) / 100,
-      containerFeesSum: containerFeesSeen ? Math.round(containerFeesSum * 100) / 100 : null,
+      sumTotalAmount: byDayAmountComplete ? round2(sumTotalAmount) : null,
+      amountParsing: { totalRecords: records, parsed: parsedAmounts, unparsed: unparsedAmounts, complete: byDayAmountComplete },
+      accrualAggregates,
+      accrualAggregatesTruncated: aggTruncated,
+      schemasByAccruedCategory,
+      containerFeesSum: containerFeesSeen ? round2(containerFeesSum) : null,
       accruedCategories: Array.from(categories).sort(),
       schema,
       responseShape: bydayShape,
@@ -640,19 +738,52 @@ export async function POST(req: NextRequest) {
     let records = 0;
     let schema: unknown = null;
     let postShape: unknown = null; // безопасная форма 200-ответа postings (метод реально вызван)
+    let postingGroups = 0;
+    let groupsWithAccruals = 0;
+    let postingLinkedRecords = 0;
     const categories = new Set<string>();
+    const postCatSchemas = new Map<string, { records: number; schema: unknown }>();
     if (r.ok) {
       postShape = responseShape(r.json); // ДО парсинга, без значений
       const root = asObj(r.json);
-      const items =
-        asArr(root.result).length > 0 ? asArr(root.result)
-        : asArr(root.postings).length > 0 ? asArr(root.postings)
-        : asArr(asObj(root.result).postings);
-      if (items.length > 0) schema = keySchema(items[0], 3);
-      records = items.length;
-      for (const it of items) {
-        const cat = asObj(it).accrued_category;
-        if (typeof cat === "string") categories.add(cat);
+      // ДОКАЗАНО (live responseShape): root.posting_accruals[]; внутри группы group.accruals[].
+      const groups = asArr(root.posting_accruals);
+      if (groups.length > 0) {
+        postingGroups = groups.length;
+        for (const g of groups) {
+          const grp = asObj(g);
+          const nested = asArr(grp.accruals);
+          if (nested.length > 0) groupsWithAccruals += 1;
+          // связь доказывается ВНЕШНЕЙ структурой: непустой string posting_number группы.
+          // Само значение posting_number наружу НЕ выходит — только boolean-учёт.
+          const linked = typeof grp.posting_number === "string" && grp.posting_number.length > 0;
+          for (const it of nested) {
+            const o = asObj(it);
+            if (schema === null) schema = keySchema(o, 3); // первый реальный nested accrual (type-only)
+            records += 1;
+            if (linked) postingLinkedRecords += 1;
+            const rawCat = o.accrued_category;
+            if (typeof rawCat === "string") categories.add(rawCat);
+            const cat = normAccruedCategory(rawCat);
+            if (!postCatSchemas.has(cat) && postCatSchemas.size < CAT_SCHEMA_CAP) {
+              postCatSchemas.set(cat, { records: 0, schema: keySchema(o, 3) });
+            }
+            const cs = postCatSchemas.get(cat);
+            if (cs) cs.records += 1;
+          }
+        }
+      } else {
+        // Доказанного root wrapper нет → прежние fallback-пути без регрессии и без угадывания.
+        const items =
+          asArr(root.result).length > 0 ? asArr(root.result)
+          : asArr(root.postings).length > 0 ? asArr(root.postings)
+          : asArr(asObj(root.result).postings);
+        if (items.length > 0) schema = keySchema(items[0], 3);
+        records = items.length;
+        for (const it of items) {
+          const cat = asObj(it).accrued_category;
+          if (typeof cat === "string") categories.add(cat);
+        }
       }
     }
     methods.accrual_postings = {
@@ -660,8 +791,14 @@ export async function POST(req: NextRequest) {
       status: r.status,
       batches: 1,
       postingsQueried: batch.length,
+      postingGroups,
+      groupsWithAccruals,
       records,
+      postingLinkedRecords,
       accruedCategories: Array.from(categories).sort(),
+      schemasByAccruedCategory: Array.from(postCatSchemas.entries())
+        .map(([accrued_category, v]) => ({ accrued_category, records: v.records, schema: v.schema }))
+        .sort((x, y) => (x.accrued_category < y.accrued_category ? -1 : x.accrued_category > y.accrued_category ? 1 : 0)),
       schema,
       responseShape: postShape,
       error: errCode(r),
@@ -750,8 +887,10 @@ export async function POST(req: NextRequest) {
   // delta считаем ТОЛЬКО когда и new, и legacy завершены полностью: без 429, без
   // общего лимита, без per-method error/truncated и без legacy.partial. Дополнительно
   // требуем !truncated — delta невозможна при любой частичности.
+  // newComplete требует, чтобы ВСЕ by-day amounts были распознаны (byDayAmountComplete).
+  const byDayAmt = asObj(byDay.amountParsing);
   const newComplete =
-    !rateLimited && !newApiLimitReached && byDay.error === "ok" && byDay.truncated === false && newTotal !== null;
+    !rateLimited && !newApiLimitReached && byDay.error === "ok" && byDay.truncated === false && byDayAmt.complete === true && newTotal !== null;
   const legacyComplete =
     legacyRan && legacyObj.status === 200 && legacyObj.partial === false && oldTotal !== null;
   const comparisonOk = newComplete && legacyComplete && !truncated;
@@ -775,6 +914,10 @@ export async function POST(req: NextRequest) {
   };
   const byDaySchema = asObj(methods.accrual_by_day).schema;
   const postingsSchema = asObj(methods.accrual_postings).schema;
+  // posting_link доказывается ВНЕШНЕЙ структурой posting_accruals[].posting_number →
+  // .accruals[], а НЕ поиском posting_number внутри nested accrual item.
+  const postLinked = asObj(methods.accrual_postings).postingLinkedRecords;
+  const postingLink = typeof postLinked === "number" && postLinked > 0;
   const fieldPresence = {
     amount_or_net: schemaHasKey(byDaySchema, ["total_amount", "amount", "net"]) || schemaHasKey(postingsSchema, ["amount", "total_amount"]),
     accrual_id: schemaHasKey(byDaySchema, ["accrual_id", "type_id"]) || schemaHasKey(postingsSchema, ["accrual_id", "type_id"]),
@@ -783,7 +926,7 @@ export async function POST(req: NextRequest) {
     commission: schemaHasKey(postingsSchema, ["sale_commission", "commission"]),
     logistics: schemaHasKey(postingsSchema, ["delivery_charge", "return_delivery_charge", "logistics"]),
     returns: schemaHasKey(postingsSchema, ["returns", "return"]) || schemaHasKey(byDaySchema, ["returns"]),
-    posting_link: schemaHasKey(postingsSchema, ["posting_number", "posting"]),
+    posting_link: postingLink,
     pagination_dedup_id: schemaHasKey(byDaySchema, ["last_id", "operation_id", "id"]) || schemaHasKey(postingsSchema, ["operation_id", "id"]),
     container_fees: schemaHasKey(byDaySchema, ["container_fees"]) || schemaHasKey(postingsSchema, ["container_fees"]),
   };
@@ -792,7 +935,8 @@ export async function POST(req: NextRequest) {
   // доказательство отсутствия полей (просто finance-метод не завершился).
   const byDayFin = asObj(methods.accrual_by_day);
   const postFin = asObj(methods.accrual_postings);
-  const byDayFinOk = byDayFin.error === "ok" && byDayFin.truncated !== true && byDayFin.schema != null;
+  const byDayAmtOk = asObj(byDayFin.amountParsing).complete === true;
+  const byDayFinOk = byDayFin.error === "ok" && byDayFin.truncated !== true && byDayFin.schema != null && byDayAmtOk;
   const postFinOk = postFin.error === "ok" && postFin.schema != null;
   const fieldPresenceComplete = !rateLimited && !newApiLimitReached && byDayFinOk && postFinOk;
 
