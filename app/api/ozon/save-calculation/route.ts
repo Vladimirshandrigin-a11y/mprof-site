@@ -324,7 +324,16 @@ export async function POST(req: NextRequest) {
   const tx = loaded.draft.taxonomy;
   const financeTaxonomy = {
     classifierVersion: tx.classifierVersion,
-    sourceEndpoint: "https://api-seller.ozon.ru/v3/finance/transaction/list",
+    // Честный endpoint ФАКТИЧЕСКИ использованного источника: legacy → та же строка
+    // byte-for-byte; accrual → /v1/finance/accrual/by-day. classifierVersion и
+    // snapshot.kind НЕ меняем — их гейтят page.tsx (месяц по kind==="ozon-api-v1") и
+    // ozon-finance-taxonomy-view (classifierVersion===поддерживаемый); их смена сломала
+    // бы загрузку истории/UI. Различие источника несёт sourceEndpoint (+ маркер ниже).
+    sourceEndpoint: loaded.financeSource.sourceEndpoint,
+    // Additive-маркер источника ТОЛЬКО для accrual → legacy metadata остаётся byte-for-byte.
+    ...(loaded.financeSource.source === "accrual_by_day"
+      ? { financeSource: "accrual_by_day" as const }
+      : {}),
     operationCount: t.operationCount,
     // signed итоги по корзинам
     logistics: t.logistics,

@@ -44,6 +44,18 @@ export function isAccrualFinanceEnabled(): boolean {
   return process.env.OZON_FINANCE_ACCRUAL_ENABLED === "true";
 }
 
+// Единый типизированный контракт МЕТА-ИНФОРМАЦИИ фактически выбранного источника —
+// определяется по ОДНОМУ разу на источник (здесь accrual; legacy — в profit.ts).
+// classifierVersion / snapshot.kind НЕ дифференцируем: их гейтят page.tsx (месяц по
+// kind==="ozon-api-v1") и ozon-finance-taxonomy-view (classifierVersion===поддерживаемый),
+// поэтому честное различие несёт sourceEndpoint (+ additive-маркер в snapshot).
+export type FinanceSource = "accrual_by_day" | "transaction_list";
+export type FinanceSourceMeta = { source: FinanceSource; sourceEndpoint: string };
+export const ACCRUAL_FINANCE_SOURCE: FinanceSourceMeta = {
+  source: "accrual_by_day",
+  sourceEndpoint: BY_DAY_URL,
+};
+
 const asObj = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
 const asArr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
@@ -228,10 +240,16 @@ function makeRealFetcher(clientId: string, apiKey: string, budget: Budget): Page
       if (wait > 0) await sleep(wait);
     }
     if (Date.now() >= budget.deadline) return { ok: false }; // дедлайн ПОСЛЕ sleep
+    // Timeout запроса ограничен ОСТАВШИМСЯ временем до дедлайна: последний запрос НЕ
+    // может продлить loader за дедлайн (40s не превращается в 55s). Не хватает времени
+    // → запрос не стартуем, возвращаем { ok:false } → legacy fallback.
+    const remainingMs = budget.deadline - Date.now();
+    if (remainingMs <= 0) return { ok: false };
+    const effectiveTimeout = Math.min(TIMEOUT_MS, remainingMs);
     budget.lastStart = Date.now();
     budget.used += 1;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeout);
     try {
       const res = await fetch(BY_DAY_URL, {
         method: "POST",
@@ -275,12 +293,23 @@ export async function loadAccrualDraft(
     for (let p = 0; p < BY_DAY_MAX_PAGES_PER_DAY; p++) {
       const r = await fetchPage(day, lastId);
       if (!r.ok) return null; // 429/deadline/потолок/сеть/битый JSON → legacy
-      const root = asObj(r.json);
-      const items = asArr(root.accruals); // доказанный root.accruals[]
-      for (const it of items) records.push(it);
+      // Строгий контракт КАЖДОГО HTTP 200: root — объект с СОБСТВЕННЫМ массивом accruals.
+      // Пустой [] — валидный день без операций. Отсутствие/null/не-массив → invalid →
+      // весь accrual draft отбрасывается (частичный месяц не выдаём за полный; один
+      // malformed день среди валидных обнуляет весь результат → legacy).
+      const root = r.json;
+      if (root === null || typeof root !== "object" || Array.isArray(root)) return null;
+      const rootObj = root as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(rootObj, "accruals")) return null;
+      const accruals = rootObj.accruals;
+      if (!Array.isArray(accruals)) return null; // null/object/string/number → invalid
+      for (const it of accruals) records.push(it);
+      // last_id: если присутствует — обязан быть строкой (доказанный тип пагинации).
+      const rawLastId = rootObj.last_id;
+      if (rawLastId !== undefined && typeof rawLastId !== "string") return null;
       const prevLastId = lastId;
-      const nextId = typeof root.last_id === "string" ? root.last_id : "";
-      if (nextId === "" || nextId === prevLastId || items.length === 0) break; // конец дня
+      const nextId = typeof rawLastId === "string" ? rawLastId : "";
+      if (nextId === "" || nextId === prevLastId || accruals.length === 0) break; // конец дня
       if (p === BY_DAY_MAX_PAGES_PER_DAY - 1) return null; // страниц больше потолка → legacy
       lastId = nextId;
     }
