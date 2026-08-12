@@ -18,6 +18,7 @@ import {
   loadRealizationDiagnostic,
   type RealizationDiagnostic,
 } from "./realization";
+import { isAccrualFinanceEnabled, loadAccrualDraft } from "./accrual";
 
 // ============================================================================
 // Общий модуль предварительной/финальной прибыли через Ozon API.
@@ -529,10 +530,19 @@ export async function loadAndComputeApiProfit(
 ): Promise<ApiProfitLoaded> {
   const { admin, userId, clientId, apiKey, range, month, manualExpenses } = input;
 
-  // 1) финансы Ozon (operations) → Итого Ozon
-  const tx = await fetchOzonTransactions(clientId, apiKey, range);
-  if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
-  const draft = aggregateDraft(tx.operations, tx.partial);
+  // 1) финансы Ozon → OzonDraftAggregate. При включённом флаге сначала пробуем новый
+  //    accrual-источник (/v1/finance/accrual/by-day); ЛЮБАЯ его неудача (429/deadline/
+  //    truncation/невалидное обязательное поле/reconciliation) → null и полный откат к
+  //    существующему legacy-агрегатору byte-for-byte. Флаг выключен → legacy как и раньше.
+  let draft: OzonDraftAggregate | null = null;
+  if (isAccrualFinanceEnabled()) {
+    draft = await loadAccrualDraft({ clientId, apiKey, month });
+  }
+  if (draft === null) {
+    const tx = await fetchOzonTransactions(clientId, apiKey, range);
+    if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
+    draft = aggregateDraft(tx.operations, tx.partial);
+  }
 
   // 2) каталог себестоимости пользователя (read-only, только свои строки) — нужен
   //    и для сопоставления отчёта реализации, и для справочной себестоимости.
