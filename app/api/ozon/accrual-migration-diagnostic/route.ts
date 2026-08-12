@@ -22,7 +22,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../../cloud/_lib/auth";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
-import { monthToRange, fetchOzonTransactions } from "../_lib/finance";
+import { monthToRange, fetchOzonTransactions, aggregateDraft } from "../_lib/finance";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -308,6 +308,33 @@ function finalizeTaxonomyEvidence(ev: TaxonomyEvidence): {
     .sort((a, b) => a.type_id - b.type_id);
   return { records: ev.records, typeIdEvidence: ev.buckets, byTypeId };
 }
+
+// ---- Safe path-навигация + product-кандидаты gross revenue (value-free) ----
+// Идёт по цепочке ключей строго через объекты; любой отсутствующий/не-объектный
+// уровень → undefined. Сырое значение наружу НЕ отдаётся — только парсится строгим
+// parseMoneyAmount в агрегированную сумму.
+function getByPath(root: unknown, keys: readonly string[]): unknown {
+  let cur: unknown = root;
+  for (const k of keys) {
+    if (cur === null || typeof cur !== "object" || Array.isArray(cur)) return undefined;
+    cur = (cur as Record<string, unknown>)[k];
+  }
+  return cur;
+}
+// Доказанные (live deep-shape) product-level пути-кандидаты источника gross revenue.
+// Внутри posting.products[] проверяем ТОЛЬКО эти денежные листья; сравнение с
+// legacyRevenue — на стороне grossRevenueEvidence. Никаких SKU/offer_id/дат/сырых строк.
+const GROSS_CANDIDATE_PATHS: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["commission.sale_amount", ["commission", "sale_amount", "amount"]],
+  ["commission.seller_price", ["commission", "seller_price", "amount"]],
+  ["commission.sale_price", ["commission", "sale_price", "amount"]],
+  ["commission.sale_commission", ["commission", "sale_commission", "amount"]],
+  ["commission.commission", ["commission", "commission", "amount"]],
+  ["commission.coinvestment", ["commission", "coinvestment", "amount"]],
+  ["commission.bonus", ["commission", "bonus", "amount"]],
+  ["delivery.total_accrued", ["delivery", "total_accrued", "amount"]],
+];
+type GrossCandAcc = { present: number; parsed: number; unparsed: number; sum: number };
 
 // accrued_category → безопасная нормализация. Известные из live-ответа: ITEM/NON_ITEM/
 // POSTING; всё прочее → "OTHER". Категория хранится как ЗНАЧЕНИЕ поля массива (НЕ ключ).
@@ -603,6 +630,10 @@ export async function POST(req: NextRequest) {
     let deepShapeItemFee: unknown = null; // D: форма item_fees.fees[0]
     let deepShapePostingProduct: unknown = null; // D: форма posting.products[0]
     let deepShapeContainerFee: unknown = null; // D: форма первого non-null container_fees
+    const itemEvidence = newTaxonomyEvidence(); // 2: taxonomy по item_fees.fees[].type_id
+    let grossProductRecords = 0; // 3: число просмотренных posting.products[]
+    const grossCandAccs = new Map<string, GrossCandAcc>(); // 3: аккумуляторы кандидатов gross
+    for (const [name] of GROSS_CANDIDATE_PATHS) grossCandAccs.set(name, { present: 0, parsed: 0, unparsed: 0, sum: 0 });
     for (const day of days) {
       if (rateLimited || Date.now() >= budget.deadline) break;
       let lastId = "";
@@ -692,6 +723,42 @@ export async function POST(req: NextRequest) {
           if (deepShapeContainerFee === null && o.container_fees !== undefined && o.container_fees !== null) {
             deepShapeContainerFee = responseShape(o.container_fees);
           }
+          // ---- Evidence 2: ITEM taxonomy по доказанному пути item_fees.fees[].fees[].type_id + .accrued.amount ----
+          // Внешний item_fees.fees[] — SKU-группы; фактическая fee-запись лежит во
+          // ВНУТРЕННЕМ .fees[]. type_id/accrued читаем ТОЛЬКО из внутренней записи;
+          // sku внешней группы НЕ читаем/не сохраняем/не возвращаем. Счётчики
+          // itemTaxonomy считают внутренние fee-записи, а не внешние SKU-группы.
+          {
+            const skuGroups = asArr(asObj(o.item_fees).fees);
+            for (const g of skuGroups) {
+              const innerFees = asArr(asObj(g).fees);
+              for (const f of innerFees) {
+                const fo = asObj(f);
+                addTaxonomyEvidence(itemEvidence, fo.type_id, asObj(fo.accrued).amount);
+              }
+            }
+          }
+          // ---- Evidence 3: кандидаты gross revenue по доказанным posting.products[] путям ----
+          {
+            const products = asArr(asObj(o.posting).products);
+            for (const prod of products) {
+              const po = asObj(prod);
+              grossProductRecords += 1;
+              for (const [name, keys] of GROSS_CANDIDATE_PATHS) {
+                const acc = grossCandAccs.get(name);
+                if (!acc) continue;
+                const leaf = getByPath(po, keys);
+                if (leaf === undefined) continue; // missing = records − present
+                acc.present += 1;
+                const a = parseMoneyAmount(leaf);
+                if (a === null) acc.unparsed += 1;
+                else {
+                  acc.parsed += 1;
+                  acc.sum += a;
+                }
+              }
+            }
+          }
         }
         pages += 1;
         // пагинация by-day: last_id приоритетно из root.last_id (доказано), пусто → конец дня.
@@ -730,6 +797,23 @@ export async function POST(req: NextRequest) {
       .sort((x, y) => (x.accrued_category < y.accrued_category ? -1 : x.accrued_category > y.accrued_category ? 1 : 0));
     // evidence-финализация (все суммы — только classification, вне net-итога)
     const nonItemTaxonomy = finalizeTaxonomyEvidence(nonItemEvidence);
+    const itemTaxonomy = finalizeTaxonomyEvidence(itemEvidence);
+    const grossCandidates: Record<string, unknown> = {};
+    for (const [name] of GROSS_CANDIDATE_PATHS) {
+      const acc = grossCandAccs.get(name) ?? { present: 0, parsed: 0, unparsed: 0, sum: 0 };
+      // complete = у ВСЕХ product-записей путь присутствует и распознан.
+      const complete = grossProductRecords > 0 && acc.present === grossProductRecords && acc.unparsed === 0;
+      grossCandidates[name] = {
+        records: grossProductRecords,
+        present: acc.present,
+        missing: grossProductRecords - acc.present,
+        parsed: acc.parsed,
+        unparsed: acc.unparsed,
+        complete,
+        // total — число ТОЛЬКО при complete; иначе null (любой missing/unparsed).
+        total: complete ? round2(acc.sum) : null,
+      };
+    }
     methods.accrual_by_day = {
       endpoint: "/v1/finance/accrual/by-day",
       status,
@@ -755,6 +839,14 @@ export async function POST(req: NextRequest) {
         posting_product: deepShapePostingProduct,
         container_fees: deepShapeContainerFee,
       },
+      // 2: ITEM taxonomy по item_fees.fees[].type_id (type_id наружу только 1–119).
+      itemTaxonomy: {
+        records: itemTaxonomy.records,
+        typeIdEvidence: itemTaxonomy.typeIdEvidence,
+        byTypeId: itemTaxonomy.byTypeId,
+      },
+      // 3: кандидаты gross revenue из posting.products[] (только агрегаты; без сырых значений).
+      grossCandidates,
       containerFeesSum: containerFeesSeen ? round2(containerFeesSum) : null,
       accruedCategories: Array.from(categories).sort(),
       schema,
@@ -897,6 +989,10 @@ export async function POST(req: NextRequest) {
     const postCatSchemas = new Map<string, { records: number; schema: unknown }>();
     // C: taxonomy-evidence по доказанному пути posting_accruals[].accruals[].type_id (value-free суммы).
     const postingEvidence = newTaxonomyEvidence();
+    // 4: grand-total nested accrued.amount (ВСЕ nested records, без фильтра типа) для gross-эвиденса.
+    let postAccSum = 0;
+    let postAccParsed = 0;
+    let postAccUnparsed = 0;
     if (r.ok) {
       postShape = responseShape(r.json); // ДО парсинга, без значений
       const root = asObj(r.json);
@@ -917,6 +1013,15 @@ export async function POST(req: NextRequest) {
             records += 1;
             // C: taxonomy-evidence по nested type_id + .accrued.amount (доказанный путь; в net не входит).
             addTaxonomyEvidence(postingEvidence, o.type_id, asObj(o.accrued).amount);
+            // 4: grand-total accrued (все типы) — только evidence, в net/comparison не входит.
+            {
+              const pa = parseMoneyAmount(asObj(o.accrued).amount);
+              if (pa === null) postAccUnparsed += 1;
+              else {
+                postAccParsed += 1;
+                postAccSum += pa;
+              }
+            }
             if (linked) postingLinkedRecords += 1;
             const rawCat = o.accrued_category;
             if (typeof rawCat === "string") categories.add(rawCat);
@@ -957,6 +1062,14 @@ export async function POST(req: NextRequest) {
         records: postingTaxonomy.records,
         typeIdEvidence: postingTaxonomy.typeIdEvidence,
         byTypeId: postingTaxonomy.byTypeId,
+      },
+      // 4: grand-total nested accrued.amount (все типы) + полнота; в net не входит.
+      nestedAccruedTotal: {
+        records,
+        parsed: postAccParsed,
+        unparsed: postAccUnparsed,
+        total: postAccUnparsed === 0 ? round2(postAccSum) : null,
+        complete: postAccUnparsed === 0,
       },
       accruedCategories: Array.from(categories).sort(),
       schemasByAccruedCategory: Array.from(postCatSchemas.entries())
@@ -1013,6 +1126,14 @@ export async function POST(req: NextRequest) {
       let sum = 0;
       for (const op of tx.operations) sum += numOr0(op.amount);
       oldTotal = Math.round(sum * 100) / 100;
+      // 1: breakdown ТЕМ ЖЕ aggregateDraft, что и основной расчёт (формулы не дублируем).
+      // Только итоговые числовые бакеты OzonDraftTotals + net-reconciliation; сырые
+      // operations НЕ отдаём. Инвариант finance.ts: revenue+commission+logistics+
+      // services+storage+ads+adjustments+other === Σ amount (== sumAmount).
+      const t = aggregateDraft(tx.operations, tx.partial).totals;
+      const netReconciliation = round2(
+        t.revenue + t.commission + t.logistics + t.services + t.storage + t.ads + t.adjustments + t.other
+      );
       legacy = {
         endpoint: "/v3/finance/transaction/list",
         status: 200,
@@ -1020,6 +1141,21 @@ export async function POST(req: NextRequest) {
         pages: tx.pageCount,
         partial: tx.partial,
         sumAmount: oldTotal,
+        breakdown: {
+          revenue: t.revenue,
+          commission: t.commission,
+          logistics: t.logistics,
+          logisticsLegacy: t.logisticsLegacy,
+          logisticsServices: t.logisticsServices,
+          services: t.services,
+          storage: t.storage,
+          ads: t.ads,
+          adjustments: t.adjustments,
+          other: t.other,
+          operationCount: t.operationCount,
+          netReconciliation,
+          reconciles: round2(netReconciliation - oldTotal) === 0,
+        },
       };
     } else {
       legacy = { endpoint: "/v3/finance/transaction/list", status: null, error: tx.code };
@@ -1103,6 +1239,49 @@ export async function POST(req: NextRequest) {
   const postFinOk = postFin.error === "ok" && postFin.schema != null;
   const fieldPresenceComplete = !rateLimited && !newApiLimitReached && byDayFinOk && postFinOk;
 
+  // ---- gross revenue evidence: сводит legacyRevenue, by-day net truth, nested accrued и
+  //      product-кандидаты. ТОЛЬКО числа и дельты; какой кандидат = gross, НЕ утверждаем.
+  //      Ничего не хардкодим. В net/comparison/profit НЕ участвует. ----
+  const byDayForGross = asObj(methods.accrual_by_day);
+  const postForGross = asObj(methods.accrual_postings);
+  const legacyBreakdown = asObj(asObj(legacy).breakdown);
+  const legacyRevenue = typeof legacyBreakdown.revenue === "number" ? legacyBreakdown.revenue : null;
+  // postingNetTotal := by-day sumTotalAmount — ЕДИНСТВЕННЫЙ доказанный new net truth
+  // (nested amounts уже внутри него; здесь для net повторно НЕ вычитаются).
+  const postingNetTotal = typeof byDayForGross.sumTotalAmount === "number" ? byDayForGross.sumTotalAmount : null;
+  const nestedAccObj = asObj(postForGross.nestedAccruedTotal);
+  const nestedPostingAccruedTotal = {
+    total: typeof nestedAccObj.total === "number" ? nestedAccObj.total : null,
+    records: typeof nestedAccObj.records === "number" ? nestedAccObj.records : 0,
+    parsed: typeof nestedAccObj.parsed === "number" ? nestedAccObj.parsed : 0,
+    unparsed: typeof nestedAccObj.unparsed === "number" ? nestedAccObj.unparsed : 0,
+    complete: nestedAccObj.complete === true,
+  };
+  const postingNetMinusNestedAccrued =
+    postingNetTotal !== null && nestedPostingAccruedTotal.total !== null && nestedPostingAccruedTotal.complete
+      ? round2(postingNetTotal - nestedPostingAccruedTotal.total)
+      : null;
+  const productCandidates: Record<string, unknown> = {};
+  for (const [name, cand] of Object.entries(asObj(byDayForGross.grossCandidates))) {
+    const c = asObj(cand);
+    const complete = c.complete === true;
+    const total = typeof c.total === "number" ? c.total : null;
+    productCandidates[name] = {
+      ...c,
+      // дельта к legacyRevenue — ТОЛЬКО для полного кандидата при известном legacyRevenue.
+      deltaToLegacyRevenue:
+        complete && total !== null && legacyRevenue !== null ? round2(total - legacyRevenue) : null,
+    };
+  }
+  const grossRevenueEvidence = {
+    legacyRevenue,
+    postingNetTotal,
+    nestedPostingAccruedTotal,
+    postingNetMinusNestedAccrued,
+    productCandidates,
+    note: "Только числа и дельты. Какой кандидат = gross revenue, диагностика НЕ утверждает; nested amounts уже в by-day total и повторно не вычитаются из net.",
+  };
+
   return NextResponse.json(
     {
       ok: true,
@@ -1119,6 +1298,7 @@ export async function POST(req: NextRequest) {
       methods,
       legacy,
       comparison,
+      grossRevenueEvidence,
       fieldPresence,
       safety:
         "Диагностика ничего не сохраняет, не списывает расчёт и не изменяет прибыль. Идентификаторы (posting_number/operation_id/SKU/offer_id/названия) не возвращаются — только имена ключей, типы и агрегаты.",
