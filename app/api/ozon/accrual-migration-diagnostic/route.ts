@@ -723,12 +723,19 @@ export async function POST(req: NextRequest) {
           if (deepShapeContainerFee === null && o.container_fees !== undefined && o.container_fees !== null) {
             deepShapeContainerFee = responseShape(o.container_fees);
           }
-          // ---- Evidence 2: ITEM taxonomy по доказанному пути item_fees.fees[].type_id + .accrued.amount ----
+          // ---- Evidence 2: ITEM taxonomy по доказанному пути item_fees.fees[].fees[].type_id + .accrued.amount ----
+          // Внешний item_fees.fees[] — SKU-группы; фактическая fee-запись лежит во
+          // ВНУТРЕННЕМ .fees[]. type_id/accrued читаем ТОЛЬКО из внутренней записи;
+          // sku внешней группы НЕ читаем/не сохраняем/не возвращаем. Счётчики
+          // itemTaxonomy считают внутренние fee-записи, а не внешние SKU-группы.
           {
-            const fees = asArr(asObj(o.item_fees).fees);
-            for (const f of fees) {
-              const fo = asObj(f);
-              addTaxonomyEvidence(itemEvidence, fo.type_id, asObj(fo.accrued).amount);
+            const skuGroups = asArr(asObj(o.item_fees).fees);
+            for (const g of skuGroups) {
+              const innerFees = asArr(asObj(g).fees);
+              for (const f of innerFees) {
+                const fo = asObj(f);
+                addTaxonomyEvidence(itemEvidence, fo.type_id, asObj(fo.accrued).amount);
+              }
             }
           }
           // ---- Evidence 3: кандидаты gross revenue по доказанным posting.products[] путям ----
@@ -794,15 +801,17 @@ export async function POST(req: NextRequest) {
     const grossCandidates: Record<string, unknown> = {};
     for (const [name] of GROSS_CANDIDATE_PATHS) {
       const acc = grossCandAccs.get(name) ?? { present: 0, parsed: 0, unparsed: 0, sum: 0 };
+      // complete = у ВСЕХ product-записей путь присутствует и распознан.
+      const complete = grossProductRecords > 0 && acc.present === grossProductRecords && acc.unparsed === 0;
       grossCandidates[name] = {
         records: grossProductRecords,
         present: acc.present,
         missing: grossProductRecords - acc.present,
         parsed: acc.parsed,
         unparsed: acc.unparsed,
-        // complete = у ВСЕХ product-записей путь присутствует и распознан.
-        complete: grossProductRecords > 0 && acc.present === grossProductRecords && acc.unparsed === 0,
-        total: round2(acc.sum),
+        complete,
+        // total — число ТОЛЬКО при complete; иначе null (любой missing/unparsed).
+        total: complete ? round2(acc.sum) : null,
       };
     }
     methods.accrual_by_day = {
