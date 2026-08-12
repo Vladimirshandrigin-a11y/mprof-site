@@ -812,6 +812,10 @@ export async function POST(req: NextRequest) {
         complete,
         // total — число ТОЛЬКО при complete; иначе null (любой missing/unparsed).
         total: complete ? round2(acc.sum) : null,
+        // parsedPresentTotal — Σ распознанных present-значений (уже накопленный acc.sum);
+        // число при parsed>0, иначе null. Позволяет сверить present-подмножество с
+        // legacyRevenue даже при incomplete; НЕ меняет complete/total-семантику.
+        parsedPresentTotal: acc.parsed > 0 ? round2(acc.sum) : null,
       };
     }
     methods.accrual_by_day = {
@@ -1266,11 +1270,16 @@ export async function POST(req: NextRequest) {
     const c = asObj(cand);
     const complete = c.complete === true;
     const total = typeof c.total === "number" ? c.total : null;
+    const parsedPresentTotal = typeof c.parsedPresentTotal === "number" ? c.parsedPresentTotal : null;
     productCandidates[name] = {
       ...c,
       // дельта к legacyRevenue — ТОЛЬКО для полного кандидата при известном legacyRevenue.
       deltaToLegacyRevenue:
         complete && total !== null && legacyRevenue !== null ? round2(total - legacyRevenue) : null,
+      // дельта present-подмножества к legacyRevenue — при известном parsedPresentTotal и
+      // legacyRevenue (incomplete допустим). Только число; кандидат выручкой НЕ объявляется.
+      parsedPresentDeltaToLegacyRevenue:
+        parsedPresentTotal !== null && legacyRevenue !== null ? round2(parsedPresentTotal - legacyRevenue) : null,
     };
   }
   const grossRevenueEvidence = {
