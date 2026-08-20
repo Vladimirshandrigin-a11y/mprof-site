@@ -18,6 +18,20 @@ import {
   loadRealizationDiagnostic,
   type RealizationDiagnostic,
 } from "./realization";
+import {
+  isAccrualFinanceEnabled,
+  loadAccrualDraft,
+  ACCRUAL_FINANCE_SOURCE,
+  type FinanceSourceMeta,
+} from "./accrual";
+
+// Legacy-источник финансов (тот же endpoint, что save-calculation писал жёстко).
+// Определён здесь по ОДНОМУ разу; accrual-мета живёт в accrual.ts. Никакого
+// дублирования идентичности источника в нескольких местах.
+const LEGACY_FINANCE_SOURCE: FinanceSourceMeta = {
+  source: "transaction_list",
+  sourceEndpoint: "https://api-seller.ozon.ru/v3/finance/transaction/list",
+};
 
 // ============================================================================
 // Общий модуль предварительной/финальной прибыли через Ozon API.
@@ -500,6 +514,8 @@ export type ApiProfitLoaded =
       /** База налога: выручка реализации за вычетом возвратов — уже > 0. */
       realizationRevenueForTax: number;
       computed: ApiProfitComputed;
+      /** Мета фактически использованного источника финансов (accrual vs legacy). */
+      financeSource: FinanceSourceMeta;
     }
   | { ok: false; kind: "ozon"; code: OzonFinanceErrorCode }
   | { ok: false; kind: "catalog" }
@@ -529,10 +545,28 @@ export async function loadAndComputeApiProfit(
 ): Promise<ApiProfitLoaded> {
   const { admin, userId, clientId, apiKey, range, month, manualExpenses } = input;
 
-  // 1) финансы Ozon (operations) → Итого Ozon
-  const tx = await fetchOzonTransactions(clientId, apiKey, range);
-  if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
-  const draft = aggregateDraft(tx.operations, tx.partial);
+  // 1) финансы Ozon → OzonDraftAggregate. При включённом флаге сначала пробуем новый
+  //    accrual-источник (/v1/finance/accrual/by-day); ЛЮБАЯ его неудача (429/deadline/
+  //    truncation/невалидное обязательное поле/reconciliation) → null и полный откат к
+  //    существующему legacy-агрегатору byte-for-byte. Флаг выключен → legacy как и раньше.
+  let draft: OzonDraftAggregate | null = null;
+  let financeSource: FinanceSourceMeta = LEGACY_FINANCE_SOURCE;
+  if (isAccrualFinanceEnabled()) {
+    // B2: ЛЮБОЙ throw accrual-пути (не только возврат null) → нет draft → legacy fallback.
+    // Секреты / тело ответа / идентификаторы НЕ логируем; console не добавляем.
+    try {
+      draft = await loadAccrualDraft({ clientId, apiKey, month });
+    } catch {
+      draft = null;
+    }
+    if (draft !== null) financeSource = ACCRUAL_FINANCE_SOURCE;
+  }
+  if (draft === null) {
+    const tx = await fetchOzonTransactions(clientId, apiKey, range);
+    if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
+    draft = aggregateDraft(tx.operations, tx.partial);
+    // financeSource остаётся LEGACY (accrual не использован или произошёл откат)
+  }
 
   // 2) каталог себестоимости пользователя (read-only, только свои строки) — нужен
   //    и для сопоставления отчёта реализации, и для справочной себестоимости.
@@ -589,5 +623,6 @@ export async function loadAndComputeApiProfit(
     productionCost,
     realizationRevenueForTax,
     computed,
+    financeSource,
   };
 }
