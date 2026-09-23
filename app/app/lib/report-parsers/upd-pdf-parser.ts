@@ -29,6 +29,12 @@ const LOG = "[upd-parser]";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PdfjsLib = any;
 
+/** ИНН Ozon (ООО «Интернет Решения») — публичный реквизит из формы УПД/
+ *  счёта-фактуры (не персональные данные пользователя). Используется как
+ *  якорь: «продавец» в загруженном УПД должен быть Ozon, а не сторонний
+ *  контрагент со случайно похожим шаблоном документа. */
+export const OZON_LEGAL_INN = "7704217370";
+
 // ============================================================================
 // Public types
 // ============================================================================
@@ -57,6 +63,19 @@ export interface UpdParsedReport {
   commissionAmount: number | null;
   /** Текст строки, где найдена комиссия (для отладки). null — не найдена. */
   commissionRowText: string | null;
+  /**
+   * Дата документа (ISO 'YYYY-MM-DD') из реквизита «Счёт-фактура № … от
+   * ДД.ММ.ГГГГ» (обязательный реквизит по форме УПД, п.1) — для проверки
+   * совместимости периода с отчётом о реализации. null — не найдена (тогда
+   * проверка периода не блокирует: неопределённость ≠ доказанное несовпадение).
+   */
+  documentDate: string | null;
+  /**
+   * ИНН продавца из реквизита «ИНН/КПП продавца» — для проверки, что документ
+   * действительно от Ozon (OZON_LEGAL_INN), а не от стороннего контрагента со
+   * похожим шаблоном УПД. null — реквизит не найден (не блокирует: см. выше).
+   */
+  sellerInn: string | null;
 }
 
 export interface UpdRowDebug {
@@ -212,6 +231,38 @@ function groupIntoRows(items: PdfTextItem[]): UpdRowDebug[] {
       .join(" ");
   }
   return rows;
+}
+
+/**
+ * Дата документа: «Счёт-фактура № … от ДД.ММ.ГГГГ» — обязательный реквизит
+ * (п.1 формы УПД), поэтому надёжнее ручных подписей вроде «Дата отгрузки».
+ * Ищем по ВСЕМУ склеенному тексту документа (не по одной строке): двухколоночная
+ * шапка УПД (штамп «Статус» слева + основной блок справа) может смешивать текст
+ * соседних визуальных строк в одну y-группу — anchor+regex устойчивее, чем
+ * позиционный per-row поиск. Возвращает ISO 'YYYY-MM-DD' или null.
+ */
+function findDocumentDate(rows: UpdRowDebug[]): string | null {
+  const fullText = rows.map((r) => r.joinedText).join(" ");
+  const m = /счет-фактура\s*№?\s*\d*\s*от\s+(\d{2})\.(\d{2})\.(\d{4})/i.exec(
+    fullText
+  );
+  if (!m) return null;
+  const [, dd, mm, yyyy] = m;
+  const day = Number(dd);
+  const month = Number(mm);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/**
+ * ИНН продавца: «ИНН/КПП продавца ДДДДДДДДДД / …» — обязательный реквизит
+ * (п.2б формы УПД). Тот же full-text подход, что и для даты (см. выше).
+ * Возвращает строку цифр (10 или 12 знаков) или null, если не найдена.
+ */
+function findSellerInn(rows: UpdRowDebug[]): string | null {
+  const fullText = rows.map((r) => r.joinedText).join(" ");
+  const m = /продавца[^\d]{0,20}(\d{10,12})\b/i.exec(fullText);
+  return m ? m[1] : null;
 }
 
 // ============================================================================
@@ -467,6 +518,10 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
     }
     console.log(LOG, "commissionAmount:", commissionAmount);
 
+    const documentDate = findDocumentDate(rows);
+    const sellerInn = findSellerInn(rows);
+    console.log(LOG, "documentDate:", documentDate, "sellerInn:", sellerInn);
+
     return finish({
       ok: true,
       error: null,
@@ -479,6 +534,8 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
         source: pickedAt,
         commissionAmount,
         commissionRowText,
+        documentDate,
+        sellerInn,
       },
       debugInfo,
     });

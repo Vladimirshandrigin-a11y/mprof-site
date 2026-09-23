@@ -1540,6 +1540,11 @@ type SkuContext = {
   withoutCost: number;
   updServicesTotal: number;
   updCommissionTotal: number;
+  /** false — разбивка УПД на услуги/комиссию неизвестна (см. page.tsx
+   *  NetProfitBreakdown.commissionKnown); updServicesTotal тогда содержит ВЕСЬ
+   *  УПД-расход. true по умолчанию — старые записи (без поля) считались
+   *  всегда «известными» по построению (два независимых PDF). */
+  commissionKnown: boolean;
   packaging: number;
   delivery: number;
   salary: number;
@@ -1573,6 +1578,7 @@ function extractSkuContext(history: AnalyticsCalc[]): SkuContext {
     withoutCost: 0,
     updServicesTotal: 0,
     updCommissionTotal: 0,
+    commissionKnown: true,
     packaging: 0,
     delivery: 0,
     salary: 0,
@@ -1586,6 +1592,8 @@ function extractSkuContext(history: AnalyticsCalc[]): SkuContext {
     };
     ctx.updServicesTotal = n("updServicesTotal");
     ctx.updCommissionTotal = n("updCommissionTotal");
+    ctx.commissionKnown =
+      typeof ins.commissionKnown === "boolean" ? ins.commissionKnown : true;
     ctx.packaging = n("packaging");
     ctx.delivery = n("deliveryToWarehouse");
     ctx.salary = n("salary");
@@ -2000,14 +2008,26 @@ function buildRiskItems(f: AiFinancials, ctx: SkuContext): AiItem[] {
       `Повышенная себестоимость ${s.costPct.toFixed(1)}%: следите за закупочными ценами.`,
       "medium"
     );
-  if (ctx.updServicesTotal > 0 || ctx.updCommissionTotal > 0)
-    push(
-      `Сверка с УПД: услуги ${fmt(ctx.updServicesTotal)} ₽ и вознаграждение ${fmt(
-        ctx.updCommissionTotal
-      )} ₽ — расхождения с отчётом съедают прибыль незаметно.`,
-      "medium"
-    );
-  else
+  if (ctx.updServicesTotal > 0 || ctx.updCommissionTotal > 0) {
+    if (ctx.commissionKnown) {
+      push(
+        `Сверка с УПД: услуги ${fmt(ctx.updServicesTotal)} ₽ и вознаграждение ${fmt(
+          ctx.updCommissionTotal
+        )} ₽ — расхождения с отчётом съедают прибыль незаметно.`,
+        "medium"
+      );
+    } else {
+      // commissionKnown=false: строку «Агентское вознаграждение» в УПД не
+      // распознали, updServicesTotal содержит ВЕСЬ расход — не называем это
+      // «услугами» отдельно от «вознаграждения» (ложная точность).
+      push(
+        `Сверка с УПД: общий расход по документу ${fmt(
+          ctx.updServicesTotal + ctx.updCommissionTotal
+        )} ₽ (комиссию отдельно выделить не удалось) — расхождения с отчётом съедают прибыль незаметно.`,
+        "medium"
+      );
+    }
+  } else
     push(
       "Расхождение отчёта и акта УПД: услуги и агентское вознаграждение часто учтены не полностью.",
       "medium"

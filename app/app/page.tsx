@@ -40,6 +40,7 @@ import {
 } from "./lib/report-parsers/ozon-parser"
 import {
   parseUpdPdf,
+  OZON_LEGAL_INN,
   type UpdDebugInfo,
 } from "./lib/report-parsers/upd-pdf-parser"
 
@@ -177,6 +178,17 @@ type NetProfitBreakdown = {
    * независимыми суммами, отображение и формула не меняются.
    */
   docFormat?: "single-upd" | "dual-upd";
+  /**
+   * Известна ли разбивка УПД на услуги/комиссию отдельно, или updServicesTotal
+   * содержит ВЕСЬ УПД-расход (updCommissionTotal=0) потому что строку «Агентское
+   * вознаграждение» не удалось распознать в документе? false — разбивка
+   * неизвестна: UI обязан показать ОДИН общий расход «Расходы по УПД» с
+   * пояснением, а НЕ два ряда (иначе получится ложное «Агентское
+   * вознаграждение: 0 ₽», которого мы не проверяли). Optional — старые записи
+   * (dual-upd, два независимых PDF) без поля читаются как true: там обе суммы
+   * были независимо распознаны по построению, неоднозначности не было.
+   */
+  commissionKnown?: boolean;
 };
 
 /** Безопасно достаёт NetProfitBreakdown из ai_insights (jsonb → unknown). */
@@ -239,6 +251,8 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
       o.docFormat === "single-upd" || o.docFormat === "dual-upd"
         ? o.docFormat
         : undefined,
+    commissionKnown:
+      typeof o.commissionKnown === "boolean" ? o.commissionKnown : undefined,
   };
 }
 
@@ -359,6 +373,31 @@ function buildHistDetailRows(
             maximumFractionDigits: 2,
           })}%)`
         : "Налог";
+    // commissionKnown===false (single-упд, строка «Агентское вознаграждение»
+    // не распознана) → ОДИН ряд общим расходом, а не «Агентское
+    // вознаграждение: 0 ₽» (это выглядело бы как подтверждённый ноль, а не
+    // «не удалось выделить»). undefined (старые dual-upd записи) → как раньше.
+    const updRowsKnown = b.commissionKnown !== false;
+    const updRows: HistDetailRow[] = updRowsKnown
+      ? [
+          {
+            label: "Расходы Ozon по УПД",
+            value: b.updServicesTotal,
+            kind: "expense",
+          },
+          {
+            label: "Агентское вознаграждение",
+            value: b.updCommissionTotal,
+            kind: "expense",
+          },
+        ]
+      : [
+          {
+            label: "Расходы по УПД (комиссия не выделена)",
+            value: b.updServicesTotal + b.updCommissionTotal,
+            kind: "expense",
+          },
+        ];
     return [
       { label: "Выручка Ozon", value: b.revenueOzon, kind: "income" },
       {
@@ -366,16 +405,7 @@ function buildHistDetailRows(
         value: b.loyaltyPayouts,
         kind: "income",
       },
-      {
-        label: "Расходы Ozon по УПД",
-        value: b.updServicesTotal,
-        kind: "expense",
-      },
-      {
-        label: "Агентское вознаграждение",
-        value: b.updCommissionTotal,
-        kind: "expense",
-      },
+      ...updRows,
       {
         label: "Прибыль до себестоимости",
         value: b.profitBeforeCost,
@@ -1517,6 +1547,8 @@ export default function AppPage() {
     sourceFileName?: string | null;
     /** Комплект документов — для honest snapshot-маркера при сохранении. */
     docFormat?: "single-upd" | "dual-upd";
+    /** false — разбивка УПД на услуги/комиссию неизвестна (см. NetProfitBreakdown). */
+    commissionKnown?: boolean;
   } | null>(null);
   const [combinedDebug, setCombinedDebug] = useState<{
     xlsx: OzonDebugInfo | null;
@@ -1759,6 +1791,9 @@ export default function AppPage() {
       // источник при пересохранении: свежий single-upd остаётся single-upd,
       // восстановленный старый dual-upd остаётся dual-upd).
       docFormat: combinedResult.docFormat,
+      // Аналогично — известность разбивки УПД пропускаем как есть, не
+      // «чиним» задним числом при пересохранении восстановленной записи.
+      commissionKnown: combinedResult.commissionKnown,
     };
 
     // Поля записи — идентичны для update и insert.
@@ -1966,6 +2001,30 @@ export default function AppPage() {
       const payoutValue =
         adj === 0 ? money(0) : (adj > 0 ? "+" : "−") + money(Math.abs(adj));
 
+      // commissionKnown===false → один общий ряд расхода УПД, без ложного
+      // «Агентское вознаграждение: 0 ₽» (см. buildHistDetailRows — тот же принцип).
+      const crUpdRowsKnown = cr.commissionKnown !== false;
+      const crUpdRows: ProfitPdfRow[] = crUpdRowsKnown
+        ? [
+            {
+              label: "Расходы Ozon по УПД",
+              value: "−" + money(cr.updServicesTotal),
+              kind: "expense",
+            },
+            {
+              label: "Агентское вознаграждение",
+              value: "−" + money(cr.updCommissionTotal),
+              kind: "expense",
+            },
+          ]
+        : [
+            {
+              label: "Расходы по УПД (комиссия не выделена)",
+              value: "−" + money(cr.updServicesTotal + cr.updCommissionTotal),
+              kind: "expense",
+            },
+          ];
+
       // Полная разбивка расчёта — 10 строк по ТЗ. «Прочие расходы» — свёрнутая
       // группа (реклама + упаковка + доставка + зарплата + прочее).
       const rows: ProfitPdfRow[] = [
@@ -1975,16 +2034,7 @@ export default function AppPage() {
           value: "+" + money(cr.loyaltyPayouts),
           kind: "income",
         },
-        {
-          label: "Расходы Ozon по УПД",
-          value: "−" + money(cr.updServicesTotal),
-          kind: "expense",
-        },
-        {
-          label: "Агентское вознаграждение",
-          value: "−" + money(cr.updCommissionTotal),
-          kind: "expense",
-        },
+        ...crUpdRows,
         {
           label: "Прибыль до себестоимости",
           value: money(cr.profitBeforeCost),
@@ -2441,6 +2491,9 @@ export default function AppPage() {
       // Сохранённый признак комплекта документов; старые записи без поля —
       // "dual-upd" (не переосмысливаем их источник).
       docFormat: b.docFormat ?? "dual-upd",
+      // Старые dual-upd записи (два независимых PDF) без поля → true: там
+      // неоднозначности не было по построению.
+      commissionKnown: b.commissionKnown ?? true,
     });
     // Восстанавливаем выбранный график выплат (старые записи → стандартный 0%).
     setPayoutSchedule(b.payoutSchedule ?? { ...DEFAULT_PAYOUT_SCHEDULE });
@@ -3044,20 +3097,33 @@ export default function AppPage() {
     const revenueFromTotals = xlsxRes.report.totals.revenueFromTotalsRow;
     const loyaltyPayouts =
       xlsxRes.report.totals.loyaltyPayoutsFromTotalsRow ?? 0;
-    // Единый УПД: totalAmount (col9, с налогом) — единственный ПОЛНЫЙ расход.
-    // commissionAmount — best-effort сумма строки «Агентское вознаграждение»
-    // (подмножество totalAmount, НЕ отдельное слагаемое). updServicesTotal/
-    // updCommissionTotal — те же поля snapshot/DB, что и в старом 2-PDF flow:
-    // updCommissionTotal = найденная комиссия (или 0, если строка не найдена),
-    // updServicesTotal = остаток (totalAmount − updCommissionTotal). Их сумма
-    // всегда равна totalAmount — каждый рубль учтён ровно один раз.
+    // Единый УПД: totalAmount (col9, с налогом) — единственный ПОЛНЫЙ расход,
+    // ОБЯЗАТЕЛЕН. Если parseUpdPdf вернул ok:true, totalAmount по построению —
+    // ненулевое число (candidate-сбор отбрасывает нули), но проверяем явно —
+    // это ЗАЩИТА, а не подстановка нуля: нечитаемый итог → ошибка ДО consume/save.
     const updTotal = updSrvRes.report.totalAmount;
-    const updCommissionTotal =
+    if (!(updTotal > 0)) {
+      console.warn("[upload-docs] УПД totalAmount invalid:", updTotal);
+      setCombinedStatus("error");
+      setCombinedError(
+        "Не удалось прочитать итоговую сумму УПД («Всего к оплате»). Проверьте, что загружен оригинальный PDF от Ozon."
+      );
+      return;
+    }
+    // commissionAmount — best-effort сумма строки «Агентское вознаграждение»
+    // (подмножество totalAmount, НЕ отдельное слагаемое). commissionKnown=false,
+    // если строка не распознана — тогда updServicesTotal хранит ВЕСЬ totalAmount
+    // (updCommissionTotal=0) для формулы/БД (см. profitBeforeCost ниже — итог
+    // вычитается ровно один раз независимо от разбивки), а UI обязан показать
+    // ОДИН общий расход с пояснением, а не «Агентское вознаграждение: 0 ₽»
+    // (см. buildHistDetailRows/downloadProfitPdf/JSX-блоки результата).
+    const commissionKnown =
       updSrvRes.report.commissionAmount !== null &&
       updSrvRes.report.commissionAmount > 0 &&
-      updSrvRes.report.commissionAmount <= updTotal
-        ? updSrvRes.report.commissionAmount
-        : 0;
+      updSrvRes.report.commissionAmount <= updTotal;
+    const updCommissionTotal = commissionKnown
+      ? (updSrvRes.report.commissionAmount as number)
+      : 0;
     const updServicesTotal = updTotal - updCommissionTotal;
 
     if (revenueFromTotals === null || revenueFromTotals <= 0) {
@@ -3076,14 +3142,54 @@ export default function AppPage() {
       return;
     }
 
-    // PR #25: дубль-гард ДО списания. Месяц — из периода отчёта (приоритет) или
-    // имени XLSX-файла; если месяц надёжно не определить (null) → НЕ блокируем,
-    // сохранение важнее. «Отмена» → откатываем статус в idle и выходим ДО
-    // consumeCalculation (попытка НЕ списывается).
+    // ---- Совместимость документов: продавец УПД должен быть Ozon ----
+    // Реквизит «ИНН/КПП продавца» найден И отличается от известного ИНН Ozon →
+    // документ точно НЕ от Ozon (сторонний контрагент со случайно похожим
+    // шаблоном УПД) → отклоняем ДО дубль-гарда/consume. Реквизит НЕ найден →
+    // НЕ блокируем (неопределённость ≠ доказанное несовпадение).
+    if (
+      updSrvRes.report.sellerInn !== null &&
+      updSrvRes.report.sellerInn !== OZON_LEGAL_INN
+    ) {
+      console.warn(
+        "[upload-docs] УПД sellerInn mismatch:",
+        updSrvRes.report.sellerInn
+      );
+      setCombinedStatus("error");
+      setCombinedError(
+        "Загруженный УПД не похож на документ от Ozon (реквизиты продавца не совпадают). Проверьте файл."
+      );
+      return;
+    }
+
+    // ---- Совместимость документов: период отчёта и период УПД ----
+    // Оба периода надёжно определены И различаются → однозначно разные
+    // отчётные месяцы → отклоняем. Если хотя бы один период не определён —
+    // НЕ блокируем (та же консервативная политика, что и у дубль-гарда ниже).
     const uploadMonth = resolveReportMonth(
       xlsxRes.report.period,
       slotXlsx?.name ?? null
     );
+    const updMonth = updSrvRes.report.documentDate
+      ? updSrvRes.report.documentDate.slice(0, 7)
+      : null;
+    if (uploadMonth && updMonth && uploadMonth.slice(0, 7) !== updMonth) {
+      console.warn("[upload-docs] period mismatch:", {
+        uploadMonth,
+        updMonth,
+      });
+      setCombinedStatus("error");
+      setCombinedError(
+        `Период отчёта (${uploadMonth.slice(
+          0,
+          7
+        )}) и период УПД (${updMonth}) не совпадают. Проверьте, что оба документа за один месяц.`
+      );
+      return;
+    }
+
+    // PR #25: дубль-гард ДО списания. «Отмена» → откатываем статус в idle и
+    // выходим ДО consumeCalculation (попытка НЕ списывается).
     if (
       !(await confirmNoMonthDuplicate(
         uploadMonth ? uploadMonth.slice(0, 7) : null,
@@ -3131,6 +3237,7 @@ export default function AppPage() {
       // содержимого XLSX не распознан (приоритет 2 в resolveReportMonth).
       sourceFileName: slotXlsx?.name ?? null,
       docFormat: "single-upd",
+      commissionKnown,
     });
 
     // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
@@ -3197,6 +3304,7 @@ export default function AppPage() {
         products: xlsxRes.report.products,
         estimate: xlsxRes.report.estimate,
         docFormat: "single-upd",
+        commissionKnown,
       };
 
       const canPersist = !!user?.id;
@@ -11039,29 +11147,57 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       ₽
                     </span>
                   </div>
-                  <div className="upload-3-row negative">
-                    <span>УПД доп. услуги</span>
-                    <span className="num">
-                      −
-                      {combinedResult.updServicesTotal.toLocaleString("ru-RU", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      })}{" "}
-                      ₽
-                    </span>
-                  </div>
-                  <div className="upload-3-row negative">
-                    <span>УПД агентское вознаграждение</span>
-                    <span className="num">
-                      −
-                      {combinedResult.updCommissionTotal.toLocaleString("ru-RU", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      })}{" "}
-                      ₽
-                    </span>
-                  </div>
+                  {combinedResult.commissionKnown !== false ? (
+                    <>
+                      <div className="upload-3-row negative">
+                        <span>УПД доп. услуги</span>
+                        <span className="num">
+                          −
+                          {combinedResult.updServicesTotal.toLocaleString("ru-RU", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}{" "}
+                          ₽
+                        </span>
+                      </div>
+                      <div className="upload-3-row negative">
+                        <span>УПД агентское вознаграждение</span>
+                        <span className="num">
+                          −
+                          {combinedResult.updCommissionTotal.toLocaleString("ru-RU", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}{" "}
+                          ₽
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="upload-3-row negative">
+                      <span>Расходы по УПД (комиссия не выделена)</span>
+                      <span className="num">
+                        −
+                        {(
+                          combinedResult.updServicesTotal +
+                          combinedResult.updCommissionTotal
+                        ).toLocaleString("ru-RU", {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}{" "}
+                        ₽
+                      </span>
+                    </div>
+                  )}
                 </div>
+                {combinedResult.commissionKnown === false && (
+                  <div className="upload-3-note" role="note">
+                    <p className="upload-3-note-text">
+                      Не удалось отдельно распознать строку «Агентское
+                      вознаграждение» в УПД — показан общий расход по документу
+                      целиком. Итог и формула прибыли от этого не меняются.
+                    </p>
+                  </div>
+                )}
                 <div className="upload-3-note" role="note">
                   <div className="upload-3-note-title">
                     Почему сумма может отличаться от выплаты Ozon?
@@ -11356,34 +11492,53 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                             ₽
                           </span>
                         </div>
-                        <div className="upload-3-row negative">
-                          <span>Расходы Ozon по УПД</span>
-                          <span className="num">
-                            −
-                            {combinedResult.updServicesTotal.toLocaleString(
-                              "ru-RU",
-                              {
+                        {combinedResult.commissionKnown !== false ? (
+                          <>
+                            <div className="upload-3-row negative">
+                              <span>Расходы Ozon по УПД</span>
+                              <span className="num">
+                                −
+                                {combinedResult.updServicesTotal.toLocaleString(
+                                  "ru-RU",
+                                  {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  }
+                                )}{" "}
+                                ₽
+                              </span>
+                            </div>
+                            <div className="upload-3-row negative">
+                              <span>Агентское вознаграждение</span>
+                              <span className="num">
+                                −
+                                {combinedResult.updCommissionTotal.toLocaleString(
+                                  "ru-RU",
+                                  {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  }
+                                )}{" "}
+                                ₽
+                              </span>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="upload-3-row negative">
+                            <span>Расходы по УПД (комиссия не выделена)</span>
+                            <span className="num">
+                              −
+                              {(
+                                combinedResult.updServicesTotal +
+                                combinedResult.updCommissionTotal
+                              ).toLocaleString("ru-RU", {
                                 minimumFractionDigits: 2,
                                 maximumFractionDigits: 2,
-                              }
-                            )}{" "}
-                            ₽
-                          </span>
-                        </div>
-                        <div className="upload-3-row negative">
-                          <span>Агентское вознаграждение</span>
-                          <span className="num">
-                            −
-                            {combinedResult.updCommissionTotal.toLocaleString(
-                              "ru-RU",
-                              {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              }
-                            )}{" "}
-                            ₽
-                          </span>
-                        </div>
+                              })}{" "}
+                              ₽
+                            </span>
+                          </div>
+                        )}
                         <div className="upload-3-row subtotal">
                           <span>Прибыль до себестоимости</span>
                           <span className="num">
