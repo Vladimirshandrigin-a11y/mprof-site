@@ -96,6 +96,17 @@ export interface OzonParsedReport {
    * сомнительные данные. НЕ влияет на totals/estimate — это отдельный слой.
    */
   products: OzonProductRow[];
+  /**
+   * ИНН ПОЛУЧАТЕЛЯ из шапки отчёта («Получатель:» … «ИНН» ДДДДДДДДДД) —
+   * получатель реализации это продавец маркетплейса (селлер), чьи документы
+   * мы обрабатываем. Используется ТОЛЬКО для проверки, что этот XLSX-отчёт и
+   * загруженный УПД принадлежат одному и тому же селлеру (сверяется с
+   * buyerInn УПД, см. upd-pdf-parser.ts) — «Плательщик» (Ozon) в той же шапке
+   * НЕ берём, это другая сторона документа. Строка, не число (ИНН —
+   * идентификатор). null — реквизит не найден или колонка получателя
+   * не определена.
+   */
+  recipientInn: string | null;
 }
 
 export type HeaderConfidence = "low" | "medium" | "high";
@@ -371,6 +382,66 @@ function detectArticleNameCols(
     }
   }
   return { articleCol, nameCol };
+}
+
+/** Целое число цифр (10 или 12 знаков — ИП/юрлицо), иначе null. */
+function normalizeInn(s: string): string | null {
+  const t = s.trim();
+  return /^\d{10}$|^\d{12}$/.test(t) ? t : null;
+}
+
+/**
+ * ИНН получателя: шапка «Отчёт о реализации» содержит ДВА блока БОК О БОК —
+ * «Плательщик:» (Ozon, левые колонки) и «Получатель:» (продавец маркетплейса,
+ * правые колонки), каждый со своей парой строк «ИНН <значение>» / «КПП
+ * <значение>» на СВОИХ колонках. НЕ берём первый попавшийся «ИНН» в тексте —
+ * это может оказаться ИНН Ozon (Плательщик) вместо продавца: нужна именно
+ * колонка, выровненная с «Получатель:», а не текстовый порядок.
+ *
+ * Алгоритм:
+ *  1. Найти ячейку с текстом «получатель» (без учёта регистра/двоеточия) —
+ *     её колонка = recipientCol.
+ *  2. В СЛЕДУЮЩИХ ~6 строках найти ячейку «инн» (точное совпадение слова).
+ *     Если на этой строке НЕСКОЛЬКО ячеек «инн» (обычно две — Плательщик и
+ *     Получатель) — берём ту, чья колонка >= recipientCol и БЛИЖАЙШАЯ к нему
+ *     (это и есть парная колонка получателя); если такой нет — не гадаем,
+ *     возвращаем null.
+ *  3. Значение — соседняя ячейка СПРАВА от найденной «инн»-метки.
+ */
+function findRecipientInn(rows: unknown[][]): string | null {
+  let recipientRow = -1;
+  let recipientCol = -1;
+  for (let r = 0; r < rows.length && recipientRow === -1; r++) {
+    const row = rows[r];
+    if (!Array.isArray(row)) continue;
+    for (let c = 0; c < row.length; c++) {
+      const t = asCellString(row[c]).trim().toLowerCase();
+      if (/^получатель:?$/.test(t)) {
+        recipientRow = r;
+        recipientCol = c;
+        break;
+      }
+    }
+  }
+  if (recipientRow === -1) return null;
+
+  for (let r = recipientRow + 1; r < Math.min(recipientRow + 7, rows.length); r++) {
+    const row = rows[r];
+    if (!Array.isArray(row)) continue;
+    let bestCol = -1;
+    for (let c = 0; c < row.length; c++) {
+      const t = asCellString(row[c]).trim().toLowerCase();
+      if (t !== "инн") continue;
+      if (c < recipientCol) continue; // это пара «Плательщика», не наша
+      if (bestCol === -1 || c < bestCol) bestCol = c;
+    }
+    if (bestCol === -1) continue;
+    const value = asCellString(row[bestCol + 1]);
+    const inn = normalizeInn(value);
+    if (inn) return inn;
+    return null; // метка «ИНН» найдена, но значение не похоже на ИНН — не гадаем
+  }
+  return null;
 }
 
 /**
@@ -2195,6 +2266,9 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
     debugInfo.finalTotals = finalTotals;
     debugInfo.finalEstimate = finalEstimate;
 
+    const recipientInn = findRecipientInn(dataRows);
+    console.log(LOG, "recipientInn:", recipientInn);
+
     const report: OzonParsedReport = {
       marketplace: "ozon",
       detected: true,
@@ -2203,6 +2277,7 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
       totals: finalTotals,
       estimate: finalEstimate,
       products,
+      recipientInn,
     };
 
     // eslint-disable-next-line no-console

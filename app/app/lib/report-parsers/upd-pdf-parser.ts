@@ -29,12 +29,6 @@ const LOG = "[upd-parser]";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PdfjsLib = any;
 
-/** ИНН Ozon (ООО «Интернет Решения») — публичный реквизит из формы УПД/
- *  счёта-фактуры (не персональные данные пользователя). Используется как
- *  якорь: «продавец» в загруженном УПД должен быть Ozon, а не сторонний
- *  контрагент со случайно похожим шаблоном документа. */
-export const OZON_LEGAL_INN = "7704217370";
-
 // ============================================================================
 // Public types
 // ============================================================================
@@ -71,11 +65,16 @@ export interface UpdParsedReport {
    */
   documentDate: string | null;
   /**
-   * ИНН продавца из реквизита «ИНН/КПП продавца» — для проверки, что документ
-   * действительно от Ozon (OZON_LEGAL_INN), а не от стороннего контрагента со
-   * похожим шаблоном УПД. null — реквизит не найден (не блокирует: см. выше).
+   * ИНН ПОКУПАТЕЛЯ из реквизита «ИНН/КПП покупателя» (п.6б формы УПД) — в
+   * терминах документа Ozon выступает продавцом услуг, а покупатель — это
+   * ПРОДАВЕЦ МАРКЕТПЛЕЙСА (селлер), чьи документы мы обрабатываем. Используется
+   * ТОЛЬКО для проверки, что XLSX-отчёт и этот УПД принадлежат одному и тому же
+   * селлеру (сверяется с «Получатель» ИНН отчёта о реализации, см. ozon-parser.ts
+   * recipientInn) — НЕ для проверки «документ от Ozon» (это другой реквизит,
+   * «продавец» УПД). Строка, не число (ИНН — идентификатор, не значение для
+   * арифметики). null — реквизит не найден.
    */
-  sellerInn: string | null;
+  buyerInn: string | null;
 }
 
 export interface UpdRowDebug {
@@ -255,13 +254,18 @@ function findDocumentDate(rows: UpdRowDebug[]): string | null {
 }
 
 /**
- * ИНН продавца: «ИНН/КПП продавца ДДДДДДДДДД / …» — обязательный реквизит
- * (п.2б формы УПД). Тот же full-text подход, что и для даты (см. выше).
- * Возвращает строку цифр (10 или 12 знаков) или null, если не найдена.
+ * ИНН ПОКУПАТЕЛЯ: «ИНН/КПП покупателя ДДДДДДДДДД / …» — обязательный реквизит
+ * (п.6б формы УПД). В документе Ozon выступает продавцом услуг, а покупатель —
+ * это продавец маркетплейса (селлер), т.е. именно тот, чьи документы мы
+ * сверяем между собой. Якорь «покупателя» — НЕ «продавца» (это Ozon, другая
+ * сторона документа, для нашей проверки бесполезна). Тот же full-text подход,
+ * что и для даты (см. выше) — anchor+regex устойчивее per-row поиска при
+ * двухколоночной шапке. Возвращает строку цифр (10 или 12 знаков, ИНН — это
+ * ИДЕНТИФИКАТОР, храним строкой, не числом) или null, если не найдена.
  */
-function findSellerInn(rows: UpdRowDebug[]): string | null {
+function findBuyerInn(rows: UpdRowDebug[]): string | null {
   const fullText = rows.map((r) => r.joinedText).join(" ");
-  const m = /продавца[^\d]{0,20}(\d{10,12})\b/i.exec(fullText);
+  const m = /покупателя[^\d]{0,20}(\d{10,12})\b/i.exec(fullText);
   return m ? m[1] : null;
 }
 
@@ -519,8 +523,8 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
     console.log(LOG, "commissionAmount:", commissionAmount);
 
     const documentDate = findDocumentDate(rows);
-    const sellerInn = findSellerInn(rows);
-    console.log(LOG, "documentDate:", documentDate, "sellerInn:", sellerInn);
+    const buyerInn = findBuyerInn(rows);
+    console.log(LOG, "documentDate:", documentDate, "buyerInn:", buyerInn);
 
     return finish({
       ok: true,
@@ -535,7 +539,7 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
         commissionAmount,
         commissionRowText,
         documentDate,
-        sellerInn,
+        buyerInn,
       },
       debugInfo,
     });

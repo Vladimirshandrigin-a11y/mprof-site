@@ -40,7 +40,6 @@ import {
 } from "./lib/report-parsers/ozon-parser"
 import {
   parseUpdPdf,
-  OZON_LEGAL_INN,
   type UpdDebugInfo,
 } from "./lib/report-parsers/upd-pdf-parser"
 
@@ -3142,22 +3141,36 @@ export default function AppPage() {
       return;
     }
 
-    // ---- Совместимость документов: продавец УПД должен быть Ozon ----
-    // Реквизит «ИНН/КПП продавца» найден И отличается от известного ИНН Ozon →
-    // документ точно НЕ от Ozon (сторонний контрагент со случайно похожим
-    // шаблоном УПД) → отклоняем ДО дубль-гарда/consume. Реквизит НЕ найден →
-    // НЕ блокируем (неопределённость ≠ доказанное несовпадение).
+    // ---- Совместимость документов: один и тот же продавец маркетплейса ----
+    // XLSX «Получатель» ИНН (recipientInn) и УПД «Покупатель» ИНН (buyerInn) —
+    // это ОДИН И ТОТ ЖЕ продавец маркетплейса (селлер): в обоих документах
+    // Ozon — противоположная сторона («Плательщик» в XLSX, «Продавец» в УПД).
+    // Защита от смешивания документов РАЗНЫХ селлеров/магазинов — НЕ проверка
+    // «документ от Ozon». В отличие от проверки периода ниже, здесь
+    // неопределённость ТОЖЕ блокирует (fail-closed): нельзя признать документы
+    // совместимыми, если принадлежность продавцу не подтверждена.
     if (
-      updSrvRes.report.sellerInn !== null &&
-      updSrvRes.report.sellerInn !== OZON_LEGAL_INN
+      xlsxRes.report.recipientInn === null ||
+      updSrvRes.report.buyerInn === null
     ) {
-      console.warn(
-        "[upload-docs] УПД sellerInn mismatch:",
-        updSrvRes.report.sellerInn
-      );
+      console.warn("[upload-docs] seller-identity INN not readable:", {
+        recipientInn: xlsxRes.report.recipientInn,
+        buyerInn: updSrvRes.report.buyerInn,
+      });
       setCombinedStatus("error");
       setCombinedError(
-        "Загруженный УПД не похож на документ от Ozon (реквизиты продавца не совпадают). Проверьте файл."
+        "Не удалось определить продавца по одному из документов (ИНН получателя в отчёте о реализации или ИНН покупателя в УПД). Проверьте, что загружены оригинальные файлы Ozon."
+      );
+      return;
+    }
+    if (xlsxRes.report.recipientInn !== updSrvRes.report.buyerInn) {
+      console.warn("[upload-docs] seller-identity mismatch:", {
+        recipientInn: xlsxRes.report.recipientInn,
+        buyerInn: updSrvRes.report.buyerInn,
+      });
+      setCombinedStatus("error");
+      setCombinedError(
+        "Отчёт о реализации и УПД относятся к разным продавцам (ИНН не совпадает). Проверьте, что оба документа — из одного магазина Ozon."
       );
       return;
     }
