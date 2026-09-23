@@ -44,6 +44,19 @@ export interface UpdParsedReport {
   rowNumbers: number[];
   /** Откуда взяли значение. */
   source: "rightmost-on-row" | "column-9" | "fallback-largest";
+  /**
+   * Единый УПД (услуги + агентское вознаграждение одним документом) может
+   * содержать отдельную строку-позицию «Агентское вознаграждение за продажу».
+   * Best-effort: сумма ЭТОЙ строки (col9, с налогом) — только для ОТДЕЛЬНОГО
+   * отображения комиссии внутри общего расхода УПД. НЕ обязательна: если строка
+   * не найдена, totalAmount остаётся единственным и полным источником расхода —
+   * формула ничего не теряет, просто не показывает разбивку. null, если не
+   * найдена. Значение уже входит в totalAmount — вызывающий код не должен
+   * прибавлять его повторно.
+   */
+  commissionAmount: number | null;
+  /** Текст строки, где найдена комиссия (для отладки). null — не найдена. */
+  commissionRowText: string | null;
 }
 
 export interface UpdRowDebug {
@@ -73,6 +86,13 @@ export interface UpdDebugInfo {
     pickedValue: number;
     pickedAt: "rightmost-on-row" | "column-9" | "fallback-largest";
   } | null;
+  /** Кандидаты на строку «Агентское вознаграждение» (для отладки, best-effort). */
+  commissionRowCandidates: Array<{
+    pageNum: number;
+    y: number;
+    rowText: string;
+    numbers: number[];
+  }>;
   failedAt: string | null;
 }
 
@@ -225,6 +245,7 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
     firstRows: [],
     totalRowCandidates: [],
     selectedRow: null,
+    commissionRowCandidates: [],
     failedAt: null,
   };
 
@@ -399,6 +420,53 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
     // eslint-disable-next-line no-console
     console.log(LOG, "row numbers (by x):", numbersSortedByX);
 
+    // ---- Best-effort: строка-позиция «Агентское вознаграждение за продажу» ----
+    // Единый УПД (услуги + комиссия одним документом) содержит её как ОДНУ из
+    // строк-позиций (табличная строка, НЕ итог). Ищем по тому же принципу, что
+    // и «Всего к оплате»: label-текст на строке + самое правое число (col9,
+    // «Стоимость … с налогом — всего»). НЕ обязательна — если не найдена,
+    // totalAmount остаётся единственным полным источником расхода. Строку
+    // «Всего к оплате» не матчим (разные regex), поэтому эта сумма — ПОДМНОЖЕСТВО
+    // totalAmount, а не отдельное слагаемое (вызывающий код не должен её
+    // прибавлять к totalAmount повторно).
+    const commissionCandidates: typeof debugInfo.commissionRowCandidates = [];
+    for (const row of rows) {
+      // \S* (не \w*): \w — ТОЛЬКО ASCII [A-Za-z0-9_], кириллица под него не
+      // подпадает ("агентск" + "ое" не матчился бы \w*). \S* — любые не-пробельные
+      // символы, работает для кириллицы без Unicode-флага регулярки.
+      if (!/агентск\S*\s+вознагражд/i.test(row.joinedText)) continue;
+      const numbers: number[] = [];
+      for (const cell of row.cells) {
+        const n = asNumber(cell.text);
+        if (n !== 0) numbers.push(n);
+      }
+      commissionCandidates.push({
+        pageNum: row.pageNum,
+        y: row.y,
+        rowText: row.joinedText,
+        numbers,
+      });
+    }
+    debugInfo.commissionRowCandidates = commissionCandidates;
+    console.log(
+      LOG,
+      `commission row candidates: ${commissionCandidates.length}`,
+      commissionCandidates
+    );
+
+    let commissionAmount: number | null = null;
+    let commissionRowText: string | null = null;
+    if (commissionCandidates.length > 0) {
+      // Первая позиция-строка (обычно одна). Самое правое число = col9.
+      const commissionRow = commissionCandidates[0];
+      if (commissionRow.numbers.length > 0) {
+        commissionAmount =
+          commissionRow.numbers[commissionRow.numbers.length - 1];
+        commissionRowText = commissionRow.rowText;
+      }
+    }
+    console.log(LOG, "commissionAmount:", commissionAmount);
+
     return finish({
       ok: true,
       error: null,
@@ -409,6 +477,8 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
         detectedRowText: chosen.rowText,
         rowNumbers: chosen.numbers,
         source: pickedAt,
+        commissionAmount,
+        commissionRowText,
       },
       debugInfo,
     });

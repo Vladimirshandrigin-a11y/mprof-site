@@ -272,7 +272,9 @@ const HEADER_PATTERNS: Record<FieldKey, RegExp[]> = {
     /продаж/i,
     /\brevenue\b/i,
   ],
-  returns: [/возврат/i, /\breturn/i],
+  // "возврат" (noun stem) и "возвращ" (participle stem, "Возвращено клиентом" —
+  // текущая Ozon realization-шапка) — разные корни в русском, поэтому нужны оба.
+  returns: [/возврат/i, /возвращ/i, /\breturn/i],
   loyalty: [/баллы/i, /лояльност/i, /бонус/i],
   commission: [
     /комисси/i,
