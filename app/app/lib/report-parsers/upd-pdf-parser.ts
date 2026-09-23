@@ -44,6 +44,37 @@ export interface UpdParsedReport {
   rowNumbers: number[];
   /** Откуда взяли значение. */
   source: "rightmost-on-row" | "column-9" | "fallback-largest";
+  /**
+   * Единый УПД (услуги + агентское вознаграждение одним документом) может
+   * содержать отдельную строку-позицию «Агентское вознаграждение за продажу».
+   * Best-effort: сумма ЭТОЙ строки (col9, с налогом) — только для ОТДЕЛЬНОГО
+   * отображения комиссии внутри общего расхода УПД. НЕ обязательна: если строка
+   * не найдена, totalAmount остаётся единственным и полным источником расхода —
+   * формула ничего не теряет, просто не показывает разбивку. null, если не
+   * найдена. Значение уже входит в totalAmount — вызывающий код не должен
+   * прибавлять его повторно.
+   */
+  commissionAmount: number | null;
+  /** Текст строки, где найдена комиссия (для отладки). null — не найдена. */
+  commissionRowText: string | null;
+  /**
+   * Дата документа (ISO 'YYYY-MM-DD') из реквизита «Счёт-фактура № … от
+   * ДД.ММ.ГГГГ» (обязательный реквизит по форме УПД, п.1) — для проверки
+   * совместимости периода с отчётом о реализации. null — не найдена (тогда
+   * проверка периода не блокирует: неопределённость ≠ доказанное несовпадение).
+   */
+  documentDate: string | null;
+  /**
+   * ИНН ПОКУПАТЕЛЯ из реквизита «ИНН/КПП покупателя» (п.6б формы УПД) — в
+   * терминах документа Ozon выступает продавцом услуг, а покупатель — это
+   * ПРОДАВЕЦ МАРКЕТПЛЕЙСА (селлер), чьи документы мы обрабатываем. Используется
+   * ТОЛЬКО для проверки, что XLSX-отчёт и этот УПД принадлежат одному и тому же
+   * селлеру (сверяется с «Получатель» ИНН отчёта о реализации, см. ozon-parser.ts
+   * recipientInn) — НЕ для проверки «документ от Ozon» (это другой реквизит,
+   * «продавец» УПД). Строка, не число (ИНН — идентификатор, не значение для
+   * арифметики). null — реквизит не найден.
+   */
+  buyerInn: string | null;
 }
 
 export interface UpdRowDebug {
@@ -73,6 +104,13 @@ export interface UpdDebugInfo {
     pickedValue: number;
     pickedAt: "rightmost-on-row" | "column-9" | "fallback-largest";
   } | null;
+  /** Кандидаты на строку «Агентское вознаграждение» (для отладки, best-effort). */
+  commissionRowCandidates: Array<{
+    pageNum: number;
+    y: number;
+    rowText: string;
+    numbers: number[];
+  }>;
   failedAt: string | null;
 }
 
@@ -194,6 +232,43 @@ function groupIntoRows(items: PdfTextItem[]): UpdRowDebug[] {
   return rows;
 }
 
+/**
+ * Дата документа: «Счёт-фактура № … от ДД.ММ.ГГГГ» — обязательный реквизит
+ * (п.1 формы УПД), поэтому надёжнее ручных подписей вроде «Дата отгрузки».
+ * Ищем по ВСЕМУ склеенному тексту документа (не по одной строке): двухколоночная
+ * шапка УПД (штамп «Статус» слева + основной блок справа) может смешивать текст
+ * соседних визуальных строк в одну y-группу — anchor+regex устойчивее, чем
+ * позиционный per-row поиск. Возвращает ISO 'YYYY-MM-DD' или null.
+ */
+function findDocumentDate(rows: UpdRowDebug[]): string | null {
+  const fullText = rows.map((r) => r.joinedText).join(" ");
+  const m = /счет-фактура\s*№?\s*\d*\s*от\s+(\d{2})\.(\d{2})\.(\d{4})/i.exec(
+    fullText
+  );
+  if (!m) return null;
+  const [, dd, mm, yyyy] = m;
+  const day = Number(dd);
+  const month = Number(mm);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+/**
+ * ИНН ПОКУПАТЕЛЯ: «ИНН/КПП покупателя ДДДДДДДДДД / …» — обязательный реквизит
+ * (п.6б формы УПД). В документе Ozon выступает продавцом услуг, а покупатель —
+ * это продавец маркетплейса (селлер), т.е. именно тот, чьи документы мы
+ * сверяем между собой. Якорь «покупателя» — НЕ «продавца» (это Ozon, другая
+ * сторона документа, для нашей проверки бесполезна). Тот же full-text подход,
+ * что и для даты (см. выше) — anchor+regex устойчивее per-row поиска при
+ * двухколоночной шапке. Возвращает строку цифр (10 или 12 знаков, ИНН — это
+ * ИДЕНТИФИКАТОР, храним строкой, не числом) или null, если не найдена.
+ */
+function findBuyerInn(rows: UpdRowDebug[]): string | null {
+  const fullText = rows.map((r) => r.joinedText).join(" ");
+  const m = /покупателя[^\d]{0,20}(\d{10,12})\b/i.exec(fullText);
+  return m ? m[1] : null;
+}
+
 // ============================================================================
 // Public API
 // ============================================================================
@@ -225,6 +300,7 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
     firstRows: [],
     totalRowCandidates: [],
     selectedRow: null,
+    commissionRowCandidates: [],
     failedAt: null,
   };
 
@@ -399,6 +475,57 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
     // eslint-disable-next-line no-console
     console.log(LOG, "row numbers (by x):", numbersSortedByX);
 
+    // ---- Best-effort: строка-позиция «Агентское вознаграждение за продажу» ----
+    // Единый УПД (услуги + комиссия одним документом) содержит её как ОДНУ из
+    // строк-позиций (табличная строка, НЕ итог). Ищем по тому же принципу, что
+    // и «Всего к оплате»: label-текст на строке + самое правое число (col9,
+    // «Стоимость … с налогом — всего»). НЕ обязательна — если не найдена,
+    // totalAmount остаётся единственным полным источником расхода. Строку
+    // «Всего к оплате» не матчим (разные regex), поэтому эта сумма — ПОДМНОЖЕСТВО
+    // totalAmount, а не отдельное слагаемое (вызывающий код не должен её
+    // прибавлять к totalAmount повторно).
+    const commissionCandidates: typeof debugInfo.commissionRowCandidates = [];
+    for (const row of rows) {
+      // \S* (не \w*): \w — ТОЛЬКО ASCII [A-Za-z0-9_], кириллица под него не
+      // подпадает ("агентск" + "ое" не матчился бы \w*). \S* — любые не-пробельные
+      // символы, работает для кириллицы без Unicode-флага регулярки.
+      if (!/агентск\S*\s+вознагражд/i.test(row.joinedText)) continue;
+      const numbers: number[] = [];
+      for (const cell of row.cells) {
+        const n = asNumber(cell.text);
+        if (n !== 0) numbers.push(n);
+      }
+      commissionCandidates.push({
+        pageNum: row.pageNum,
+        y: row.y,
+        rowText: row.joinedText,
+        numbers,
+      });
+    }
+    debugInfo.commissionRowCandidates = commissionCandidates;
+    console.log(
+      LOG,
+      `commission row candidates: ${commissionCandidates.length}`,
+      commissionCandidates
+    );
+
+    let commissionAmount: number | null = null;
+    let commissionRowText: string | null = null;
+    if (commissionCandidates.length > 0) {
+      // Первая позиция-строка (обычно одна). Самое правое число = col9.
+      const commissionRow = commissionCandidates[0];
+      if (commissionRow.numbers.length > 0) {
+        commissionAmount =
+          commissionRow.numbers[commissionRow.numbers.length - 1];
+        commissionRowText = commissionRow.rowText;
+      }
+    }
+    console.log(LOG, "commissionAmount:", commissionAmount);
+
+    const documentDate = findDocumentDate(rows);
+    const buyerInn = findBuyerInn(rows);
+    console.log(LOG, "documentDate:", documentDate, "buyerInn:", buyerInn);
+
     return finish({
       ok: true,
       error: null,
@@ -409,6 +536,10 @@ export async function parseUpdPdf(file: File): Promise<UpdParseResult> {
         detectedRowText: chosen.rowText,
         rowNumbers: chosen.numbers,
         source: pickedAt,
+        commissionAmount,
+        commissionRowText,
+        documentDate,
+        buyerInn,
       },
       debugInfo,
     });

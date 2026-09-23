@@ -167,6 +167,27 @@ type NetProfitBreakdown = {
   products?: OzonProductRow[];
   /** Тоталы отчёта (estimate) — источник распределяемых расходов для пересчёта. */
   estimate?: OzonEstimate | null;
+  /**
+   * Явный признак комплекта документов, из которого посчитан расчёт.
+   * "single-upd" — новый формат (Ozon с 2026 г.): XLSX + 1 УПД (услуги и
+   * агентское вознаграждение одним PDF), updCommissionTotal — best-effort
+   * разбивка ВНУТРИ totalAmount. "dual-upd" — старый формат: 2 отдельных PDF.
+   * Optional — старые записи (без поля) читаются как "dual-upd" и НЕ
+   * переосмысливаются: их updServicesTotal/updCommissionTotal уже были двумя
+   * независимыми суммами, отображение и формула не меняются.
+   */
+  docFormat?: "single-upd" | "dual-upd";
+  /**
+   * Известна ли разбивка УПД на услуги/комиссию отдельно, или updServicesTotal
+   * содержит ВЕСЬ УПД-расход (updCommissionTotal=0) потому что строку «Агентское
+   * вознаграждение» не удалось распознать в документе? false — разбивка
+   * неизвестна: UI обязан показать ОДИН общий расход «Расходы по УПД» с
+   * пояснением, а НЕ два ряда (иначе получится ложное «Агентское
+   * вознаграждение: 0 ₽», которого мы не проверяли). Optional — старые записи
+   * (dual-upd, два независимых PDF) без поля читаются как true: там обе суммы
+   * были независимо распознаны по построению, неоднозначности не было.
+   */
+  commissionKnown?: boolean;
 };
 
 /** Безопасно достаёт NetProfitBreakdown из ai_insights (jsonb → unknown). */
@@ -225,6 +246,12 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
             };
           })()
         : null,
+    docFormat:
+      o.docFormat === "single-upd" || o.docFormat === "dual-upd"
+        ? o.docFormat
+        : undefined,
+    commissionKnown:
+      typeof o.commissionKnown === "boolean" ? o.commissionKnown : undefined,
   };
 }
 
@@ -345,6 +372,31 @@ function buildHistDetailRows(
             maximumFractionDigits: 2,
           })}%)`
         : "Налог";
+    // commissionKnown===false (single-упд, строка «Агентское вознаграждение»
+    // не распознана) → ОДИН ряд общим расходом, а не «Агентское
+    // вознаграждение: 0 ₽» (это выглядело бы как подтверждённый ноль, а не
+    // «не удалось выделить»). undefined (старые dual-upd записи) → как раньше.
+    const updRowsKnown = b.commissionKnown !== false;
+    const updRows: HistDetailRow[] = updRowsKnown
+      ? [
+          {
+            label: "Расходы Ozon по УПД",
+            value: b.updServicesTotal,
+            kind: "expense",
+          },
+          {
+            label: "Агентское вознаграждение",
+            value: b.updCommissionTotal,
+            kind: "expense",
+          },
+        ]
+      : [
+          {
+            label: "Расходы по УПД (комиссия не выделена)",
+            value: b.updServicesTotal + b.updCommissionTotal,
+            kind: "expense",
+          },
+        ];
     return [
       { label: "Выручка Ozon", value: b.revenueOzon, kind: "income" },
       {
@@ -352,16 +404,7 @@ function buildHistDetailRows(
         value: b.loyaltyPayouts,
         kind: "income",
       },
-      {
-        label: "Расходы Ozon по УПД",
-        value: b.updServicesTotal,
-        kind: "expense",
-      },
-      {
-        label: "Агентское вознаграждение",
-        value: b.updCommissionTotal,
-        kind: "expense",
-      },
+      ...updRows,
       {
         label: "Прибыль до себестоимости",
         value: b.profitBeforeCost,
@@ -1472,14 +1515,21 @@ export default function AppPage() {
   const [uploadedReports, setUploadedReports] = useState<UploadedReport[]>([]);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
-  // ===== 3-file architecture: XLSX (реализация) + 2× PDF (УПД) =====
-  // Слот 1: Отчёт о реализации товара (XLSX) → revenue + loyaltyPayouts
-  // Слот 2: УПД доп. услуги (PDF)          → updServicesTotal (расход)
-  // Слот 3: УПД агентское вознаграждение   → updCommissionTotal (расход)
+  // ===== Doc-based architecture: XLSX (реализация) + 1× PDF (единый УПД) =====
+  // Ozon сменил комплект документов: комиссия и услуги теперь в ОДНОМ УПД PDF
+  // (раньше было 2 отдельных PDF). Слот 1: Отчёт о реализации товара (XLSX) →
+  // revenue + loyaltyPayouts. Слот 2: единый УПД (PDF) → totalAmount (с налогом,
+  // единственный полный расход) + best-effort commissionAmount (строка
+  // «Агентское вознаграждение» ВНУТРИ totalAmount — для отдельного отображения,
+  // НЕ отдельное слагаемое). updServicesTotal/updCommissionTotal — те же поля,
+  // что и раньше (совместимость со старыми записями истории): теперь
+  // updCommissionTotal = commissionAmount (или 0, если строка не найдена),
+  // updServicesTotal = totalAmount − updCommissionTotal (остаток), поэтому их
+  // сумма всегда равна totalAmount (каждая сумма учтена ровно один раз).
   // Формула: profitBeforeCost = revenue + loyaltyPayouts - updServices - updCommission
   const [slotXlsx, setSlotXlsx] = useState<File | null>(null);
+  // Единый УПД (услуги + агентское вознаграждение одним PDF).
   const [slotUpdServices, setSlotUpdServices] = useState<File | null>(null);
-  const [slotUpdCommission, setSlotUpdCommission] = useState<File | null>(null);
   const [combinedStatus, setCombinedStatus] = useState<
     "idle" | "processing" | "success" | "error"
   >("idle");
@@ -1494,11 +1544,14 @@ export default function AppPage() {
     period: string | null;
     /** Имя XLSX-файла — fallback-источник месяца, если период не распарсился. */
     sourceFileName?: string | null;
+    /** Комплект документов — для honest snapshot-маркера при сохранении. */
+    docFormat?: "single-upd" | "dual-upd";
+    /** false — разбивка УПД на услуги/комиссию неизвестна (см. NetProfitBreakdown). */
+    commissionKnown?: boolean;
   } | null>(null);
   const [combinedDebug, setCombinedDebug] = useState<{
     xlsx: OzonDebugInfo | null;
     updServices: UpdDebugInfo | null;
-    updCommission: UpdDebugInfo | null;
   } | null>(null);
   /** Per-SKU строки из последнего распарсенного отчёта Ozon — для подстановки
    *  себестоимости из каталога и блока «Прибыль по товарам». Заполняется в
@@ -1540,10 +1593,9 @@ export default function AppPage() {
   }, []);
   const xlsxInputRef = useRef<HTMLInputElement | null>(null);
   const updServicesInputRef = useRef<HTMLInputElement | null>(null);
-  const updCommissionInputRef = useRef<HTMLInputElement | null>(null);
   /** Какой слот сейчас под перетаскиванием — для подсветки. */
   const [dragOverSlot, setDragOverSlot] = useState<
-    "xlsx" | "updServices" | "updCommission" | null
+    "xlsx" | "updServices" | null
   >(null);
 
   // ===== Финальный калькулятор чистой прибыли =====
@@ -1734,6 +1786,13 @@ export default function AppPage() {
       // себестоимость по актуальному каталогу (не по застывшему снапшоту).
       products: reportProducts,
       estimate: reportEstimate,
+      // Пропускаем признак комплекта документов как есть (не переосмысливаем
+      // источник при пересохранении: свежий single-upd остаётся single-upd,
+      // восстановленный старый dual-upd остаётся dual-upd).
+      docFormat: combinedResult.docFormat,
+      // Аналогично — известность разбивки УПД пропускаем как есть, не
+      // «чиним» задним числом при пересохранении восстановленной записи.
+      commissionKnown: combinedResult.commissionKnown,
     };
 
     // Поля записи — идентичны для update и insert.
@@ -1941,6 +2000,30 @@ export default function AppPage() {
       const payoutValue =
         adj === 0 ? money(0) : (adj > 0 ? "+" : "−") + money(Math.abs(adj));
 
+      // commissionKnown===false → один общий ряд расхода УПД, без ложного
+      // «Агентское вознаграждение: 0 ₽» (см. buildHistDetailRows — тот же принцип).
+      const crUpdRowsKnown = cr.commissionKnown !== false;
+      const crUpdRows: ProfitPdfRow[] = crUpdRowsKnown
+        ? [
+            {
+              label: "Расходы Ozon по УПД",
+              value: "−" + money(cr.updServicesTotal),
+              kind: "expense",
+            },
+            {
+              label: "Агентское вознаграждение",
+              value: "−" + money(cr.updCommissionTotal),
+              kind: "expense",
+            },
+          ]
+        : [
+            {
+              label: "Расходы по УПД (комиссия не выделена)",
+              value: "−" + money(cr.updServicesTotal + cr.updCommissionTotal),
+              kind: "expense",
+            },
+          ];
+
       // Полная разбивка расчёта — 10 строк по ТЗ. «Прочие расходы» — свёрнутая
       // группа (реклама + упаковка + доставка + зарплата + прочее).
       const rows: ProfitPdfRow[] = [
@@ -1950,16 +2033,7 @@ export default function AppPage() {
           value: "+" + money(cr.loyaltyPayouts),
           kind: "income",
         },
-        {
-          label: "Расходы Ozon по УПД",
-          value: "−" + money(cr.updServicesTotal),
-          kind: "expense",
-        },
-        {
-          label: "Агентское вознаграждение",
-          value: "−" + money(cr.updCommissionTotal),
-          kind: "expense",
-        },
+        ...crUpdRows,
         {
           label: "Прибыль до себестоимости",
           value: money(cr.profitBeforeCost),
@@ -2413,6 +2487,12 @@ export default function AppPage() {
       updCommissionTotal: b.updCommissionTotal,
       profitBeforeCost: b.profitBeforeCost,
       period: b.reportPeriod ?? null,
+      // Сохранённый признак комплекта документов; старые записи без поля —
+      // "dual-upd" (не переосмысливаем их источник).
+      docFormat: b.docFormat ?? "dual-upd",
+      // Старые dual-upd записи (два независимых PDF) без поля → true: там
+      // неоднозначности не было по построению.
+      commissionKnown: b.commissionKnown ?? true,
     });
     // Восстанавливаем выбранный график выплат (старые записи → стандартный 0%).
     setPayoutSchedule(b.payoutSchedule ?? { ...DEFAULT_PAYOUT_SCHEDULE });
@@ -2866,10 +2946,10 @@ export default function AppPage() {
     setCalcMode("manual");
   };
 
-  // ===== 3-file flow helpers =====
+  // ===== Doc-based flow helpers (XLSX + единый УПД) =====
   /** Положить файл в КОНКРЕТНЫЙ слот (через input[type=file] click). */
   const acceptSlot = (
-    slot: "xlsx" | "updServices" | "updCommission",
+    slot: "xlsx" | "updServices",
     file: File | null
   ) => {
     if (!file) return;
@@ -2879,25 +2959,24 @@ export default function AppPage() {
       showToast("Слот 1: только XLSX или CSV", "err");
       return;
     }
-    if (slot !== "xlsx" && !isPdf) {
+    if (slot === "updServices" && !isPdf) {
       showToast("Слот УПД: только PDF", "err");
       return;
     }
     if (slot === "xlsx") setSlotXlsx(file);
     if (slot === "updServices") setSlotUpdServices(file);
-    if (slot === "updCommission") setSlotUpdCommission(file);
   };
 
   /**
    * Маршрутизация файлов из drag&drop — мы можем не знать на какой
    * именно слот перетащил пользователь (он мог промахнуться). По типу:
-   *  - XLSX/CSV → slot 1 (realization)
-   *  - PDF → первый пустой PDF-слот (services → commission)
+   *  - XLSX/CSV → slot 1 (реализация)
+   *  - PDF → slot 2 (единый УПД)
    * `preferredSlot` подсказывает желаемый слот (если drop попал на конкретный).
    */
   const acceptDroppedFile = (
     file: File | null,
-    preferredSlot: "xlsx" | "updServices" | "updCommission" | null
+    preferredSlot: "xlsx" | "updServices" | null
   ) => {
     if (!file) return;
     const isXlsx = /\.(xlsx|csv)$/i.test(file.name);
@@ -2912,34 +2991,18 @@ export default function AppPage() {
       return;
     }
     if (isPdf) {
-      // Если drop попал точно на PDF-слот — кладём туда (даже перезаписав)
-      if (preferredSlot === "updServices") {
-        setSlotUpdServices(file);
-        return;
+      if (slotUpdServices && preferredSlot !== "updServices") {
+        showToast("Заменили файл УПД", "warn");
       }
-      if (preferredSlot === "updCommission") {
-        setSlotUpdCommission(file);
-        return;
-      }
-      // Иначе — в первый пустой PDF-слот
-      if (!slotUpdServices) {
-        setSlotUpdServices(file);
-      } else if (!slotUpdCommission) {
-        setSlotUpdCommission(file);
-      } else {
-        // Оба заняты — заменяем второй (более вероятный «refresh»)
-        setSlotUpdCommission(file);
-        showToast("Заменили УПД агентское вознаграждение", "warn");
-      }
+      setSlotUpdServices(file);
       return;
     }
-    showToast("Только XLSX/CSV (слот 1) или PDF (слоты 2/3)", "err");
+    showToast("Только XLSX/CSV (слот 1) или PDF (слот 2 — УПД)", "err");
   };
 
   const resetCombinedFlow = () => {
     setSlotXlsx(null);
     setSlotUpdServices(null);
-    setSlotUpdCommission(null);
     setCombinedStatus("idle");
     setCombinedError("");
     setCombinedResult(null);
@@ -2959,14 +3022,14 @@ export default function AppPage() {
   };
 
   const analyzeAllThree = async () => {
-    if (!slotXlsx || !slotUpdServices || !slotUpdCommission) {
-      showToast("Загрузите все 3 файла", "warn");
+    if (!slotXlsx || !slotUpdServices) {
+      showToast("Загрузите оба файла", "warn");
       return;
     }
     if (combinedStatus === "processing") return;
     if (!canCalculate) {
       // eslint-disable-next-line no-console
-      console.warn("[upload-3] blocked by paywall");
+      console.warn("[upload-docs] blocked by paywall");
       setSelectedTier(null);
       setTariffModalOpen(true);
       return;
@@ -2983,36 +3046,32 @@ export default function AppPage() {
     setReportCogsTotal(null);
 
     // eslint-disable-next-line no-console
-    console.log("[upload-3] starting parallel parse of 3 files", {
+    console.log("[upload-docs] starting parallel parse", {
       xlsx: slotXlsx.name,
-      updServices: slotUpdServices.name,
-      updCommission: slotUpdCommission.name,
+      upd: slotUpdServices.name,
     });
 
-    // Параллельный парсинг всех трёх
-    const [xlsxRes, updSrvRes, updComRes] = await Promise.all([
+    // Параллельный парсинг обоих документов
+    const [xlsxRes, updSrvRes] = await Promise.all([
       parseOzonReport(slotXlsx),
       parseUpdPdf(slotUpdServices),
-      parseUpdPdf(slotUpdCommission),
     ]);
 
     setCombinedDebug({
       xlsx: xlsxRes.debugInfo,
       updServices: updSrvRes.debugInfo,
-      updCommission: updComRes.debugInfo,
     });
 
     // eslint-disable-next-line no-console
-    console.log("[upload-3] parse results:", {
+    console.log("[upload-docs] parse results:", {
       xlsxOk: xlsxRes.ok,
       xlsxRevenueFromTotals:
         xlsxRes.report?.totals.revenueFromTotalsRow ?? null,
       xlsxLoyaltyFromTotals:
         xlsxRes.report?.totals.loyaltyPayoutsFromTotalsRow ?? null,
-      updServicesOk: updSrvRes.ok,
-      updServicesTotal: updSrvRes.report?.totalAmount ?? null,
-      updCommissionOk: updComRes.ok,
-      updCommissionTotal: updComRes.report?.totalAmount ?? null,
+      updOk: updSrvRes.ok,
+      updTotalAmount: updSrvRes.report?.totalAmount ?? null,
+      updCommissionAmount: updSrvRes.report?.commissionAmount ?? null,
     });
 
     if (!xlsxRes.ok || !xlsxRes.report) {
@@ -3025,14 +3084,7 @@ export default function AppPage() {
     if (!updSrvRes.ok || !updSrvRes.report) {
       setCombinedStatus("error");
       setCombinedError(
-        `УПД доп. услуги: ${updSrvRes.error ?? "не удалось обработать"}`
-      );
-      return;
-    }
-    if (!updComRes.ok || !updComRes.report) {
-      setCombinedStatus("error");
-      setCombinedError(
-        `УПД агентское: ${updComRes.error ?? "не удалось обработать"}`
+        `УПД: ${updSrvRes.error ?? "не удалось обработать"}`
       );
       return;
     }
@@ -3044,13 +3096,39 @@ export default function AppPage() {
     const revenueFromTotals = xlsxRes.report.totals.revenueFromTotalsRow;
     const loyaltyPayouts =
       xlsxRes.report.totals.loyaltyPayoutsFromTotalsRow ?? 0;
-    const updServicesTotal = updSrvRes.report.totalAmount;
-    const updCommissionTotal = updComRes.report.totalAmount;
+    // Единый УПД: totalAmount (col9, с налогом) — единственный ПОЛНЫЙ расход,
+    // ОБЯЗАТЕЛЕН. Если parseUpdPdf вернул ok:true, totalAmount по построению —
+    // ненулевое число (candidate-сбор отбрасывает нули), но проверяем явно —
+    // это ЗАЩИТА, а не подстановка нуля: нечитаемый итог → ошибка ДО consume/save.
+    const updTotal = updSrvRes.report.totalAmount;
+    if (!(updTotal > 0)) {
+      console.warn("[upload-docs] УПД totalAmount invalid:", updTotal);
+      setCombinedStatus("error");
+      setCombinedError(
+        "Не удалось прочитать итоговую сумму УПД («Всего к оплате»). Проверьте, что загружен оригинальный PDF от Ozon."
+      );
+      return;
+    }
+    // commissionAmount — best-effort сумма строки «Агентское вознаграждение»
+    // (подмножество totalAmount, НЕ отдельное слагаемое). commissionKnown=false,
+    // если строка не распознана — тогда updServicesTotal хранит ВЕСЬ totalAmount
+    // (updCommissionTotal=0) для формулы/БД (см. profitBeforeCost ниже — итог
+    // вычитается ровно один раз независимо от разбивки), а UI обязан показать
+    // ОДИН общий расход с пояснением, а не «Агентское вознаграждение: 0 ₽»
+    // (см. buildHistDetailRows/downloadProfitPdf/JSX-блоки результата).
+    const commissionKnown =
+      updSrvRes.report.commissionAmount !== null &&
+      updSrvRes.report.commissionAmount > 0 &&
+      updSrvRes.report.commissionAmount <= updTotal;
+    const updCommissionTotal = commissionKnown
+      ? (updSrvRes.report.commissionAmount as number)
+      : 0;
+    const updServicesTotal = updTotal - updCommissionTotal;
 
     if (revenueFromTotals === null || revenueFromTotals <= 0) {
       // eslint-disable-next-line no-console
       console.warn(
-        "[upload-3] revenue text-match failed — strict policy, no fallback",
+        "[upload-docs] revenue text-match failed — strict policy, no fallback",
         {
           matchedRevenueTotalDetails:
             xlsxRes.debugInfo.matchedRevenueTotalDetails,
@@ -3063,14 +3141,68 @@ export default function AppPage() {
       return;
     }
 
-    // PR #25: дубль-гард ДО списания. Месяц — из периода отчёта (приоритет) или
-    // имени XLSX-файла; если месяц надёжно не определить (null) → НЕ блокируем,
-    // сохранение важнее. «Отмена» → откатываем статус в idle и выходим ДО
-    // consumeCalculation (попытка НЕ списывается).
+    // ---- Совместимость документов: один и тот же продавец маркетплейса ----
+    // XLSX «Получатель» ИНН (recipientInn) и УПД «Покупатель» ИНН (buyerInn) —
+    // это ОДИН И ТОТ ЖЕ продавец маркетплейса (селлер): в обоих документах
+    // Ozon — противоположная сторона («Плательщик» в XLSX, «Продавец» в УПД).
+    // Защита от смешивания документов РАЗНЫХ селлеров/магазинов — НЕ проверка
+    // «документ от Ozon». В отличие от проверки периода ниже, здесь
+    // неопределённость ТОЖЕ блокирует (fail-closed): нельзя признать документы
+    // совместимыми, если принадлежность продавцу не подтверждена.
+    if (
+      xlsxRes.report.recipientInn === null ||
+      updSrvRes.report.buyerInn === null
+    ) {
+      console.warn("[upload-docs] seller-identity INN not readable:", {
+        recipientInn: xlsxRes.report.recipientInn,
+        buyerInn: updSrvRes.report.buyerInn,
+      });
+      setCombinedStatus("error");
+      setCombinedError(
+        "Не удалось определить продавца по одному из документов (ИНН получателя в отчёте о реализации или ИНН покупателя в УПД). Проверьте, что загружены оригинальные файлы Ozon."
+      );
+      return;
+    }
+    if (xlsxRes.report.recipientInn !== updSrvRes.report.buyerInn) {
+      console.warn("[upload-docs] seller-identity mismatch:", {
+        recipientInn: xlsxRes.report.recipientInn,
+        buyerInn: updSrvRes.report.buyerInn,
+      });
+      setCombinedStatus("error");
+      setCombinedError(
+        "Отчёт о реализации и УПД относятся к разным продавцам (ИНН не совпадает). Проверьте, что оба документа — из одного магазина Ozon."
+      );
+      return;
+    }
+
+    // ---- Совместимость документов: период отчёта и период УПД ----
+    // Оба периода надёжно определены И различаются → однозначно разные
+    // отчётные месяцы → отклоняем. Если хотя бы один период не определён —
+    // НЕ блокируем (та же консервативная политика, что и у дубль-гарда ниже).
     const uploadMonth = resolveReportMonth(
       xlsxRes.report.period,
       slotXlsx?.name ?? null
     );
+    const updMonth = updSrvRes.report.documentDate
+      ? updSrvRes.report.documentDate.slice(0, 7)
+      : null;
+    if (uploadMonth && updMonth && uploadMonth.slice(0, 7) !== updMonth) {
+      console.warn("[upload-docs] period mismatch:", {
+        uploadMonth,
+        updMonth,
+      });
+      setCombinedStatus("error");
+      setCombinedError(
+        `Период отчёта (${uploadMonth.slice(
+          0,
+          7
+        )}) и период УПД (${updMonth}) не совпадают. Проверьте, что оба документа за один месяц.`
+      );
+      return;
+    }
+
+    // PR #25: дубль-гард ДО списания. «Отмена» → откатываем статус в idle и
+    // выходим ДО consumeCalculation (попытка НЕ списывается).
     if (
       !(await confirmNoMonthDuplicate(
         uploadMonth ? uploadMonth.slice(0, 7) : null,
@@ -3086,7 +3218,7 @@ export default function AppPage() {
     const consumed = await consumeCalculation();
     if (!consumed.ok) {
       // eslint-disable-next-line no-console
-      console.warn("[upload-3] consume blocked → paywall", consumed.reason);
+      console.warn("[upload-docs] consume blocked → paywall", consumed.reason);
       setCombinedStatus("idle");
       setSelectedTier(null);
       setTariffModalOpen(true);
@@ -3099,7 +3231,7 @@ export default function AppPage() {
       revenue + loyaltyPayouts - updServicesTotal - updCommissionTotal;
 
     // eslint-disable-next-line no-console
-    console.log("[upload-3] FORMULA:", {
+    console.log("[upload-docs] FORMULA:", {
       revenue,
       loyaltyPayouts,
       updServicesTotal,
@@ -3117,6 +3249,8 @@ export default function AppPage() {
       // Имя файла Ozon — fallback для определения месяца, если период из
       // содержимого XLSX не распознан (приоритет 2 в resolveReportMonth).
       sourceFileName: slotXlsx?.name ?? null,
+      docFormat: "single-upd",
+      commissionKnown,
     });
 
     // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
@@ -3149,7 +3283,7 @@ export default function AppPage() {
       logistics: String(updCommissionTotal.toFixed(2)),
     });
 
-    // Сохраняем результат 3-file flow в историю + Supabase как calculation (mode='upload').
+    // Сохраняем результат doc-based flow в историю + Supabase как calculation (mode='upload').
     // Все доп. расходы = 0, поэтому identity profit = revenue − total_expenses (= profitBeforeCost).
     {
       const now = new Date();
@@ -3182,6 +3316,8 @@ export default function AppPage() {
         // мог пересчитать себестоимость по актуальному каталогу товаров.
         products: xlsxRes.report.products,
         estimate: xlsxRes.report.estimate,
+        docFormat: "single-upd",
+        commissionKnown,
       };
 
       const canPersist = !!user?.id;
@@ -10715,16 +10851,15 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         )}
 
         {calcMode === "upload" && (
-          <div className="card upload-card" role="region" aria-label="Загрузка отчёта (3 файла)">
+          <div className="card upload-card" role="region" aria-label="Загрузка отчёта (2 файла)">
             <div className="upload-3-head">
               <div className="upload-3-title">
-                Расчёт по документам Ozon — 3 файла
+                Расчёт по документам Ozon
               </div>
               <p className="upload-3-sub">
-                Загрузите XLSX-отчёт о реализации и оба УПД (доп. услуги +
-                агентское вознаграждение). Сайт считает прибыль на основе
-                выручки Ozon, выплат от партнёров, расходов по УПД и агентского
-                вознаграждения.
+                Загрузите отчёт о реализации Ozon (XLSX) и УПД на услуги и
+                вознаграждение Ozon (PDF). Сайт считает прибыль на основе
+                выручки Ozon, выплат от партнёров и расходов по УПД.
               </p>
             </div>
 
@@ -10841,9 +10976,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               >
                 <div className="upload-slot-num" aria-hidden="true">2</div>
                 <div className="upload-slot-body">
-                  <div className="upload-slot-label">УПД доп. услуги</div>
+                  <div className="upload-slot-label">
+                    УПД на услуги и вознаграждение Ozon
+                  </div>
                   <div className="upload-slot-desc">
-                    PDF с расходами Ozon по услугам
+                    PDF: единый документ с комиссией и услугами Ozon
                   </div>
                   <div className="upload-slot-meta">PDF</div>
                   {slotUpdServices ? (
@@ -10880,76 +11017,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                   />
                 </div>
               </div>
-
-              {/* Slot 3: UPD commission */}
-              <div
-                className={
-                  "upload-slot " +
-                  (slotUpdCommission ? "is-ready " : "") +
-                  (dragOverSlot === "updCommission" ? "is-drag" : "")
-                }
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setDragOverSlot("updCommission");
-                }}
-                onDragLeave={(e) => {
-                  e.preventDefault();
-                  setDragOverSlot(null);
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setDragOverSlot(null);
-                  acceptDroppedFile(
-                    e.dataTransfer.files?.[0] ?? null,
-                    "updCommission"
-                  );
-                }}
-              >
-                <div className="upload-slot-num" aria-hidden="true">3</div>
-                <div className="upload-slot-body">
-                  <div className="upload-slot-label">
-                    УПД агентское вознаграждение
-                  </div>
-                  <div className="upload-slot-desc">
-                    PDF с комиссией/вознаграждением Ozon
-                  </div>
-                  <div className="upload-slot-meta">PDF</div>
-                  {slotUpdCommission ? (
-                    <div className="upload-slot-file" title={slotUpdCommission.name}>
-                      <span className="upload-slot-file-name">
-                        {slotUpdCommission.name}
-                      </span>
-                      <button
-                        type="button"
-                        className="upload-slot-remove"
-                        onClick={() => setSlotUpdCommission(null)}
-                        aria-label="Удалить файл"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="upload-slot-pick"
-                      onClick={() => updCommissionInputRef.current?.click()}
-                    >
-                      Выбрать файл
-                    </button>
-                  )}
-                  <input
-                    ref={updCommissionInputRef}
-                    type="file"
-                    accept=".pdf"
-                    style={{ display: "none" }}
-                    onChange={(e) =>
-                      acceptSlot("updCommission", e.target.files?.[0] ?? null)
-                    }
-                  />
-                </div>
-              </div>
             </div>
 
             <div className="upload-3-actions">
@@ -10960,15 +11027,14 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 disabled={
                   combinedStatus === "processing" ||
                   !slotXlsx ||
-                  !slotUpdServices ||
-                  !slotUpdCommission
+                  !slotUpdServices
                 }
               >
                 {combinedStatus === "processing"
-                  ? "Анализируем 3 файла…"
-                  : "Проанализировать все 3 файла"}
+                  ? "Анализируем документы…"
+                  : "Проанализировать документы"}
               </button>
-              {(slotXlsx || slotUpdServices || slotUpdCommission ||
+              {(slotXlsx || slotUpdServices ||
                 combinedStatus !== "idle") && (
                 <button
                   type="button"
@@ -11034,9 +11100,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                         </span>
                         <span className="np-hero-note-txt">
                           Перед выводом итоговой прибыли проверьте, что загружены
-                          все документы (отчёт Ozon, УПД по услугам и агентскому)
-                          и заполнены себестоимость, налог и прочие расходы. Если
-                          часть данных отсутствует, итог может быть неполным.
+                          оба документа (отчёт Ozon и УПД) и заполнены
+                          себестоимость, налог и прочие расходы. Если часть
+                          данных отсутствует, итог может быть неполным.
                         </span>
                       </div>
                     </>
@@ -11094,29 +11160,57 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                       ₽
                     </span>
                   </div>
-                  <div className="upload-3-row negative">
-                    <span>УПД доп. услуги</span>
-                    <span className="num">
-                      −
-                      {combinedResult.updServicesTotal.toLocaleString("ru-RU", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      })}{" "}
-                      ₽
-                    </span>
-                  </div>
-                  <div className="upload-3-row negative">
-                    <span>УПД агентское вознаграждение</span>
-                    <span className="num">
-                      −
-                      {combinedResult.updCommissionTotal.toLocaleString("ru-RU", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      })}{" "}
-                      ₽
-                    </span>
-                  </div>
+                  {combinedResult.commissionKnown !== false ? (
+                    <>
+                      <div className="upload-3-row negative">
+                        <span>УПД доп. услуги</span>
+                        <span className="num">
+                          −
+                          {combinedResult.updServicesTotal.toLocaleString("ru-RU", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}{" "}
+                          ₽
+                        </span>
+                      </div>
+                      <div className="upload-3-row negative">
+                        <span>УПД агентское вознаграждение</span>
+                        <span className="num">
+                          −
+                          {combinedResult.updCommissionTotal.toLocaleString("ru-RU", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}{" "}
+                          ₽
+                        </span>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="upload-3-row negative">
+                      <span>Расходы по УПД (комиссия не выделена)</span>
+                      <span className="num">
+                        −
+                        {(
+                          combinedResult.updServicesTotal +
+                          combinedResult.updCommissionTotal
+                        ).toLocaleString("ru-RU", {
+                          minimumFractionDigits: 2,
+                          maximumFractionDigits: 2,
+                        })}{" "}
+                        ₽
+                      </span>
+                    </div>
+                  )}
                 </div>
+                {combinedResult.commissionKnown === false && (
+                  <div className="upload-3-note" role="note">
+                    <p className="upload-3-note-text">
+                      Не удалось отдельно распознать строку «Агентское
+                      вознаграждение» в УПД — показан общий расход по документу
+                      целиком. Итог и формула прибыли от этого не меняются.
+                    </p>
+                  </div>
+                )}
                 <div className="upload-3-note" role="note">
                   <div className="upload-3-note-title">
                     Почему сумма может отличаться от выплаты Ozon?
@@ -11411,34 +11505,53 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                             ₽
                           </span>
                         </div>
-                        <div className="upload-3-row negative">
-                          <span>Расходы Ozon по УПД</span>
-                          <span className="num">
-                            −
-                            {combinedResult.updServicesTotal.toLocaleString(
-                              "ru-RU",
-                              {
+                        {combinedResult.commissionKnown !== false ? (
+                          <>
+                            <div className="upload-3-row negative">
+                              <span>Расходы Ozon по УПД</span>
+                              <span className="num">
+                                −
+                                {combinedResult.updServicesTotal.toLocaleString(
+                                  "ru-RU",
+                                  {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  }
+                                )}{" "}
+                                ₽
+                              </span>
+                            </div>
+                            <div className="upload-3-row negative">
+                              <span>Агентское вознаграждение</span>
+                              <span className="num">
+                                −
+                                {combinedResult.updCommissionTotal.toLocaleString(
+                                  "ru-RU",
+                                  {
+                                    minimumFractionDigits: 2,
+                                    maximumFractionDigits: 2,
+                                  }
+                                )}{" "}
+                                ₽
+                              </span>
+                            </div>
+                          </>
+                        ) : (
+                          <div className="upload-3-row negative">
+                            <span>Расходы по УПД (комиссия не выделена)</span>
+                            <span className="num">
+                              −
+                              {(
+                                combinedResult.updServicesTotal +
+                                combinedResult.updCommissionTotal
+                              ).toLocaleString("ru-RU", {
                                 minimumFractionDigits: 2,
                                 maximumFractionDigits: 2,
-                              }
-                            )}{" "}
-                            ₽
-                          </span>
-                        </div>
-                        <div className="upload-3-row negative">
-                          <span>Агентское вознаграждение</span>
-                          <span className="num">
-                            −
-                            {combinedResult.updCommissionTotal.toLocaleString(
-                              "ru-RU",
-                              {
-                                minimumFractionDigits: 2,
-                                maximumFractionDigits: 2,
-                              }
-                            )}{" "}
-                            ₽
-                          </span>
-                        </div>
+                              })}{" "}
+                              ₽
+                            </span>
+                          </div>
+                        )}
                         <div className="upload-3-row subtotal">
                           <span>Прибыль до себестоимости</span>
                           <span className="num">
@@ -11525,10 +11638,14 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     </div>
 
                     {(() => {
+                      // Единый УПД: services+commission ≡ totalAmount, поэтому
+                      // проверяем СУММУ (agentское вознаграждение может законно
+                      // быть 0, если строка-позиция не найдена — это НЕ значит,
+                      // что расход не загружен, см. UpdParsedReport.commissionAmount).
                       const updOk =
-                        (combinedResult?.updServicesTotal ?? 0) > 0;
-                      const agencyOk =
-                        (combinedResult?.updCommissionTotal ?? 0) > 0;
+                        (combinedResult?.updServicesTotal ?? 0) +
+                          (combinedResult?.updCommissionTotal ?? 0) >
+                        0;
                       const cov = reportCostCoverage;
                       const total = cov?.total ?? 0;
                       const withCost = cov?.withCost ?? 0;
@@ -11574,17 +11691,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           ? { state: "ok", label: "Расходы по УПД учтены" }
                           : {
                               state: "warn",
-                              label: "Расходы по УПД не загружены",
-                              hint: "прибыль может быть завышена",
-                            },
-                        agencyOk
-                          ? {
-                              state: "ok",
-                              label: "Агентское вознаграждение учтено",
-                            }
-                          : {
-                              state: "warn",
-                              label: "Агентское вознаграждение не загружено",
+                              label: "УПД не загружен",
                               hint: "прибыль может быть завышена",
                             },
                         !hasProducts
@@ -11650,13 +11757,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                             },
                       ];
 
-                      const critical = !reportOk || !updOk || !agencyOk;
+                      const critical = !reportOk || !updOk;
                       const inaccurate = costWarn || taxWarn;
                       const missingCore: string[] = [];
                       if (!reportOk) missingCore.push("отчёт Ozon");
-                      if (!updOk) missingCore.push("расходы по УПД");
-                      if (!agencyOk)
-                        missingCore.push("агентское вознаграждение");
+                      if (!updOk) missingCore.push("УПД");
                       const softIssues: string[] = [];
                       if (costWarn)
                         softIssues.push(
