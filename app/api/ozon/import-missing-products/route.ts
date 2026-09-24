@@ -54,6 +54,10 @@ function errorResponse(code: OzonFinanceErrorCode): NextResponse {
     timeout: { status: 504, error: "Ozon не ответил вовремя. Попробуйте ещё раз" },
     bad_response: { status: 502, error: "Ozon вернул неожиданный ответ" },
     unavailable: { status: 502, error: "Ozon временно недоступен" },
+    // deadline — недостижим отсюда: этот route не передаёт deadlineMs в
+    // fetchOzonTransactions. Запись нужна ТОЛЬКО для полноты
+    // Record<OzonFinanceErrorCode, …> — код добавлен для diagnostic-роута.
+    deadline: { status: 504, error: "Ozon не ответил вовремя. Попробуйте ещё раз" },
   };
   const { status, error } = map[code];
   return NextResponse.json({ error, code }, { status, headers: NO_STORE });

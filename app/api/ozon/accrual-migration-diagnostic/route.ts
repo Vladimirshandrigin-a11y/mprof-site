@@ -1287,24 +1287,34 @@ export async function POST(req: NextRequest) {
   const newApiComplete = !rateLimited && !newApiLimitReached && newMethodsClean;
 
   // ======= 6) СТАРЫЙ finance-агрегатор — ПОСЛЕДНИМ, только если new завершены =========
-  // Переиспользуем существующий модуль без изменений: Σ amount по операциям.
+  // Переиспользуем существующий модуль, формула/пагинация/агрегация НЕ МЕНЯЮТСЯ —
+  // добавлен ТОЛЬКО опциональный 4-й параметр deadlineMs (finance.ts, backward-
+  // compatible: save-calculation/import-missing-products/postings-match-diagnostic
+  // его не передают — их поведение byte-for-byte прежнее).
   //
-  // ВАЖНО (не архитектурное решение, а честная фиксация факта): fetchOzonTransactions
-  // — ЧУЖОЙ модуль (_lib/finance.ts, общий с боевым save-calculation, НЕ трогаем) —
-  // НЕ проверяет budget.deadline этой диагностики вообще. У него СВОЙ независимый
-  // per-page таймаут (TIMEOUT_MS=20000 в finance.ts) и до LEGACY_MAX_REQUESTS=20
-  // страниц. К моменту, когда доходит очередь до legacy, СТРОГО последовательный
-  // pacer (MIN_REQUEST_INTERVAL_MS=1100мс/старт) новых методов (особенно by-day —
-  // по 1 запросу на КАЖДЫЙ день месяца) уже мог израсходовать почти весь
-  // DIAG_DEADLINE_MS=40000 общего мягкого дедлайна диагностики — см.
-  // budgetRemainingMsAtLegacyStart ниже (РЕАЛЬНО измеренный остаток, не оценка).
-  // Если новые методы НЕ помещаются в общий бюджет перед legacy, минимальный
-  // read-only способ сверки БЕЗ повторной загрузки уже успешных этапов —
-  // legacyOnly:true (см. парсинг body выше): пропускает все 5 новых методов,
-  // legacy получает ВЕСЬ 40-секундный бюджет для себя одного, отдельным запросом.
-  // Слепое увеличение DIAG_DEADLINE_MS здесь НЕ делается: это НЕ решает проблему
-  // (просто отодвигает тот же конфликт дальше) и НЕ обосновано данными о реальном
-  // внешнем таймауте (см. summary ниже и PR #87 — Timeweb не подтверждён логами).
+  // ИТОГОВЫЙ КОНТРАКТ ДЕДЛАЙНА (без противоречия «общий, но legacy не входит»):
+  // DIAG_DEADLINE_MS=40000 — ОДИН budget.deadline на ВЕСЬ запрос диагностики,
+  // включая legacy. «Legacy не входит в budget новых методов» касалось ТОЛЬКО
+  // ЛИМИТА ЗАПРОСОВ (LEGACY_MAX_REQUESTS=20 зарезервированы ОТДЕЛЬНО от
+  // NEW_API_MAX_REQUESTS=130, потолок ≤150 — см. константы вверху файла), а НЕ
+  // временного дедлайна: budget.deadline (время) — один и тот же для всех фаз,
+  // просто legacy передаёт его В finance.ts явно (deadlineMs), а не через
+  // разделяемый Budget-объект (тот привязан к pacer/budget.used новых методов,
+  // которых у legacy нет — там свой TIMEOUT_MS/страница и MAX_PAGES=20).
+  // Итог: 1 дедлайн по ВРЕМЕНИ на всю диагностику; 2 РАЗНЫХ лимита по ЧИСЛУ
+  // запросов (новые методы vs legacy), зарезервированных не пересекаясь.
+  //
+  // К моменту, когда доходит очередь до legacy, строгий pacer новых методов
+  // (особенно by-day — 1 запрос на КАЖДЫЙ день месяца) уже мог израсходовать
+  // почти весь бюджет — см. budgetRemainingMsAtLegacyStart ниже (РЕАЛЬНО
+  // измеренный остаток, не оценка). Если новые методы НЕ помещаются в общий
+  // бюджет перед legacy, минимальный read-only способ сверки БЕЗ повторной
+  // загрузки уже успешных этапов — legacyOnly:true (см. парсинг body выше):
+  // пропускает все 5 новых методов, legacy получает ВЕСЬ 40-секундный бюджет
+  // для себя одного, отдельным запросом. Слепое увеличение DIAG_DEADLINE_MS
+  // здесь НЕ делается: это НЕ решает проблему (просто отодвигает тот же
+  // конфликт дальше) и НЕ обосновано данными о реальном внешнем таймауте
+  // (см. PR #87 — Timeweb не подтверждён логами).
   let legacy: Record<string, unknown> = {
     endpoint: "/v3/finance/transaction/list",
     status: null,
@@ -1321,7 +1331,13 @@ export async function POST(req: NextRequest) {
     legacyRan = true;
     budgetRemainingMsAtLegacyStart = budget.deadline - Date.now();
     const t0Legacy = Date.now();
-    const tx = await fetchOzonTransactions(clientId, apiKey, range);
+    // ЕДИНЫЙ дедлайн диагностики передан явно: budget.deadline уже прошёл →
+    // fetchPage(page=1) вернёт code:"deadline" НЕМЕДЛЕННО, без единого fetch()
+    // (требование 1 — «если бюджет исчерпан до вызова, не отправляй запрос»).
+    // Если наступит ВО ВРЕМЯ уже идущей страницы — тот же AbortController,
+    // что и обычный TIMEOUT_MS, реально прерывает fetch (требование 2 —
+    // подтверждённая отмена, не Promise.race без реальной остановки).
+    const tx = await fetchOzonTransactions(clientId, apiKey, range, budget.deadline);
     durationsMs.legacy = Date.now() - t0Legacy;
     if (tx.ok) {
       let sum = 0;
@@ -1362,21 +1378,24 @@ export async function POST(req: NextRequest) {
       };
     } else {
       // Различаем причину, а не сваливаем всё в одно "unavailable":
-      //   • request_timeout — finance.ts СВОЙ AbortController (20с/страница) сработал;
+      //   • budget_exhausted — сработал ЕДИНЫЙ дедлайн диагностики (deadlineMs,
+      //     переданный явно в fetchOzonTransactions выше) — ЛИБО он уже прошёл
+      //     ДО старта legacy (запрос не отправлялся вовсе — требование 1), ЛИБО
+      //     наступил ВО ВРЕМЯ уже идущей страницы (реально прерванной тем же
+      //     AbortController, что и обычный таймаут — требование 2). Это ТЕПЕРЬ
+      //     доказанная, а не предполагаемая причина: finance.ts возвращает
+      //     "deadline" ТОЛЬКО когда сам его различил (см. doc-comment fetchPage).
+      //   • request_timeout — finance.ts СВОЙ AbortController (20с/страница)
+      //     сработал ПЕРВЫМ (deadlineMs ещё не наступил) — НЕ бюджет диагностики;
       //   • ozon_http_error — реальный HTTP-ответ получен (сеть дошла), status —
       //     ФАКТИЧЕСКИЙ код (401/403/429/5xx/…), а не подтверждённый null;
       //   • rate_limited — Ozon вернул 429 (finance.ts НЕ ретраит legacy сам —
       //     отдельно от ozonPost-ретрая новых методов, это тоже чужой модуль);
       //   • network_error — fetch бросил исключение, которое НЕ AbortError (DNS/
       //     соединение оборвано/TLS/и т.п.) — ответа не было вообще.
-      // budgetRemainingMsAtLegacyStart — РЕАЛЬНО измеренный остаток мягкого
-      // дедлайна диагностики В МОМЕНТ старта legacy (см. doc-comment блока 6
-      // выше). Мы НЕ утверждаем, что именно нехватка бюджета — причина ЭТОЙ
-      // конкретной ошибки: budgetRemainingMsAtLegacyStart и errorKind — два
-      // независимых факта, оставленных рядом для честного сопоставления, а не
-      // единый вывод.
       const errorKind: string =
-        tx.code === "timeout" ? "request_timeout"
+        tx.code === "deadline" ? "budget_exhausted"
+        : tx.code === "timeout" ? "request_timeout"
         : tx.code === "rate_limited" ? "rate_limited"
         : typeof tx.status === "number" ? "ozon_http_error"
         : "network_error";

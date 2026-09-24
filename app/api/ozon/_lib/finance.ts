@@ -37,8 +37,14 @@ export type OzonFinanceErrorCode =
   | "forbidden" // 403
   | "rate_limited" // 429
   | "unavailable" // 5xx / сеть
-  | "timeout" // abort по таймауту
-  | "bad_response"; // не-JSON / неожиданная форма ответа
+  | "timeout" // abort по таймауту TIMEOUT_MS (см. deadlineMs ниже — другой abort-источник)
+  | "bad_response" // не-JSON / неожиданная форма ответа
+  // deadline — сработал ВНЕШНИЙ deadlineMs (опциональный параметр
+  // fetchOzonTransactions/fetchPage), а НЕ собственный TIMEOUT_MS этого модуля.
+  // Возвращается ТОЛЬКО когда вызывающий код явно передал deadlineMs — для
+  // существующих вызовов (deadlineMs не передан) этот код невозможен, поведение
+  // не меняется.
+  | "deadline";
 
 /** Минимальная форма операции — читаем ТОЛЬКО нужные поля. Всё опционально:
  *  если Ozon вернёт иначе, мягко коалесцируем в 0/пусто, а не падаем. */
@@ -157,15 +163,37 @@ type PageResult =
   | { ok: true; data: OzonTxResponse }
   | { ok: false; code: OzonFinanceErrorCode; status?: number };
 
-/** Одна страница транзакций. Никогда не бросает: сеть/таймаут → код ошибки. */
+/**
+ * Одна страница транзакций. Никогда не бросает: сеть/таймаут → код ошибки.
+ *
+ * deadlineMs — ОПЦИОНАЛЬНЫЙ абсолютный timestamp (Date.now()-база), которым
+ * вызывающий код может ограничить ЭТУ страницу извне (нужно диагностике —
+ * см. accrual-migration-diagnostic/route.ts, у которой есть СВОЙ общий
+ * мягкий дедлайн на весь запрос). undefined (как во всех существующих
+ * вызовах из save-calculation/profit.ts) → поведение ПОЛНОСТЬЮ прежнее,
+ * единственный таймер — TIMEOUT_MS. Если deadlineMs задан:
+ *   • уже прошёл ДО старта этой страницы → НЕ делаем fetch вообще, сразу
+ *     code:"deadline" (не тратим бюджет на заведомо бессмысленный запрос);
+ *   • наступит РАНЬШЕ TIMEOUT_MS во время запроса → берём ТОТ ЖЕ
+ *     AbortController, что и обычный таймаут (единый механизм отмены, а не
+ *     Promise.race без реальной отмены — гонка сама по себе не прерывает
+ *     уже запущенный fetch, только перестаёт его ждать) — abort ВСЕГДА
+ *     реально останавливает соединение, просто триггер мог сработать раньше.
+ */
 async function fetchPage(
   clientId: string,
   apiKey: string,
   range: MonthRange,
-  page: number
+  page: number,
+  deadlineMs?: number
 ): Promise<PageResult> {
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+    return { ok: false, code: "deadline" };
+  }
+  const timeoutMs =
+    deadlineMs !== undefined ? Math.min(TIMEOUT_MS, deadlineMs - Date.now()) : TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(OZON_TX_URL, {
       method: "POST",
@@ -202,25 +230,36 @@ async function fetchPage(
     return { ok: true, data: (json as OzonTxResponse) ?? {} };
   } catch (e) {
     const aborted = e instanceof Error && e.name === "AbortError";
-    return { ok: false, code: aborted ? "timeout" : "unavailable" };
+    if (!aborted) return { ok: false, code: "unavailable" };
+    // Различаем, КАКОЙ из двух таймеров реально сработал первым: если
+    // deadlineMs уже прошёл — это он (иначе он был бы ещё впереди), а не
+    // обычный TIMEOUT_MS.
+    const viaDeadline = deadlineMs !== undefined && Date.now() >= deadlineMs;
+    return { ok: false, code: viaDeadline ? "deadline" : "timeout" };
   } finally {
     clearTimeout(timer);
   }
 }
 
-/** Все операции за период с безопасной пагинацией. Если страниц больше лимита —
- *  возвращаем partial:true (то, что успели), без бесконечного цикла. */
+/**
+ * Все операции за период с безопасной пагинацией. Если страниц больше лимита —
+ * возвращаем partial:true (то, что успели), без бесконечного цикла.
+ *
+ * deadlineMs — ОПЦИОНАЛЬНЫЙ, см. doc-comment fetchPage. undefined → поведение
+ * НЕ МЕНЯЕТСЯ (существующие вызовы из save-calculation/profit.ts его не передают).
+ */
 export async function fetchOzonTransactions(
   clientId: string,
   apiKey: string,
-  range: MonthRange
+  range: MonthRange,
+  deadlineMs?: number
 ): Promise<OzonFinanceFetchResult> {
   const operations: OzonOperation[] = [];
   let pageCount = 1;
   let rowCount = 0;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
-    const r = await fetchPage(clientId, apiKey, range, page);
+    const r = await fetchPage(clientId, apiKey, range, page, deadlineMs);
     if (!r.ok) return r;
 
     const result = r.data.result ?? {};
