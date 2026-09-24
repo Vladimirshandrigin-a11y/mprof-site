@@ -166,11 +166,14 @@ export function computeProductBreakdownRows(
       const profit = detailComplete
         ? netRevenue + loyaltyForRow - cogs - allocatedExpenses + allocatedPayoutAdj
         : null;
+      // Маржа не определена при нулевой/отрицательной выручке (возвраты
+      // превысили продажи) — null, а НЕ 0%, иначе выглядит как «маржа
+      // ровно ноль» вместо «не считается». profit НЕ меняется.
       const margin = !detailComplete
         ? null
         : netRevenue > 0
           ? (profit! / netRevenue) * 100
-          : 0;
+          : null;
       out.push({
         article: a.article,
         name: a.name || match.name || a.article,
