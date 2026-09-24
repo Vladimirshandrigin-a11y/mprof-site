@@ -1442,7 +1442,7 @@ export default function AppPage() {
   // Какой прогон дал текущий accrualDiagResult — только для подписи над JSON.
   // Один слот результата на оба режима: второй результат не подмешивается к
   // первому, поэтому «сравнение, пока нет обоих» просто нечего сравнивать здесь.
-  const [accrualDiagResultMode, setAccrualDiagResultMode] = useState<"new" | "legacy" | "realization" | null>(null);
+  const [accrualDiagResultMode, setAccrualDiagResultMode] = useState<"new" | "legacy" | "realization" | "fullcalc" | null>(null);
 
   // Ozon Performance API (реклама/продвижение) — PR #43 foundation. Отдельное
   // подключение и отдельная таблица; секрет в браузере не держим.
@@ -4386,6 +4386,43 @@ export default function AppPage() {
         method: "POST",
         headers: { ...authHeaders, "Content-Type": "application/json" },
         body: JSON.stringify({ month: accrualDiagMonth, realizationOnly: true }),
+        cache: "no-store",
+      });
+      const json = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) {
+        setAccrualDiagError(json?.error || `Ошибка ${res.status}`);
+        return;
+      }
+      setAccrualDiagResult(json);
+    } catch {
+      setAccrualDiagError("Сеть недоступна. Попробуйте ещё раз.");
+    } finally {
+      setAccrualDiagLoading(false);
+    }
+  };
+
+  // Изолированная read-only проверка ПОЛНОГО нового (accrual) расчёта —
+  // РЕАЛЬНЫЙ loadAndComputeApiProfit с opts.forceAccrual:true (выбор accrual
+  // делает ТОЛЬКО сервер после owner-проверки — здесь клиент лишь просит
+  // запустить проверку, а не выбирает источник). Ничего не списывает, не
+  // сохраняет, не меняет каталог/историю (route.ts блок 8 не вызывает
+  // consume/insert вовсе). OZON_FINANCE_ACCRUAL_ENABLED (боевой флаг) не трогается.
+  const runFullCalcCheckDiagnostic = async () => {
+    if (accrualDiagLoading) return;
+    setAccrualDiagLoading(true);
+    setAccrualDiagError("");
+    setAccrualDiagResult(null);
+    setAccrualDiagResultMode("fullcalc");
+    try {
+      const authHeaders = await ozonAuthHeaders();
+      if (!authHeaders.Authorization) {
+        setAccrualDiagError("Нужно войти в аккаунт");
+        return;
+      }
+      const res = await fetch("/api/ozon/accrual-migration-diagnostic", {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ month: accrualDiagMonth, fullCalcCheck: true }),
         cache: "no-store",
       });
       const json = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -9839,6 +9876,15 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               >
                 {accrualDiagLoading && accrualDiagResultMode === "realization" ? "Проверяем…" : "Проверить отчёт реализации"}
               </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={runFullCalcCheckDiagnostic}
+                disabled={accrualDiagLoading}
+                style={{ padding: "9px 16px", borderRadius: "9px", whiteSpace: "nowrap" }}
+              >
+                {accrualDiagLoading && accrualDiagResultMode === "fullcalc" ? "Проверяем…" : "Проверить полный новый расчёт"}
+              </button>
             </div>
             <label style={{ display: "flex", alignItems: "center", gap: ".4rem", fontSize: ".72rem", color: "var(--txt2)", marginBottom: ".8rem", cursor: "pointer" }}>
               <input
@@ -9859,7 +9905,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     ? "Результат: только старый метод (новые методы не запускались)"
                     : accrualDiagResultMode === "realization"
                       ? "Результат: только отчёт о реализации (новые методы и старый метод не запускались)"
-                      : "Результат: новые методы Ozon"}
+                      : accrualDiagResultMode === "fullcalc"
+                        ? "Результат: полный новый расчёт (тот же loadAndComputeApiProfit, что и сохранение — ничего не списано и не сохранено)"
+                        : "Результат: новые методы Ozon"}
                 </div>
                 <pre
                   aria-label="Результат диагностики (безопасная схема)"
