@@ -1956,7 +1956,6 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
       ? { loyaltyCol: null, loyaltyReturnedCol: null, known: false }
       : detectLoyaltyGroupColumns(dataRows, headerRowIdx, colMap.loyalty);
     const loyaltyPayoutPerSkuKnown = loyaltyGroupCols.known;
-    // eslint-disable-next-line no-console
     console.log(LOG, "loyalty group columns:", loyaltyGroupCols);
 
     const rowsAfterHeader = Math.max(0, dataRows.length - headerRowIdx - 1);
