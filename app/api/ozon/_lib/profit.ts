@@ -581,26 +581,24 @@ export async function loadAndComputeApiProfit(
   }
   const catalogRows = (catalog ?? []) as CatalogRow[];
 
-  // 3) БОЕВАЯ себестоимость из отчёта о реализации Ozon + валидация надёжности.
-  //    productionCost = candidateCogs.bySaleQty (Σ кол-во продаж × cost каталога).
-  const realization = await loadRealizationDiagnostic({
-    clientId,
-    apiKey,
-    month,
-    catalog: catalogRows,
-  });
+  // 3+4) БОЕВАЯ себестоимость из отчёта о реализации Ozon (валидация надёжности
+  //    ниже) и СПРАВОЧНАЯ себестоимость по отправлениям (postings, best-effort,
+  //    НЕ участвует в прибыли и НЕ гейтит расчёт) — ДВА НЕЗАВИСИМЫХ похода к
+  //    Ozon (ни один не читает результат другого), раньше шли строго
+  //    последовательно без причины. Запускаем одновременно: итоговые числа не
+  //    меняются, меняется только порядок выполнения. Draft (шаг 1) и каталог
+  //    (шаг 2) остаются ДО этого места намеренно — при их ошибке функция уже
+  //    вышла раньше и не тратит лишние живые запросы к Ozon на realization/postings.
+  const [realization, postings] = await Promise.all([
+    loadRealizationDiagnostic({ clientId, apiKey, month, catalog: catalogRows }),
+    fetchMonthPostings(clientId, apiKey, range),
+  ]);
   const resolution = resolveRealizationProductionCost(realization);
   if (!resolution.ok) {
     return { ok: false, kind: "realization_cost", resolution };
   }
   const productionCost = resolution.productionCost;
   const realizationRevenueForTax = resolution.realizationRevenueForTax;
-
-  // 4) СПРАВОЧНАЯ себестоимость по отправлениям (postings) — best-effort. НЕ
-  //    участвует в прибыли и НЕ гейтит расчёт: фатальная ошибка отправлений НЕ
-  //    валит боевой расчёт (показываем справку 0). Прежняя delivered-only логика
-  //    больше НЕ боевая себестоимость.
-  const postings = await fetchMonthPostings(clientId, apiKey, range);
   const cost = aggregateProfitCostDraft(
     postings.fatalCode ? [] : postings.items,
     postings.warnings,
