@@ -23,6 +23,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../../cloud/_lib/auth";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { monthToRange, fetchOzonTransactions, aggregateDraft } from "../_lib/finance";
+import { loadRealizationDiagnostic } from "../_lib/realization";
+import type { CatalogRow } from "../_lib/postings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -560,12 +562,28 @@ export async function POST(req: NextRequest) {
   // comment у блока 6 ниже — зачем это нужно и почему это МИНИМАЛЬНЫЙ способ,
   // а не архитектурное изменение).
   let legacyOnly = false;
+  // checkRealization=true — НЕЗАВИСИМАЯ read-only проверка /v2/finance/realization
+  // (себестоимость/база налога боевого расчёта). Не влияет на legacyOnly/skipTypes/
+  // новые методы; ничего не списывает и не сохраняет. См. блок 7 ниже.
+  let checkRealization = false;
+  // realizationOnly=true — ИЗОЛИРОВАННЫЙ прогон ТОЛЬКО блока 7 (realization): ни
+  // новые методы (types/by-day/FBO/FBS/accrual_postings), ни legacy (даже если
+  // legacyOnly тоже передан) НЕ запускаются вовсе. Подразумевает checkRealization
+  // (не нужно передавать оба). Realization получает ВЕСЬ 40-секундный бюджет
+  // диагностики для себя — тот же паттерн, что legacyOnly у блока 6.
+  let realizationOnly = false;
   try {
-    const body = (await req.json()) as { month?: unknown; skipTypes?: unknown; legacyOnly?: unknown };
+    const body = (await req.json()) as {
+      month?: unknown;
+      skipTypes?: unknown;
+      legacyOnly?: unknown;
+      checkRealization?: unknown;
+      realizationOnly?: unknown;
+    };
     if (typeof body?.month === "string" && /^\d{4}-\d{2}$/.test(body.month)) {
       month = body.month;
     }
-    // skipTypes/legacyOnly строго boolean: присутствует и не boolean → 400 (безопасный код).
+    // skipTypes/legacyOnly/checkRealization строго boolean: присутствует и не boolean → 400.
     if (body?.skipTypes !== undefined && typeof body.skipTypes !== "boolean") {
       return NextResponse.json(
         { error: "skipTypes должен быть boolean", code: "bad_skip_types" },
@@ -578,11 +596,30 @@ export async function POST(req: NextRequest) {
         { status: 400, headers: NO_STORE }
       );
     }
+    if (body?.checkRealization !== undefined && typeof body.checkRealization !== "boolean") {
+      return NextResponse.json(
+        { error: "checkRealization должен быть boolean", code: "bad_check_realization" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
+    if (body?.realizationOnly !== undefined && typeof body.realizationOnly !== "boolean") {
+      return NextResponse.json(
+        { error: "realizationOnly должен быть boolean", code: "bad_realization_only" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
     if (typeof body?.skipTypes === "boolean") skipTypes = body.skipTypes;
     if (typeof body?.legacyOnly === "boolean") legacyOnly = body.legacyOnly;
+    if (typeof body?.checkRealization === "boolean") checkRealization = body.checkRealization;
+    if (typeof body?.realizationOnly === "boolean") realizationOnly = body.realizationOnly;
   } catch {
-    /* пустое/битое тело → дефолты: month=2026-06, skipTypes=false, legacyOnly=false */
+    /* пустое/битое тело → дефолты: все флаги false, month=2026-06 */
   }
+  // realizationOnly ПОДРАЗУМЕВАЕТ checkRealization (иначе изолированный прогон
+  // ничего бы не проверил) и ОТКЛЮЧАЕТ legacyOnly-запуск legacy (см. блок 6/7 ниже).
+  if (realizationOnly) checkRealization = true;
+  const skipNewMethods = legacyOnly || realizationOnly;
+  const newMethodsSkipReason = realizationOnly ? "realization_only_mode" : "legacy_only_mode";
   const range = monthToRange(month);
   if (!range) {
     return NextResponse.json(
@@ -664,15 +701,16 @@ export async function POST(req: NextRequest) {
     accrualPostings: null,
     legacy: null,
   };
-  if (legacyOnly) {
+  if (skipNewMethods) {
     // Независимая read-only сверка: новые методы НЕ вызываются вовсе — legacy
-    // (блок 6) получает ВЕСЬ 40-секундный бюджет для себя одного. См. doc-
-    // comment у блока 6 — почему это МИНИМАЛЬНЫЙ способ, не архитектурное решение.
+    // (legacyOnly) или realization (realizationOnly) получает ВЕСЬ 40-секундный
+    // бюджет для себя одного. См. doc-comment у блока 6/7 — почему это
+    // МИНИМАЛЬНЫЙ способ, не архитектурное решение.
     methods.accrual_types = {
       endpoint: "/v1/finance/accrual/types",
       status: 0,
       skipped: true,
-      reason: "legacy_only_mode",
+      reason: newMethodsSkipReason,
     };
   } else if (skipTypes) {
     // Явный owner-пропуск: types НЕ вызывается, budget не растёт, truncated
@@ -736,8 +774,8 @@ export async function POST(req: NextRequest) {
   // блокирует последующие фазы (FBO/FBS/accrual_postings), только помечает
   // truncated и останавливает ДАЛЬНЕЙШИЕ дни этого месяца (уже полученные дни
   // сохраняются, не отбрасываются и не перезапрашиваются).
-  if (legacyOnly) {
-    methods.accrual_by_day = { endpoint: "/v1/finance/accrual/by-day", status: 0, skipped: true, reason: "legacy_only_mode" };
+  if (skipNewMethods) {
+    methods.accrual_by_day = { endpoint: "/v1/finance/accrual/by-day", status: 0, skipped: true, reason: newMethodsSkipReason };
   } else {
     const t0ByDay = Date.now();
     const days = daysOfMonth(month);
@@ -1020,8 +1058,8 @@ export async function POST(req: NextRequest) {
   // ===================== 3) FBO /v3/posting/fbo/list (справочный) =====================
   // Независимая фаза — пробуем даже если предыдущая (by-day) уже отметила
   // rateLimited после исчерпания собственных ретраев.
-  if (legacyOnly) {
-    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status: 0, skipped: true, reason: "legacy_only_mode" };
+  if (skipNewMethods) {
+    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status: 0, skipped: true, reason: newMethodsSkipReason };
   } else {
     const t0Fbo = Date.now();
     let cursor = "";
@@ -1082,8 +1120,8 @@ export async function POST(req: NextRequest) {
 
   // ===================== 4) FBS /v4/posting/fbs/list (справочный) =====================
   // Независимая фаза — пробуем даже если ранее уже была отметка rateLimited.
-  if (legacyOnly) {
-    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status: 0, skipped: true, reason: "legacy_only_mode" };
+  if (skipNewMethods) {
+    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status: 0, skipped: true, reason: newMethodsSkipReason };
   } else {
     const t0Fbs = Date.now();
     let cursor = "";
@@ -1258,8 +1296,8 @@ export async function POST(req: NextRequest) {
     };
     durationsMs.accrualPostings = Date.now() - t0AccrualPostings;
   } else {
-    methods.accrual_postings = legacyOnly
-      ? { endpoint: "/v1/finance/accrual/postings", status: 0, skipped: true, reason: "legacy_only_mode" }
+    methods.accrual_postings = skipNewMethods
+      ? { endpoint: "/v1/finance/accrual/postings", status: 0, skipped: true, reason: newMethodsSkipReason }
       : {
           endpoint: "/v1/finance/accrual/postings",
           status: 0,
@@ -1327,7 +1365,10 @@ export async function POST(req: NextRequest) {
   // legacy — если новые данные полны (без 429/лимита/ошибки/обрезки) ИЛИ явно
   // запрошен независимый режим legacyOnly. Страницы (≤LEGACY_MAX_REQUESTS)
   // зарезервированы ВНЕ budget новых методов → суммарный потолок ≤150 (как раньше).
-  if (newApiComplete || legacyOnly) {
+  // realizationOnly ПОДАВЛЯЕТ legacy безусловно (даже если legacyOnly тоже
+  // передан) — изолированный прогон блока 7 не должен трогать отключённый
+  // endpoint вообще (endpoint официально мёртв с 2026-09-08 — см. PR #89/#90).
+  if (!realizationOnly && (newApiComplete || legacyOnly)) {
     legacyRan = true;
     budgetRemainingMsAtLegacyStart = budget.deadline - Date.now();
     const t0Legacy = Date.now();
@@ -1410,14 +1451,84 @@ export async function POST(req: NextRequest) {
     }
   }
 
+  // ======= 7) /v2/finance/realization — НЕЗАВИСИМАЯ read-only проверка ============
+  // Себестоимость и база налога боевого API-расчёта (loadAndComputeApiProfit, шаги
+  // 3-4) берутся ИЗ ЭТОГО endpoint'а, а НЕ из /v3/finance/transaction/list или
+  // accrual — миграция выручки НЕ гарантирует, что этот, отдельный, источник жив.
+  // Переиспользуем РЕАЛЬНУЮ loadRealizationDiagnostic (тот же модуль, что и боевой
+  // расчёт) — не копируем логику. Наружу отдаём ТОЛЬКО статус/период/полноту/
+  // агрегаты: candidateCogs.sample (offer_id/названия товаров) и debug (схема
+  // ответа) сюда НЕ передаются — этот блок вообще не запрашивает каталог products
+  // (передаём пустой массив), поэтому matched/candidateCogs всегда 0/0 — это
+  // проверка ДОСТУПНОСТИ и ПОЛНОТЫ полей отчёта, а не себестоимости конкретных
+  // товаров. checkRealization=false (по умолчанию) → блок не запускается вовсе,
+  // НЕ делает лишний живой запрос и не тратит diag-бюджет новых методов/legacy.
+  //
+  // deadlineMs = budget.deadline — тот же ЕДИНЫЙ мягкий дедлайн диагностики, что и
+  // у legacy (блок 6, см. его doc-comment про итоговый контракт дедлайна). Если
+  // бюджет уже исчерпан ДО старта — realization.ts не делает fetch вовсе
+  // (code:"deadline"). Если время заканчивается ВО ВРЕМЯ запроса — ТОТ ЖЕ
+  // AbortController, что и обычный TIMEOUT_MS, реально прерывает соединение
+  // (не Promise.race без остановки). В realizationOnly-режиме budget.deadline
+  // ещё почти полный (новые методы/legacy не запускались) — тот же паттерн, что
+  // legacyOnly даёт legacy весь бюджет для себя.
+  let realizationCheck: unknown = null;
+  // Не просто "запрос не удался" — ТОЖЕ несёт честную неполноту, если запрос
+  // прошёл (connected:true), но отчёт пуст/без нужных полей (dataComplete:false).
+  // Иначе truncated:false рядом с dataComplete:false выглядело бы противоречиво —
+  // то самое смешение «HTTP 200» и «данные полны», которого просит избегать эта
+  // задача, просто перенесённое из realizationCheck в truncated.
+  let realizationIncomplete = false;
+  if (checkRealization) {
+    const rz = await loadRealizationDiagnostic({
+      clientId,
+      apiKey,
+      month,
+      catalog: [] as CatalogRow[],
+      deadlineMs: budget.deadline,
+    });
+    // HTTP 200 (connected:true) САМ ПО СЕБЕ не значит «данные полны»: отчёт мог
+    // прийти пустым или без нужных полей. dataComplete требует РЕАЛЬНЫХ строк,
+    // присутствия идентификатора/количества/суммы И положительной базы налога
+    // (taxRevenueBase = deliveryAmount − returnAmount) — это то, что боевому
+    // расчёту реально нужно от этого отчёта (см. resolveRealizationProductionCost
+    // в profit.ts). Совпадение с каталогом (себестоимость конкретных товаров) —
+    // ОТДЕЛЬНЫЙ шаг, эта проверка каталог не запрашивает (см. выше).
+    const dataComplete =
+      rz.connected &&
+      rz.rowCount > 0 &&
+      rz.fieldsPresent.offerId &&
+      rz.fieldsPresent.deliveryQuantity &&
+      rz.fieldsPresent.deliveryAmount &&
+      rz.sums.taxRevenueBase > 0;
+    realizationIncomplete = !dataComplete;
+    realizationCheck = {
+      connected: rz.connected,
+      errorCode: rz.errorCode ?? null,
+      period: { month: rz.month, year: rz.year },
+      rowCount: rz.rowCount,
+      dataComplete,
+      fieldsPresent: rz.fieldsPresent,
+      sums: rz.sums,
+      warnings: rz.warnings,
+      notes: rz.notes,
+      note: "connected:true — это HTTP 200, не подтверждение полноты; смотрите dataComplete. Каталог себестоимости в эту проверку не передаётся — candidateCogs здесь не о конкретных товарах, а о доступности/полноте самого отчёта. Товары/offer_id/названия не возвращаются.",
+    };
+  }
+
   // ---- честная полнота: остановились ли раньше полного плана ----
   const anyMethodTruncated = Object.values(methods).some((m) => asObj(m).truncated === true);
   const anyMethodSkipped = Object.values(methods).some((m) => {
     const o = asObj(m);
-    // already_collected (owner: справочник уже собран) и legacy_only_mode
-    // (owner: независимая сверка БЕЗ новых методов) — намеренные пропуски,
-    // НЕ признак обрезки плана.
-    return o.skipped === true && o.reason !== "already_collected" && o.reason !== "legacy_only_mode";
+    // already_collected (owner: справочник уже собран), legacy_only_mode и
+    // realization_only_mode (owner: независимая сверка БЕЗ новых методов) —
+    // намеренные пропуски, НЕ признак обрезки плана.
+    return (
+      o.skipped === true &&
+      o.reason !== "already_collected" &&
+      o.reason !== "legacy_only_mode" &&
+      o.reason !== "realization_only_mode"
+    );
   });
   const anyMethodErrored = Object.values(methods).some((m) => {
     const e = asObj(m).error;
@@ -1433,9 +1544,17 @@ export async function POST(req: NextRequest) {
   // статус мог честно показывать truncated:false при незавершённом сравнении.
   const legacyFailed = legacyRan && !legacyComplete;
   // truncated=true, если план не отработал полностью: 429 / budget / pagination cap /
-  // deadline|timeout|прочая ошибка метода / пропущенные фазы / провал legacy.
+  // deadline|timeout|прочая ошибка метода / пропущенные фазы / провал legacy /
+  // запрошенная (checkRealization) проверка реализации не подключилась ИЛИ
+  // подключилась, но не дала dataComplete (пустой отчёт/нет нужных полей).
   const truncated =
-    rateLimited || newApiLimitReached || anyMethodTruncated || anyMethodSkipped || anyMethodErrored || legacyFailed;
+    rateLimited ||
+    newApiLimitReached ||
+    anyMethodTruncated ||
+    anyMethodSkipped ||
+    anyMethodErrored ||
+    legacyFailed ||
+    realizationIncomplete;
 
   // ---- сравнение old vs new (диагностика; НЕ утверждение об эквивалентности) ----
   const byDay = asObj(methods.accrual_by_day);
@@ -1547,6 +1666,7 @@ export async function POST(req: NextRequest) {
       ok: true,
       month,
       legacyOnly,
+      realizationOnly,
       range: { since: range.dateFrom, to: range.dateTo },
       rateLimited,
       retryAfterSeconds,
@@ -1565,6 +1685,8 @@ export async function POST(req: NextRequest) {
       legacy,
       comparison,
       grossRevenueEvidence,
+      checkRealization,
+      realizationCheck,
       fieldPresence,
       safety:
         "Диагностика ничего не сохраняет, не списывает расчёт и не изменяет прибыль. Идентификаторы (posting_number/operation_id/SKU/offer_id/названия) не возвращаются — только имена ключей, типы и агрегаты.",
