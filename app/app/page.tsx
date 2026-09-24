@@ -1442,7 +1442,7 @@ export default function AppPage() {
   // Какой прогон дал текущий accrualDiagResult — только для подписи над JSON.
   // Один слот результата на оба режима: второй результат не подмешивается к
   // первому, поэтому «сравнение, пока нет обоих» просто нечего сравнивать здесь.
-  const [accrualDiagResultMode, setAccrualDiagResultMode] = useState<"new" | "legacy" | null>(null);
+  const [accrualDiagResultMode, setAccrualDiagResultMode] = useState<"new" | "legacy" | "realization" | null>(null);
 
   // Ozon Performance API (реклама/продвижение) — PR #43 foundation. Отдельное
   // подключение и отдельная таблица; секрет в браузере не держим.
@@ -4351,6 +4351,41 @@ export default function AppPage() {
         method: "POST",
         headers: { ...authHeaders, "Content-Type": "application/json" },
         body: JSON.stringify({ month: accrualDiagMonth, legacyOnly: true }),
+        cache: "no-store",
+      });
+      const json = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) {
+        setAccrualDiagError(json?.error || `Ошибка ${res.status}`);
+        return;
+      }
+      setAccrualDiagResult(json);
+    } catch {
+      setAccrualDiagError("Сеть недоступна. Попробуйте ещё раз.");
+    } finally {
+      setAccrualDiagLoading(false);
+    }
+  };
+
+  // Изолированная read-only проверка ТОЛЬКО отчёта о реализации (/v2/finance/
+  // realization, realizationOnly:true) — сервер не запускает ни новые методы,
+  // ни (отключённый) legacy (см. doc-comment блока 7 в route.ts). Тот же общий
+  // result/error/loading state — второй результат не подмешивается к первому.
+  const runRealizationOnlyDiagnostic = async () => {
+    if (accrualDiagLoading) return;
+    setAccrualDiagLoading(true);
+    setAccrualDiagError("");
+    setAccrualDiagResult(null);
+    setAccrualDiagResultMode("realization");
+    try {
+      const authHeaders = await ozonAuthHeaders();
+      if (!authHeaders.Authorization) {
+        setAccrualDiagError("Нужно войти в аккаунт");
+        return;
+      }
+      const res = await fetch("/api/ozon/accrual-migration-diagnostic", {
+        method: "POST",
+        headers: { ...authHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ month: accrualDiagMonth, realizationOnly: true }),
         cache: "no-store",
       });
       const json = (await res.json().catch(() => null)) as { error?: string } | null;
@@ -9795,6 +9830,15 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
               >
                 {accrualDiagLoading && accrualDiagResultMode === "legacy" ? "Проверяем…" : "Проверить только старый метод"}
               </button>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={runRealizationOnlyDiagnostic}
+                disabled={accrualDiagLoading}
+                style={{ padding: "9px 16px", borderRadius: "9px", whiteSpace: "nowrap" }}
+              >
+                {accrualDiagLoading && accrualDiagResultMode === "realization" ? "Проверяем…" : "Проверить отчёт реализации"}
+              </button>
             </div>
             <label style={{ display: "flex", alignItems: "center", gap: ".4rem", fontSize: ".72rem", color: "var(--txt2)", marginBottom: ".8rem", cursor: "pointer" }}>
               <input
@@ -9813,7 +9857,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 <div style={{ fontSize: ".7rem", color: "var(--txt3)", marginBottom: ".35rem" }}>
                   {accrualDiagResultMode === "legacy"
                     ? "Результат: только старый метод (новые методы не запускались)"
-                    : "Результат: новые методы Ozon"}
+                    : accrualDiagResultMode === "realization"
+                      ? "Результат: только отчёт о реализации (новые методы и старый метод не запускались)"
+                      : "Результат: новые методы Ozon"}
                 </div>
                 <pre
                   aria-label="Результат диагностики (безопасная схема)"

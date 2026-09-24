@@ -210,15 +210,34 @@ export type RealizationDiagnostic = {
 /**
  * Получить отчёт о реализации Ozon за конкретный месяц.
  * apiKey уже расшифрован; НЕ логируется и НЕ возвращается.
+ *
+ * deadlineMs — ОПЦИОНАЛЬНЫЙ абсолютный timestamp (Date.now()-база), которым
+ * вызывающий код может ограничить ЭТОТ запрос извне (нужно диагностике — см.
+ * accrual-migration-diagnostic/route.ts, у которой есть СВОЙ общий мягкий
+ * дедлайн на весь запрос). undefined (как в существующем вызове из
+ * profit.ts/loadAndComputeApiProfit) → поведение ПОЛНОСТЬЮ прежнее, единственный
+ * таймер — TIMEOUT_MS. Если deadlineMs задан:
+ *   • уже прошёл ДО старта запроса → НЕ делаем fetch вообще, сразу code:"deadline"
+ *     (не тратим бюджет на заведомо бессмысленный запрос);
+ *   • наступит РАНЬШЕ TIMEOUT_MS во время запроса → берём ТОТ ЖЕ AbortController,
+ *     что и обычный таймаут (единый механизм отмены, а не Promise.race без
+ *     реальной отмены) — abort ВСЕГДА реально останавливает соединение, просто
+ *     триггер мог сработать раньше.
  */
 export async function fetchRealizationReport(
   clientId: string,
   apiKey: string,
   month: number,
-  year: number
+  year: number,
+  deadlineMs?: number
 ): Promise<RealizationFetchResult> {
+  if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+    return { ok: false, code: "deadline" };
+  }
+  const timeoutMs =
+    deadlineMs !== undefined ? Math.min(TIMEOUT_MS, deadlineMs - Date.now()) : TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(REALIZATION_URL, {
       method: "POST",
@@ -250,7 +269,11 @@ export async function fetchRealizationReport(
     return { ok: true, rows, rawRowCount: rows.length };
   } catch (e) {
     const aborted = e instanceof Error && e.name === "AbortError";
-    return { ok: false, code: aborted ? "timeout" : "unavailable" };
+    if (!aborted) return { ok: false, code: "unavailable" };
+    // Различаем, КАКОЙ из двух таймеров реально сработал первым: если deadlineMs
+    // уже прошёл — это он (иначе он был бы ещё впереди), а не обычный TIMEOUT_MS.
+    const viaDeadline = deadlineMs !== undefined && Date.now() >= deadlineMs;
+    return { ok: false, code: viaDeadline ? "deadline" : "timeout" };
   } finally {
     clearTimeout(timer);
   }
@@ -637,14 +660,19 @@ export function buildRealizationDiagnostic(
  * Удобная обёртка: распарсить "YYYY-MM", получить отчёт и собрать диагностику.
  * Используется gated-роутом save-calculation ПОСЛЕ успешного списания/сохранения.
  * Никогда не бросает — при любой ошибке вернёт connected:false с кодом.
+ *
+ * deadlineMs — ОПЦИОНАЛЬНЫЙ, см. doc-comment fetchRealizationReport. undefined →
+ * поведение НЕ МЕНЯЕТСЯ (существующий вызов из profit.ts/loadAndComputeApiProfit
+ * его не передаёт).
  */
 export async function loadRealizationDiagnostic(params: {
   clientId: string;
   apiKey: string;
   month: string; // "YYYY-MM"
   catalog: CatalogRow[];
+  deadlineMs?: number;
 }): Promise<RealizationDiagnostic> {
-  const { clientId, apiKey, month, catalog } = params;
+  const { clientId, apiKey, month, catalog, deadlineMs } = params;
   const m = /^(\d{4})-(\d{2})$/.exec(month);
   const year = m ? Number(m[1]) : 0;
   const monthNum = m ? Number(m[2]) : 0;
@@ -656,6 +684,6 @@ export async function loadRealizationDiagnostic(params: {
       year
     );
   }
-  const fetched = await fetchRealizationReport(clientId, apiKey, monthNum, year);
+  const fetched = await fetchRealizationReport(clientId, apiKey, monthNum, year, deadlineMs);
   return buildRealizationDiagnostic(fetched, catalog, monthNum, year);
 }
