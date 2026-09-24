@@ -22,6 +22,7 @@ import {
   isAccrualFinanceEnabled,
   loadAccrualDraft,
   ACCRUAL_FINANCE_SOURCE,
+  type AccrualLoadErrorCode,
   type FinanceSourceMeta,
 } from "./accrual";
 
@@ -159,6 +160,56 @@ export function errorResponse(code: OzonFinanceErrorCode): NextResponse {
     // Запись нужна ТОЛЬКО для полноты Record<OzonFinanceErrorCode, …> — этот
     // код добавлен для diagnostic-роута, а не для боевого расчёта.
     deadline: { status: 504, error: "Ozon не ответил вовремя. Попробуйте ещё раз" },
+  };
+  const { status, error } = map[code];
+  return NextResponse.json({ error, code }, { status, headers: NO_STORE });
+}
+
+/**
+ * Код неудачи accrual-источника → человеко-понятный текст + HTTP-статус.
+ * ВАЖНО: это НЕ errorResponse(OzonFinanceErrorCode) — accrual-источник (при
+ * включённом флаге) БОЛЬШЕ НЕ откатывается на legacy при собственной неудаче
+ * (endpoint отключён Ozon 2026-09-08), поэтому у него СВОИ, более точные причины
+ * незавершённости (см. AccrualLoadErrorCode в accrual.ts), а не общий "unavailable".
+ */
+export function accrualErrorResponse(code: AccrualLoadErrorCode): NextResponse {
+  const map: Record<AccrualLoadErrorCode, { status: number; error: string }> = {
+    rate_limited: {
+      status: 429,
+      error: "Ozon слишком часто отвечает «попробуйте позже» (429). Попробуйте рассчитать ещё раз через несколько минут.",
+    },
+    deadline_exceeded: {
+      status: 504,
+      error: "Не удалось загрузить начисления Ozon за месяц в отведённое время. Попробуйте ещё раз позже.",
+    },
+    request_limit_exceeded: {
+      status: 502,
+      error: "Загрузка начислений Ozon за месяц потребовала слишком много запросов. Попробуйте ещё раз позже.",
+    },
+    pagination_truncated: {
+      status: 502,
+      error: "Начислений Ozon за один из дней месяца оказалось больше, чем расчёт может безопасно обработать.",
+    },
+    malformed_response: {
+      status: 502,
+      error: "Ozon вернул неожиданный формат данных о начислениях. Попробуйте ещё раз позже.",
+    },
+    reconciliation_mismatch: {
+      status: 502,
+      error: "Начисления Ozon за месяц не сошлись по сумме — расчёт не сделан, чтобы не показать неверную прибыль.",
+    },
+    network_error: {
+      status: 502,
+      error: "Ozon временно недоступен. Попробуйте ещё раз позже.",
+    },
+    bad_month: {
+      status: 400,
+      error: "Месяц должен быть в формате ГГГГ-ММ",
+    },
+    no_data: {
+      status: 400,
+      error: "За выбранный месяц нет начислений Ozon.",
+    },
   };
   const { status, error } = map[code];
   return NextResponse.json({ error, code }, { status, headers: NO_STORE });
@@ -523,6 +574,7 @@ export type ApiProfitLoaded =
       financeSource: FinanceSourceMeta;
     }
   | { ok: false; kind: "ozon"; code: OzonFinanceErrorCode }
+  | { ok: false; kind: "accrual"; code: AccrualLoadErrorCode }
   | { ok: false; kind: "catalog" }
   | {
       ok: false;
@@ -550,27 +602,36 @@ export async function loadAndComputeApiProfit(
 ): Promise<ApiProfitLoaded> {
   const { admin, userId, clientId, apiKey, range, month, manualExpenses } = input;
 
-  // 1) финансы Ozon → OzonDraftAggregate. При включённом флаге сначала пробуем новый
-  //    accrual-источник (/v1/finance/accrual/by-day); ЛЮБАЯ его неудача (429/deadline/
-  //    truncation/невалидное обязательное поле/reconciliation) → null и полный откат к
-  //    существующему legacy-агрегатору byte-for-byte. Флаг выключен → legacy как и раньше.
-  let draft: OzonDraftAggregate | null = null;
-  let financeSource: FinanceSourceMeta = LEGACY_FINANCE_SOURCE;
+  // 1) финансы Ozon → OzonDraftAggregate.
+  //    Флаг ВЫКЛЮЧЕН (текущий прод, 2026-09) → legacy control-flow БЕЗ ИЗМЕНЕНИЙ,
+  //    byte-for-byte как раньше (единственный путь ниже, идентичен предыдущей версии).
+  //    Флаг ВКЛЮЧЁН → ТОЛЬКО accrual-источник (/v1/finance/accrual/by-day). Отката
+  //    на legacy при его неудаче БОЛЬШЕ НЕТ: /v3/finance/transaction/list официально
+  //    отключён Ozon 2026-09-08 (подтверждено официальным Telegram-каналом Ozon
+  //    Seller API) — откатываться некуда, "fallback" на мёртвый endpoint давал бы
+  //    ТОТ ЖЕ честный отказ, только скрытый под чужим кодом ошибки. Вместо этого —
+  //    kind:"accrual" с точным AccrualLoadErrorCode (см. accrual.ts), которое
+  //    вызывающий route останавливает ДО consume/save.
+  let draft: OzonDraftAggregate;
+  let financeSource: FinanceSourceMeta;
   if (isAccrualFinanceEnabled()) {
-    // B2: ЛЮБОЙ throw accrual-пути (не только возврат null) → нет draft → legacy fallback.
-    // Секреты / тело ответа / идентификаторы НЕ логируем; console не добавляем.
+    // accrual.ts спроектирован НЕ бросать (все парсеры defensive) — try/catch здесь
+    // ТОЛЬКО защитная сеть от непредвиденного исключения, НЕ путь отката на legacy:
+    // неожиданный throw мапится в ТОТ ЖЕ честный network_error, что и обычный сбой сети.
+    let loaded;
     try {
-      draft = await loadAccrualDraft({ clientId, apiKey, month });
+      loaded = await loadAccrualDraft({ clientId, apiKey, month });
     } catch {
-      draft = null;
+      return { ok: false, kind: "accrual", code: "network_error" };
     }
-    if (draft !== null) financeSource = ACCRUAL_FINANCE_SOURCE;
-  }
-  if (draft === null) {
+    if (!loaded.ok) return { ok: false, kind: "accrual", code: loaded.code };
+    draft = loaded.draft;
+    financeSource = ACCRUAL_FINANCE_SOURCE;
+  } else {
     const tx = await fetchOzonTransactions(clientId, apiKey, range);
     if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
     draft = aggregateDraft(tx.operations, tx.partial);
-    // financeSource остаётся LEGACY (accrual не использован или произошёл откат)
+    financeSource = LEGACY_FINANCE_SOURCE;
   }
 
   // 2) каталог себестоимости пользователя (read-only, только свои строки) — нужен

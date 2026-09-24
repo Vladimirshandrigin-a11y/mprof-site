@@ -3,6 +3,7 @@ import { authenticateRequest, getUserScopedClient } from "../../cloud/_lib/auth"
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
 import {
+  accrualErrorResponse,
   buildApiProfitResponseBody,
   errorResponse,
   loadAndComputeApiProfit,
@@ -193,6 +194,9 @@ export async function POST(req: NextRequest) {
   });
   if (!loaded.ok) {
     if (loaded.kind === "ozon") return errorResponse(loaded.code);
+    // accrual-источник (флаг включён) без отката на отключённый legacy — честная
+    // причина незавершённости ДО consume/save (см. doc-comment в profit.ts/accrual.ts).
+    if (loaded.kind === "accrual") return accrualErrorResponse(loaded.code);
     if (loaded.kind === "catalog") {
       return NextResponse.json(
         { error: "Ошибка чтения каталога себестоимости" },
@@ -352,6 +356,14 @@ export async function POST(req: NextRequest) {
       remainingServices: tx.remainingServices,
       remainingOther: tx.remainingOther,
     },
+    // Additive: суммы операций accrual-источника, НЕ отнесённые к «Реклама»/
+    // «Компенсации» (нет справочника типов в этом запуске ИЛИ type_id не в
+    // известном наборе) — реальные суммы, а не подгонка остатком (см. doc-
+    // comment buildAccrualDraft, accrual.ts). У legacy это поле отсутствует
+    // (не появляется в snapshot вовсе) — старые записи истории не трогает.
+    ...(loaded.draft.unclassified && loaded.draft.unclassified.length > 0
+      ? { unclassified: loaded.draft.unclassified }
+      : {}),
   };
 
   const snapshot = {
