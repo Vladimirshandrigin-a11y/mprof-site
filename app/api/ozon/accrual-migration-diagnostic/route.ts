@@ -551,24 +551,37 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  // ---- body: month + skipTypes (единственный вход; никаких ключей/user_id из body) ----
+  // ---- body: month + skipTypes + legacyOnly (единственный вход; никаких ключей/user_id из body) ----
   let month = "2026-06";
   let skipTypes = false; // отсутствует → обратная совместимость (types вызывается)
+  // legacyOnly=true — независимая read-only сверка БЕЗ повторной загрузки новых
+  // методов: новые методы (types/by-day/FBO/FBS/accrual_postings) не вызываются
+  // вовсе, legacy получает ВЕСЬ 40-секундный бюджет для себя одного (см. doc-
+  // comment у блока 6 ниже — зачем это нужно и почему это МИНИМАЛЬНЫЙ способ,
+  // а не архитектурное изменение).
+  let legacyOnly = false;
   try {
-    const body = (await req.json()) as { month?: unknown; skipTypes?: unknown };
+    const body = (await req.json()) as { month?: unknown; skipTypes?: unknown; legacyOnly?: unknown };
     if (typeof body?.month === "string" && /^\d{4}-\d{2}$/.test(body.month)) {
       month = body.month;
     }
-    // skipTypes строго boolean: присутствует и не boolean → 400 (безопасный код).
+    // skipTypes/legacyOnly строго boolean: присутствует и не boolean → 400 (безопасный код).
     if (body?.skipTypes !== undefined && typeof body.skipTypes !== "boolean") {
       return NextResponse.json(
         { error: "skipTypes должен быть boolean", code: "bad_skip_types" },
         { status: 400, headers: NO_STORE }
       );
     }
+    if (body?.legacyOnly !== undefined && typeof body.legacyOnly !== "boolean") {
+      return NextResponse.json(
+        { error: "legacyOnly должен быть boolean", code: "bad_legacy_only" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
     if (typeof body?.skipTypes === "boolean") skipTypes = body.skipTypes;
+    if (typeof body?.legacyOnly === "boolean") legacyOnly = body.legacyOnly;
   } catch {
-    /* пустое/битое тело → дефолты: month=2026-06, skipTypes=false */
+    /* пустое/битое тело → дефолты: month=2026-06, skipTypes=false, legacyOnly=false */
   }
   const range = monthToRange(month);
   if (!range) {
@@ -643,7 +656,25 @@ export async function POST(req: NextRequest) {
   // null — справочник в этом запуске недоступен (skipTypes или сбой) → ниже ни
   // один type_id НЕ раскрывается как «известный» (см. typeIdBucket/knownTypeId).
   let knownTypeIds: Set<number> | null = null;
-  if (skipTypes) {
+  const durationsMs: Record<string, number | null> = {
+    types: null,
+    byDay: null,
+    fbo: null,
+    fbs: null,
+    accrualPostings: null,
+    legacy: null,
+  };
+  if (legacyOnly) {
+    // Независимая read-only сверка: новые методы НЕ вызываются вовсе — legacy
+    // (блок 6) получает ВЕСЬ 40-секундный бюджет для себя одного. См. doc-
+    // comment у блока 6 — почему это МИНИМАЛЬНЫЙ способ, не архитектурное решение.
+    methods.accrual_types = {
+      endpoint: "/v1/finance/accrual/types",
+      status: 0,
+      skipped: true,
+      reason: "legacy_only_mode",
+    };
+  } else if (skipTypes) {
     // Явный owner-пропуск: types НЕ вызывается, budget не растёт, truncated
     // НЕ выставляется. Пропуск (reason already_collected) намеренный → не
     // считается незавершённостью плана. knownTypeIds остаётся null — в этом
@@ -655,6 +686,7 @@ export async function POST(req: NextRequest) {
       reason: "already_collected",
     };
   } else {
+    const t0Types = Date.now();
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/types`, headers, undefined, budget);
     noteRateLimit(r);
     let count = 0;
@@ -694,6 +726,7 @@ export async function POST(req: NextRequest) {
       if (ids.size > 0) knownTypeIds = ids;
     }
     methods.accrual_types = { endpoint: "/v1/finance/accrual/types", status: r.status, count, dictionary, schema, error: errCode(r) };
+    durationsMs.types = Date.now() - t0Types;
   }
 
   // ================= 2) accrual/by-day (finance-фаза, по дням месяца) =================
@@ -703,7 +736,10 @@ export async function POST(req: NextRequest) {
   // блокирует последующие фазы (FBO/FBS/accrual_postings), только помечает
   // truncated и останавливает ДАЛЬНЕЙШИЕ дни этого месяца (уже полученные дни
   // сохраняются, не отбрасываются и не перезапрашиваются).
-  {
+  if (legacyOnly) {
+    methods.accrual_by_day = { endpoint: "/v1/finance/accrual/by-day", status: 0, skipped: true, reason: "legacy_only_mode" };
+  } else {
+    const t0ByDay = Date.now();
     const days = daysOfMonth(month);
     let daysQueried = 0;
     let pages = 0;
@@ -978,12 +1014,16 @@ export async function POST(req: NextRequest) {
       truncated,
       error: lastErr,
     };
+    durationsMs.byDay = Date.now() - t0ByDay;
   }
 
   // ===================== 3) FBO /v3/posting/fbo/list (справочный) =====================
   // Независимая фаза — пробуем даже если предыдущая (by-day) уже отметила
   // rateLimited после исчерпания собственных ретраев.
-  {
+  if (legacyOnly) {
+    methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status: 0, skipped: true, reason: "legacy_only_mode" };
+  } else {
+    const t0Fbo = Date.now();
     let cursor = "";
     let pages = 0;
     let records = 0;
@@ -1037,11 +1077,15 @@ export async function POST(req: NextRequest) {
       if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
     }
     methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, responseShape: fboShape, truncated, error: lastErr };
+    durationsMs.fbo = Date.now() - t0Fbo;
   }
 
   // ===================== 4) FBS /v4/posting/fbs/list (справочный) =====================
   // Независимая фаза — пробуем даже если ранее уже была отметка rateLimited.
-  {
+  if (legacyOnly) {
+    methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status: 0, skipped: true, reason: "legacy_only_mode" };
+  } else {
+    const t0Fbs = Date.now();
     let cursor = "";
     let pages = 0;
     let records = 0;
@@ -1091,11 +1135,13 @@ export async function POST(req: NextRequest) {
       if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
     }
     methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, responseShape: fbsShape, truncated, error: lastErr };
+    durationsMs.fbs = Date.now() - t0Fbs;
   }
 
   // ========= 5) accrual/postings — только после posting_numbers из FBO/FBS ===========
   // Независимая фаза — пробуем даже если ранее уже была отметка rateLimited
   // (собственный ozonPost() уже отретраил 429 внутри себя с учётом Retry-After).
+  const t0AccrualPostings = Date.now();
   if (postingNumbers.length > 0) {
     const batch = postingNumbers.slice(0, MAX_POSTING_NUMBERS);
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/postings`, headers, { posting_numbers: batch }, budget);
@@ -1210,17 +1256,20 @@ export async function POST(req: NextRequest) {
       responseShape: postShape,
       error: errCode(r),
     };
+    durationsMs.accrualPostings = Date.now() - t0AccrualPostings;
   } else {
-    methods.accrual_postings = {
-      endpoint: "/v1/finance/accrual/postings",
-      status: 0,
-      batches: 0,
-      postingsQueried: 0,
-      records: 0,
-      schema: null,
-      error: "no_posting_numbers",
-      note: "FBO/FBS не вернули отправлений за месяц — нечего запрашивать.",
-    };
+    methods.accrual_postings = legacyOnly
+      ? { endpoint: "/v1/finance/accrual/postings", status: 0, skipped: true, reason: "legacy_only_mode" }
+      : {
+          endpoint: "/v1/finance/accrual/postings",
+          status: 0,
+          batches: 0,
+          postingsQueried: 0,
+          records: 0,
+          schema: null,
+          error: "no_posting_numbers",
+          note: "FBO/FBS не вернули отправлений за месяц — нечего запрашивать.",
+        };
   }
 
   // ---- полны ли новые методы (нужно для gate legacy и честного truncated) ----
@@ -1238,7 +1287,34 @@ export async function POST(req: NextRequest) {
   const newApiComplete = !rateLimited && !newApiLimitReached && newMethodsClean;
 
   // ======= 6) СТАРЫЙ finance-агрегатор — ПОСЛЕДНИМ, только если new завершены =========
-  // Переиспользуем существующий модуль без изменений: Σ amount по операциям.
+  // Переиспользуем существующий модуль, формула/пагинация/агрегация НЕ МЕНЯЮТСЯ —
+  // добавлен ТОЛЬКО опциональный 4-й параметр deadlineMs (finance.ts, backward-
+  // compatible: save-calculation/import-missing-products/postings-match-diagnostic
+  // его не передают — их поведение byte-for-byte прежнее).
+  //
+  // ИТОГОВЫЙ КОНТРАКТ ДЕДЛАЙНА (без противоречия «общий, но legacy не входит»):
+  // DIAG_DEADLINE_MS=40000 — ОДИН budget.deadline на ВЕСЬ запрос диагностики,
+  // включая legacy. «Legacy не входит в budget новых методов» касалось ТОЛЬКО
+  // ЛИМИТА ЗАПРОСОВ (LEGACY_MAX_REQUESTS=20 зарезервированы ОТДЕЛЬНО от
+  // NEW_API_MAX_REQUESTS=130, потолок ≤150 — см. константы вверху файла), а НЕ
+  // временного дедлайна: budget.deadline (время) — один и тот же для всех фаз,
+  // просто legacy передаёт его В finance.ts явно (deadlineMs), а не через
+  // разделяемый Budget-объект (тот привязан к pacer/budget.used новых методов,
+  // которых у legacy нет — там свой TIMEOUT_MS/страница и MAX_PAGES=20).
+  // Итог: 1 дедлайн по ВРЕМЕНИ на всю диагностику; 2 РАЗНЫХ лимита по ЧИСЛУ
+  // запросов (новые методы vs legacy), зарезервированных не пересекаясь.
+  //
+  // К моменту, когда доходит очередь до legacy, строгий pacer новых методов
+  // (особенно by-day — 1 запрос на КАЖДЫЙ день месяца) уже мог израсходовать
+  // почти весь бюджет — см. budgetRemainingMsAtLegacyStart ниже (РЕАЛЬНО
+  // измеренный остаток, не оценка). Если новые методы НЕ помещаются в общий
+  // бюджет перед legacy, минимальный read-only способ сверки БЕЗ повторной
+  // загрузки уже успешных этапов — legacyOnly:true (см. парсинг body выше):
+  // пропускает все 5 новых методов, legacy получает ВЕСЬ 40-секундный бюджет
+  // для себя одного, отдельным запросом. Слепое увеличение DIAG_DEADLINE_MS
+  // здесь НЕ делается: это НЕ решает проблему (просто отодвигает тот же
+  // конфликт дальше) и НЕ обосновано данными о реальном внешнем таймауте
+  // (см. PR #87 — Timeweb не подтверждён логами).
   let legacy: Record<string, unknown> = {
     endpoint: "/v3/finance/transaction/list",
     status: null,
@@ -1247,12 +1323,22 @@ export async function POST(req: NextRequest) {
   };
   let oldTotal: number | null = null;
   let legacyRan = false;
-  // legacy — только если новые данные полны (без 429/лимита/ошибки/обрезки). Его
-  // страницы (≤LEGACY_MAX_REQUESTS) зарезервированы ВНЕ budget новых методов →
-  // суммарный потолок доказуемо ≤150.
-  if (newApiComplete) {
+  let budgetRemainingMsAtLegacyStart: number | null = null;
+  // legacy — если новые данные полны (без 429/лимита/ошибки/обрезки) ИЛИ явно
+  // запрошен независимый режим legacyOnly. Страницы (≤LEGACY_MAX_REQUESTS)
+  // зарезервированы ВНЕ budget новых методов → суммарный потолок ≤150 (как раньше).
+  if (newApiComplete || legacyOnly) {
     legacyRan = true;
-    const tx = await fetchOzonTransactions(clientId, apiKey, range);
+    budgetRemainingMsAtLegacyStart = budget.deadline - Date.now();
+    const t0Legacy = Date.now();
+    // ЕДИНЫЙ дедлайн диагностики передан явно: budget.deadline уже прошёл →
+    // fetchPage(page=1) вернёт code:"deadline" НЕМЕДЛЕННО, без единого fetch()
+    // (требование 1 — «если бюджет исчерпан до вызова, не отправляй запрос»).
+    // Если наступит ВО ВРЕМЯ уже идущей страницы — тот же AbortController,
+    // что и обычный TIMEOUT_MS, реально прерывает fetch (требование 2 —
+    // подтверждённая отмена, не Promise.race без реальной остановки).
+    const tx = await fetchOzonTransactions(clientId, apiKey, range, budget.deadline);
+    durationsMs.legacy = Date.now() - t0Legacy;
     if (tx.ok) {
       let sum = 0;
       for (const op of tx.operations) sum += numOr0(op.amount);
@@ -1272,6 +1358,8 @@ export async function POST(req: NextRequest) {
         pages: tx.pageCount,
         partial: tx.partial,
         sumAmount: oldTotal,
+        durationMs: durationsMs.legacy,
+        budgetRemainingMsAtLegacyStart,
         breakdown: {
           revenue: t.revenue,
           commission: t.commission,
@@ -1289,7 +1377,36 @@ export async function POST(req: NextRequest) {
         },
       };
     } else {
-      legacy = { endpoint: "/v3/finance/transaction/list", status: null, error: tx.code };
+      // Различаем причину, а не сваливаем всё в одно "unavailable":
+      //   • budget_exhausted — сработал ЕДИНЫЙ дедлайн диагностики (deadlineMs,
+      //     переданный явно в fetchOzonTransactions выше) — ЛИБО он уже прошёл
+      //     ДО старта legacy (запрос не отправлялся вовсе — требование 1), ЛИБО
+      //     наступил ВО ВРЕМЯ уже идущей страницы (реально прерванной тем же
+      //     AbortController, что и обычный таймаут — требование 2). Это ТЕПЕРЬ
+      //     доказанная, а не предполагаемая причина: finance.ts возвращает
+      //     "deadline" ТОЛЬКО когда сам его различил (см. doc-comment fetchPage).
+      //   • request_timeout — finance.ts СВОЙ AbortController (20с/страница)
+      //     сработал ПЕРВЫМ (deadlineMs ещё не наступил) — НЕ бюджет диагностики;
+      //   • ozon_http_error — реальный HTTP-ответ получен (сеть дошла), status —
+      //     ФАКТИЧЕСКИЙ код (401/403/429/5xx/…), а не подтверждённый null;
+      //   • rate_limited — Ozon вернул 429 (finance.ts НЕ ретраит legacy сам —
+      //     отдельно от ozonPost-ретрая новых методов, это тоже чужой модуль);
+      //   • network_error — fetch бросил исключение, которое НЕ AbortError (DNS/
+      //     соединение оборвано/TLS/и т.п.) — ответа не было вообще.
+      const errorKind: string =
+        tx.code === "deadline" ? "budget_exhausted"
+        : tx.code === "timeout" ? "request_timeout"
+        : tx.code === "rate_limited" ? "rate_limited"
+        : typeof tx.status === "number" ? "ozon_http_error"
+        : "network_error";
+      legacy = {
+        endpoint: "/v3/finance/transaction/list",
+        status: typeof tx.status === "number" ? tx.status : null,
+        error: tx.code,
+        errorKind,
+        durationMs: durationsMs.legacy,
+        budgetRemainingMsAtLegacyStart,
+      };
     }
   }
 
@@ -1297,23 +1414,32 @@ export async function POST(req: NextRequest) {
   const anyMethodTruncated = Object.values(methods).some((m) => asObj(m).truncated === true);
   const anyMethodSkipped = Object.values(methods).some((m) => {
     const o = asObj(m);
-    // already_collected — намеренный owner-пропуск types, НЕ признак обрезки плана.
-    return o.skipped === true && o.reason !== "already_collected";
+    // already_collected (owner: справочник уже собран) и legacy_only_mode
+    // (owner: независимая сверка БЕЗ новых методов) — намеренные пропуски,
+    // НЕ признак обрезки плана.
+    return o.skipped === true && o.reason !== "already_collected" && o.reason !== "legacy_only_mode";
   });
   const anyMethodErrored = Object.values(methods).some((m) => {
     const e = asObj(m).error;
     // "rate_limited" помечает skipped-фазу (учтено выше), "no_posting_numbers" — не ошибка.
     return typeof e === "string" && e !== "ok" && e !== "no_posting_numbers" && e !== "rate_limited";
   });
+  const legacyObj = asObj(legacy);
+  const legacyComplete =
+    legacyRan && legacyObj.status === 200 && legacyObj.partial === false && oldTotal !== null;
+  // legacy запускался, но НЕ завершился — сравнение не состоялось, даже если
+  // сбор новых данных прошёл идеально (rateLimited=false, все методы truncated=false).
+  // Раньше это НЕ попадало в truncated (legacy не входит в `methods`) — общий
+  // статус мог честно показывать truncated:false при незавершённом сравнении.
+  const legacyFailed = legacyRan && !legacyComplete;
   // truncated=true, если план не отработал полностью: 429 / budget / pagination cap /
-  // deadline|timeout|прочая ошибка метода / пропущенные фазы.
+  // deadline|timeout|прочая ошибка метода / пропущенные фазы / провал legacy.
   const truncated =
-    rateLimited || newApiLimitReached || anyMethodTruncated || anyMethodSkipped || anyMethodErrored;
+    rateLimited || newApiLimitReached || anyMethodTruncated || anyMethodSkipped || anyMethodErrored || legacyFailed;
 
   // ---- сравнение old vs new (диагностика; НЕ утверждение об эквивалентности) ----
   const byDay = asObj(methods.accrual_by_day);
   const newTotal = typeof byDay.sumTotalAmount === "number" ? byDay.sumTotalAmount : null;
-  const legacyObj = asObj(legacy);
   // delta считаем ТОЛЬКО когда и new, и legacy завершены полностью: без 429, без
   // общего лимита, без per-method error/truncated и без legacy.partial. Дополнительно
   // требуем !truncated — delta невозможна при любой частичности.
@@ -1321,8 +1447,6 @@ export async function POST(req: NextRequest) {
   const byDayAmt = asObj(byDay.amountParsing);
   const newComplete =
     !rateLimited && !newApiLimitReached && byDay.error === "ok" && byDay.truncated === false && byDayAmt.complete === true && newTotal !== null;
-  const legacyComplete =
-    legacyRan && legacyObj.status === 200 && legacyObj.partial === false && oldTotal !== null;
   const comparisonOk = newComplete && legacyComplete && !truncated;
   const comparison = {
     oldTotal,
@@ -1422,6 +1546,7 @@ export async function POST(req: NextRequest) {
     {
       ok: true,
       month,
+      legacyOnly,
       range: { since: range.dateFrom, to: range.dateTo },
       rateLimited,
       retryAfterSeconds,
@@ -1431,6 +1556,11 @@ export async function POST(req: NextRequest) {
       ...(legacyRan ? { legacyRequestsMax: LEGACY_MAX_REQUESTS } : {}),
       totalRequestsUpperBound: budget.used + (legacyRan ? LEGACY_MAX_REQUESTS : 0),
       totalRequestLimit: TOTAL_MAX_REQUESTS,
+      // Безопасные длительности этапов (мс) + единый мягкий дедлайн диагностики.
+      // Ни ключей, ни идентификаторов продавца — только числа. null — этап не
+      // запускался (skipTypes/legacyOnly/недостижим по плану).
+      diagDeadlineMs: DIAG_DEADLINE_MS,
+      durationsMs,
       methods,
       legacy,
       comparison,
