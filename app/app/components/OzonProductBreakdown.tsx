@@ -4,20 +4,42 @@
 // OzonProductBreakdown — ЧИСТАЯ прибыль по товарам после загрузки отчёта Ozon.
 //
 // Логика:
-//   1. Берём per-SKU строки из распарсенного отчёта (report.products).
+//   1. Берём per-SKU строки из распарсенного отчёта (report.products) и
+//      агрегируем по артикулу: выручка, ВОЗВРАТЫ (сумма), количество.
+//      Строка «только возврат» (revenue=0, returnsAmount>0) не теряется —
+//      попадает в агрегат своего артикула как обычная строка.
 //   2. Для каждого артикула ищем товар в каталоге пользователя (products.sku).
-//   3. Общие расходы отчёта (estimate: комиссия, логистика, хранение, реклама,
-//      налог, прочее) распределяем по товарам ПРОПОРЦИОНАЛЬНО выручке.
-//   4. Найден + есть cost_price → считаем себестоимость и чистую прибыль.
+//   3. Чистая (после возвратов) выручка = revenue − returnsAmount — ЕДИНСТВЕННОЕ
+//      определение выручки здесь (тот же принцип, что и в основном расчёте:
+//      revenueFromTotalsRow уже за вычетом возвратов). Нераспределяемые сверху
+//      суммы основного расчёта (props distributableExpenses = УПД + налог +
+//      прочие ручные расходы; loyaltyPayoutsTotal — выплаты партнёров;
+//      payoutAdjustmentTotal — корректировка графика выплат) распределяются
+//      ПРОПОРЦИОНАЛЬНО доле net-выручки товара в общей net-выручке (то же
+//      обоснованное правило, что было для estimate-расходов раньше). Каждая
+//      сумма вычитается/прибавляется ЗДЕСЬ только через распределение — сама
+//      она уже вычтена РОВНО ОДИН РАЗ на уровне основного расчёта (page.tsx),
+//      здесь только её разбивка по SKU.
+//   4. Найден + есть cost_price → считаем себестоимость (cost_price × qty
+//      ПРОДАННЫХ единиц — как и раньше, без изменений) и чистую прибыль.
 //      Не найден / cost_price = 0 → блок «Товары без себестоимости».
 //   5. Аналитика: самые прибыльные, товары в минус, товары без себестоимости.
 //
 // Формулы (на товар, агрегировано по артикулу):
-//   доля в выручке   = выручка товара / выручка отчёта        (guard ÷0)
-//   распред. расходы = (комиссия+логистика+хранение+реклама+налог+прочее) × доля
-//   себестоимость    = cost_price × количество
-//   чистая прибыль   = выручка − себестоимость − распред. расходы
-//   чистая маржа, %  = выручка > 0 ? чистая прибыль / выручка × 100 : 0
+//   чистая выручка   = revenue − returnsAmount
+//   доля в выручке    = чистая выручка / Σ чистых выручек всех товаров (guard ÷0)
+//   распред. расходы  = distributableExpenses × доля
+//   распред. выплаты  = loyaltyPayoutsTotal × доля
+//   распред. график   = payoutAdjustmentTotal × доля
+//   себестоимость     = cost_price × количество (проданных единиц)
+//   чистая прибыль    = чистая выручка + распред. выплаты − себестоимость
+//                        − распред. расходы + распред. график
+//   чистая маржа, %   = чистая выручка > 0 ? чистая прибыль / чистая выручка × 100 : 0
+//
+// Промежуточные суммы НЕ округляются построчно (только форматирование при
+// отображении) — иначе сумма 55 округлённых строк могла бы разойтись с
+// основным итогом на несколько копеек. Так гарантируется точное совпадение
+// Σ чистая прибыль(SKU) с основным итогом при полном покрытии себестоимостью.
 //
 // НЕ меняет общий расчёт отчёта — это отдельный производный слой поверх него.
 // Стиль — тема M-PROF (глобальные CSS-переменные --gold/--txt/--green/…).
@@ -31,10 +53,12 @@ import {
   updateProductInCloud,
   type Product,
 } from "../lib/supabase-cloud";
-import type {
-  OzonProductRow,
-  OzonEstimate,
-} from "../lib/report-parsers/ozon-parser";
+import type { OzonProductRow } from "../lib/report-parsers/ozon-parser";
+import {
+  computeProductBreakdownRows,
+  computeProductBreakdownTotals,
+  type ProductBreakdownRow,
+} from "../lib/product-breakdown-calc";
 
 /** Ключевой товар для PDF-отчёта родителя (подмножество BreakdownRow). */
 export interface KeyProduct {
@@ -66,9 +90,26 @@ export interface CostCoverageSnapshot {
 
 interface Props {
   products: OzonProductRow[];
-  /** Тоталы отчёта (estimate) — источник общих расходов для распределения. */
-  estimate: OzonEstimate | null;
   user: User | null;
+  /**
+   * Нераспределяемые по SKU расходы основного расчёта (УПД целиком + налог +
+   * прочие ручные расходы: реклама/упаковка/доставка/зарплата/прочее) —
+   * КАЖДАЯ сумма уже вычтена РОВНО ОДИН РАЗ на уровне combinedResult/profitCalc
+   * в page.tsx; здесь только пропорциональная по net-выручке разбивка на SKU.
+   * undefined/0 — расходы не распределяются (чистая прибыль = выручка − COGS).
+   */
+  distributableExpenses?: number;
+  /**
+   * Выплаты от партнёров (combinedResult.loyaltyPayouts, уже за вычетом
+   * возвратов) — доход, распределяется тем же правилом, что и расходы выше.
+   */
+  loyaltyPayoutsTotal?: number;
+  /**
+   * Корректировка графика выплат Ozon (profitCalc.payoutScheduleAdjustment) —
+   * знак сохраняется (+ скидка/доход, − комиссия/расход), распределяется тем
+   * же правилом.
+   */
+  payoutAdjustmentTotal?: number;
   /**
    * Колбэк с суммарной себестоимостью (cost_price × qty по сматченным SKU).
    * Родитель использует его для автозаполнения поля «Себестоимость товара»
@@ -89,25 +130,11 @@ interface Props {
   onCostCoverage?: (data: CostCoverageSnapshot) => void;
 }
 
-/** Строка результата по одному артикулу (агрегирована по отчёту). */
-interface BreakdownRow {
-  article: string;
-  name: string;
-  revenue: number;
-  quantity: number;
-  /** Найден ли товар в каталоге. */
-  matched: boolean;
-  /** Себестоимость за единицу (из каталога). null — товар не найден. */
-  unitCost: number | null;
-  /** Себестоимость продаж = unitCost × quantity. null — нет себестоимости. */
-  cogs: number | null;
-  /** Чистая прибыль = revenue − cogs − распред. расходы. null — нет cost. */
-  profit: number | null;
-  /** Чистая маржа, %. null — нет себестоимости. */
-  margin: number | null;
-  /** Есть пригодная (>0) себестоимость — иначе чистую прибыль не считаем. */
-  hasCost: boolean;
-}
+/**
+ * Строка результата по одному артикулу — реэкспорт типа из чистой функции
+ * расчёта (product-breakdown-calc.ts), чтобы формула считалась В ОДНОМ месте.
+ */
+type BreakdownRow = ProductBreakdownRow;
 
 function formatRub(n: number): string {
   return (
@@ -152,7 +179,9 @@ function normArticle(s: string | null | undefined): string {
 
 export function OzonProductBreakdown({
   products,
-  estimate,
+  distributableExpenses,
+  loyaltyPayoutsTotal,
+  payoutAdjustmentTotal,
   user,
   onCogsTotal,
   onKeyProducts,
@@ -213,104 +242,19 @@ export function OzonProductBreakdown({
   }, [user, products]);
 
   // ===== Матчинг + расчёт чистой прибыли по SKU =====
-  // Общие расходы отчёта (комиссия, логистика, хранение, реклама, налог,
-  // прочее) берём из estimate и распределяем по товарам ПРОПОРЦИОНАЛЬНО
-  // выручке. Себестоимость в этот пул НЕ входит — она считается отдельно по
-  // каждому товару из каталога (cost_price × quantity).
-  const rows = useMemo<BreakdownRow[]>(() => {
-    // Индекс каталога по нормализованному sku.
-    const bySku = new Map<string, Product>();
-    for (const p of catalog) {
-      const key = normArticle(p.sku);
-      if (key && !bySku.has(key)) bySku.set(key, p);
-    }
-
-    // Тоталы отчёта для распределения расходов. estimate может быть null —
-    // тогда расходы 0, и чистая прибыль вырождается в выручка − себестоимость.
-    const totalRevenue = estimate?.revenue ?? 0;
-    const totalExpenses =
-      (estimate?.commission ?? 0) +
-      (estimate?.logistics ?? 0) +
-      (estimate?.storage ?? 0) +
-      (estimate?.ads ?? 0) +
-      (estimate?.tax ?? 0) +
-      (estimate?.other ?? 0);
-
-    // Агрегируем строки отчёта по артикулу (один товар может встречаться
-    // несколькими строками — суммируем выручку и количество).
-    const agg = new Map<
-      string,
-      { article: string; name: string; revenue: number; quantity: number }
-    >();
-    for (const pr of products) {
-      const key = normArticle(pr.article);
-      if (!key) continue;
-      const ex = agg.get(key);
-      if (ex) {
-        ex.revenue += pr.revenue;
-        ex.quantity += pr.quantity;
-        if (!ex.name && pr.name) ex.name = pr.name;
-      } else {
-        agg.set(key, {
-          article: pr.article.trim(),
-          name: pr.name.trim(),
-          revenue: pr.revenue,
-          quantity: pr.quantity,
-        });
-      }
-    }
-
-    const out: BreakdownRow[] = [];
-    for (const [key, a] of agg) {
-      // Доля товара в общей выручке отчёта (guard против деления на ноль).
-      const revenueShare = totalRevenue > 0 ? a.revenue / totalRevenue : 0;
-      // Распределённые на товар общие расходы (без себестоимости).
-      const allocated = totalExpenses * revenueShare;
-
-      const match = bySku.get(key);
-      const unitCost = match ? match.cost_price : null;
-      const hasCost = unitCost !== null && unitCost > 0;
-
-      if (match && hasCost) {
-        const cogs = unitCost * a.quantity;
-        // Чистая прибыль = выручка − себестоимость − распределённые расходы.
-        const profit = a.revenue - cogs - allocated;
-        const margin = a.revenue > 0 ? (profit / a.revenue) * 100 : 0;
-        out.push({
-          article: a.article,
-          name: a.name || match.name || a.article,
-          revenue: a.revenue,
-          quantity: a.quantity,
-          matched: true,
-          unitCost,
-          cogs,
-          profit,
-          margin,
-          hasCost: true,
-        });
-      } else {
-        // Нет пригодной себестоимости (товар не в каталоге ИЛИ cost_price = 0):
-        // чистую прибыль не считаем — она была бы неточной. Товар уходит в
-        // блок «Товары без себестоимости».
-        out.push({
-          article: a.article,
-          name: (match ? a.name || match.name : a.name) || a.article,
-          revenue: a.revenue,
-          quantity: a.quantity,
-          matched: !!match,
-          unitCost,
-          cogs: null,
-          profit: null,
-          margin: null,
-          hasCost: false,
-        });
-      }
-    }
-
-    // По умолчанию — по выручке убыванию.
-    out.sort((x, y) => y.revenue - x.revenue);
-    return out;
-  }, [products, catalog, estimate]);
+  // Нераспределяемые сверху суммы основного расчёта (props) распределяются
+  // по товарам ПРОПОРЦИОНАЛЬНО net-выручке (см. заголовочный комментарий
+  // файла). Себестоимость в этот пул НЕ входит — она считается отдельно по
+  // каждому товару из каталога (cost_price × quantity проданных единиц).
+  const rows = useMemo<BreakdownRow[]>(
+    () =>
+      computeProductBreakdownRows(products, catalog, {
+        distributableExpenses,
+        loyaltyPayoutsTotal,
+        payoutAdjustmentTotal,
+      }),
+    [products, catalog, distributableExpenses, loyaltyPayoutsTotal, payoutAdjustmentTotal]
+  );
 
   // ===== Аналитика товаров =====
   // Используем уже рассчитанные значения (revenue/profit/margin) — ничего не
@@ -455,28 +399,7 @@ export function OzonProductBreakdown({
   }
 
   // ===== Итоги =====
-  const totals = useMemo(() => {
-    let revenue = 0;
-    let cogs = 0;
-    let profit = 0;
-    let withCost = 0;
-    for (const r of rows) {
-      revenue += r.revenue;
-      if (r.hasCost) {
-        cogs += r.cogs ?? 0;
-        profit += r.profit ?? 0;
-        withCost++;
-      }
-    }
-    return {
-      revenue,
-      cogs,
-      profit,
-      withCost,
-      total: rows.length,
-      withoutCost: rows.length - withCost,
-    };
-  }, [rows]);
+  const totals = useMemo(() => computeProductBreakdownTotals(rows), [rows]);
 
   // Пробрасываем суммарную себестоимость каталога в родителя — для автозаполнения
   // поля «Себестоимость товара» в блоке «Дополнительные расходы».
@@ -705,8 +628,12 @@ export function OzonProductBreakdown({
           {/* Итоговые чипы */}
           <div className="pb-summary">
             <div className="pb-chip">
-              <span className="pb-chip-l">Выручка</span>
+              <span className="pb-chip-l">Выручка (после возвратов)</span>
               <span className="pb-chip-v">{formatRub(totals.revenue)}</span>
+            </div>
+            <div className="pb-chip">
+              <span className="pb-chip-l">Возвраты</span>
+              <span className="pb-chip-v">{formatRub(totals.returnsAmount)}</span>
             </div>
             <div className="pb-chip">
               <span className="pb-chip-l">Себестоимость</span>
@@ -1391,7 +1318,7 @@ export function OzonProductBreakdown({
 
         .pb-summary {
           display: grid;
-          grid-template-columns: repeat(4, 1fr);
+          grid-template-columns: repeat(5, 1fr);
           gap: 0.7rem;
           margin-top: 1.2rem;
         }

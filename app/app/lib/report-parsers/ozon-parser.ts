@@ -78,6 +78,15 @@ export interface OzonProductRow {
   name: string;
   revenue: number;
   quantity: number;
+  /**
+   * Сумма возврата этой строки (колонка «Возвращено на сумму, руб.»),
+   * положительная величина (тот же знак-конвенция, что и агрегат
+   * totals.returns). 0, если строка не является возвратом. Строка
+   * «только возврат» (revenue=0, quantity=0, returnsAmount>0) — реальная
+   * позиция, НЕ мусор: без этого поля она выглядела бы пустой и терялась
+   * бы в производных расчётах (чистая выручка по SKU = revenue − returnsAmount).
+   */
+  returnsAmount: number;
 }
 
 export interface OzonParsedReport {
@@ -1988,6 +1997,9 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
             name: nameCol !== null ? asCellString(row[nameCol]).trim() : "",
             revenue: rev,
             quantity: qty,
+            // Math.abs — та же знак-конвенция, что у агрегата totals.returns
+            // (Σ per-SKU returnsAmount по построению равна totals.returns).
+            returnsAmount: Math.abs(returnsVal),
           });
         }
       }

@@ -226,6 +226,9 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
               name: typeof rr.name === "string" ? rr.name : "",
               revenue: n(rr.revenue),
               quantity: n(rr.quantity),
+              // Старые записи БД сохранены без этого поля — 0 (совпадает с
+              // поведением до фикса: возвраты не выделялись отдельно).
+              returnsAmount: n(rr.returnsAmount),
             };
           })
           .filter((x): x is OzonProductRow => x !== null)
@@ -11928,12 +11931,26 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         )}
 
         {/* Чистая прибыль по товарам — себестоимость из каталога по sku +
-            распределение общих расходов отчёта пропорционально выручке.
+            распределение НЕраспределяемых расходов основного расчёта (УПД +
+            налог + прочие ручные расходы) и выплат партнёров/графика выплат
+            пропорционально net-выручке (после возвратов). Те же суммы, что
+            уже вычтены/прибавлены РОВНО ОДИН РАЗ в combinedResult/profitCalc —
+            здесь только их разбивка по SKU, чтобы Σ чистая прибыль(SKU)
+            совпадала с основным итогом при полном покрытии себестоимостью.
             Показывается, когда в распарсенном отчёте есть per-SKU строки. */}
         {reportProducts.length > 0 && (
           <OzonProductBreakdown
             products={reportProducts}
-            estimate={reportEstimate}
+            distributableExpenses={
+              combinedResult
+                ? combinedResult.updServicesTotal +
+                  combinedResult.updCommissionTotal +
+                  (profitCalc?.tax ?? 0) +
+                  (profitCalc?.otherExpensesGroup ?? 0)
+                : 0
+            }
+            loyaltyPayoutsTotal={combinedResult?.loyaltyPayouts ?? 0}
+            payoutAdjustmentTotal={profitCalc?.payoutScheduleAdjustment ?? 0}
             user={user}
             onCogsTotal={handleReportCogsTotal}
             onKeyProducts={handleReportKeyProducts}
