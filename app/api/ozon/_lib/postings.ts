@@ -335,8 +335,15 @@ export async function fetchMonthPostings(
     { label: "FBS (со своего склада)", run: () => fetchFbsPostings(clientId, apiKey, range) },
   ];
 
-  for (const { label, run } of schemes) {
-    const r = await run();
+  // FBO и FBS — независимые endpoint'ы (разные URL, никто не читает результат
+  // другого) — раньше шли строго последовательно без причины. Запускаем
+  // одновременно: итог (items/warnings/counts) идентичен, порядок warning-строк
+  // в списке может отличаться (какая схема ответила первой), сами тексты и их
+  // смысл — нет. Существенно сокращает суммарную задержку /api/ozon/save-calculation.
+  const results = await Promise.all(schemes.map(({ run }) => run()));
+  for (let i = 0; i < schemes.length; i++) {
+    const { label } = schemes[i];
+    const r = results[i];
     if (r.ok) {
       items.push(...r.items);
       postingCount += r.postingCount;
