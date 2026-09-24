@@ -23,6 +23,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../../cloud/_lib/auth";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { monthToRange, fetchOzonTransactions, aggregateDraft } from "../_lib/finance";
+import { loadRealizationDiagnostic } from "../_lib/realization";
+import type { CatalogRow } from "../_lib/postings";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -560,12 +562,21 @@ export async function POST(req: NextRequest) {
   // comment у блока 6 ниже — зачем это нужно и почему это МИНИМАЛЬНЫЙ способ,
   // а не архитектурное изменение).
   let legacyOnly = false;
+  // checkRealization=true — НЕЗАВИСИМАЯ read-only проверка /v2/finance/realization
+  // (себестоимость/база налога боевого расчёта). Не влияет на legacyOnly/skipTypes/
+  // новые методы; ничего не списывает и не сохраняет. См. блок 7 ниже.
+  let checkRealization = false;
   try {
-    const body = (await req.json()) as { month?: unknown; skipTypes?: unknown; legacyOnly?: unknown };
+    const body = (await req.json()) as {
+      month?: unknown;
+      skipTypes?: unknown;
+      legacyOnly?: unknown;
+      checkRealization?: unknown;
+    };
     if (typeof body?.month === "string" && /^\d{4}-\d{2}$/.test(body.month)) {
       month = body.month;
     }
-    // skipTypes/legacyOnly строго boolean: присутствует и не boolean → 400 (безопасный код).
+    // skipTypes/legacyOnly/checkRealization строго boolean: присутствует и не boolean → 400.
     if (body?.skipTypes !== undefined && typeof body.skipTypes !== "boolean") {
       return NextResponse.json(
         { error: "skipTypes должен быть boolean", code: "bad_skip_types" },
@@ -578,10 +589,17 @@ export async function POST(req: NextRequest) {
         { status: 400, headers: NO_STORE }
       );
     }
+    if (body?.checkRealization !== undefined && typeof body.checkRealization !== "boolean") {
+      return NextResponse.json(
+        { error: "checkRealization должен быть boolean", code: "bad_check_realization" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
     if (typeof body?.skipTypes === "boolean") skipTypes = body.skipTypes;
     if (typeof body?.legacyOnly === "boolean") legacyOnly = body.legacyOnly;
+    if (typeof body?.checkRealization === "boolean") checkRealization = body.checkRealization;
   } catch {
-    /* пустое/битое тело → дефолты: month=2026-06, skipTypes=false, legacyOnly=false */
+    /* пустое/битое тело → дефолты: month=2026-06, skipTypes=false, legacyOnly=false, checkRealization=false */
   }
   const range = monthToRange(month);
   if (!range) {
@@ -1542,6 +1560,39 @@ export async function POST(req: NextRequest) {
     note: "Только числа и дельты. Какой кандидат = gross revenue, диагностика НЕ утверждает; nested amounts уже в by-day total и повторно не вычитаются из net.",
   };
 
+  // ======= 7) /v2/finance/realization — НЕЗАВИСИМАЯ read-only проверка ============
+  // Себестоимость и база налога боевого API-расчёта (loadAndComputeApiProfit, шаги
+  // 3-4) берутся ИЗ ЭТОГО endpoint'а, а НЕ из /v3/finance/transaction/list или
+  // accrual — миграция выручки НЕ гарантирует, что этот, отдельный, источник жив.
+  // Переиспользуем РЕАЛЬНУЮ loadRealizationDiagnostic (тот же модуль, что и боевой
+  // расчёт) — не копируем логику. Наружу отдаём ТОЛЬКО статус/период/полноту/
+  // агрегаты: candidateCogs.sample (offer_id/названия товаров) и debug (схема
+  // ответа) сюда НЕ передаются — этот блок вообще не запрашивает каталог products
+  // (передаём пустой массив), поэтому matched/candidateCogs всегда 0/0 — это
+  // проверка ДОСТУПНОСТИ и ПОЛНОТЫ полей отчёта, а не себестоимости конкретных
+  // товаров. checkRealization=false (по умолчанию) → блок не запускается вовсе,
+  // НЕ делает лишний живой запрос и не тратит diag-бюджет новых методов/legacy.
+  let realizationCheck: unknown = null;
+  if (checkRealization) {
+    const rz = await loadRealizationDiagnostic({
+      clientId,
+      apiKey,
+      month,
+      catalog: [] as CatalogRow[],
+    });
+    realizationCheck = {
+      connected: rz.connected,
+      errorCode: rz.errorCode ?? null,
+      period: { month: rz.month, year: rz.year },
+      rowCount: rz.rowCount,
+      fieldsPresent: rz.fieldsPresent,
+      sums: rz.sums,
+      warnings: rz.warnings,
+      notes: rz.notes,
+      note: "Каталог себестоимости в эту проверку не передаётся — candidateCogs здесь не о конкретных товарах, а о доступности/полноте самого отчёта. Товары/offer_id/названия не возвращаются.",
+    };
+  }
+
   return NextResponse.json(
     {
       ok: true,
@@ -1565,6 +1616,8 @@ export async function POST(req: NextRequest) {
       legacy,
       comparison,
       grossRevenueEvidence,
+      checkRealization,
+      realizationCheck,
       fieldPresence,
       safety:
         "Диагностика ничего не сохраняет, не списывает расчёт и не изменяет прибыль. Идентификаторы (posting_number/operation_id/SKU/offer_id/названия) не возвращаются — только имена ключей, типы и агрегаты.",
