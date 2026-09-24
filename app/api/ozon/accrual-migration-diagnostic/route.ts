@@ -25,6 +25,7 @@ import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { monthToRange, fetchOzonTransactions, aggregateDraft } from "../_lib/finance";
 import { loadRealizationDiagnostic } from "../_lib/realization";
 import type { CatalogRow } from "../_lib/postings";
+import { loadAndComputeApiProfit, parseManualExpenses } from "../_lib/profit";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -572,6 +573,12 @@ export async function POST(req: NextRequest) {
   // (не нужно передавать оба). Realization получает ВЕСЬ 40-секундный бюджет
   // диагностики для себя — тот же паттерн, что legacyOnly у блока 6.
   let realizationOnly = false;
+  // fullCalcCheck=true — ИЗОЛИРОВАННЫЙ вызов РЕАЛЬНОГО loadAndComputeApiProfit
+  // (тот же модуль, что save-calculation) с явным opts.forceAccrual:true —
+  // формула НЕ копируется, вызывается тот же код. НЕ запускает ни новые методы,
+  // ни legacy, ни блок 7 — свой ранний return ниже. См. блок 8.
+  let fullCalcCheck = false;
+  let manualExpensesRaw: unknown = undefined;
   try {
     const body = (await req.json()) as {
       month?: unknown;
@@ -579,6 +586,8 @@ export async function POST(req: NextRequest) {
       legacyOnly?: unknown;
       checkRealization?: unknown;
       realizationOnly?: unknown;
+      fullCalcCheck?: unknown;
+      manualExpenses?: unknown;
     };
     if (typeof body?.month === "string" && /^\d{4}-\d{2}$/.test(body.month)) {
       month = body.month;
@@ -608,10 +617,18 @@ export async function POST(req: NextRequest) {
         { status: 400, headers: NO_STORE }
       );
     }
+    if (body?.fullCalcCheck !== undefined && typeof body.fullCalcCheck !== "boolean") {
+      return NextResponse.json(
+        { error: "fullCalcCheck должен быть boolean", code: "bad_full_calc_check" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
     if (typeof body?.skipTypes === "boolean") skipTypes = body.skipTypes;
     if (typeof body?.legacyOnly === "boolean") legacyOnly = body.legacyOnly;
     if (typeof body?.checkRealization === "boolean") checkRealization = body.checkRealization;
     if (typeof body?.realizationOnly === "boolean") realizationOnly = body.realizationOnly;
+    if (typeof body?.fullCalcCheck === "boolean") fullCalcCheck = body.fullCalcCheck;
+    manualExpensesRaw = body?.manualExpenses;
   } catch {
     /* пустое/битое тело → дефолты: все флаги false, month=2026-06 */
   }
@@ -661,6 +678,99 @@ export async function POST(req: NextRequest) {
     "Api-Key": apiKey,
     "Content-Type": "application/json",
   };
+
+  // ======= 8) fullCalcCheck — РЕАЛЬНЫЙ полный расчёт через loadAndComputeApiProfit
+  // с явным opts.forceAccrual:true =========================================
+  // ИЗОЛИРОВАННЫЙ ранний return: новые методы/legacy/блок 7 НЕ запускаются —
+  // вместо собственной пошаговой логики этого route вызывается ТОТ ЖЕ модуль,
+  // что и боевой /api/ozon/save-calculation (никакой отдельной копии формулы).
+  // forceAccrual выбирается ИСКЛЮЧИТЕЛЬНО здесь, в серверном коде, ПОСЛЕ
+  // isDiagnosticOwner-проверки выше — клиент НЕ может передать этот выбор
+  // никаким полем тела запроса (fullCalcCheck только просит запустить эту
+  // ветку, саму опцию forceAccrual:true код передаёт сам, см. profit.ts).
+  // OZON_FINANCE_ACCRUAL_ENABLED (боевой флаг save-calculation) НЕ читается и
+  // НЕ трогается: opts.forceAccrual действует ТОЛЬКО для этого вызова.
+  // Ничего не считает дважды: consume/insert НЕ вызываются вовсе (их делает
+  // ТОЛЬКО save-calculation/route.ts ПОСЛЕ этой функции — здесь этот код
+  // просто не написан).
+  if (fullCalcCheck) {
+    const meParsed = parseManualExpenses(manualExpensesRaw);
+    if (!meParsed.ok) {
+      return NextResponse.json(
+        { error: meParsed.error, code: "bad_manual_expenses" },
+        { status: 400, headers: NO_STORE }
+      );
+    }
+    const loaded = await loadAndComputeApiProfit(
+      { admin, userId, clientId, apiKey, range, month, manualExpenses: meParsed.value },
+      { forceAccrual: true }
+    );
+    const safety =
+      "Диагностика ничего не сохраняет, не списывает расчёт и не изменяет каталог/историю. " +
+      "Товары/ключи/персональные данные не возвращаются.";
+    if (!loaded.ok) {
+      // Неполные данные — ЧЕСТНО без итоговой прибыли (никакой подстановки).
+      const failureCode =
+        loaded.kind === "ozon" || loaded.kind === "accrual"
+          ? loaded.code
+          : loaded.kind === "realization_cost"
+            ? loaded.resolution.code
+            : null;
+      return NextResponse.json(
+        {
+          ok: true,
+          month,
+          fullCalcCheck: true,
+          financeSource: "accrual_by_day",
+          complete: false,
+          failureKind: loaded.kind,
+          failureCode,
+          timings: loaded.timings,
+          safety,
+        },
+        { status: 200, headers: NO_STORE }
+      );
+    }
+    const c = loaded.computed;
+    return NextResponse.json(
+      {
+        ok: true,
+        month,
+        fullCalcCheck: true,
+        financeSource: loaded.financeSource.source,
+        complete: true,
+        // ---- полнота исходных данных (агрегаты, без товаров) ----
+        dataCompleteness: {
+          accrualWarningsCount: loaded.draft.warnings.length,
+          accrualUnclassifiedCount: loaded.draft.unclassified ? loaded.draft.unclassified.length : 0,
+          realizationConnected: loaded.realization.connected,
+          realizationRowCount: loaded.realization.rowCount,
+          realizationMatchedRows: loaded.realization.candidateCogs.matchedRows,
+          realizationUnmatchedRows: loaded.realization.candidateCogs.unmatchedRows,
+          realizationMatchedNoCostRows: loaded.realization.candidateCogs.matchedNoCostRows,
+          postingsCoverage: loaded.cost.coverage,
+        },
+        // ---- итог начислений / себестоимость / налог / расходы / прибыль ----
+        netAccrualsTotal: c.ozonOperationsTotal,
+        costTotal: c.matchedCostTotal,
+        costStatus: c.status,
+        taxBase: c.taxRevenueBase,
+        taxAmount: c.manualExpenses.tax,
+        ownExpenses: {
+          packaging: c.manualExpenses.packaging,
+          warehouseDelivery: c.manualExpenses.warehouseDelivery,
+          salary: c.manualExpenses.salary,
+          other: c.manualExpenses.other,
+          total: c.manualExpenses.total,
+        },
+        netProfit: c.netProfit,
+        margin: c.margin,
+        timings: loaded.timings,
+        safety,
+      },
+      { status: 200, headers: NO_STORE }
+    );
+  }
 
   const budget: Budget = { used: 0, lastStart: 0, deadline: Date.now() + DIAG_DEADLINE_MS };
   let rateLimited = false;

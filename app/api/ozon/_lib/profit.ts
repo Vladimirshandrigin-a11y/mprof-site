@@ -557,6 +557,19 @@ export type ApiProfitInputs = {
   manualExpenses: ManualExpenses;
 };
 
+/**
+ * Безопасные (без ключей/PII/списка товаров) длительности этапов — ТОЛЬКО
+ * числа мс, посчитанные вокруг УЖЕ существующих шагов функции ниже (не
+ * отдельная реализация/копия формулы, просто Date.now()-разметка). Каждая
+ * длительность null, если её шаг не был достигнут (функция вышла раньше).
+ */
+export type ApiProfitTimings = {
+  financeMs: number | null;
+  catalogMs: number | null;
+  realizationAndPostingsMs: number | null;
+  totalMs: number;
+};
+
 export type ApiProfitLoaded =
   | {
       ok: true;
@@ -572,14 +585,16 @@ export type ApiProfitLoaded =
       computed: ApiProfitComputed;
       /** Мета фактически использованного источника финансов (accrual vs legacy). */
       financeSource: FinanceSourceMeta;
+      timings: ApiProfitTimings;
     }
-  | { ok: false; kind: "ozon"; code: OzonFinanceErrorCode }
-  | { ok: false; kind: "accrual"; code: AccrualLoadErrorCode }
-  | { ok: false; kind: "catalog" }
+  | { ok: false; kind: "ozon"; code: OzonFinanceErrorCode; timings: ApiProfitTimings }
+  | { ok: false; kind: "accrual"; code: AccrualLoadErrorCode; timings: ApiProfitTimings }
+  | { ok: false; kind: "catalog"; timings: ApiProfitTimings }
   | {
       ok: false;
       kind: "realization_cost";
       resolution: Extract<RealizationCostResolution, { ok: false }>;
+      timings: ApiProfitTimings;
     };
 
 /**
@@ -596,25 +611,46 @@ export type ApiProfitLoaded =
  *
  * НИЧЕГО не сохраняет и НЕ списывает — это делает вызывающий роут.
  * apiKey приходит уже расшифрованным; здесь он НЕ логируется и НЕ возвращается.
+ *
+ * opts.forceAccrual — ТОЛЬКО для read-only owner-диагностики полного расчёта
+ * (accrual-migration-diagnostic/route.ts, fullCalcCheck). НИКОГДА не читается
+ * из тела клиентского запроса ни в этом файле, ни в save-calculation/route.ts —
+ * единственный вызывающий, который его передаёт, делает это ЖЁСТКО в серверном
+ * коде ПОСЛЕ собственной owner-проверки (см. isDiagnosticOwner). save-calculation
+ * (боевой расчёт) opts НЕ передаёт вовсе → поведение зависит ТОЛЬКО от
+ * OZON_FINANCE_ACCRUAL_ENABLED, как и раньше, byte-for-byte.
  */
 export async function loadAndComputeApiProfit(
-  input: ApiProfitInputs
+  input: ApiProfitInputs,
+  opts?: { forceAccrual?: boolean }
 ): Promise<ApiProfitLoaded> {
   const { admin, userId, clientId, apiKey, range, month, manualExpenses } = input;
+  const t0 = Date.now();
+  let financeMs: number | null = null;
+  let catalogMs: number | null = null;
+  let realizationAndPostingsMs: number | null = null;
+  const timingsNow = (): ApiProfitTimings => ({
+    financeMs,
+    catalogMs,
+    realizationAndPostingsMs,
+    totalMs: Date.now() - t0,
+  });
 
   // 1) финансы Ozon → OzonDraftAggregate.
   //    Флаг ВЫКЛЮЧЕН (текущий прод, 2026-09) → legacy control-flow БЕЗ ИЗМЕНЕНИЙ,
   //    byte-for-byte как раньше (единственный путь ниже, идентичен предыдущей версии).
-  //    Флаг ВКЛЮЧЁН → ТОЛЬКО accrual-источник (/v1/finance/accrual/by-day). Отката
-  //    на legacy при его неудаче БОЛЬШЕ НЕТ: /v3/finance/transaction/list официально
-  //    отключён Ozon 2026-09-08 (подтверждено официальным Telegram-каналом Ozon
-  //    Seller API) — откатываться некуда, "fallback" на мёртвый endpoint давал бы
-  //    ТОТ ЖЕ честный отказ, только скрытый под чужим кодом ошибки. Вместо этого —
-  //    kind:"accrual" с точным AccrualLoadErrorCode (см. accrual.ts), которое
-  //    вызывающий route останавливает ДО consume/save.
+  //    Флаг ВКЛЮЧЁН (или opts.forceAccrual — см. doc-comment выше) → ТОЛЬКО
+  //    accrual-источник (/v1/finance/accrual/by-day). Отката на legacy при его
+  //    неудаче БОЛЬШЕ НЕТ: /v3/finance/transaction/list официально отключён Ozon
+  //    2026-09-08 (подтверждено официальным Telegram-каналом Ozon Seller API) —
+  //    откатываться некуда, "fallback" на мёртвый endpoint давал бы ТОТ ЖЕ честный
+  //    отказ, только скрытый под чужим кодом ошибки. Вместо этого — kind:"accrual"
+  //    с точным AccrualLoadErrorCode (см. accrual.ts), которое вызывающий route
+  //    останавливает ДО consume/save.
   let draft: OzonDraftAggregate;
   let financeSource: FinanceSourceMeta;
-  if (isAccrualFinanceEnabled()) {
+  const tFinance0 = Date.now();
+  if (opts?.forceAccrual || isAccrualFinanceEnabled()) {
     // accrual.ts спроектирован НЕ бросать (все парсеры defensive) — try/catch здесь
     // ТОЛЬКО защитная сеть от непредвиденного исключения, НЕ путь отката на legacy:
     // неожиданный throw мапится в ТОТ ЖЕ честный network_error, что и обычный сбой сети.
@@ -622,28 +658,33 @@ export async function loadAndComputeApiProfit(
     try {
       loaded = await loadAccrualDraft({ clientId, apiKey, month });
     } catch {
-      return { ok: false, kind: "accrual", code: "network_error" };
+      financeMs = Date.now() - tFinance0;
+      return { ok: false, kind: "accrual", code: "network_error", timings: timingsNow() };
     }
-    if (!loaded.ok) return { ok: false, kind: "accrual", code: loaded.code };
+    financeMs = Date.now() - tFinance0;
+    if (!loaded.ok) return { ok: false, kind: "accrual", code: loaded.code, timings: timingsNow() };
     draft = loaded.draft;
     financeSource = ACCRUAL_FINANCE_SOURCE;
   } else {
     const tx = await fetchOzonTransactions(clientId, apiKey, range);
-    if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code };
+    financeMs = Date.now() - tFinance0;
+    if (!tx.ok) return { ok: false, kind: "ozon", code: tx.code, timings: timingsNow() };
     draft = aggregateDraft(tx.operations, tx.partial);
     financeSource = LEGACY_FINANCE_SOURCE;
   }
 
   // 2) каталог себестоимости пользователя (read-only, только свои строки) — нужен
   //    и для сопоставления отчёта реализации, и для справочной себестоимости.
+  const tCatalog0 = Date.now();
   const { data: catalog, error: catErr } = await admin
     .from("products")
     .select("sku, name, cost_price")
     .eq("user_id", userId);
+  catalogMs = Date.now() - tCatalog0;
   if (catErr) {
     // eslint-disable-next-line no-console
     console.error("[ozon/profit] products select error", catErr);
-    return { ok: false, kind: "catalog" };
+    return { ok: false, kind: "catalog", timings: timingsNow() };
   }
   const catalogRows = (catalog ?? []) as CatalogRow[];
 
@@ -655,13 +696,15 @@ export async function loadAndComputeApiProfit(
   //    меняются, меняется только порядок выполнения. Draft (шаг 1) и каталог
   //    (шаг 2) остаются ДО этого места намеренно — при их ошибке функция уже
   //    вышла раньше и не тратит лишние живые запросы к Ozon на realization/postings.
+  const tParallel0 = Date.now();
   const [realization, postings] = await Promise.all([
     loadRealizationDiagnostic({ clientId, apiKey, month, catalog: catalogRows }),
     fetchMonthPostings(clientId, apiKey, range),
   ]);
+  realizationAndPostingsMs = Date.now() - tParallel0;
   const resolution = resolveRealizationProductionCost(realization);
   if (!resolution.ok) {
-    return { ok: false, kind: "realization_cost", resolution };
+    return { ok: false, kind: "realization_cost", resolution, timings: timingsNow() };
   }
   const productionCost = resolution.productionCost;
   const realizationRevenueForTax = resolution.realizationRevenueForTax;
@@ -686,6 +729,7 @@ export async function loadAndComputeApiProfit(
     realization,
     productionCost,
     realizationRevenueForTax,
+    timings: timingsNow(),
     computed,
     financeSource,
   };
