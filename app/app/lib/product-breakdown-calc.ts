@@ -25,6 +25,14 @@ export interface ProductBreakdownRow {
   revenue: number;
   /** Сумма возвратов артикула (₽) — уже вычтена из revenue, для отображения. */
   returnsAmount: number;
+  /**
+   * Выплаты по механикам лояльности этого артикула (G − K, агрегировано по
+   * повторным строкам). Учтены в profit НАПРЯМУЮ (не пропорционально), когда
+   * opts.loyaltyPayoutPerSkuKnown=true; иначе 0 здесь (доля из
+   * loyaltyPayoutsTotal учтена в profit пропорционально, а не в этом поле —
+   * см. computeProductBreakdownRows).
+   */
+  loyaltyPayout: number;
   quantity: number;
   matched: boolean;
   unitCost: number | null;
@@ -37,10 +45,34 @@ export interface ProductBreakdownRow {
 export interface ProductBreakdownOpts {
   /** УПД целиком + налог + прочие ручные расходы — распределяются по SKU. */
   distributableExpenses?: number;
-  /** Выплаты от партнёров (после возвратов) — распределяются по SKU. */
+  /**
+   * Выплаты от партнёров (после возвратов), основной итог. Используется
+   * ТОЛЬКО как fallback — распределяется по SKU пропорционально net-выручке,
+   * когда loyaltyPayoutPerSkuKnown=false (реальные per-SKU G−K недоступны,
+   * репорт другого формата / группировка колонок не распознана).
+   */
   loyaltyPayoutsTotal?: number;
+  /**
+   * true — products[].loyaltyPayout (G−K) достоверен для каждой строки
+   * (report.loyaltyPayoutPerSkuKnown из ozon-parser.ts) — тогда выплаты по
+   * SKU берутся НАПРЯМУЮ (Σ известных G−K), не пропорционально: известное
+   * значение точнее распределения по доле выручки и не искажает прибыль
+   * конкретного товара. false/undefined — используется fallback
+   * loyaltyPayoutsTotal, распределённый пропорционально (как раньше).
+   */
+  loyaltyPayoutPerSkuKnown?: boolean;
   /** Корректировка графика выплат Ozon (знак сохраняется) — распределяется по SKU. */
   payoutAdjustmentTotal?: number;
+  /**
+   * false — снапшот восстановлен из БД БЕЗ подтверждённых returnsAmount/
+   * loyaltyPayout по строкам (старый формат, до этого поля). unitCost/cogs
+   * остаются достоверными (себестоимость не зависит от возвратов/лояльности),
+   * но profit/margin форсируются в null для ВСЕХ строк — «чистая прибыль» и
+   * рейтинги (которые из неё выводятся) не должны показываться как
+   * достоверные на неполных данных. undefined/true — данные полные (все
+   * свежие расчёты; восстановленные новые снапшоты).
+   */
+  productDetailComplete?: boolean;
 }
 
 /** Нормализация артикула/sku для матчинга: trim + lower + схлопывание пробелов. */
@@ -74,6 +106,7 @@ export function computeProductBreakdownRows(
       grossRevenue: number;
       returnsAmount: number;
       quantity: number;
+      loyaltyPayout: number;
     }
   >();
   for (const pr of products) {
@@ -84,6 +117,7 @@ export function computeProductBreakdownRows(
       ex.grossRevenue += pr.revenue;
       ex.returnsAmount += pr.returnsAmount;
       ex.quantity += pr.quantity;
+      ex.loyaltyPayout += pr.loyaltyPayout;
       if (!ex.name && pr.name) ex.name = pr.name;
     } else {
       agg.set(key, {
@@ -92,6 +126,7 @@ export function computeProductBreakdownRows(
         grossRevenue: pr.revenue,
         returnsAmount: pr.returnsAmount,
         quantity: pr.quantity,
+        loyaltyPayout: pr.loyaltyPayout,
       });
     }
   }
@@ -104,13 +139,20 @@ export function computeProductBreakdownRows(
   const expensesTotal = opts.distributableExpenses ?? 0;
   const loyaltyTotal = opts.loyaltyPayoutsTotal ?? 0;
   const payoutAdjTotal = opts.payoutAdjustmentTotal ?? 0;
+  // Известные per-SKU G−K точнее распределения по доле выручки — используем
+  // их напрямую, а НЕ пропорционально, когда они достоверны (см. doc-comment
+  // ProductBreakdownOpts.loyaltyPayoutPerSkuKnown). Иначе — старый fallback.
+  const loyaltyKnown = opts.loyaltyPayoutPerSkuKnown === true;
+  // false ТОЛЬКО для снапшотов старого формата (см. doc-comment
+  // productDetailComplete) — profit/margin форсируются в null ниже.
+  const detailComplete = opts.productDetailComplete !== false;
 
   const out: ProductBreakdownRow[] = [];
   for (const [key, a] of agg) {
     const netRevenue = a.grossRevenue - a.returnsAmount;
     const share = totalNetRevenue !== 0 ? netRevenue / totalNetRevenue : 0;
     const allocatedExpenses = expensesTotal * share;
-    const allocatedLoyalty = loyaltyTotal * share;
+    const loyaltyForRow = loyaltyKnown ? a.loyaltyPayout : loyaltyTotal * share;
     const allocatedPayoutAdj = payoutAdjTotal * share;
 
     const match = bySku.get(key);
@@ -118,15 +160,23 @@ export function computeProductBreakdownRows(
     const hasCost = unitCost !== null && unitCost > 0;
 
     if (match && hasCost) {
+      // cogs НЕ зависит от возвратов/лояльности — достоверна даже при
+      // detailComplete=false (себестоимость = unitCost × проданных единиц).
       const cogs = unitCost * a.quantity;
-      const profit =
-        netRevenue + allocatedLoyalty - cogs - allocatedExpenses + allocatedPayoutAdj;
-      const margin = netRevenue > 0 ? (profit / netRevenue) * 100 : 0;
+      const profit = detailComplete
+        ? netRevenue + loyaltyForRow - cogs - allocatedExpenses + allocatedPayoutAdj
+        : null;
+      const margin = !detailComplete
+        ? null
+        : netRevenue > 0
+          ? (profit! / netRevenue) * 100
+          : 0;
       out.push({
         article: a.article,
         name: a.name || match.name || a.article,
         revenue: netRevenue,
         returnsAmount: a.returnsAmount,
+        loyaltyPayout: loyaltyForRow,
         quantity: a.quantity,
         matched: true,
         unitCost,
@@ -141,6 +191,7 @@ export function computeProductBreakdownRows(
         name: (match ? a.name || match.name : a.name) || a.article,
         revenue: netRevenue,
         returnsAmount: a.returnsAmount,
+        loyaltyPayout: loyaltyForRow,
         quantity: a.quantity,
         matched: !!match,
         unitCost,
@@ -159,8 +210,15 @@ export function computeProductBreakdownRows(
 export interface ProductBreakdownTotals {
   revenue: number;
   returnsAmount: number;
+  /** Σ loyaltyPayout по ВСЕМ строкам (не только hasCost) — для сверки с
+   *  основным итогом (combinedResult.loyaltyPayouts), см. requirement. */
+  loyaltyPayout: number;
   cogs: number;
   profit: number;
+  /** false — profit выше НЕ достоверна (восстановленный снапшот старого
+   *  формата, см. ProductBreakdownOpts.productDetailComplete) — UI должен
+   *  показать «—»/пояснение, а не число, похожее на точное. */
+  profitKnown: boolean;
   withCost: number;
   total: number;
   withoutCost: number;
@@ -172,23 +230,29 @@ export function computeProductBreakdownTotals(
 ): ProductBreakdownTotals {
   let revenue = 0;
   let returnsAmount = 0;
+  let loyaltyPayout = 0;
   let cogs = 0;
   let profit = 0;
   let withCost = 0;
+  let profitKnown = true;
   for (const r of rows) {
     revenue += r.revenue;
     returnsAmount += r.returnsAmount;
+    loyaltyPayout += r.loyaltyPayout;
     if (r.hasCost) {
       cogs += r.cogs ?? 0;
       profit += r.profit ?? 0;
       withCost++;
+      if (r.profit === null) profitKnown = false;
     }
   }
   return {
     revenue,
     returnsAmount,
+    loyaltyPayout,
     cogs,
     profit,
+    profitKnown,
     withCost,
     total: rows.length,
     withoutCost: rows.length - withCost,

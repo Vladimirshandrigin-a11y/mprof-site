@@ -87,6 +87,16 @@ export interface OzonProductRow {
    * бы в производных расчётах (чистая выручка по SKU = revenue − returnsAmount).
    */
   returnsAmount: number;
+  /**
+   * Чистые выплаты по механикам лояльности этой строки = «Выплаты при
+   * реализации» (группа «Реализовано») минус «Возврат выплат» (группа
+   * «Возвращено клиентом») — обе колонки в отчёте называются ОДИНАКОВО
+   * («Выплаты по механикам лояльности партнёров, руб.»), различаются только
+   * объединённой ячейкой-группой строкой выше (см. detectLoyaltyGroupColumns).
+   * Достоверно ТОЛЬКО когда report.loyaltyPayoutPerSkuKnown === true — иначе
+   * 0 (группировка не распознана, значение неизвестно, а не подтверждённый 0).
+   */
+  loyaltyPayout: number;
 }
 
 export interface OzonParsedReport {
@@ -105,6 +115,16 @@ export interface OzonParsedReport {
    * сомнительные данные. НЕ влияет на totals/estimate — это отдельный слой.
    */
   products: OzonProductRow[];
+  /**
+   * true — колонки «Выплаты при реализации» (G) и «Возврат выплат» (K)
+   * надёжно различены по группе-шапке (объединённые ячейки «Реализовано» /
+   * «Возвращено клиентом» строкой выше полевых заголовков), и
+   * `products[].loyaltyPayout` — доверенное net-значение G−K. false —
+   * группировка не распознана (другой формат отчёта / шапка не совпала):
+   * per-SKU loyaltyPayout НЕ достоверен (все 0), нужно использовать
+   * пропорциональное распределение totals.loyaltyPayoutsFromTotalsRow.
+   */
+  loyaltyPayoutPerSkuKnown: boolean;
   /**
    * ИНН ПОЛУЧАТЕЛЯ из шапки отчёта («Получатель:» … «ИНН» ДДДДДДДДДД) —
    * получатель реализации это продавец маркетплейса (селлер), чьи документы
@@ -391,6 +411,89 @@ function detectArticleNameCols(
     }
   }
   return { articleCol, nameCol };
+}
+
+/** Групповая метка-шапка над блоком «Реализовано» (продажа). */
+const SALE_GROUP_PATTERN = /реализовано/i;
+/** Групповая метка-шапка над блоком «Возвращено клиентом» (возврат). */
+const RETURN_GROUP_PATTERN = /возвращ.{0,20}клиент/i;
+
+/**
+ * Различить колонку «Выплаты при реализации» (G) от «Возврат выплат» (K).
+ *
+ * В реальном отчёте обе колонки на полевой header-строке называются
+ * ОДИНАКОВО («Выплаты по механикам лояльности партнёров, руб.») — различие
+ * только в объединённой ячейке-группе СТРОКОЙ ВЫШЕ: «Реализовано» (F:I) слева,
+ * «Возвращено клиентом» (J:M) справа. sheet_to_json не разворачивает merge —
+ * группа лежит только в top-left ячейке диапазона, поэтому группу
+ * «наследуем» вправо вручную (аналогично двум блокам «Плательщик»/
+ * «Получатель» в шапке реквизитов, см. findRecipientInn).
+ *
+ * Строго: если группа-строка не найдена, или под каждой из двух групп не
+ * нашлось ровно по одной loyalty-колонке, или найденная «продажная» колонка
+ * не совпадает с уже выбранной generic-сканером colMap.loyalty — не гадаем,
+ * known=false (per-SKU loyaltyPayout будет 0 у всех строк, а не ложное
+ * значение; вызывающий код в этом случае распределяет totals пропорционально).
+ */
+function detectLoyaltyGroupColumns(
+  rows: unknown[][],
+  headerRowIdx: number,
+  genericLoyaltyCol: number | undefined
+): { loyaltyCol: number | null; loyaltyReturnedCol: number | null; known: boolean } {
+  const notFound = { loyaltyCol: null, loyaltyReturnedCol: null, known: false };
+  if (!Array.isArray(rows) || headerRowIdx <= 0) return notFound;
+
+  const fieldRow = rows[headerRowIdx];
+  if (!Array.isArray(fieldRow)) return notFound;
+
+  const startIdx = Math.max(0, headerRowIdx - 3);
+  let groupRow: unknown[] | null = null;
+  for (let r = headerRowIdx - 1; r >= startIdx; r--) {
+    const row = rows[r];
+    if (!Array.isArray(row)) continue;
+    const hasSale = row.some((c) =>
+      SALE_GROUP_PATTERN.test(asCellString(c).toLowerCase().trim())
+    );
+    const hasReturn = row.some((c) =>
+      RETURN_GROUP_PATTERN.test(asCellString(c).toLowerCase().trim())
+    );
+    if (hasSale && hasReturn) {
+      groupRow = row;
+      break;
+    }
+  }
+  if (!groupRow) return notFound;
+
+  // Forward-fill вправо: merged-группа лежит только в первой ячейке диапазона.
+  const width = Math.max(groupRow.length, fieldRow.length);
+  const groupByCol: Array<"sale" | "return" | null> = new Array(width).fill(null);
+  let current: "sale" | "return" | null = null;
+  for (let c = 0; c < width; c++) {
+    const text = asCellString(groupRow[c]).toLowerCase().trim();
+    if (text) {
+      if (SALE_GROUP_PATTERN.test(text)) current = "sale";
+      else if (RETURN_GROUP_PATTERN.test(text)) current = "return";
+    }
+    groupByCol[c] = current;
+  }
+
+  let loyaltyCol: number | null = null;
+  let loyaltyReturnedCol: number | null = null;
+  for (let c = 0; c < width; c++) {
+    const text = asCellString(fieldRow[c]).toLowerCase().trim();
+    if (!text || !HEADER_PATTERNS.loyalty.some((p) => p.test(text))) continue;
+    const group = groupByCol[c];
+    if (group === "sale" && loyaltyCol === null) loyaltyCol = c;
+    else if (group === "return" && loyaltyReturnedCol === null) loyaltyReturnedCol = c;
+  }
+
+  if (loyaltyCol === null || loyaltyReturnedCol === null) return notFound;
+  // Sanity: должно совпасть с leftmost-match generic-сканера (если он вообще
+  // нашёл loyalty-колонку). Расхождение — не доверяем группировке.
+  if (genericLoyaltyCol !== undefined && genericLoyaltyCol !== loyaltyCol) {
+    return notFound;
+  }
+  return { loyaltyCol, loyaltyReturnedCol, known: true };
 }
 
 /** Целое число цифр (10 или 12 знаков — ИП/юрлицо), иначе null. */
@@ -1846,6 +1949,16 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
     // eslint-disable-next-line no-console
     console.log(LOG, "per-SKU columns:", { articleCol, nameCol });
 
+    // Колонки G/K (выплаты при реализации / возврат выплат) — различаются
+    // ТОЛЬКО по группе-шапке выше (см. detectLoyaltyGroupColumns). Не гадаем
+    // при realization-fallback (PUA-мусор в заголовках).
+    const loyaltyGroupCols = usedRealizationFallback
+      ? { loyaltyCol: null, loyaltyReturnedCol: null, known: false }
+      : detectLoyaltyGroupColumns(dataRows, headerRowIdx, colMap.loyalty);
+    const loyaltyPayoutPerSkuKnown = loyaltyGroupCols.known;
+    // eslint-disable-next-line no-console
+    console.log(LOG, "loyalty group columns:", loyaltyGroupCols);
+
     const rowsAfterHeader = Math.max(0, dataRows.length - headerRowIdx - 1);
     debugInfo.rowsAfterHeader = rowsAfterHeader;
 
@@ -1944,6 +2057,11 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
       const loyaltyVal = safeNumber(
         colMap.loyalty !== undefined ? row[colMap.loyalty] : 0
       );
+      const loyaltyReturnedVal = safeNumber(
+        loyaltyGroupCols.loyaltyReturnedCol !== null
+          ? row[loyaltyGroupCols.loyaltyReturnedCol]
+          : 0
+      );
 
       // Если в revenue-колонке 0, но есть qty * price — используем расчётное.
       // Также покрывает случай, когда colMap.revenue === undefined вообще.
@@ -1971,7 +2089,8 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
         taxVal !== 0 ||
         storageVal !== 0 ||
         returnsVal !== 0 ||
-        loyaltyVal !== 0;
+        loyaltyVal !== 0 ||
+        loyaltyReturnedVal !== 0;
       if (!hasMeaningfulValue) {
         skipReasons.noMeaningfulValue++;
         if (skipReasons.noMeaningfulValue <= 3) {
@@ -2000,6 +2119,11 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
             // Math.abs — та же знак-конвенция, что у агрегата totals.returns
             // (Σ per-SKU returnsAmount по построению равна totals.returns).
             returnsAmount: Math.abs(returnsVal),
+            // G − K. 0 (не «G-only»), если группировка не распознана —
+            // см. loyaltyPayoutPerSkuKnown на уровне report.
+            loyaltyPayout: loyaltyPayoutPerSkuKnown
+              ? Math.abs(loyaltyVal) - Math.abs(loyaltyReturnedVal)
+              : 0,
           });
         }
       }
@@ -2289,6 +2413,7 @@ export async function parseOzonReport(file: File): Promise<ParseResult> {
       totals: finalTotals,
       estimate: finalEstimate,
       products,
+      loyaltyPayoutPerSkuKnown,
       recipientInn,
     };
 

@@ -105,11 +105,27 @@ interface Props {
    */
   loyaltyPayoutsTotal?: number;
   /**
+   * true — per-SKU G−K (products[].loyaltyPayout) достоверен и используется
+   * НАПРЯМУЮ вместо пропорционального распределения loyaltyPayoutsTotal (см.
+   * report.loyaltyPayoutPerSkuKnown в ozon-parser.ts). false/undefined —
+   * старый fallback: пропорционально по доле net-выручки.
+   */
+  loyaltyPayoutPerSkuKnown?: boolean;
+  /**
    * Корректировка графика выплат Ozon (profitCalc.payoutScheduleAdjustment) —
    * знак сохраняется (+ скидка/доход, − комиссия/расход), распределяется тем
    * же правилом.
    */
   payoutAdjustmentTotal?: number;
+  /**
+   * false — products пришли из восстановленного снапшота СТАРОГО формата, в
+   * котором returnsAmount/loyaltyPayout по строкам не сохранялись. В этом
+   * случае «чистая прибыль» по SKU и рейтинги (которые из неё выводятся) не
+   * показываются как достоверные — только выручка/себестоимость/покрытие
+   * (которые не зависят от возвратов/лояльности). undefined/true — данные
+   * полные (свежий расчёт или новый снапшот).
+   */
+  productDetailComplete?: boolean;
   /**
    * Колбэк с суммарной себестоимостью (cost_price × qty по сматченным SKU).
    * Родитель использует его для автозаполнения поля «Себестоимость товара»
@@ -181,12 +197,19 @@ export function OzonProductBreakdown({
   products,
   distributableExpenses,
   loyaltyPayoutsTotal,
+  loyaltyPayoutPerSkuKnown,
   payoutAdjustmentTotal,
+  productDetailComplete,
   user,
   onCogsTotal,
   onKeyProducts,
   onCostCoverage,
 }: Props) {
+  // false ТОЛЬКО для восстановленного снапшота старого формата (см. Props
+  // doc-comment) — гейтит и баннер, и честность «Возвратов»/рейтингов, не
+  // только «Чистую прибыль» (которая дополнительно гейтится per-row через
+  // totals.profitKnown, зависящим от покрытия себестоимостью).
+  const detailComplete = productDetailComplete !== false;
   const [catalog, setCatalog] = useState<Product[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -251,9 +274,19 @@ export function OzonProductBreakdown({
       computeProductBreakdownRows(products, catalog, {
         distributableExpenses,
         loyaltyPayoutsTotal,
+        loyaltyPayoutPerSkuKnown,
         payoutAdjustmentTotal,
+        productDetailComplete,
       }),
-    [products, catalog, distributableExpenses, loyaltyPayoutsTotal, payoutAdjustmentTotal]
+    [
+      products,
+      catalog,
+      distributableExpenses,
+      loyaltyPayoutsTotal,
+      loyaltyPayoutPerSkuKnown,
+      payoutAdjustmentTotal,
+      productDetailComplete,
+    ]
   );
 
   // ===== Аналитика товаров =====
@@ -604,6 +637,19 @@ export function OzonProductBreakdown({
         позволяет оценить чистую прибыль по каждому SKU.
       </div>
 
+      {!detailComplete && (
+        <div className="pb-note pb-note-warn">
+          Точная разбивка недоступна для этого сохранённого расчёта — он
+          создан до обновления формата, и суммы возвратов/выплат партнёров по
+          отдельным товарам не сохранены (ниже показаны как «Неизвестно», а
+          не как подтверждённый ноль). Себестоимость и количество верны, но
+          выручка может быть завышена (без вычета неизвестных возвратов), а
+          чистая прибыль и рейтинги товаров по этому расчёту не
+          показываются — пересчитайте отчёт заново из исходных файлов, чтобы
+          увидеть точные значения.
+        </div>
+      )}
+
       {!user && (
         <div className="pb-note">
           Войдите и заполните «Каталог товаров» — система подставит себестоимость
@@ -628,12 +674,16 @@ export function OzonProductBreakdown({
           {/* Итоговые чипы */}
           <div className="pb-summary">
             <div className="pb-chip">
-              <span className="pb-chip-l">Выручка (после возвратов)</span>
+              <span className="pb-chip-l">
+                {detailComplete ? "Выручка (после возвратов)" : "Выручка (возвраты не подтверждены)"}
+              </span>
               <span className="pb-chip-v">{formatRub(totals.revenue)}</span>
             </div>
             <div className="pb-chip">
               <span className="pb-chip-l">Возвраты</span>
-              <span className="pb-chip-v">{formatRub(totals.returnsAmount)}</span>
+              <span className="pb-chip-v">
+                {detailComplete ? formatRub(totals.returnsAmount) : "Неизвестно"}
+              </span>
             </div>
             <div className="pb-chip">
               <span className="pb-chip-l">Себестоимость</span>
@@ -641,13 +691,17 @@ export function OzonProductBreakdown({
             </div>
             <div className="pb-chip">
               <span className="pb-chip-l">Чистая прибыль</span>
-              <span
-                className={
-                  "pb-chip-v " + (totals.profit >= 0 ? "pos" : "neg")
-                }
-              >
-                {formatSignedRub(totals.profit)}
-              </span>
+              {totals.profitKnown ? (
+                <span
+                  className={
+                    "pb-chip-v " + (totals.profit >= 0 ? "pos" : "neg")
+                  }
+                >
+                  {formatSignedRub(totals.profit)}
+                </span>
+              ) : (
+                <span className="pb-chip-v">Недоступно</span>
+              )}
             </div>
             <div className="pb-chip">
               <span className="pb-chip-l">С себестоимостью</span>
@@ -773,8 +827,9 @@ export function OzonProductBreakdown({
 
           {scored.length === 0 ? (
             <div className="pba-note">
-              Аналитика прибыли появится, когда товары из отчёта получат
-              себестоимость из «Каталога товаров».
+              {totals.profitKnown
+                ? "Аналитика прибыли появится, когда товары из отчёта получат себестоимость из «Каталога товаров»."
+                : "Недоступно для этого сохранённого расчёта (см. пояснение выше) — точная прибыль по товарам не сохранена."}
             </div>
           ) : (
             <>

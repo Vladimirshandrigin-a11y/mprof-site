@@ -165,6 +165,24 @@ type NetProfitBreakdown = {
    * старые записи без этого поля восстанавливаются по агрегатам, как раньше.
    */
   products?: OzonProductRow[];
+  /**
+   * true — products[] сохранены ТЕКУЩИМ парсером и returnsAmount/loyaltyPayout
+   * по каждой строке достоверны (не «подтверждённый 0», а реально посчитаны).
+   * Ставится true безусловно при сохранении свежего расчёта. Optional —
+   * старые записи (до этого поля) читаются как false: «Чистая прибыль по
+   * товарам» и рейтинги НЕ показываются как достоверные для них (возвраты и
+   * выплаты партнёров по строкам не сохранялись, 0 означал бы ложное
+   * подтверждение отсутствия, а не «неизвестно»). Себестоимость/выручка это
+   * не затрагивает — они не зависят от возвратов/лояльности.
+   */
+  productDetailComplete?: boolean;
+  /**
+   * report.loyaltyPayoutPerSkuKnown из ozon-parser.ts — колонки «Выплаты при
+   * реализации»/«Возврат выплат» надёжно различены по группе-шапке для этого
+   * отчёта, per-SKU loyaltyPayout достоверен. Используется ТОЛЬКО когда
+   * productDetailComplete=true — иначе не важно (прибыль уже скрыта целиком).
+   */
+  loyaltyPayoutPerSkuKnown?: boolean;
   /** Тоталы отчёта (estimate) — источник распределяемых расходов для пересчёта. */
   estimate?: OzonEstimate | null;
   /**
@@ -216,6 +234,18 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
     payoutSchedule: asPayoutSchedule(o.payoutSchedule),
     payoutScheduleAdjustment: n(o.payoutScheduleAdjustment),
     reportPeriod: typeof o.reportPeriod === "string" ? o.reportPeriod : null,
+    // Старые записи (до этого поля) → false: returnsAmount/loyaltyPayout по
+    // строкам НЕ подтверждены (см. doc-comment productDetailComplete выше).
+    // «Чистая прибыль по товарам» честно покажет недоступность вместо
+    // ложного нуля/итога — гейтится ниже через productDetailComplete=false.
+    productDetailComplete:
+      typeof o.productDetailComplete === "boolean"
+        ? o.productDetailComplete
+        : false,
+    loyaltyPayoutPerSkuKnown:
+      typeof o.loyaltyPayoutPerSkuKnown === "boolean"
+        ? o.loyaltyPayoutPerSkuKnown
+        : false,
     products: Array.isArray(o.products)
       ? o.products
           .map((r): OzonProductRow | null => {
@@ -226,9 +256,11 @@ function asNetProfitBreakdown(v: unknown): NetProfitBreakdown | null {
               name: typeof rr.name === "string" ? rr.name : "",
               revenue: n(rr.revenue),
               quantity: n(rr.quantity),
-              // Старые записи БД сохранены без этого поля — 0 (совпадает с
-              // поведением до фикса: возвраты не выделялись отдельно).
+              // 0 на старых записях — численно безопасный дефолт: недостоверность
+              // всей per-SKU разбивки помечена выше через productDetailComplete
+              // (гейтит profit/margin целиком), а НЕ через это число.
               returnsAmount: n(rr.returnsAmount),
+              loyaltyPayout: n(rr.loyaltyPayout),
             };
           })
           .filter((x): x is OzonProductRow => x !== null)
@@ -1560,6 +1592,27 @@ export default function AppPage() {
    *  себестоимости из каталога и блока «Прибыль по товарам». Заполняется в
    *  обоих flow (одиночный upload и 3-file). Пусто → блок не показывается. */
   const [reportProducts, setReportProducts] = useState<OzonProductRow[]>([]);
+  /**
+   * report.loyaltyPayoutPerSkuKnown последнего отчёта — true, когда колонки
+   * «Выплаты при реализации» (G) и «Возврат выплат» (K) надёжно различены по
+   * группе-шапке, и reportProducts[].loyaltyPayout достоверен для каждой
+   * строки (используется НАПРЯМУЮ в блоке «Чистая прибыль по товарам», а не
+   * распределяется пропорционально). Ставится/сбрасывается вместе с
+   * reportProducts во всех местах. false для восстановленных из БД записей
+   * старого формата (без этого поля в снапшоте) — намеренно, см.
+   * restoreUploadCalc/asNetProfitBreakdown.
+   */
+  const [reportLoyaltyPayoutPerSkuKnown, setReportLoyaltyPayoutPerSkuKnown] =
+    useState(false);
+  /**
+   * false — reportProducts восстановлены из снапшота СТАРОГО формата (без
+   * returnsAmount/loyaltyPayout по строкам) — «Чистая прибыль по товарам»
+   * должна честно показать недоступность точной прибыли/рейтингов, а не
+   * ложный «0» или неверную сумму. true — свежий расчёт или новый снапшот
+   * (данные по строкам полные). См. restoreUploadCalc/asNetProfitBreakdown.
+   */
+  const [reportProductDetailComplete, setReportProductDetailComplete] =
+    useState(true);
   /** Тоталы (estimate) последнего отчёта — источник общих расходов для
    *  распределения по SKU в блоке «Чистая прибыль по товарам». Ставится вместе
    *  с reportProducts в обоих flow, сбрасывается там же. */
@@ -1788,6 +1841,12 @@ export default function AppPage() {
       // Per-SKU строки + estimate — чтобы восстановление из истории пересчитало
       // себестоимость по актуальному каталогу (не по застывшему снапшоту).
       products: reportProducts,
+      // Из state, НЕ хардкод true: при пересохранении УЖЕ восстановленного
+      // старого расчёта (без повторной загрузки файлов) reportProducts — это
+      // всё ещё старые несовершенные данные, пересохранение не должно ложно
+      // подтверждать полноту.
+      productDetailComplete: reportProductDetailComplete,
+      loyaltyPayoutPerSkuKnown: reportLoyaltyPayoutPerSkuKnown,
       estimate: reportEstimate,
       // Пропускаем признак комплекта документов как есть (не переосмысливаем
       // источник при пересохранении: свежий single-upd остаётся single-upd,
@@ -2504,6 +2563,10 @@ export default function AppPage() {
     // каталогом и пересчитать себестоимость (COGS) при открытии старого расчёта.
     const restoredProducts = b.products ?? [];
     setReportProducts(restoredProducts);
+    // productDetailComplete=false у старых записей (до этого поля) — «Чистая
+    // прибыль по товарам» честно покажет недоступность вместо ложного нуля.
+    setReportProductDetailComplete(b.productDetailComplete ?? false);
+    setReportLoyaltyPayoutPerSkuKnown(b.loyaltyPayoutPerSkuKnown ?? false);
     setReportEstimate(b.estimate ?? null);
     // Сбрасываем ключевые товары — OzonProductBreakdown пересчитает и пробросит
     // свежие best/worst (или оставит null, если совпадений нет).
@@ -2677,6 +2740,8 @@ export default function AppPage() {
     setUploadErrorMsg("");
     setUploadDebugInfo(null);
     setReportProducts([]);
+    setReportProductDetailComplete(true);
+    setReportLoyaltyPayoutPerSkuKnown(false);
     setReportEstimate(null);
     setReportKeyProducts(null);
     setReportCostCoverage(null);
@@ -2762,6 +2827,8 @@ export default function AppPage() {
     // Per-SKU слой для блока «Чистая прибыль по товарам» (best-effort: пусто,
     // если колонки артикула в отчёте не распознаны — тогда блок не показывается).
     setReportProducts(report.products);
+    setReportProductDetailComplete(true);
+    setReportLoyaltyPayoutPerSkuKnown(report.loyaltyPayoutPerSkuKnown);
     // estimate — источник общих расходов для распределения по SKU.
     setReportEstimate(est);
 
@@ -3011,6 +3078,8 @@ export default function AppPage() {
     setCombinedResult(null);
     setCombinedDebug(null);
     setReportProducts([]);
+    setReportProductDetailComplete(true);
+    setReportLoyaltyPayoutPerSkuKnown(false);
     setReportEstimate(null);
     setReportKeyProducts(null);
     setReportCostCoverage(null);
@@ -3043,6 +3112,8 @@ export default function AppPage() {
     setCombinedResult(null);
     setCombinedDebug(null);
     setReportProducts([]);
+    setReportProductDetailComplete(true);
+    setReportLoyaltyPayoutPerSkuKnown(false);
     setReportEstimate(null);
     setReportKeyProducts(null);
     setReportCostCoverage(null);
@@ -3258,6 +3329,8 @@ export default function AppPage() {
 
     // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
     setReportProducts(xlsxRes.report.products);
+    setReportProductDetailComplete(true);
+    setReportLoyaltyPayoutPerSkuKnown(xlsxRes.report.loyaltyPayoutPerSkuKnown);
     setReportEstimate(xlsxRes.report.estimate);
 
     // Автозаполнение блока «Дополнительные расходы».
@@ -3318,6 +3391,9 @@ export default function AppPage() {
         // Сохраняем per-SKU строки + estimate в snapshot, чтобы клик по истории
         // мог пересчитать себестоимость по актуальному каталогу товаров.
         products: xlsxRes.report.products,
+        // Свежий парсинг — returnsAmount/loyaltyPayout по строкам достоверны.
+        productDetailComplete: true,
+        loyaltyPayoutPerSkuKnown: xlsxRes.report.loyaltyPayoutPerSkuKnown,
         estimate: xlsxRes.report.estimate,
         docFormat: "single-upd",
         commissionKnown,
@@ -11932,12 +12008,16 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 
         {/* Чистая прибыль по товарам — себестоимость из каталога по sku +
             распределение НЕраспределяемых расходов основного расчёта (УПД +
-            налог + прочие ручные расходы) и выплат партнёров/графика выплат
-            пропорционально net-выручке (после возвратов). Те же суммы, что
-            уже вычтены/прибавлены РОВНО ОДИН РАЗ в combinedResult/profitCalc —
-            здесь только их разбивка по SKU, чтобы Σ чистая прибыль(SKU)
-            совпадала с основным итогом при полном покрытии себестоимостью.
-            Показывается, когда в распарсенном отчёте есть per-SKU строки. */}
+            налог + прочие ручные расходы) пропорционально net-выручке (после
+            возвратов); выплаты партнёров по SKU — НАПРЯМУЮ из per-SKU G−K
+            (reportLoyaltyPayoutPerSkuKnown=true), иначе fallback тем же
+            пропорциональным правилом. Те же суммы, что уже вычтены/прибавлены
+            РОВНО ОДИН РАЗ в combinedResult/profitCalc — здесь только их
+            разбивка по SKU, чтобы Σ чистая прибыль(SKU) совпадала с основным
+            итогом при полном покрытии себестоимостью И полных per-SKU данных
+            (productDetailComplete=true; иначе блок честно показывает
+            недоступность, см. OzonProductBreakdown). Показывается, когда в
+            распарсенном отчёте есть per-SKU строки. */}
         {reportProducts.length > 0 && (
           <OzonProductBreakdown
             products={reportProducts}
@@ -11950,7 +12030,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 : 0
             }
             loyaltyPayoutsTotal={combinedResult?.loyaltyPayouts ?? 0}
+            loyaltyPayoutPerSkuKnown={reportLoyaltyPayoutPerSkuKnown}
             payoutAdjustmentTotal={profitCalc?.payoutScheduleAdjustment ?? 0}
+            productDetailComplete={reportProductDetailComplete}
             user={user}
             onCogsTotal={handleReportCogsTotal}
             onKeyProducts={handleReportKeyProducts}
