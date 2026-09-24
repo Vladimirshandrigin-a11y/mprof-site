@@ -356,6 +356,14 @@ export async function POST(req: NextRequest) {
       remainingServices: tx.remainingServices,
       remainingOther: tx.remainingOther,
     },
+    // Additive: суммы операций accrual-источника, НЕ отнесённые к «Реклама»/
+    // «Компенсации» (нет справочника типов в этом запуске ИЛИ type_id не в
+    // известном наборе) — реальные суммы, а не подгонка остатком (см. doc-
+    // comment buildAccrualDraft, accrual.ts). У legacy это поле отсутствует
+    // (не появляется в snapshot вовсе) — старые записи истории не трогает.
+    ...(loaded.draft.unclassified && loaded.draft.unclassified.length > 0
+      ? { unclassified: loaded.draft.unclassified }
+      : {}),
   };
 
   const snapshot = {
