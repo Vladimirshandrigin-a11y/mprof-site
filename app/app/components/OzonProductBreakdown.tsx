@@ -796,7 +796,12 @@ export function OzonProductBreakdown({
                       data-label="Чистая маржа"
                     >
                       {r.margin === null ? (
-                        <span className="pb-dash">—</span>
+                        <span
+                          className="pb-dash"
+                          title="Маржа не рассчитывается при нулевой или отрицательной выручке"
+                        >
+                          —
+                        </span>
                       ) : (
                         <span className={r.margin >= 0 ? "pos" : "neg"}>
                           {r.margin.toFixed(1)}%
@@ -868,14 +873,23 @@ export function OzonProductBreakdown({
                         </div>
                         <div className="pba-stat">
                           <span className="pba-stat-l">Чистая маржа</span>
-                          <span
-                            className={
-                              "pba-stat-v " +
-                              ((bestProduct.margin ?? 0) >= 0 ? "pos" : "neg")
-                            }
-                          >
-                            {(bestProduct.margin ?? 0).toFixed(1)}%
-                          </span>
+                          {bestProduct.margin === null ? (
+                            <span
+                              className="pba-stat-v pb-dash"
+                              title="Маржа не рассчитывается при нулевой или отрицательной выручке"
+                            >
+                              —
+                            </span>
+                          ) : (
+                            <span
+                              className={
+                                "pba-stat-v " +
+                                (bestProduct.margin >= 0 ? "pos" : "neg")
+                              }
+                            >
+                              {bestProduct.margin.toFixed(1)}%
+                            </span>
+                          )}
                         </div>
                       </div>
                     </>
@@ -912,9 +926,18 @@ export function OzonProductBreakdown({
                         </div>
                         <div className="pba-stat">
                           <span className="pba-stat-l">Чистая маржа</span>
-                          <span className="pba-stat-v neg">
-                            {(worstProduct.margin ?? 0).toFixed(1)}%
-                          </span>
+                          {worstProduct.margin === null ? (
+                            <span
+                              className="pba-stat-v pb-dash"
+                              title="Маржа не рассчитывается при нулевой или отрицательной выручке"
+                            >
+                              —
+                            </span>
+                          ) : (
+                            <span className="pba-stat-v neg">
+                              {worstProduct.margin.toFixed(1)}%
+                            </span>
+                          )}
                         </div>
                       </div>
                     </>
@@ -1010,9 +1033,18 @@ export function OzonProductBreakdown({
                                 role="cell"
                                 data-label="Чистая маржа"
                               >
-                                <span className={(r.margin ?? 0) >= 0 ? "pos" : "neg"}>
-                                  {(r.margin ?? 0).toFixed(1)}%
-                                </span>
+                                {r.margin === null ? (
+                                  <span
+                                    className="pb-dash"
+                                    title="Маржа не рассчитывается при нулевой или отрицательной выручке"
+                                  >
+                                    —
+                                  </span>
+                                ) : (
+                                  <span className={r.margin >= 0 ? "pos" : "neg"}>
+                                    {r.margin.toFixed(1)}%
+                                  </span>
+                                )}
                               </span>
                             </div>
                           ))}
@@ -1111,9 +1143,16 @@ export function OzonProductBreakdown({
                                 role="cell"
                                 data-label="Чистая маржа"
                               >
-                                <span className="neg">
-                                  {(r.margin ?? 0).toFixed(1)}%
-                                </span>
+                                {r.margin === null ? (
+                                  <span
+                                    className="pb-dash"
+                                    title="Маржа не рассчитывается при нулевой или отрицательной выручке"
+                                  >
+                                    —
+                                  </span>
+                                ) : (
+                                  <span className="neg">{r.margin.toFixed(1)}%</span>
+                                )}
                               </span>
                             </div>
                           ))}
