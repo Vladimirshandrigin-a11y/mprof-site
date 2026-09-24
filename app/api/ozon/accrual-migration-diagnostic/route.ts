@@ -52,6 +52,16 @@ const DIAG_DEADLINE_MS = 40000;
 const TOTAL_MAX_REQUESTS = 150;
 const LEGACY_MAX_REQUESTS = 20; // fetchOzonTransactions: макс. 20 внутренних страниц
 const NEW_API_MAX_REQUESTS = TOTAL_MAX_REQUESTS - LEGACY_MAX_REQUESTS; // 130
+// ---- 429-ретрай (Retry-After, ограниченное число попыток, ограниченное время) ----
+// До MAX_429_RETRIES_PER_CALL повторов ОДНОГО и того же запроса при 429. Ждём
+// Retry-After (если Ozon его прислал), иначе RETRY_DEFAULT_WAIT_MS; ожидание
+// НИКОГДА не превышает RETRY_WAIT_CAP_MS и НИКОГДА не выходит за budget.deadline
+// (мягкий общий дедлайн диагностики не растягивается ретраями). Каждая попытка
+// (успешная или нет) считается как реальный запрос и учитывается в budget.used —
+// общий потолок ≤130/≤150 остаётся доказанным без изменений.
+const MAX_429_RETRIES_PER_CALL = 2;
+const RETRY_DEFAULT_WAIT_MS = 2000;
+const RETRY_WAIT_CAP_MS = 10000;
 
 type OzonHeaders = { "Client-Id": string; "Api-Key": string; "Content-Type": string };
 
@@ -62,19 +72,22 @@ type OzonHeaders = { "Client-Id": string; "Api-Key": string; "Content-Type": str
 type Budget = { used: number; lastStart: number; deadline: number };
 
 type FetchOut =
-  | { ok: true; status: number; json: unknown }
+  | { ok: true; status: number; json: unknown; retries?: number }
   | {
       ok: false;
       status: number;
       code: "invalid_key" | "forbidden" | "rate_limited" | "timeout" | "bad_response" | "unavailable" | "deadline";
       retryAfter?: number | null;
+      /** Сколько РЕАЛЬНЫХ повторов 429 было сделано для этого логического запроса
+       *  (0 — если retries не применялись/не понадобились). */
+      retries?: number;
     };
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ---- один безопасный POST к Ozon (никогда не бросает) ----
+// ---- одна попытка POST к Ozon (никогда не бросает) ----
 // Проходит через единый pacer/budget/deadline: параллельных запросов нет.
-async function ozonPost(
+async function ozonPostOnce(
   url: string,
   headers: OzonHeaders,
   body: unknown,
@@ -141,6 +154,45 @@ async function ozonPost(
   }
 }
 
+// ---- POST к Ozon с ограниченным ретраем на 429 (Retry-After, capped, bounded) ----
+// Один И ТОТ ЖЕ логический запрос повторяется до MAX_429_RETRIES_PER_CALL раз ТОЛЬКО
+// при code:"rate_limited". Ждём Retry-After (если прислан, иначе дефолт), но не
+// дольше RETRY_WAIT_CAP_MS. Ждём ЛИБО столько, сколько намеревались (полный,
+// возможно урезанный кэпом срок), ЛИБО не ждём вовсе: если оставшегося времени
+// до budget.deadline не хватает на ПОЛНЫЙ намеренный срок — сдаёмся СРАЗУ, а НЕ
+// ждём урезанный огрызок «сколько успеем». Урезанное ожидание не является честным
+// соблюдением Retry-After (Ozon попросил конкретный срок — либо выдерживаем его,
+// либо не претворяемся, что выдержали) и почти наверняка снова упрётся в 429,
+// впустую тратя бюджет запросов. Любая ДРУГАЯ ошибка (invalid_key/forbidden/
+// timeout/…) не ретраится — только 429 индицирует «подождать и попробовать ещё
+// раз». Каждая попытка (успех или нет) — реальный fetch, budget.used растёт как раньше.
+async function ozonPost(
+  url: string,
+  headers: OzonHeaders,
+  body: unknown,
+  budget: Budget
+): Promise<FetchOut> {
+  let last: FetchOut = { ok: false, status: 0, code: "unavailable" };
+  for (let attempt = 0; attempt <= MAX_429_RETRIES_PER_CALL; attempt++) {
+    const r = await ozonPostOnce(url, headers, body, budget);
+    if (r.ok || r.code !== "rate_limited") {
+      return attempt > 0 ? { ...r, retries: attempt } : r;
+    }
+    last = { ...r, retries: attempt };
+    if (attempt === MAX_429_RETRIES_PER_CALL) break; // повторы исчерпаны
+    const headerWaitMs =
+      typeof r.retryAfter === "number" ? Math.max(0, r.retryAfter * 1000) : RETRY_DEFAULT_WAIT_MS;
+    const intendedWaitMs = Math.min(headerWaitMs, RETRY_WAIT_CAP_MS);
+    const remainingMs = budget.deadline - Date.now();
+    // Не хватает времени, чтобы честно выдержать ПОЛНЫЙ (возможно, уже урезанный
+    // кэпом) намеренный срок — сдаёмся без попытки, а не ждём меньше положенного.
+    if (intendedWaitMs > remainingMs - 500) break;
+    if (intendedWaitMs > 0) await sleep(intendedWaitMs);
+    // intendedWaitMs===0 (Retry-After:0) → повторяем СРАЗУ, без sleep.
+  }
+  return last;
+}
+
 // ---- утилиты формы (ТОЛЬКО имена ключей + типы, никаких значений) ----
 function typeName(v: unknown): string {
   if (v === null) return "null";
@@ -190,8 +242,12 @@ function parseMoneyAmount(value: unknown): number | null {
 }
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
-// accrual_id — глобальный идентификатор ТИПА начисления (не posting/order). Принимаем
-// только конечное целое в разумном диапазоне; иначе null (в агрегате — безопасный count).
+// accrual_id — идентификатор КОНКРЕТНОЙ ЗАПИСИ начисления (по одному on by-day
+// record), НЕ идентификатор её ТИПА услуги. НЕ путать с type_id (см. ниже) —
+// type_id классифицирует ВИД услуги/комиссии и сверяется со справочником
+// /v1/finance/accrual/types; accrual_id этому справочнику не принадлежит и
+// против него не сверяется. Принимаем только конечное целое в разумном
+// диапазоне; иначе null (в агрегате — безопасный count).
 function safeAccrualId(v: unknown): number | null {
   if (typeof v !== "number" || !Number.isInteger(v) || !Number.isFinite(v)) return null;
   if (v < 0 || v > 1_000_000_000) return null;
@@ -202,6 +258,9 @@ function safeAccrualId(v: unknown): number | null {
 // Возвращает имя ВЗАИМОИСКЛЮЧАЮЩЕГО bucket. Классификация ПОЛНАЯ: любое значение попадает
 // ровно в один bucket, поэтому сумма всех bucket-счётчиков == числу by-day records. Само
 // значение ID наружу НЕ выходит — только имя bucket. Диапазоны не пересекаются.
+// Бакеты описывают ТОЛЬКО форму значения (знак/ноль/положительное) — БЕЗ деления
+// по «известному диапазону типов»: accrual_id не type_id и справочнику типов не
+// подчиняется (см. doc-comment safeAccrualId выше).
 function accrualIdBucket(v: unknown): string {
   if (v === undefined || v === null) return "missingOrNull";
   if (typeof v === "string") return "string";
@@ -209,9 +268,7 @@ function accrualIdBucket(v: unknown): string {
   if (!Number.isFinite(v) || !Number.isInteger(v)) return "numberNonFiniteOrFractional";
   if (v < 0) return "integerNegative";
   if (v === 0) return "integerZero";
-  if (v <= 119) return "integerKnownRange1To119"; // 1..119
-  if (v <= 1_000_000_000) return "integer120To1e9"; // 120..1e9 (граница 1e9 включительно)
-  return "integerAbove1e9"; // > 1e9
+  return "integerPositive";
 }
 const ACCRUAL_ID_BUCKET_KEYS = [
   "missingOrNull",
@@ -220,9 +277,7 @@ const ACCRUAL_ID_BUCKET_KEYS = [
   "numberNonFiniteOrFractional",
   "integerNegative",
   "integerZero",
-  "integerKnownRange1To119",
-  "integer120To1e9",
-  "integerAbove1e9",
+  "integerPositive",
 ] as const;
 function emptyAccrualIdBuckets(): Record<string, number> {
   const o: Record<string, number> = {};
@@ -231,40 +286,50 @@ function emptyAccrualIdBuckets(): Record<string, number> {
 }
 
 // ---- Evidence-классификатор taxonomy type_id (value-free) ----
-// type_id РАЗРЕШЕНО раскрывать ТОЛЬКО как целое 1..119 (глобальный справочник типов).
-// Всё прочее — только счётчик bucket, без значения. Классификация полная (сумма bucket-
-// счётчиков == числу учтённых records источника).
-function typeIdBucket(v: unknown): string {
+// type_id РАЗРЕШЕНО раскрывать ТОЛЬКО когда оно найдено в РЕАЛЬНО ПОЛУЧЕННОМ в
+// ЭТОМ запуске справочнике /v1/finance/accrual/types (known — Set известных
+// type_id ИЗ ЭТОГО справочника, не жёсткая граница 1..119: справочник растёт —
+// сейчас, например, 124 позиции, а не 119). known===null — справочник в этом
+// запуске не получен (skipTypes или сбой types) → доказать «известность» нечем,
+// ни одно значение НЕ раскрывается (dictionaryUnavailable), только форма.
+// known известен, но значения нет в нём → notInDictionary (может быть новый,
+// ещё не задокументированный тип — тоже не раскрываем, только bucket).
+// Классификация полная: сумма bucket-счётчиков == числу учтённых records источника.
+function typeIdBucket(v: unknown, known: ReadonlySet<number> | null): string {
   if (v === undefined || v === null) return "missingOrNull";
   if (typeof v === "string") return "string";
   if (typeof v !== "number") return "otherType";
   if (!Number.isFinite(v) || !Number.isInteger(v)) return "numberNonFiniteOrFractional";
-  if (v >= 1 && v <= 119) return "integerInRange1To119";
-  return "integerOutOfRange";
+  if (known === null) return "dictionaryUnavailable";
+  return known.has(v) ? "knownFromDictionary" : "notInDictionary";
 }
 const TYPE_ID_BUCKET_KEYS = [
   "missingOrNull",
   "string",
   "otherType",
   "numberNonFiniteOrFractional",
-  "integerInRange1To119",
-  "integerOutOfRange",
+  "dictionaryUnavailable",
+  "knownFromDictionary",
+  "notInDictionary",
 ] as const;
 function emptyTypeIdBuckets(): Record<string, number> {
   const o: Record<string, number> = {};
   for (const k of TYPE_ID_BUCKET_KEYS) o[k] = 0;
   return o;
 }
-// known type_id → целое 1..119, иначе null (значение не раскрываем).
-function knownTypeId(v: unknown): number | null {
+// known type_id → само значение ТОЛЬКО если оно есть в реально полученном
+// справочнике этого запуска; иначе null (значение не раскрываем).
+function knownTypeId(v: unknown, known: ReadonlySet<number> | null): number | null {
   if (typeof v !== "number" || !Number.isInteger(v) || !Number.isFinite(v)) return null;
-  return v >= 1 && v <= 119 ? v : null;
+  if (known === null) return null;
+  return known.has(v) ? v : null;
 }
 
 // ---- Аккумулятор taxonomy-evidence по ОДНОМУ источнику (NON_ITEM by-day ИЛИ posting nested) ----
 // records — знаменатель (сколько записей источника учтено); buckets — исчерпывающая
-// классификация type_id; byType — агрегаты ТОЛЬКО по известным 1..119. Денежные суммы
-// здесь — ТОЛЬКО classification evidence; в net-итог/comparison они НЕ входят.
+// классификация type_id; byType — агрегаты ТОЛЬКО по type_id из реально полученного
+// в этом запуске справочника. Денежные суммы здесь — ТОЛЬКО classification evidence;
+// в net-итог/comparison они НЕ входят.
 type TaxonomyEvidence = {
   records: number;
   buckets: Record<string, number>;
@@ -273,11 +338,16 @@ type TaxonomyEvidence = {
 function newTaxonomyEvidence(): TaxonomyEvidence {
   return { records: 0, buckets: emptyTypeIdBuckets(), byType: new Map() };
 }
-function addTaxonomyEvidence(ev: TaxonomyEvidence, typeIdRaw: unknown, amountRaw: unknown): void {
+function addTaxonomyEvidence(
+  ev: TaxonomyEvidence,
+  typeIdRaw: unknown,
+  amountRaw: unknown,
+  knownTypeIds: ReadonlySet<number> | null
+): void {
   ev.records += 1;
-  ev.buckets[typeIdBucket(typeIdRaw)] += 1;
-  const id = knownTypeId(typeIdRaw);
-  if (id === null) return; // out-of-range / unknown → только bucket, без значения и без суммы
+  ev.buckets[typeIdBucket(typeIdRaw, knownTypeIds)] += 1;
+  const id = knownTypeId(typeIdRaw, knownTypeIds);
+  if (id === null) return; // не из справочника / справочник недоступен → только bucket
   let g = ev.byType.get(id);
   if (!g) {
     g = { records: 0, parsed: 0, unparsed: 0, sum: 0 };
@@ -542,8 +612,13 @@ export async function POST(req: NextRequest) {
 
   // safe-код ошибки метода (без raw)
   const errCode = (r: FetchOut): string => (r.ok ? "ok" : r.code);
-  // Централизованная фиксация 429: ставим rateLimited и (один раз) retryAfterSeconds.
-  // После этого все следующие фазы и legacy НЕ выполняются.
+  // Фиксация 429: ставим rateLimited и (один раз) retryAfterSeconds — ТОЛЬКО для
+  // (а) честного truncated/fieldPresenceComplete/comparisonOk и (б) гейта legacy
+  // ниже. Каждая фаза САМА уже отретраила 429 внутри ozonPost (Retry-After,
+  // ограниченное число попыток) прежде чем вернуть rate_limited сюда — поэтому
+  // ОДНА фаза, упавшая по 429 после исчерпания ретраев, БОЛЬШЕ НЕ блокирует
+  // следующие независимые фазы (по-прежнему успевшие/успешные данные не
+  // перезапрашиваются и не отбрасываются).
   const noteRateLimit = (r: FetchOut) => {
     if (!r.ok && r.code === "rate_limited") {
       rateLimited = true;
@@ -552,31 +627,29 @@ export async function POST(req: NextRequest) {
       }
     }
   };
-  // Явный маркер фазы, пропущенной из-за уже случившегося 429.
-  const skippedMethod = (endpoint: string) => ({
-    endpoint,
-    status: 0,
-    skipped: true,
-    error: "rate_limited" as const,
-  });
 
   // ============== 1) accrual/types — ПЕРВЫЙ Ozon-запрос (finance-first), ==============
-  // ============== ЕСЛИ владелец не пропустил (справочник 119 типов уже собран). =======
+  // ============== ЕСЛИ владелец не пропустил (справочник типов уже собран). ===========
+  // knownTypeIds — Set type_id ИЗ РЕАЛЬНО ПОЛУЧЕННОГО в этом запуске справочника;
+  // null — справочник в этом запуске недоступен (skipTypes или сбой) → ниже ни
+  // один type_id НЕ раскрывается как «известный» (см. typeIdBucket/knownTypeId).
+  let knownTypeIds: Set<number> | null = null;
   if (skipTypes) {
-    // Явный owner-пропуск: types НЕ вызывается, budget не растёт, rateLimited/truncated
-    // НЕ выставляются. Первым РЕАЛЬНЫМ Ozon-запросом станет by-day. Пропуск (reason
-    // already_collected) намеренный → не считается незавершённостью плана.
+    // Явный owner-пропуск: types НЕ вызывается, budget не растёт, truncated
+    // НЕ выставляется. Пропуск (reason already_collected) намеренный → не
+    // считается незавершённостью плана. knownTypeIds остаётся null — в этом
+    // запуске справочника нет, byTypeId-значения type_id не раскрываются.
     methods.accrual_types = {
       endpoint: "/v1/finance/accrual/types",
       status: 0,
       skipped: true,
       reason: "already_collected",
     };
-  } else if (!rateLimited) {
+  } else {
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/types`, headers, undefined, budget);
     noteRateLimit(r);
     let count = 0;
-    let dictionary: Array<{ accrual_id: unknown; name: unknown; description: unknown }> = [];
+    let dictionary: Array<{ type_id: unknown; name: unknown; description: unknown }> = [];
     let schema: unknown = null;
     if (r.ok) {
       // типы могут лежать в result[] / types[] / accrual_types[] — берём мягко.
@@ -587,23 +660,41 @@ export async function POST(req: NextRequest) {
         : asArr(root.accrual_types);
       if (arr.length > 0) schema = keySchema(arr[0], 3);
       count = arr.length;
-      // Справочник типов — глобальная классификация (не персональные данные) → показываем.
+      // Справочник типов — глобальная классификация (не персональные данные) →
+      // показываем. Поле называем type_id (НЕ accrual_id — это разные сущности,
+      // см. doc-comment safeAccrualId): это словарь ВИДОВ услуги/комиссии.
       dictionary = arr.slice(0, 300).map((t) => {
         const o = asObj(t);
         return {
-          accrual_id: o.accrual_id ?? o.type_id ?? o.id ?? null,
+          type_id: o.type_id ?? o.accrual_id ?? o.id ?? null,
           name: o.name ?? o.title ?? null,
           description: o.description ?? o.desc ?? null,
         };
       });
+      // knownTypeIds строится из ЭТОГО же дерева (arr), а не из slice(0,300)-
+      // урезанного dictionary — справочник не настолько большой, чтобы урезание
+      // требовалось, но classification не должна зависеть от лимита показа.
+      const ids = new Set<number>();
+      for (const t of arr) {
+        const o = asObj(t);
+        const idRaw = o.type_id ?? o.accrual_id ?? o.id;
+        if (typeof idRaw === "number" && Number.isInteger(idRaw) && Number.isFinite(idRaw)) {
+          ids.add(idRaw);
+        }
+      }
+      if (ids.size > 0) knownTypeIds = ids;
     }
     methods.accrual_types = { endpoint: "/v1/finance/accrual/types", status: r.status, count, dictionary, schema, error: errCode(r) };
-  } else {
-    methods.accrual_types = skippedMethod("/v1/finance/accrual/types");
   }
 
   // ================= 2) accrual/by-day (finance-фаза, по дням месяца) =================
-  if (!rateLimited) {
+  // Гейта по rateLimited ПРЕДЫДУЩЕЙ фазы больше нет: by-day — независимый метод,
+  // пробуем его в любом случае (собственный pacer/budget/deadline внутри ozonPost
+  // остаются единственным ограничителем). Если 429 случится ЗДЕСЬ — это НЕ
+  // блокирует последующие фазы (FBO/FBS/accrual_postings), только помечает
+  // truncated и останавливает ДАЛЬНЕЙШИЕ дни этого месяца (уже полученные дни
+  // сохраняются, не отбрасываются и не перезапрашиваются).
+  {
     const days = daysOfMonth(month);
     let daysQueried = 0;
     let pages = 0;
@@ -612,6 +703,7 @@ export async function POST(req: NextRequest) {
     let containerFeesSum = 0;
     let containerFeesSeen = false;
     let truncated = false;
+    let dayFetchFailed = false; // 429/timeout/ошибка ПОСЛЕ retry — не просто "лимит страниц"
     let status = 0;
     let schema: unknown = null;
     let lastErr = "ok";
@@ -635,7 +727,9 @@ export async function POST(req: NextRequest) {
     const grossCandAccs = new Map<string, GrossCandAcc>(); // 3: аккумуляторы кандидатов gross
     for (const [name] of GROSS_CANDIDATE_PATHS) grossCandAccs.set(name, { present: 0, parsed: 0, unparsed: 0, sum: 0 });
     for (const day of days) {
-      if (rateLimited || Date.now() >= budget.deadline) break;
+      // dayFetchFailed — своя (не чужой фазы) персистентная неудача уже была в
+      // этом месяце → дальнейшие дни пробовать бессмысленно (see comment ниже).
+      if (dayFetchFailed || Date.now() >= budget.deadline) break;
       let lastId = "";
       for (let p = 0; p < BY_DAY_MAX_PAGES_PER_DAY; p++) {
         const r = await ozonPost(`${SELLER}/v1/finance/accrual/by-day`, headers, { date: day, last_id: lastId }, budget);
@@ -643,6 +737,11 @@ export async function POST(req: NextRequest) {
         lastErr = errCode(r);
         if (!r.ok) {
           noteRateLimit(r);
+          // Персистентная (после retry) неудача этого дня — весь месяц отдать
+          // как «завершённый» уже нельзя: помечаем truncated честно, а не
+          // молчаливым частичным итогом. Уже накопленные дни НЕ отбрасываются.
+          dayFetchFailed = true;
+          truncated = true;
           break;
         }
         // Безопасная форма первого 200-ответа — ДО парсинга (ключи+типы, без значений).
@@ -709,7 +808,7 @@ export async function POST(req: NextRequest) {
           // ---- Evidence B: NON_ITEM taxonomy по доказанному пути non_item_fee.type_id + .accrued.amount ----
           if (cat === "NON_ITEM") {
             const nif = asObj(o.non_item_fee);
-            addTaxonomyEvidence(nonItemEvidence, nif.type_id, asObj(nif.accrued).amount);
+            addTaxonomyEvidence(nonItemEvidence, nif.type_id, asObj(nif.accrued).amount, knownTypeIds);
           }
           // ---- Evidence D: глубокие type-only формы (responseShape, без scalar-значений) ----
           if (deepShapeItemFee === null) {
@@ -734,7 +833,7 @@ export async function POST(req: NextRequest) {
               const innerFees = asArr(asObj(g).fees);
               for (const f of innerFees) {
                 const fo = asObj(f);
-                addTaxonomyEvidence(itemEvidence, fo.type_id, asObj(fo.accrued).amount);
+                addTaxonomyEvidence(itemEvidence, fo.type_id, asObj(fo.accrued).amount, knownTypeIds);
               }
             }
           }
@@ -774,6 +873,11 @@ export async function POST(req: NextRequest) {
       }
       daysQueried += 1;
     }
+    // Честно: если обработали МЕНЬШЕ дней, чем в месяце (дедлайн/бюджет оборвали
+    // цикл до dayFetchFailed) — тоже truncated. sumTotalAmount ниже при
+    // truncated=true всё равно может быть "complete по распознаванию", но это
+    // НЕ то же самое, что "полный месяц" — comparison/gate ниже проверяют truncated отдельно.
+    if (daysQueried < days.length) truncated = true;
     // Полнота парсинга денежных значений: сумму отдаём ТОЛЬКО если ВСЕ amounts распознаны.
     const byDayAmountComplete = unparsedAmounts === 0;
     const accrualAggregates = Array.from(aggMap.values())
@@ -824,7 +928,13 @@ export async function POST(req: NextRequest) {
       days: daysQueried,
       pages,
       records,
-      sumTotalAmount: byDayAmountComplete ? round2(sumTotalAmount) : null,
+      // sumTotalAmount — ТОЛЬКО когда И все суммы распознаны (byDayAmountComplete),
+      // И месяц реально пройден целиком (!truncated) — иначе это была бы сумма
+      // ЧАСТИ месяца, выданная за итог всего месяца (провал → не подтверждённый
+      // «полный» результат).
+      sumTotalAmount: byDayAmountComplete && !truncated ? round2(sumTotalAmount) : null,
+      // complete — ТОЛЬКО про распознавание уже полученных сумм; за полноту
+      // ФЕТЧА месяца отвечает соседнее поле truncated (см. sumTotalAmount выше).
       amountParsing: { totalRecords: records, parsed: parsedAmounts, unparsed: unparsedAmounts, complete: byDayAmountComplete },
       accrualAggregates,
       accrualAggregatesTruncated: aggTruncated,
@@ -843,7 +953,8 @@ export async function POST(req: NextRequest) {
         posting_product: deepShapePostingProduct,
         container_fees: deepShapeContainerFee,
       },
-      // 2: ITEM taxonomy по item_fees.fees[].type_id (type_id наружу только 1–119).
+      // 2: ITEM taxonomy по item_fees.fees[].type_id (type_id наружу только из
+      // реально полученного в ЭТОМ запуске справочника /v1/finance/accrual/types).
       itemTaxonomy: {
         records: itemTaxonomy.records,
         typeIdEvidence: itemTaxonomy.typeIdEvidence,
@@ -858,12 +969,12 @@ export async function POST(req: NextRequest) {
       truncated,
       error: lastErr,
     };
-  } else {
-    methods.accrual_by_day = skippedMethod("/v1/finance/accrual/by-day");
   }
 
   // ===================== 3) FBO /v3/posting/fbo/list (справочный) =====================
-  if (!rateLimited) {
+  // Независимая фаза — пробуем даже если предыдущая (by-day) уже отметила
+  // rateLimited после исчерпания собственных ретраев.
+  {
     let cursor = "";
     let pages = 0;
     let records = 0;
@@ -917,12 +1028,11 @@ export async function POST(req: NextRequest) {
       if (p === FBO_MAX_PAGES - 1 && hasNext) truncated = true;
     }
     methods.fbo_v3 = { endpoint: "/v3/posting/fbo/list", status, pages, records, schema, responseShape: fboShape, truncated, error: lastErr };
-  } else {
-    methods.fbo_v3 = skippedMethod("/v3/posting/fbo/list");
   }
 
   // ===================== 4) FBS /v4/posting/fbs/list (справочный) =====================
-  if (!rateLimited) {
+  // Независимая фаза — пробуем даже если ранее уже была отметка rateLimited.
+  {
     let cursor = "";
     let pages = 0;
     let records = 0;
@@ -972,14 +1082,12 @@ export async function POST(req: NextRequest) {
       if (p === FBS_MAX_PAGES - 1 && hasNext) truncated = true;
     }
     methods.fbs_v4 = { endpoint: "/v4/posting/fbs/list", status, pages, records, schema, responseShape: fbsShape, truncated, error: lastErr };
-  } else {
-    methods.fbs_v4 = skippedMethod("/v4/posting/fbs/list");
   }
 
   // ========= 5) accrual/postings — только после posting_numbers из FBO/FBS ===========
-  if (rateLimited) {
-    methods.accrual_postings = skippedMethod("/v1/finance/accrual/postings");
-  } else if (postingNumbers.length > 0) {
+  // Независимая фаза — пробуем даже если ранее уже была отметка rateLimited
+  // (собственный ozonPost() уже отретраил 429 внутри себя с учётом Retry-After).
+  if (postingNumbers.length > 0) {
     const batch = postingNumbers.slice(0, MAX_POSTING_NUMBERS);
     const r = await ozonPost(`${SELLER}/v1/finance/accrual/postings`, headers, { posting_numbers: batch }, budget);
     noteRateLimit(r);
@@ -1016,7 +1124,7 @@ export async function POST(req: NextRequest) {
             if (schema === null) schema = keySchema(o, 3); // первый реальный nested accrual (type-only)
             records += 1;
             // C: taxonomy-evidence по nested type_id + .accrued.amount (доказанный путь; в net не входит).
-            addTaxonomyEvidence(postingEvidence, o.type_id, asObj(o.accrued).amount);
+            addTaxonomyEvidence(postingEvidence, o.type_id, asObj(o.accrued).amount, knownTypeIds);
             // 4: grand-total accrued (все типы) — только evidence, в net/comparison не входит.
             {
               const pa = parseMoneyAmount(asObj(o.accrued).amount);
@@ -1052,6 +1160,12 @@ export async function POST(req: NextRequest) {
       }
     }
     const postingTaxonomy = finalizeTaxonomyEvidence(postingEvidence);
+    // r.ok===false (429/timeout/…, после исчерпания ретраев) → НИЧЕГО ниже не
+    // было реально получено. records/postAcc*/postingTaxonomy все остались на
+    // своих инициализирующих значениях (0/пусто) — но это НЕ «подтверждённый
+    // ноль», а «неизвестно», поэтому available:false + total/complete не
+    // изображают завершённость. Без этой развилки total получался бы round2(0)=0
+    // и complete=true даже при полном провале запроса — ложный «подтверждённый ноль».
     methods.accrual_postings = {
       endpoint: "/v1/finance/accrual/postings",
       status: r.status,
@@ -1063,18 +1177,22 @@ export async function POST(req: NextRequest) {
       postingLinkedRecords,
       // C: taxonomy по posting_accruals[].accruals[].type_id (Σ buckets == учтённые nested records).
       postingTaxonomy: {
+        available: r.ok,
         records: postingTaxonomy.records,
         typeIdEvidence: postingTaxonomy.typeIdEvidence,
         byTypeId: postingTaxonomy.byTypeId,
       },
       // 4: grand-total nested accrued.amount (все типы) + полнота; в net не входит.
-      nestedAccruedTotal: {
-        records,
-        parsed: postAccParsed,
-        unparsed: postAccUnparsed,
-        total: postAccUnparsed === 0 ? round2(postAccSum) : null,
-        complete: postAccUnparsed === 0,
-      },
+      nestedAccruedTotal: r.ok
+        ? {
+            available: true,
+            records,
+            parsed: postAccParsed,
+            unparsed: postAccUnparsed,
+            total: postAccUnparsed === 0 ? round2(postAccSum) : null,
+            complete: postAccUnparsed === 0,
+          }
+        : { available: false, records: 0, parsed: 0, unparsed: 0, total: null, complete: false },
       accruedCategories: Array.from(categories).sort(),
       schemasByAccruedCategory: Array.from(postCatSchemas.entries())
         .map(([accrued_category, v]) => ({ accrued_category, records: v.records, schema: v.schema }))
