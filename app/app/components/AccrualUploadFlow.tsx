@@ -183,6 +183,14 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
         )}
       </div>
 
+      {s.otherHeldCredits > 0 && (
+        <p className="accr-held-note" role="status">
+          {s.otherHeldCredits === 1
+            ? "Для другого файла попытка уже списана, но расчёт не записан. Этот файл её не наследует: для него попытка спишется отдельно. Вернувшись к прежнему файлу (пока страница открыта), вы сохраните его без нового списания."
+            : `Для ${s.otherHeldCredits} других файлов попытки уже списаны, но расчёты не записаны. Этот файл их не наследует: для него попытка спишется отдельно. Вернувшись к прежним файлам (пока страница открыта), вы сохраните их без нового списания.`}
+        </p>
+      )}
+
       {s.phase === "error" && s.errors.length > 0 && (
         <div className="upload-3-error" role="alert">
           <div className="upload-3-error-title">Не удалось обработать файл</div>
@@ -408,9 +416,9 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
           <div className="accr-save">
             <p className="accr-save-hint">
               {s.saved
-                ? "Расчёт уже в истории. Повторное сохранение обновляет ту же запись и попытку не списывает."
+                ? "Расчёт уже в истории. Повторное нажатие без изменений ничего не пишет; после правки значений запись обновится без нового списания."
                 : s.creditHeld
-                ? "Попытка расчёта уже списана — повторное сохранение не спишет её снова."
+                ? "Попытка по этому файлу уже списана, но расчёт не записан — повторное сохранение не спишет её снова."
                 : "Сохранение засчитывается как один расчёт по вашему тарифу (при безлимите попытки не расходуются). Отмена и ошибки до сохранения попытку не списывают."}
             </p>
             <button
@@ -475,6 +483,8 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
   .accr-st.err{color:#f0a4a4}
   .accr-file-actions{display:flex;flex-wrap:wrap;gap:.5rem;justify-content:center;margin-top:.3rem}
   .accr-noconsume{color:var(--gold2)}
+  .accr-held-note{margin:.7rem 0 0;padding:.6rem .8rem;border-radius:10px;font-size:.76rem;line-height:1.45;
+    color:#f0cd84;border:1px solid rgba(232,176,75,.32);background:rgba(232,176,75,.07)}
   .accr-notes{list-style:none;margin:.8rem 0 0;padding:0;display:flex;flex-direction:column;gap:.4rem}
   .accr-notes li{font-size:.76rem;line-height:1.45;color:var(--txt2);padding:.5rem .75rem;border-radius:9px;
     border:1px solid var(--edge);background:rgba(255,255,255,.02)}

@@ -5,7 +5,8 @@
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function makeMockCloud(over = {}) {
-  const log = { consume: 0, canCalc: 0, dup: 0, inserts: [], updates: [], histories: [] };
+  // inserts/updates/histories — только УСПЕШНЫЕ записи; *Try — все обращения, включая отказы.
+  const log = { consume: 0, canCalc: 0, dup: 0, insertTry: 0, updateTry: 0, historyTry: 0, inserts: [], updates: [], histories: [] };
   const cfg = {
     consumeOk: true,
     canCalculate: true,
@@ -36,6 +37,7 @@ export function makeMockCloud(over = {}) {
       return cfg.consumeOk ? { ok: true } : { ok: false, reason: "limit_reached" };
     },
     insertCalculation: async (cols) => {
+      log.insertTry++;
       if (cfg.delayMs) await sleep(cfg.delayMs);
       if (cfg.insertError) return { data: null, error: { message: cfg.insertError } };
       const row = { id: `calc-${++seq}`, created_at: "2026-07-01T10:00:00.000Z" };
@@ -44,6 +46,7 @@ export function makeMockCloud(over = {}) {
       return { data: row, error: null };
     },
     updateCalculation: async (id, cols) => {
+      log.updateTry++;
       if (cfg.delayMs) await sleep(cfg.delayMs);
       if (cfg.updateError) return { data: null, error: { message: cfg.updateError } };
       const prev = rows.get(id);
@@ -53,6 +56,7 @@ export function makeMockCloud(over = {}) {
       return { data: { id, created_at: prev.created_at }, error: null };
     },
     insertReportHistory: async (cols) => {
+      log.historyTry++;
       if (cfg.historyError) return { data: null, error: { message: cfg.historyError } };
       log.histories.push(clone(cols));
       return { data: {}, error: null };
@@ -60,5 +64,20 @@ export function makeMockCloud(over = {}) {
     newLocalId: () => `local-${++seq}`,
     nowIso: () => "2026-07-01T10:00:00.000Z",
   };
-  return { deps, log, rows, cfg };
+  /**
+   * Компактные счётчики всех побочных эффектов: списание, дубль-гард, обращения к записи
+   * (вместе с отказами) и успешно созданные строки calculations / report_history.
+   */
+  const counts = () => ({
+    consume: log.consume,
+    dup: log.dup,
+    insertTry: log.insertTry,
+    inserts: log.inserts.length,
+    updateTry: log.updateTry,
+    updates: log.updates.length,
+    historyTry: log.historyTry,
+    histories: log.histories.length,
+    calcRows: rows.size,
+  });
+  return { deps, log, rows, cfg, counts };
 }

@@ -11,6 +11,7 @@ import { computeAccrualProfit, type AccrualManualExpenses, type AccrualProfitCal
 import { buildAccrualSnapshot, type AccrualSnapshotV1 } from "./snapshot";
 import { pluralRu } from "./format";
 import type { CatalogEntry } from "../product-breakdown-calc";
+import type { SaveOutcome } from "./save-flow";
 
 // ---------------------------------------------------------------------------
 // Файл
@@ -230,4 +231,126 @@ export function evaluateAccrual(args: EvaluateArgs): AccrualEvaluation {
     notes,
     readyToSave: calc.readyToSave && blockers.length === 0,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Попытка расчёта = один загруженный файл
+// ---------------------------------------------------------------------------
+
+/** 53-битный строковый хэш (cyrb53): без crypto, синхронный, одинаков в браузере и Node. */
+function hash53(str: string, seed = 0): number {
+  let h1 = 0xdeadbeef ^ seed;
+  let h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+/**
+ * Отпечаток разобранного отчёта — идентичность «попытки расчёта». Тот же файл
+ * (то же содержимое строк и период) даёт тот же отпечаток; другой файл — другой.
+ * Ручные вводы и каталог в отпечаток НЕ входят: их правка остаётся в рамках попытки.
+ */
+export function reportFingerprint(report: Pick<AccrualParsedReport, "rows" | "period" | "rowCount">): string {
+  const body = JSON.stringify([report.period, report.rows]);
+  return `${report.period.month}:${report.rowCount}:${hash53(body).toString(36)}:${hash53(body, 7).toString(36)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Результат сохранения → что показать на экране (чистая функция, без React)
+// ---------------------------------------------------------------------------
+
+export interface SaveOutcomeUi {
+  note: { kind: "ok" | "warn" | "err"; text: string } | null;
+  /** true/false — выставить кнопку «Повторить сохранение»; null — не менять. */
+  needsRetry: boolean | null;
+  /** Зафиксировать содержимое как сохранённое (кнопка «Расчёт сохранён ✓»). */
+  markSaved: boolean;
+  /** Сообщить странице о записи (обновить историю и аналитику). */
+  emitSaved: boolean;
+  /** Сводка по месяцам записана — можно обновить «Аналитику по месяцам». */
+  historyRecorded: boolean;
+  openPaywall: boolean;
+  toast: { text: string; type: "ok" | "warn" | "err" } | null;
+}
+
+const UI_NONE: SaveOutcomeUi = {
+  note: null,
+  needsRetry: null,
+  markSaved: false,
+  emitSaved: false,
+  historyRecorded: false,
+  openPaywall: false,
+  toast: null,
+};
+
+export function saveOutcomeUi(out: SaveOutcome): SaveOutcomeUi {
+  switch (out.status) {
+    case "busy":
+      return UI_NONE;
+    case "not_ready":
+      return { ...UI_NONE, note: { kind: "warn", text: out.reason } };
+    case "cancelled":
+      return {
+        ...UI_NONE,
+        note: { kind: "warn", text: "Сохранение отменено. Попытка расчёта не списана, запись не создана." },
+      };
+    case "paywall":
+      return {
+        ...UI_NONE,
+        openPaywall: true,
+        note: {
+          kind: "warn",
+          text: out.reason
+            ? `Не удалось списать попытку расчёта (${out.reason}). Расчёт не сохранён, попытка не списана.`
+            : "Нет доступной попытки расчёта. Расчёт не сохранён, попытка не списана.",
+        },
+      };
+    case "save_failed":
+      return {
+        ...UI_NONE,
+        needsRetry: true,
+        note: {
+          kind: "err",
+          text: `Не удалось сохранить расчёт: ${out.error}. Попытка расчёта уже списана и закреплена за этим расчётом — повторное сохранение не спишет её снова.`,
+        },
+        toast: { text: "Не удалось сохранить расчёт", type: "err" },
+      };
+    case "unchanged":
+      return {
+        ...UI_NONE,
+        needsRetry: false,
+        markSaved: true,
+        note: { kind: "ok", text: "Расчёт уже сохранён, изменений нет — повторная запись не создана и попытка не списывалась." },
+      };
+    case "saved": {
+      const historyFailed = out.historyWrite === "failed";
+      const text = out.local
+        ? "Расчёт сохранён только на этом устройстве: войдите в аккаунт, чтобы он попал в историю."
+        : historyFailed
+        ? (out.historyWarning ?? "Расчёт сохранён, но сводка по месяцам не обновилась.")
+        : out.calculationWrite === "insert"
+        ? "Расчёт сохранён в историю."
+        : out.calculationWrite === "update"
+        ? "Изменения сохранены. Попытка не списывалась повторно."
+        : "Сводка по месяцам дописана. Расчёт уже был сохранён — повторной записи и списания нет.";
+      return {
+        note: { kind: out.local || historyFailed ? "warn" : "ok", text },
+        needsRetry: historyFailed,
+        markSaved: true,
+        emitSaved: true,
+        historyRecorded: !out.local && !historyFailed,
+        openPaywall: false,
+        toast: {
+          text: out.local ? "Расчёт сохранён локально" : "Расчёт сохранён",
+          type: out.local || historyFailed ? "warn" : "ok",
+        },
+      };
+    }
+  }
 }

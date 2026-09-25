@@ -15,6 +15,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AccrualSaveController,
+  snapshotContentKey,
   type AccrualSaveDeps,
   type CloudResult,
   type CloudRow,
@@ -26,6 +27,8 @@ import {
   EMPTY_ACCRUAL_INPUTS,
   evaluateAccrual,
   formatParseErrors,
+  reportFingerprint,
+  saveOutcomeUi,
   validateAccrualFile,
   type AccrualEvaluation,
   type AccrualParsedReport,
@@ -121,11 +124,6 @@ function resolveServices(o: AccrualUploadSessionOptions): AccrualUploadServices 
   return { ...DEFAULT_SERVICES, ...o.services };
 }
 
-/** Ключ «содержимого» снимка без времени формирования — чтобы отличать правки вводов. */
-function snapshotKey(s: AccrualSnapshotV1): string {
-  return JSON.stringify({ ...s, generatedAt: null });
-}
-
 function makeLocalId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return "local-" + crypto.randomUUID();
   return "local-" + Math.random().toString(36).slice(2, 10);
@@ -154,8 +152,10 @@ export interface AccrualUploadSession {
   dirty: boolean;
   /** Последнее сохранение не завершилось полностью (ошибка записи или сводки) — доступен повтор. */
   needsRetry: boolean;
-  /** Попытка списана, но расчёт не записан (повтор сохранения не спишет снова). */
+  /** Попытка ЭТОГО файла списана, но расчёт не записан (повтор сохранения не спишет снова). */
   creditHeld: boolean;
+  /** Сколько списанных, но не записанных попыток ждут ДРУГИХ файлов (эти файлы не наследуют списание). */
+  otherHeldCredits: number;
   downloadPdf: () => Promise<void>;
   pdfBusy: boolean;
 }
@@ -198,6 +198,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   const [saveNote, setSaveNote] = useState<SaveNote | null>(null);
   const [savedKey, setSavedKey] = useState<string | null>(null);
   const [creditHeld, setCreditHeld] = useState(false);
+  const [otherHeldCredits, setOtherHeldCredits] = useState(0);
   const [needsRetry, setNeedsRetry] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const reqRef = useRef(0);
@@ -226,8 +227,20 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     );
   };
 
+  /** Подтянуть в состояние экрана то, что известно контроллеру о текущей и «чужих» попытках. */
+  const syncAttemptState = (controller: AccrualSaveController): void => {
+    const st = controller.state;
+    setCreditHeld(st.paid && st.saved === null);
+    setOtherHeldCredits(controller.heldElsewhere);
+  };
+
   const chooseFile = async (f: File | null | undefined): Promise<void> => {
     if (!f) return;
+    if (savingRef.current) {
+      // Сменить файл посреди сохранения нельзя: запись ушла бы в чужой расчёт.
+      setSaveNote({ kind: "warn", text: "Дождитесь завершения сохранения, затем выберите другой файл." });
+      return;
+    }
     const req = ++reqRef.current;
     setSaveNote(null);
     const check = validateAccrualFile(f);
@@ -238,9 +251,11 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
       setErrors([check.message]);
       return;
     }
+    // Другой файл — другая попытка: она НЕ наследует отметку «списано» прежней. Списанная,
+    // но не записанная попытка прежнего файла остаётся за ним (вернётся вместе с файлом).
     const controller = getController();
-    controller.startNewFile();
-    setCreditHeld(controller.state.paid);
+    controller.beginAttempt(null);
+    syncAttemptState(controller);
     setNeedsRetry(false);
     setSavedKey(null);
     setFile({ name: f.name, size: f.size });
@@ -265,23 +280,32 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
       setErrors(formatParseErrors(res.errors));
       return;
     }
-    setParsed({
+    const report: AccrualParsedReport = {
       rows: res.report.rows,
       period: res.report.period,
       warnings: res.warnings,
       sheet: res.report.sheetName,
       rowCount: res.report.summary.rowCount,
-    });
+    };
+    // Тот же файл, что уже был списан, но не записан, возвращает СВОЮ попытку (без нового списания).
+    controller.beginAttempt(reportFingerprint(report));
+    syncAttemptState(controller);
+    setNeedsRetry(controller.state.paid && controller.state.saved === null);
+    setParsed(report);
     setParsedAt(new Date().toISOString());
     setPhase("ready");
     await loadCatalogFor(req);
   };
 
   const clearFile = () => {
+    if (savingRef.current) {
+      setSaveNote({ kind: "warn", text: "Дождитесь завершения сохранения, затем уберите файл." });
+      return;
+    }
     reqRef.current++;
     const controller = getController();
-    controller.startNewFile();
-    setCreditHeld(controller.state.paid);
+    controller.beginAttempt(null);
+    syncAttemptState(controller);
     setNeedsRetry(false);
     setFile(null);
     setParsed(null);
@@ -305,7 +329,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     return evaluateAccrual({ report: parsed, catalog: catalog.entries, inputs, generatedAt: parsedAt });
   }, [parsed, catalog, inputs, parsedAt]);
 
-  const currentKey = evaluation && evaluation.status === "ok" ? snapshotKey(evaluation.snapshot) : null;
+  const currentKey = evaluation && evaluation.status === "ok" ? snapshotContentKey(evaluation.snapshot) : null;
   const saved = savedKey !== null;
   const dirty = saved && currentKey !== null && currentKey !== savedKey;
 
@@ -324,53 +348,23 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
       const st = controller.state;
       if (st.saved && !o.isRowPresent(st.saved.id)) controller.forgetSaved();
       const out = await controller.save({ snapshot: ev.snapshot, ready: ev.readyToSave, userId: o.userId });
-      setCreditHeld(controller.state.paid && controller.state.saved === null);
-      switch (out.status) {
-        case "busy":
-          break;
-        case "not_ready":
-          setSaveNote({ kind: "warn", text: out.reason });
-          break;
-        case "cancelled":
-          setSaveNote({ kind: "warn", text: "Сохранение отменено. Попытка расчёта не списана, запись не создана." });
-          break;
-        case "paywall":
-          setSaveNote({
-            kind: "warn",
-            text: out.reason
-              ? `Не удалось списать попытку расчёта (${out.reason}). Расчёт не сохранён, попытка не списана.`
-              : "Нет доступной попытки расчёта. Расчёт не сохранён, попытка не списана.",
-          });
-          o.onPaywall();
-          break;
-        case "save_failed":
-          setNeedsRetry(true);
-          setSaveNote({
-            kind: "err",
-            text: `Не удалось сохранить расчёт: ${out.error}. Попытка расчёта уже списана и закреплена за этим расчётом — повторное сохранение не спишет её снова.`,
-          });
-          toast("Не удалось сохранить расчёт", "err");
-          break;
-        case "saved":
-          setNeedsRetry(out.historyWarning !== null);
-          setSavedKey(snapshotKey(ev.snapshot));
-          setSaveNote(
-            out.historyWarning
-              ? { kind: "warn", text: out.historyWarning }
-              : out.local
-              ? { kind: "warn", text: "Расчёт сохранён только на этом устройстве: войдите в аккаунт, чтобы он попал в историю." }
-              : { kind: "ok", text: out.created ? "Расчёт сохранён в историю." : "Изменения сохранены. Попытка не списывалась повторно." }
-          );
-          o.onSaved({
-            row: out.row,
-            columns: out.columns,
-            created: out.created,
-            local: out.local,
-            historyRecorded: !out.local && out.historyWarning === null,
-          });
-          toast(out.local ? "Расчёт сохранён локально" : "Расчёт сохранён", out.local || out.historyWarning ? "warn" : "ok");
-          break;
+      syncAttemptState(controller);
+      // Что показать — решает чистая saveOutcomeUi (покрыта тестами); хук только применяет.
+      const ui = saveOutcomeUi(out);
+      if (ui.needsRetry !== null) setNeedsRetry(ui.needsRetry);
+      if (ui.markSaved) setSavedKey(snapshotContentKey(ev.snapshot));
+      setSaveNote(ui.note);
+      if (ui.openPaywall) o.onPaywall();
+      if (ui.emitSaved && out.status === "saved") {
+        o.onSaved({
+          row: out.row,
+          columns: out.columns,
+          created: out.created,
+          local: out.local,
+          historyRecorded: ui.historyRecorded,
+        });
       }
+      if (ui.toast) toast(ui.toast.text, ui.toast.type);
     } finally {
       savingRef.current = false;
       setSaving(false);
@@ -410,6 +404,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     dirty,
     needsRetry,
     creditHeld,
+    otherHeldCredits,
     downloadPdf,
     pdfBusy,
   };
