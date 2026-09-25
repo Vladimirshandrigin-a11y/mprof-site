@@ -61,7 +61,12 @@ const LEGACY_FINANCE_SOURCE: FinanceSourceMeta = {
 //                         историю/отчёты идёт сумма в ₽)
 //   manualExpensesTotal = taxAmount + packaging + warehouseDelivery + salary + other
 //   netProfit           = profitBeforeManualExpenses − manualExpensesTotal
-//   margin              = ozonOperationsTotal > 0 ? netProfit/ozonOperationsTotal*100 : 0
+//   margin              = taxRevenueBase > 0 ? netProfit/taxRevenueBase*100 : 0
+//                         (маржинальность — от ВЫРУЧКИ ПОСЛЕ ВОЗВРАТОВ, той же
+//                         базы, что и налог, а НЕ от «Итого Ozon» — оно включает
+//                         логистику/комиссию/рекламу и т.п., это не выручка;
+//                         исправлено после живой сверки: 24.72% по старой
+//                         формуле vs верные 22.75% на реальных июньских числах)
 //
 // ИСТОЧНИК СЕБЕСТОИМОСТИ (боевой): отчёт о реализации Ozon (тот же источник, что и
 // документальный расчёт), а НЕ отправления (postings delivered-only). Себестоимость
@@ -304,8 +309,15 @@ export function computeApiProfit(
   );
 
   const netProfit = round2(profitBeforeManualExpenses - manualExpensesTotal);
+  // Маржинальность = чистая прибыль / ВЫРУЧКА ПОСЛЕ ВОЗВРАТОВ (taxRevenueBase —
+  // та же база, от которой считается налог, см. выше), а НЕ от «Итого Ozon»
+  // (ozonOperationsTotal включает логистику/комиссию/рекламу и т.п. — это не
+  // выручка). Живой июньский пример подтвердил ошибку старой формулы: 24.7%
+  // (netProfit/ozonOperationsTotal) вместо верных 22.75% (netProfit/taxRevenueBase,
+  // 93138.40/409403.80). netProfit/себестоимость/налог/начисления Ozon этой
+  // правкой НЕ затронуты — меняется только знаменатель margin.
   const margin =
-    ozonOperationsTotal > 0 ? round2((netProfit / ozonOperationsTotal) * 100) : 0;
+    taxRevenueBase > 0 ? round2((netProfit / taxRevenueBase) * 100) : 0;
 
   // Себестоимость из реализации приходит уже полной (валидатор отсёк неполноту),
   // поэтому complete_cost при cost>0. Защитный no_cost — если по какой-то причине
