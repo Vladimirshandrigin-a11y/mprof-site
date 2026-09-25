@@ -29,6 +29,9 @@ export const calc = req("./accrual/profit-calc.js");
 export const money = req("./accrual/money.js");
 export const buckets = req("./accrual/buckets.js");
 export const analytics = req("./accrual/product-analytics.js");
+export const snapshot = req("./accrual/snapshot.js");
+export const pdfModel = req("./accrual/pdf-model.js");
+export const format = req("./accrual/format.js");
 export const XLSX = req("xlsx");
 
 /** Разбор XLSX-буфера настоящим парсером проекта. */

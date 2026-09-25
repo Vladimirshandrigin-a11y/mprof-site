@@ -18,11 +18,14 @@
 // значения. Парсеры, загрузка файлов, оплата, Supabase и PDF не затрагиваются.
 // ============================================================================
 
+import type { AccrualChargeCategories } from "../lib/accrual/snapshot";
+
 interface ProductRef {
   article: string;
   name: string;
   profit: number;
-  margin: number;
+  /** null — маржа товара не определена (показывается «—»). */
+  margin: number | null;
 }
 
 export interface ProfitRecommendationsProps {
@@ -60,6 +63,18 @@ export interface ProfitRecommendationsProps {
   best: ProductRef | null;
   /** Самый убыточный / слабый товар. null — нет данных. */
   worst: ProductRef | null;
+  /**
+   * Только для расчёта по «Отчёту по начислениям»: реальные категории начислений
+   * (списания, ₽) ВМЕСТО УПД. Когда задано, updServicesTotal/updCommissionTotal
+   * игнорируются (там 0 — УПД в этом режиме нет и не выдумывается), а доли
+   * считаются от accrualCategories.shareBase.
+   */
+  accrualCategories?: AccrualChargeCategories;
+  /**
+   * false — маржа не определена (реализация ≤ 0): вывод строится по знаку
+   * прибыли, без порогов по марже. undefined/true — маржа известна (как раньше).
+   */
+  marginKnown?: boolean;
 }
 
 // ── Форматтеры ──────────────────────────────────────────────────────────────
@@ -72,6 +87,10 @@ function fmtSigned(n: number): string {
 }
 function pct(n: number): string {
   return n.toLocaleString("ru-RU", { maximumFractionDigits: 1 }) + "%";
+}
+/** Процент или «—» для неопределимой маржи. */
+function pctOrDash(n: number | null): string {
+  return n === null ? "\u2014" : pct(n);
 }
 function shortName(s: string, max = 44): string {
   const t = (s || "").trim() || "Без названия";
@@ -120,7 +139,10 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
     coverage,
     best,
     worst,
+    accrualCategories,
+    marginKnown,
   } = props;
+  const marginIsKnown = marginKnown !== false;
 
   // ── Состояние 1: отчёт ещё не загружен/не распознан ──
   if (!hasReport) {
@@ -178,11 +200,19 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
   }
 
   // ── Производные доли (только интерпретация готовых сумм) ──
-  const updTotal = updServicesTotal + updCommissionTotal;
-  const shareOf = (v: number) => (revenue > 0 ? (v / revenue) * 100 : 0);
+  const acc = accrualCategories;
+  const shareBase = acc ? acc.shareBase : revenue;
+  const shareOf = (v: number) => (shareBase > 0 ? (v / shareBase) * 100 : 0);
+  // Расчёт по начислениям: «услуги» = реклама и продвижение, «комиссия» =
+  // вознаграждение Ozon, «расходы Ozon» = все списания категорий. Иначе — УПД.
+  const servicesAmount = acc ? acc.advertising : updServicesTotal;
+  const commissionAmount = acc ? acc.commission : updCommissionTotal;
+  const updTotal = acc
+    ? acc.commission + acc.logistics + acc.advertising + acc.other
+    : updServicesTotal + updCommissionTotal;
   const updShare = shareOf(updTotal);
-  const servicesShare = shareOf(updServicesTotal);
-  const commissionShare = shareOf(updCommissionTotal);
+  const servicesShare = shareOf(servicesAmount);
+  const commissionShare = shareOf(commissionAmount);
   const costShare = shareOf(costPrice);
   const otherShare = shareOf(otherExpenses);
 
@@ -199,6 +229,10 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
     verdict = `Чистый убыток ${fmtRub(Math.abs(netProfit))} при выручке ${fmtRub(
       revenue
     )}. Это не приговор: ниже видно, какие расходы и товары увели прибыль в минус — начните с них.`;
+  } else if (!marginIsKnown) {
+    tone = "ok";
+    verdictTitle = "Прибыль есть, но маржу определить нельзя";
+    verdict = `Чистая прибыль ${fmtRub(netProfit)}. Маржа не определяется, потому что реализация после возвратов не положительна, — оценивайте результат по абсолютной прибыли и структуре расходов ниже.`;
   } else if (margin < 5) {
     tone = "warn";
     verdictTitle = "Прибыль есть, но запас прочности минимальный";
@@ -241,20 +275,53 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
       share: costShare,
       hot: costShare > 60,
     },
-    {
-      key: "services",
-      label: "Услуги Ozon: реклама, продвижение, хранение",
-      amount: updServicesTotal,
-      share: servicesShare,
-      hot: servicesShare > 18,
-    },
-    {
-      key: "commission",
-      label: "Агентское вознаграждение Ozon",
-      amount: updCommissionTotal,
-      share: commissionShare,
-      hot: commissionShare > 18,
-    },
+    ...(acc
+      ? [
+          {
+            key: "commission",
+            label: "Комиссия Ozon (вознаграждение)",
+            amount: acc.commission,
+            share: commissionShare,
+            hot: commissionShare > 18,
+          },
+          {
+            key: "logistics",
+            label: "Доставка и связанные услуги",
+            amount: acc.logistics,
+            share: shareOf(acc.logistics),
+            hot: shareOf(acc.logistics) > 12,
+          },
+          {
+            key: "advertising",
+            label: "Продвижение и реклама",
+            amount: acc.advertising,
+            share: servicesShare,
+            hot: servicesShare > 18,
+          },
+          {
+            key: "otherFees",
+            label: "Прочие начисления и сборы Ozon",
+            amount: acc.other,
+            share: shareOf(acc.other),
+            hot: shareOf(acc.other) > 8,
+          },
+        ]
+      : [
+          {
+            key: "services",
+            label: "Услуги Ozon: реклама, продвижение, хранение",
+            amount: updServicesTotal,
+            share: servicesShare,
+            hot: servicesShare > 18,
+          },
+          {
+            key: "commission",
+            label: "Агентское вознаграждение Ozon",
+            amount: updCommissionTotal,
+            share: commissionShare,
+            hot: commissionShare > 18,
+          },
+        ]),
     {
       key: "tax",
       label: `Налог${taxPercent > 0 ? ` · ${pct(taxPercent)}` : ""}`,
@@ -283,11 +350,11 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
       prodCards.push({
         kind: "risk",
         name: wName,
-        line: `Убыток ${fmtRub(Math.abs(worst.profit))}, маржа ${pct(
+        line: `Убыток ${fmtRub(Math.abs(worst.profit))}, маржа ${pctOrDash(
           worst.margin
         )}. Главный кандидат на пересмотр: цена, закуп или вывод из ассортимента.`,
       });
-    } else if (worst.margin < 10) {
+    } else if (worst.margin !== null && worst.margin < 10) {
       prodCards.push({
         kind: "warn",
         name: wName,
@@ -301,7 +368,7 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
     prodCards.push({
       kind: "good",
       name: shortName(best.name || best.article),
-      line: `Самый прибыльный: ${fmtSigned(best.profit)}, маржа ${pct(
+      line: `Самый прибыльный: ${fmtSigned(best.profit)}, маржа ${pctOrDash(
         best.margin
       )}. Опора ассортимента — держите остаток и карточку.`,
     });
@@ -332,9 +399,13 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
   if (updShare > 30)
     checks.push({
       kind: "warn",
-      text: `Расходы Ozon забирают ${pct(
-        updShare
-      )} выручки — сверьте отчёт по услугам и тарифы логистики/хранения.`,
+      text: acc
+        ? `Списания Ozon по отчёту начислений (комиссия, доставка, реклама, сборы) забирают ${pct(
+            updShare
+          )} реализации с учётом баллов за скидки — сверьте тарифы и категории начислений.`
+        : `Расходы Ozon забирают ${pct(
+            updShare
+          )} выручки — сверьте отчёт по услугам и тарифы логистики/хранения.`,
     });
   if (taxPercent === 0)
     checks.push({
@@ -362,7 +433,7 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
     levers.push(
       "Сравните схемы (FBO/FBS) и категории — иногда смена схемы или корректная категория заметно снижают агентское вознаграждение."
     );
-  if (margin >= 20)
+  if (marginIsKnown && margin >= 20)
     levers.push(
       "Прибыль здоровая: главный рычаг — масштабировать топ-SKU и удерживать маржу при росте оборота, а не резать расходы."
     );

@@ -332,22 +332,45 @@ export interface AccrualBreakdownRow extends ProductBreakdownRow {
 }
 
 /**
+ * Плоский источник для одной строки ProductBreakdownRow. Его умеют выдавать и
+ * рассчитанный товар (AccrualProductRow), и товар из сохранённого снимка
+ * истории (snapshot.ts) — mapping полей в ОДНОМ месте (toBreakdownRow).
+ */
+export interface AccrualBreakdownSource {
+  article: string;
+  name: string;
+  revenueBaseKopecks: number;
+  /** Отрицательное число (или 0). */
+  returnsKopecks: number;
+  partnerProgramsKopecks: number;
+  netQuantity: number;
+  matched: boolean;
+  unitCost: number | null;
+  hasCost: boolean;
+  costRequired: boolean;
+  serviceOnly: boolean;
+  cogsKopecks: number | null;
+  profitKopecks: number | null;
+  marginPercent: number | null;
+}
+
+/**
  * Адаптер к существующему ProductBreakdownRow (рубли). Соответствие полей:
  *   revenue = реализация после возвратов; returnsAmount = |возвраты|;
  *   loyaltyPayout = выплаты «Программы партнёров» по товару;
- *   quantity = НЕТТО-количество; cogs/profit/margin — как в AccrualProductRow.
+ *   quantity = НЕТТО-количество; cogs/profit/margin — как в источнике.
  * hasCost = «себестоимость известна ИЛИ не требуется» (товар только с услугами
  * с нулевым нетто-количеством не считается «без себестоимости»).
  * ВНИМАНИЕ: существующий computeProductBreakdownTotals суммирует прибыль лишь по
  * hasCost-строкам; точная сверка — AccrualProductTotals/ reconciliation в calc.
  */
-export function toProductBreakdownRows(rows: readonly AccrualProductRow[]): AccrualBreakdownRow[] {
-  return rows.map((r) => ({
+export function toBreakdownRow(r: AccrualBreakdownSource): AccrualBreakdownRow {
+  return {
     article: r.article,
     name: r.name,
     revenue: kopecksToRub(r.revenueBaseKopecks),
     returnsAmount: kopecksToRub(Math.abs(r.returnsKopecks)),
-    loyaltyPayout: kopecksToRub(r.buckets.partnerPrograms),
+    loyaltyPayout: kopecksToRub(r.partnerProgramsKopecks),
     quantity: r.netQuantity,
     matched: r.matched,
     unitCost: r.unitCost,
@@ -357,5 +380,26 @@ export function toProductBreakdownRows(rows: readonly AccrualProductRow[]): Accr
     hasCost: r.costRequired ? r.hasCost : true,
     serviceOnly: r.serviceOnly,
     costRequired: r.costRequired,
-  }));
+  };
+}
+
+export function toProductBreakdownRows(rows: readonly AccrualProductRow[]): AccrualBreakdownRow[] {
+  return rows.map((r) =>
+    toBreakdownRow({
+      article: r.article,
+      name: r.name,
+      revenueBaseKopecks: r.revenueBaseKopecks,
+      returnsKopecks: r.returnsKopecks,
+      partnerProgramsKopecks: r.buckets.partnerPrograms,
+      netQuantity: r.netQuantity,
+      matched: r.matched,
+      unitCost: r.unitCost,
+      hasCost: r.hasCost,
+      costRequired: r.costRequired,
+      serviceOnly: r.serviceOnly,
+      cogsKopecks: r.cogsKopecks,
+      profitKopecks: r.profitKopecks,
+      marginPercent: r.marginPercent,
+    })
+  );
 }

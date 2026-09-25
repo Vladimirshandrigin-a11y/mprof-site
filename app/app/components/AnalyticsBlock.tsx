@@ -6,6 +6,14 @@ import {
   type ProfitRecommendationsProps,
 } from "./ProfitRecommendations";
 import { AiAnalyticsV1 } from "./AiAnalyticsV1";
+import {
+  accrualAiProducts,
+  accrualChargeCategories,
+  accrualProfitLabel,
+  effectiveHistoryMargin,
+  readAccrualSnapshot,
+} from "../lib/accrual/snapshot";
+import { kopecksToRub } from "../lib/accrual/money";
 
 interface AnalyticsCalc {
   id: string;
@@ -23,8 +31,26 @@ interface AnalyticsCalc {
   other: number;
   date: string;
   /** ai_insights расчёта (net-profit-3file breakdown) — нужно лишь чтобы выбрать
-   *  подпись прибыли: «Чистая прибыль» vs «Прибыль до себестоимости». */
+   *  подпись прибыли: «Чистая прибыль» vs «Прибыль до себестоимости». Снимок
+   *  расчёта по начислениям (ozon-accrual-xlsx-v1) читается отдельной веткой. */
   aiInsights?: unknown;
+}
+
+/**
+ * Маржа записи истории. У снимка нового вида (расчёт по «Отчёту по начислениям»)
+ * приоритет за снимком: null = «не определена», а числовая колонка БД с 0 — лишь
+ * техническая замена. Для всех прежних записей — колонка `margin` без изменений.
+ */
+function marginOf(h: AnalyticsCalc): number | null {
+  return effectiveHistoryMargin(h.aiInsights, h.margin);
+}
+
+/** Среднее по ИЗВЕСТНЫМ маржам (записи с неопределимой маржой не считаются нулями). */
+function avgMarginOf(list: AnalyticsCalc[]): number {
+  const known = list
+    .map(marginOf)
+    .filter((m): m is number => m !== null && Number.isFinite(m));
+  return known.length > 0 ? known.reduce((a, b) => a + b, 0) / known.length : 0;
 }
 
 /** Схема доставки (fulfillment) для AI-контекста. Выбирается ПОЛЬЗОВАТЕЛЕМ вручную
@@ -79,7 +105,8 @@ interface DemoRecent {
   product: string;
   marketplace: "ozon" | "wb";
   profit: number;
-  margin: number;
+  /** null — маржа не определена (расчёт по начислениям): показывается «—». */
+  margin: number | null;
   date: string;
   /** Подпись над суммой: «Чистая прибыль» или «Прибыль до себестоимости». */
   profitLabel: string;
@@ -223,6 +250,11 @@ const fmtSigned = (n: number) =>
  * дефолт «Чистая прибыль». Формулы не трогаем — берём готовое значение profit.
  */
 function profitLabelFor(aiInsights: unknown): string {
+  // Расчёт по «Отчёту по начислениям»: предварительный результат (себестоимость
+  // неполная) не называется «чистой прибылью»; повреждённый снимок — нейтрально.
+  const acc = readAccrualSnapshot(aiInsights);
+  if (acc.status === "ok") return accrualProfitLabel(acc.snapshot);
+  if (acc.status === "invalid") return "Итог расчёта";
   if (aiInsights && typeof aiInsights === "object") {
     const o = aiInsights as Record<string, unknown>;
     if (o.kind === "net-profit-3file") {
@@ -272,8 +304,7 @@ function computeInsights(history: AnalyticsCalc[]): Insight[] {
   const sumCom = history.reduce((s, h) => s + h.commission, 0);
   const sumStore = history.reduce((s, h) => s + h.storage, 0);
   const sumProfit = history.reduce((s, h) => s + h.profit, 0);
-  const avgMargin =
-    history.reduce((s, h) => s + h.margin, 0) / history.length;
+  const avgMargin = avgMarginOf(history);
   const losing = history.find((h) => h.profit < 0);
 
   const comShare = sumRev > 0 ? sumCom / sumRev : 0;
@@ -449,8 +480,7 @@ function computeScore(history: AnalyticsCalc[]): number {
   const sumAds = history.reduce((s, h) => s + h.ads, 0);
   const sumLog = history.reduce((s, h) => s + h.logistics, 0);
   const sumCom = history.reduce((s, h) => s + h.commission, 0);
-  const avgMargin =
-    history.reduce((s, h) => s + h.margin, 0) / history.length;
+  const avgMargin = avgMarginOf(history);
   const hasLoss = history.some((h) => h.profit < 0);
 
   // base score from margin (0-50)
@@ -517,8 +547,14 @@ function getTrend(history: AnalyticsCalc[]): TrendInfo {
   // history[0] — newest (см. loadHistory order desc)
   const latest = history[0];
   const rest = history.slice(1);
-  const prevAvg = rest.reduce((s, h) => s + h.margin, 0) / rest.length;
-  const delta = latest.margin - prevAvg;
+  const latestMargin = marginOf(latest);
+  // Тренд считаем только по ИЗВЕСТНЫМ маржам (у записей с неопределимой маржой
+  // её нет — нули вместо них исказили бы динамику).
+  if (latestMargin === null || !rest.some((h) => marginOf(h) !== null)) {
+    return { dir: "flat", delta: 0 };
+  }
+  const prevAvg = avgMarginOf(rest);
+  const delta = latestMargin - prevAvg;
   if (delta > 1) return { dir: "up", delta };
   if (delta < -1) return { dir: "down", delta };
   return { dir: "flat", delta: 0 };
@@ -546,7 +582,7 @@ function computeIndicators(history: AnalyticsCalc[]): FinancialIndicators {
     logistics: sumRev > 0
       ? history.reduce((s, h) => s + h.logistics, 0) / sumRev
       : 0,
-    margin: history.reduce((s, h) => s + h.margin, 0) / history.length,
+    margin: avgMarginOf(history),
   };
 }
 
@@ -614,7 +650,7 @@ function buildFinancials(history: AnalyticsCalc[]): AiFinancials {
     // маржа по агрегату (profit/revenue) — точнее простого среднего по расчётам
     marginPct: revenue > 0
       ? (profit / revenue) * 100
-      : history.reduce((s, h) => s + h.margin, 0) / history.length,
+      : avgMarginOf(history),
     hasCost: cost > 0,
     discrepancy: revenue - expenses - profit,
   };
@@ -1548,6 +1584,11 @@ type SkuContext = {
   packaging: number;
   delivery: number;
   salary: number;
+  /**
+   * Только для расчёта по «Отчёту по начислениям»: реальные категории
+   * начислений (списания, ₽) вместо УПД. Для прежних расчётов не задано.
+   */
+  accrual?: { advertising: number; commission: number; logistics: number };
 };
 
 function tidyStr(s: string): string {
@@ -1584,6 +1625,33 @@ function extractSkuContext(history: AnalyticsCalc[]): SkuContext {
     salary: 0,
   };
   for (const h of history) {
+    // Снимок расчёта по начислениям: товары/покрытие/ручные расходы — из снимка,
+    // вместо УПД — реальные категории начислений (УПД не выдумываем).
+    const acc = readAccrualSnapshot(h.aiInsights);
+    if (acc.status === "ok") {
+      const snap = acc.snapshot;
+      const rub = (kop: number) => Math.round(kopecksToRub(kop));
+      ctx.packaging = rub(snap.manualExpenses.packagingKopecks);
+      ctx.delivery = rub(snap.manualExpenses.deliveryToWarehouseKopecks);
+      ctx.salary = rub(snap.manualExpenses.salaryKopecks);
+      ctx.products = snap.products
+        .filter((p) => p.profitKopecks !== null)
+        .map((p) => ({
+          name: (p.name || p.article).slice(0, 60),
+          sku: p.article.slice(0, 40),
+          profit: kopecksToRub(p.profitKopecks ?? 0),
+          margin: p.marginPercent ?? undefined,
+          revenue: kopecksToRub(p.revenueBaseKopecks),
+        }));
+      ctx.withoutCost = snap.costCoverage.missingCost;
+      const cat = accrualChargeCategories(snap);
+      ctx.accrual = {
+        advertising: Math.round(cat.advertising),
+        commission: Math.round(cat.commission),
+        logistics: Math.round(cat.logistics),
+      };
+      break;
+    }
     const ins = h.aiInsights as Record<string, unknown> | null | undefined;
     if (!ins || ins.kind !== "net-profit-3file") continue;
     const n = (k: string): number => {
@@ -1710,16 +1778,26 @@ function buildKpiCells(f: AiFinancials, s: AiScore, ctx: SkuContext): AiItem {
         value: `${s.logisticsPct.toFixed(1)}%`,
         tone: s.logisticsHigh ? "bad" : s.logisticsElevated ? "warn" : "good",
       },
-      {
-        // УПД/доп. услуги детализируются только в расчёте net-profit-3file;
-        // если их нет — «нет данных» (как у себестоимости), а не пустой 0%.
-        label: "УПД / доп. услуги",
-        value:
-          ctx.updServicesTotal > 0
-            ? shareStr(ctx.updServicesTotal, f.revenue)
-            : "нет данных",
-        tone: "neutral",
-      },
+      ctx.accrual
+        ? {
+            // Расчёт по «Отчёту по начислениям»: вместо УПД — реальная категория.
+            label: "Реклама и продвижение",
+            value:
+              ctx.accrual.advertising > 0
+                ? shareStr(ctx.accrual.advertising, f.revenue)
+                : "нет данных",
+            tone: "neutral",
+          }
+        : {
+            // УПД/доп. услуги детализируются только в расчёте net-profit-3file;
+            // если их нет — «нет данных» (как у себестоимости), а не пустой 0%.
+            label: "УПД / доп. услуги",
+            value:
+              ctx.updServicesTotal > 0
+                ? shareStr(ctx.updServicesTotal, f.revenue)
+                : "нет данных",
+            tone: "neutral",
+          },
     ],
   };
 }
@@ -2527,14 +2605,24 @@ export function AnalyticsBlock({
     const revenue = sum((h) => h.revenue);
     const profit = sum((h) => h.profit);
     const margin =
-      revenue > 0
-        ? (profit / revenue) * 100
-        : history.reduce((a, h) => a + h.margin, 0) / history.length;
+      revenue > 0 ? (profit / revenue) * 100 : avgMarginOf(history);
 
     // Расширенные поля — берём из aiInsights самого свежего расчёта,
     // у которого есть NetProfitBreakdown (kind: "net-profit-3file").
     let extra: Record<string, number | unknown[]> = {};
     for (const h of history) {
+      // Снимок расчёта по начислениям: только числа и короткие строки товаров
+      // (топ-15 по прибыли) + число товаров без себестоимости; УПД нет.
+      const acc = readAccrualSnapshot(h.aiInsights);
+      if (acc.status === "ok") {
+        extra = {
+          products: accrualAiProducts(acc.snapshot, 15),
+        };
+        if (acc.snapshot.costCoverage.missingCost > 0) {
+          extra.productsWithoutCost = acc.snapshot.costCoverage.missingCost;
+        }
+        break;
+      }
       const ins = h.aiInsights as Record<string, unknown> | null | undefined;
       if (!ins || ins.kind !== "net-profit-3file") continue;
       const n = (k: string) => {
@@ -2592,12 +2680,16 @@ export function AnalyticsBlock({
     }
 
     // Последние расчёты — только агрегаты по каждому (числа + площадка).
-    const recentCalcs = history.slice(0, 6).map((h) => ({
-      revenue: Math.round(h.revenue),
-      profit: Math.round(h.profit),
-      margin: Number((Number(h.margin) || 0).toFixed(1)),
-      marketplace: h.marketplace,
-    }));
+    const recentCalcs = history.slice(0, 6).map((h) => {
+      const m = marginOf(h);
+      return {
+        revenue: Math.round(h.revenue),
+        profit: Math.round(h.profit),
+        // неопределимая маржа не отправляется как 0 %
+        ...(m !== null ? { margin: Number(m.toFixed(1)) } : {}),
+        marketplace: h.marketplace,
+      };
+    });
 
     // Месяц/дата отчёта — только если это реально дата (есть цифры), чтобы не
     // слать в модель ярлыки вроде «сегодня».
@@ -2718,7 +2810,7 @@ export function AnalyticsBlock({
           product: `Расчёт #${String(h.id).slice(-4)}`,
           marketplace: h.marketplace,
           profit: h.profit,
-          margin: h.margin,
+          margin: marginOf(h),
           date: h.date,
           profitLabel: profitLabelFor(h.aiInsights),
         }))
@@ -4246,7 +4338,9 @@ export function AnalyticsBlock({
                   </div>
                 </div>
                 <div className="rc-meta">
-                  <span className="mar">маржа {r.margin.toFixed(1)}%</span>
+                  <span className="mar">
+                    маржа {r.margin === null ? "—" : `${r.margin.toFixed(1)}%`}
+                  </span>
                   <span>{r.date}</span>
                 </div>
               </div>

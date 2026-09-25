@@ -5,6 +5,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { User } from "@supabase/supabase-js"
 import appLoaderStyles from "./app-loader.module.css"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
+import {
+  AccrualSnapshotView,
+  type AccrualViewState,
+} from "./components/AccrualSnapshotView"
 import { ProductCatalog } from "./components/ProductCatalog"
 import {
   OzonProductBreakdown,
@@ -19,6 +23,16 @@ import {
   type FlatContext as OzonTaxonomyFlatContext,
   type OzonTaxonomyView,
 } from "./lib/ozon-finance-taxonomy-view"
+import {
+  accrualHistDetailRows,
+  accrualPeriodLabel,
+  accrualPeriodRange,
+  accrualProfitLabel,
+  accrualRecoProps,
+  accrualSnapshotMonthKey,
+  effectiveHistoryMargin,
+  readAccrualSnapshot,
+} from "./lib/accrual/snapshot"
 import {
   supabase,
   saveCalculationToCloud,
@@ -452,6 +466,24 @@ function buildHistDetailRows(
       { label: "Итоговая чистая прибыль", value: h.profit, kind: "total" },
     ];
   }
+  // Расчёт по «Отчёту по начислениям» (kind "ozon-accrual-xlsx-v1"): разбивка
+  // читается ТОЛЬКО из сохранённого снимка (реальные категории начислений, без
+  // УПД). Повреждённый/несовместимый снимок → честное «данные недоступны», а не
+  // нули. Ничего не пересчитывается.
+  const accrualRead = readAccrualSnapshot(h.aiInsights);
+  if (accrualRead.status === "ok") {
+    return accrualHistDetailRows(accrualRead.snapshot);
+  }
+  if (accrualRead.status === "invalid") {
+    return [
+      {
+        label:
+          "Данные расчёта недоступны: снимок повреждён или создан несовместимой версией",
+        value: null,
+        kind: "neutral",
+      },
+    ];
+  }
   // API-расчёт с валидной taxonomy (PR B): честная gross-разбивка расходов +
   // отдельная зелёная строка доходов-компенсаций. Не показываем сырой
   // отрицательный other; итог берём из stored profit (ничего не пересчитываем).
@@ -663,6 +695,10 @@ function histReportMonthKey(h: CalcResult): string | null {
   // 2) API-снимок: ВЫБРАННЫЙ месяц из period.month (НЕ месяц создания).
   const apiYm = apiSnapshotMonthKey(h.aiInsights);
   if (apiYm) return apiYm;
+  // 3) Расчёт по «Отчёту по начислениям»: месяц из period.month снимка (только
+  //    валидный снимок; повреждённый → null → месяц создания).
+  const accrualYm = accrualSnapshotMonthKey(h.aiInsights);
+  if (accrualYm) return accrualYm;
   return null;
 }
 
@@ -1509,6 +1545,13 @@ export default function AppPage() {
   // заполнены и read-only, кнопка «Рассчитать» скрыта. null → обычный
   // редактируемый ручной калькулятор. Выход из просмотра — «Очистить форму».
   const [loadedApiView, setLoadedApiView] = useState<{ compensations: number } | null>(null);
+  // Открыт сохранённый расчёт по «Отчёту по начислениям» из истории ТОЛЬКО для
+  // просмотра (снимок ozon-accrual-xlsx-v1): все числа — из снимка, без пересчёта
+  // и без обращения к каталогу. null → просмотра нет (обычный поток).
+  const [accrualView, setAccrualView] = useState<
+    (AccrualViewState & { id: string }) | null
+  >(null);
+  const [accrualPdfBusy, setAccrualPdfBusy] = useState(false);
   // Верхнеуровневые разделы дашборда: калькулятор или каталог товаров.
   // Каталог доступен только залогиненному (RLS user-scoped) — таб-бар прячем,
   // когда user отсутствует, и тогда всегда показываем калькулятор.
@@ -2589,6 +2632,46 @@ export default function AppPage() {
   };
 
   /**
+   * Открыть сохранённый расчёт по «Отчёту по начислениям» из истории ТОЛЬКО для
+   * просмотра. Числа берутся из снимка (ничего не пересчитывается, каталог не
+   * читается, в БД ничего не пишется). Документный поток может держать прежний
+   * результат — сбрасываем его, чтобы просмотр не смешивался со старыми блоками.
+   * Повреждённый/несовместимый снимок открывается как «данные недоступны».
+   */
+  const openAccrualView = (
+    item: CalcResult,
+    read: ReturnType<typeof readAccrualSnapshot>
+  ) => {
+    if (read.status === "absent") return;
+    resetCombinedFlow();
+    setLoadedApiView(null);
+    setCalcMode("upload");
+    setAccrualView(
+      read.status === "ok"
+        ? { id: item.id, status: "ok", snapshot: read.snapshot }
+        : { id: item.id, status: "invalid", reason: read.reason }
+    );
+    setSelectedId(item.id);
+    setPendingCalcScroll(true);
+  };
+
+  /** PDF-отчёт по открытому сохранённому расчёту (нового формата, с переносом страниц). */
+  const downloadAccrualSnapshotPdf = async () => {
+    if (!accrualView || accrualView.status !== "ok" || accrualPdfBusy) return;
+    setAccrualPdfBusy(true);
+    try {
+      const { downloadAccrualPdf } = await import("./lib/accrual/pdf-render");
+      await downloadAccrualPdf(accrualView.snapshot);
+      showToast("PDF-отчёт сформирован", "ok");
+    } catch (e) {
+      console.error("[pdf] downloadAccrualPdf", e);
+      showToast("Не удалось сформировать PDF", "err");
+    } finally {
+      setAccrualPdfBusy(false);
+    }
+  };
+
+  /**
    * Клик по строке «Последние расчёты» → загрузить этот расчёт в калькулятор.
    * Универсальный загрузчик поверх restoreUploadCalc:
    *   • 3-file (upload) расчёт → восстанавливаем combinedResult + форму чистой
@@ -2612,6 +2695,16 @@ export default function AppPage() {
     // Клик мог прийти со вкладки «Отчёты» — возвращаем пользователя к
     // калькулятору, где восстанавливается выбранный расчёт.
     setMainTab("calc");
+
+    // Расчёт по «Отчёту по начислениям» (ozon-accrual-xlsx-v1) — отдельная
+    // read-only ветка. Любой другой расчёт открывается прежним путём ниже, а
+    // просмотр начислений при этом закрывается.
+    const accrualRead = readAccrualSnapshot(item.aiInsights);
+    if (accrualRead.status !== "absent") {
+      openAccrualView(item, accrualRead);
+      return;
+    }
+    setAccrualView(null);
 
     // Валидный Ozon API-расчёт с financeTaxonomy → открываем в ручном калькуляторе
     // ТОЛЬКО для просмотра (view-only). Поля заполняем через taxonomy-view: логистика
@@ -3652,15 +3745,34 @@ export default function AppPage() {
           cat = "loss";
         } else {
           const b = asNetProfitBreakdown(h.aiInsights);
-          cat = b && (b.costPrice ?? 0) <= 0 ? "before" : "net";
+          const ar = readAccrualSnapshot(h.aiInsights);
+          // Расчёт по начислениям: предварительный (себестоимость неполная) — в
+          // «до себестоимости», полный — «чистая». Прежние записи — как раньше.
+          cat =
+            ar.status === "ok"
+              ? ar.snapshot.preliminary
+                ? "before"
+                : "net"
+              : b && (b.costPrice ?? 0) <= 0
+              ? "before"
+              : "net";
         }
         if (cat !== histProfitFilter) return false;
       }
       if (q !== "") {
         const b = asNetProfitBreakdown(h.aiInsights);
         const mpName = h.marketplace === "ozon" ? "Ozon" : "WB";
-        const title = b ? `Отчёт ${mpName}` : `Ручной расчёт ${mpName}`;
-        const hay = `${title} ${b?.reportPeriod ?? ""} ${h.date}`.toLowerCase();
+        const ar = readAccrualSnapshot(h.aiInsights);
+        const title = b
+          ? `Отчёт ${mpName}`
+          : ar.status !== "absent"
+          ? `Отчёт по начислениям ${mpName}`
+          : `Ручной расчёт ${mpName}`;
+        const arPeriod =
+          ar.status === "ok"
+            ? `${accrualPeriodLabel(ar.snapshot)} ${accrualPeriodRange(ar.snapshot)}`
+            : "";
+        const hay = `${title} ${b?.reportPeriod ?? arPeriod} ${h.date}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -3826,10 +3938,17 @@ export default function AppPage() {
     const ozonFeesCharges =
       Math.round((commission + logisticsCharges + storage) * 100) / 100;
     // Средняя маржинальность: по выручке, если она есть; иначе среднее по margin.
+    // Fallback — среднее по ИЗВЕСТНЫМ маржам: у расчёта по начислениям маржа
+    // берётся из снимка (null не считается нулём); прежние записи — колонка margin.
+    const knownMargins = items
+      .map((h) => effectiveHistoryMargin(h.aiInsights, Number(h.margin) || 0))
+      .filter((m): m is number => m !== null);
     const avgMargin =
       revenue > 0
         ? (profit / revenue) * 100
-        : items.reduce((s, h) => s + (Number(h.margin) || 0), 0) / count;
+        : knownMargins.length > 0
+        ? knownMargins.reduce((s, m) => s + m, 0) / knownMargins.length
+        : 0;
     let best: { key: string; profit: number } | null = null;
     let worst: { key: string; profit: number } | null = null;
     for (const m of reportsMonthly) {
@@ -4907,6 +5026,7 @@ export default function AppPage() {
       return next;
     });
     if (selectedId === id) setSelectedId(null);
+    setAccrualView((prev) => (prev && prev.id === id ? null : prev));
     setResult((prev) => (prev && prev.id === id ? null : prev));
     // Если удалили авто-запись анализа — сбрасываем хэндл, чтобы следующее
     // «Сохранить результат» вставило новую строку, а не апдейтило удалённую.
@@ -9204,7 +9324,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           hasAnyData={history.length > 0}
           hasPremium={hasPremium}
           onOpenPremium={openPremium}
-          reco={{
+          reco={
+            accrualView && accrualView.status === "ok"
+              ? accrualRecoProps(accrualView.snapshot)
+              : {
             hasReport: combinedStatus === "success" && !!combinedResult,
             ready: netProfitReady,
             revenue: combinedResult?.revenue ?? 0,
@@ -9222,7 +9345,8 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             coverage: reportCostCoverage,
             best: reportKeyProducts?.best ?? null,
             worst: reportKeyProducts?.worst ?? null,
-          }}
+          }
+          }
         />
           </>
         )}
@@ -10798,7 +10922,19 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         </details>
         )}
 
-        {calcMode === "upload" && (
+        {/* Просмотр сохранённого расчёта по «Отчёту по начислениям» из истории
+            (read-only, только из снимка). Пока он открыт, прежняя карточка
+            загрузки документов скрыта; «Закрыть просмотр» возвращает её. */}
+        {calcMode === "upload" && accrualView && (
+          <AccrualSnapshotView
+            view={accrualView}
+            onClose={() => setAccrualView(null)}
+            onDownloadPdf={downloadAccrualSnapshotPdf}
+            pdfBusy={accrualPdfBusy}
+          />
+        )}
+
+        {calcMode === "upload" && !accrualView && (
           <div className="card upload-card" role="region" aria-label="Загрузка отчёта (2 файла)">
             <div className="upload-3-head">
               <div className="upload-3-title">
@@ -11916,6 +12052,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             Данные в report_history (Supabase) сохраняются как прежде. */}
 
         {calcMode === "upload" &&
+          !accrualView &&
           uploadedReports.length > 0 &&
           (uploadStatus === "idle" || uploadStatus === "success") && (
             <div className="upload-recent">
@@ -12299,6 +12436,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 // Разбор upload-расчёта из ai_insights. null → API/ручной/старый расчёт.
                 const breakdown = asNetProfitBreakdown(h.aiInsights);
                 const isReport = !!breakdown;
+                // Расчёт по «Отчёту по начислениям»: снимок из ai_insights (или
+                // признак повреждённого). Маржа — из снимка (null → «—»).
+                const accrualRead = readAccrualSnapshot(h.aiInsights);
+                const marginValue = effectiveHistoryMargin(h.aiInsights, h.margin);
                 // Введена ли себестоимость → прибыль уже «чистая»; иначе «до себестоимости».
                 const hasCost = (breakdown?.costPrice ?? 0) > 0;
                 // Тип расчёта определяем по сохранённому mode (api/upload/manual), а НЕ
@@ -12307,7 +12448,9 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                 const calcMode: CloudCalcMode = h.mode ?? "manual";
                 // Короткий бейдж типа расчёта; маркетплейс показывает соседний .hist-mp.
                 const typeLabel =
-                  calcMode === "api"
+                  accrualRead.status !== "absent"
+                    ? "Начисления"
+                    : calcMode === "api"
                     ? "API"
                     : calcMode === "upload"
                     ? "Документы"
@@ -12325,7 +12468,11 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     : d.toLocaleDateString("ru-RU");
                 })();
                 const profitLabel =
-                  isReport && !hasCost
+                  accrualRead.status === "ok"
+                    ? accrualProfitLabel(accrualRead.snapshot)
+                    : accrualRead.status === "invalid"
+                    ? "Итог расчёта"
+                    : isReport && !hasCost
                     ? "Прибыль до себестоимости"
                     : "Чистая прибыль";
                 const expanded = expandedHist.has(h.id);
@@ -12375,7 +12522,10 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                           {fmt(Math.abs(h.profit))} ₽
                         </span>
                         <span className="hm">
-                          Маржа: {h.margin.toFixed(1)}%
+                          Маржа:{" "}
+                          {marginValue === null
+                            ? "—"
+                            : `${marginValue.toFixed(1)}%`}
                         </span>
                       </div>
 

@@ -37,6 +37,9 @@ const SOURCES = [
   "app/app/lib/accrual/product-analytics.ts",
   "app/app/lib/accrual/buckets.ts",
   "app/app/lib/accrual/money.ts",
+  "app/app/lib/accrual/format.ts",
+  "app/app/lib/accrual/snapshot.ts",
+  "app/app/lib/accrual/pdf-model.ts",
   "app/app/lib/product-breakdown-calc.ts",
 ];
 
