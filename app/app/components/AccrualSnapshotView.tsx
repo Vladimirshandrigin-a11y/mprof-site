@@ -13,6 +13,7 @@
 // upload-3-row, …), в тех же цветах, что и результат расчёта по документам.
 // ============================================================================
 
+import type { ReactNode } from "react";
 import { OzonProductBreakdown } from "./OzonProductBreakdown";
 import {
   accrualBreakdownRows,
@@ -33,12 +34,21 @@ export type AccrualViewState =
 
 interface Props {
   view: AccrualViewState;
-  onClose: () => void;
+  /** Закрыть просмотр (для живого расчёта не нужен). */
+  onClose?: () => void;
   onDownloadPdf?: () => void;
   pdfBusy?: boolean;
+  /**
+   * true — ТЕКУЩИЙ расчёт из загрузки отчёта (ещё не обязательно сохранённый):
+   * другие заголовки, нет «Закрыть просмотр», числа обновляются с вводами.
+   * false/undefined — сохранённый расчёт из истории (только просмотр).
+   */
+  live?: boolean;
+  /** Слот под пояснениями: проверка готовности и кнопки сохранения (только live). */
+  children?: ReactNode;
 }
 
-export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy }: Props) {
+export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy, live, children }: Props) {
   if (view.status === "invalid") {
     return (
       <div className="card upload-card accr-view" role="region" aria-label="Сохранённый расчёт по отчёту начислений">
@@ -55,9 +65,11 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy }: P
           </p>
         </div>
         <div className="accr-actions">
-          <button type="button" className="upload-3-btn ghost" onClick={onClose}>
-            Закрыть просмотр
-          </button>
+          {onClose && (
+            <button type="button" className="upload-3-btn ghost" onClick={onClose}>
+              Закрыть просмотр
+            </button>
+          )}
         </div>
         <style jsx>{ACCR_CSS}</style>
       </div>
@@ -77,10 +89,13 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy }: P
     <>
       <div className="card upload-card accr-view" role="region" aria-label="Сохранённый расчёт по отчёту начислений">
         <div className="upload-3-head">
-          <div className="upload-3-title">Расчёт по отчёту начислений Ozon</div>
+          <div className="upload-3-title">
+            {live ? "Результат расчёта" : "Расчёт по отчёту начислений Ozon"}
+          </div>
           <p className="upload-3-sub">
-            Сохранённый расчёт — только просмотр. Значения зафиксированы на момент расчёта и не
-            пересчитываются по текущему каталогу и ценам.
+            {live
+              ? "Итог, разбивка и товары пересчитываются сразу при изменении ставки налога, расходов и каталога себестоимости."
+              : "Сохранённый расчёт — только просмотр. Значения зафиксированы на момент расчёта и не пересчитываются по текущему каталогу и ценам."}
           </p>
         </div>
 
@@ -169,15 +184,19 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy }: P
           </ul>
         </details>
 
+        {children}
+
         <div className="accr-actions">
           {onDownloadPdf && (
             <button type="button" className="upload-3-btn primary" onClick={onDownloadPdf} disabled={pdfBusy}>
               {pdfBusy ? "Готовим PDF…" : "Скачать PDF-отчёт"}
             </button>
           )}
-          <button type="button" className="upload-3-btn ghost" onClick={onClose}>
-            Закрыть просмотр
-          </button>
+          {onClose && (
+            <button type="button" className="upload-3-btn ghost" onClick={onClose}>
+              Закрыть просмотр
+            </button>
+          )}
         </div>
         <style jsx>{ACCR_CSS}</style>
       </div>
@@ -186,6 +205,11 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy }: P
         products={[]}
         user={null}
         precomputedRows={accrualProductBreakdownRows(s)}
+        precomputedNote={
+          live
+            ? "Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной реализации. Себестоимость берётся из вашего каталога; после её изменения нажмите «Проверить снова»."
+            : undefined
+        }
       />
     </>
   );

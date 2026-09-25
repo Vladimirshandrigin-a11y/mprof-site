@@ -5,6 +5,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import type { User } from "@supabase/supabase-js"
 import appLoaderStyles from "./app-loader.module.css"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
+import { AccrualUploadFlow } from "./components/AccrualUploadFlow"
+import {
+  useAccrualUploadSession,
+  type AccrualSavedEvent,
+} from "./lib/accrual/useAccrualUploadSession"
 import {
   AccrualSnapshotView,
   type AccrualViewState,
@@ -52,10 +57,6 @@ import {
   type OzonProductRow,
   type OzonEstimate,
 } from "./lib/report-parsers/ozon-parser"
-import {
-  parseUpdPdf,
-  type UpdDebugInfo,
-} from "./lib/report-parsers/upd-pdf-parser"
 
 // Supabase client импортируется из lib/supabase-cloud (единый instance,
 // fallback на placeholder URL/key, browser-only warning при отсутствии env).
@@ -1596,13 +1597,9 @@ export default function AppPage() {
   // updServicesTotal = totalAmount − updCommissionTotal (остаток), поэтому их
   // сумма всегда равна totalAmount (каждая сумма учтена ровно один раз).
   // Формула: profitBeforeCost = revenue + loyaltyPayouts - updServices - updCommission
-  const [slotXlsx, setSlotXlsx] = useState<File | null>(null);
-  // Единый УПД (услуги + агентское вознаграждение одним PDF).
-  const [slotUpdServices, setSlotUpdServices] = useState<File | null>(null);
   const [combinedStatus, setCombinedStatus] = useState<
     "idle" | "processing" | "success" | "error"
   >("idle");
-  const [combinedError, setCombinedError] = useState("");
   const [combinedResult, setCombinedResult] = useState<{
     revenue: number;
     loyaltyPayouts: number;
@@ -1617,10 +1614,6 @@ export default function AppPage() {
     docFormat?: "single-upd" | "dual-upd";
     /** false — разбивка УПД на услуги/комиссию неизвестна (см. NetProfitBreakdown). */
     commissionKnown?: boolean;
-  } | null>(null);
-  const [combinedDebug, setCombinedDebug] = useState<{
-    xlsx: OzonDebugInfo | null;
-    updServices: UpdDebugInfo | null;
   } | null>(null);
   /** Per-SKU строки из последнего распарсенного отчёта Ozon — для подстановки
    *  себестоимости из каталога и блока «Прибыль по товарам». Заполняется в
@@ -1681,12 +1674,6 @@ export default function AppPage() {
   const handleReportCostCoverage = useCallback((data: CostCoverageSnapshot) => {
     setReportCostCoverage(data);
   }, []);
-  const xlsxInputRef = useRef<HTMLInputElement | null>(null);
-  const updServicesInputRef = useRef<HTMLInputElement | null>(null);
-  /** Какой слот сейчас под перетаскиванием — для подсветки. */
-  const [dragOverSlot, setDragOverSlot] = useState<
-    "xlsx" | "updServices" | null
-  >(null);
 
   // ===== Финальный калькулятор чистой прибыли =====
   const [showProfitForm, setShowProfitForm] = useState(false);
@@ -2574,7 +2561,6 @@ export default function AppPage() {
     if (!b) return;
     const s = (n: number) => (n ? String(n) : "");
     setCalcMode("upload");
-    setCombinedError("");
     setCombinedStatus("success");
     setCombinedResult({
       revenue: b.revenueOzon,
@@ -3100,67 +3086,13 @@ export default function AppPage() {
     setCalcMode("manual");
   };
 
-  // ===== Doc-based flow helpers (XLSX + единый УПД) =====
-  /** Положить файл в КОНКРЕТНЫЙ слот (через input[type=file] click). */
-  const acceptSlot = (
-    slot: "xlsx" | "updServices",
-    file: File | null
-  ) => {
-    if (!file) return;
-    const isXlsx = /\.(xlsx|csv)$/i.test(file.name);
-    const isPdf = /\.pdf$/i.test(file.name);
-    if (slot === "xlsx" && !isXlsx) {
-      showToast("Слот 1: только XLSX или CSV", "err");
-      return;
-    }
-    if (slot === "updServices" && !isPdf) {
-      showToast("Слот УПД: только PDF", "err");
-      return;
-    }
-    if (slot === "xlsx") setSlotXlsx(file);
-    if (slot === "updServices") setSlotUpdServices(file);
-  };
-
-  /**
-   * Маршрутизация файлов из drag&drop — мы можем не знать на какой
-   * именно слот перетащил пользователь (он мог промахнуться). По типу:
-   *  - XLSX/CSV → slot 1 (реализация)
-   *  - PDF → slot 2 (единый УПД)
-   * `preferredSlot` подсказывает желаемый слот (если drop попал на конкретный).
-   */
-  const acceptDroppedFile = (
-    file: File | null,
-    preferredSlot: "xlsx" | "updServices" | null
-  ) => {
-    if (!file) return;
-    const isXlsx = /\.(xlsx|csv)$/i.test(file.name);
-    const isPdf = /\.pdf$/i.test(file.name);
-
-    if (isXlsx) {
-      // XLSX всегда идёт в slot 1, независимо от того, куда дропнули
-      if (preferredSlot && preferredSlot !== "xlsx") {
-        showToast(`XLSX отправлен в слот 1 (реализация)`, "warn");
-      }
-      setSlotXlsx(file);
-      return;
-    }
-    if (isPdf) {
-      if (slotUpdServices && preferredSlot !== "updServices") {
-        showToast("Заменили файл УПД", "warn");
-      }
-      setSlotUpdServices(file);
-      return;
-    }
-    showToast("Только XLSX/CSV (слот 1) или PDF (слот 2 — УПД)", "err");
-  };
-
+  // ===== Document flow: остаётся только сброс. Новые расчёты идут по одному XLSX
+  // «Отчёт по начислениям» (useAccrualUploadSession); прежний расчёт по отчёту о
+  // реализации + УПД больше не запускается — код ниже нужен лишь для ОТКРЫТИЯ и
+  // пересохранения старых записей из истории (restoreUploadCalc/saveProfitResult).
   const resetCombinedFlow = () => {
-    setSlotXlsx(null);
-    setSlotUpdServices(null);
     setCombinedStatus("idle");
-    setCombinedError("");
     setCombinedResult(null);
-    setCombinedDebug(null);
     setReportProducts([]);
     setReportProductDetailComplete(true);
     setReportLoyaltyPayoutPerSkuKnown(false);
@@ -3177,387 +3109,6 @@ export default function AppPage() {
     setLastUploadCalc(null);
   };
 
-  const analyzeAllThree = async () => {
-    if (!slotXlsx || !slotUpdServices) {
-      showToast("Загрузите оба файла", "warn");
-      return;
-    }
-    if (combinedStatus === "processing") return;
-    if (!canCalculate) {
-      // eslint-disable-next-line no-console
-      console.warn("[upload-docs] blocked by paywall");
-      setSelectedTier(null);
-      setTariffModalOpen(true);
-      return;
-    }
-
-    setCombinedStatus("processing");
-    setCombinedError("");
-    setCombinedResult(null);
-    setCombinedDebug(null);
-    setReportProducts([]);
-    setReportProductDetailComplete(true);
-    setReportLoyaltyPayoutPerSkuKnown(false);
-    setReportEstimate(null);
-    setReportKeyProducts(null);
-    setReportCostCoverage(null);
-    setReportCogsTotal(null);
-
-    // eslint-disable-next-line no-console
-    console.log("[upload-docs] starting parallel parse", {
-      xlsx: slotXlsx.name,
-      upd: slotUpdServices.name,
-    });
-
-    // Параллельный парсинг обоих документов
-    const [xlsxRes, updSrvRes] = await Promise.all([
-      parseOzonReport(slotXlsx),
-      parseUpdPdf(slotUpdServices),
-    ]);
-
-    setCombinedDebug({
-      xlsx: xlsxRes.debugInfo,
-      updServices: updSrvRes.debugInfo,
-    });
-
-    // eslint-disable-next-line no-console
-    console.log("[upload-docs] parse results:", {
-      xlsxOk: xlsxRes.ok,
-      xlsxRevenueFromTotals:
-        xlsxRes.report?.totals.revenueFromTotalsRow ?? null,
-      xlsxLoyaltyFromTotals:
-        xlsxRes.report?.totals.loyaltyPayoutsFromTotalsRow ?? null,
-      updOk: updSrvRes.ok,
-      updTotalAmount: updSrvRes.report?.totalAmount ?? null,
-      updCommissionAmount: updSrvRes.report?.commissionAmount ?? null,
-    });
-
-    if (!xlsxRes.ok || !xlsxRes.report) {
-      setCombinedStatus("error");
-      setCombinedError(
-        `XLSX: ${xlsxRes.error ?? "не удалось обработать"}`
-      );
-      return;
-    }
-    if (!updSrvRes.ok || !updSrvRes.report) {
-      setCombinedStatus("error");
-      setCombinedError(
-        `УПД: ${updSrvRes.error ?? "не удалось обработать"}`
-      );
-      return;
-    }
-
-    // STRICT POLICY: revenue из XLSX берётся ТОЛЬКО через text-match строки
-    // «Итого реализовано (за вычетом возвратов)». Если text-match не нашёл —
-    // парсер возвращает null (никакого numeric fallback'а нет). В этом случае
-    // мы НЕ заполняем форму и НЕ показываем результат — это ошибка анализа.
-    const revenueFromTotals = xlsxRes.report.totals.revenueFromTotalsRow;
-    const loyaltyPayouts =
-      xlsxRes.report.totals.loyaltyPayoutsFromTotalsRow ?? 0;
-    // Единый УПД: totalAmount (col9, с налогом) — единственный ПОЛНЫЙ расход,
-    // ОБЯЗАТЕЛЕН. Если parseUpdPdf вернул ok:true, totalAmount по построению —
-    // ненулевое число (candidate-сбор отбрасывает нули), но проверяем явно —
-    // это ЗАЩИТА, а не подстановка нуля: нечитаемый итог → ошибка ДО consume/save.
-    const updTotal = updSrvRes.report.totalAmount;
-    if (!(updTotal > 0)) {
-      console.warn("[upload-docs] УПД totalAmount invalid:", updTotal);
-      setCombinedStatus("error");
-      setCombinedError(
-        "Не удалось прочитать итоговую сумму УПД («Всего к оплате»). Проверьте, что загружен оригинальный PDF от Ozon."
-      );
-      return;
-    }
-    // commissionAmount — best-effort сумма строки «Агентское вознаграждение»
-    // (подмножество totalAmount, НЕ отдельное слагаемое). commissionKnown=false,
-    // если строка не распознана — тогда updServicesTotal хранит ВЕСЬ totalAmount
-    // (updCommissionTotal=0) для формулы/БД (см. profitBeforeCost ниже — итог
-    // вычитается ровно один раз независимо от разбивки), а UI обязан показать
-    // ОДИН общий расход с пояснением, а не «Агентское вознаграждение: 0 ₽»
-    // (см. buildHistDetailRows/downloadProfitPdf/JSX-блоки результата).
-    const commissionKnown =
-      updSrvRes.report.commissionAmount !== null &&
-      updSrvRes.report.commissionAmount > 0 &&
-      updSrvRes.report.commissionAmount <= updTotal;
-    const updCommissionTotal = commissionKnown
-      ? (updSrvRes.report.commissionAmount as number)
-      : 0;
-    const updServicesTotal = updTotal - updCommissionTotal;
-
-    if (revenueFromTotals === null || revenueFromTotals <= 0) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[upload-docs] revenue text-match failed — strict policy, no fallback",
-        {
-          matchedRevenueTotalDetails:
-            xlsxRes.debugInfo.matchedRevenueTotalDetails,
-        }
-      );
-      setCombinedStatus("error");
-      setCombinedError(
-        'Проверьте, что загружен оригинальный файл «Отчёт о реализации товара» из Ozon Seller. Если ошибка повторяется, обновите страницу и загрузите файл заново.'
-      );
-      return;
-    }
-
-    // ---- Совместимость документов: один и тот же продавец маркетплейса ----
-    // XLSX «Получатель» ИНН (recipientInn) и УПД «Покупатель» ИНН (buyerInn) —
-    // это ОДИН И ТОТ ЖЕ продавец маркетплейса (селлер): в обоих документах
-    // Ozon — противоположная сторона («Плательщик» в XLSX, «Продавец» в УПД).
-    // Защита от смешивания документов РАЗНЫХ селлеров/магазинов — НЕ проверка
-    // «документ от Ozon». В отличие от проверки периода ниже, здесь
-    // неопределённость ТОЖЕ блокирует (fail-closed): нельзя признать документы
-    // совместимыми, если принадлежность продавцу не подтверждена.
-    if (
-      xlsxRes.report.recipientInn === null ||
-      updSrvRes.report.buyerInn === null
-    ) {
-      console.warn("[upload-docs] seller-identity INN not readable:", {
-        recipientInn: xlsxRes.report.recipientInn,
-        buyerInn: updSrvRes.report.buyerInn,
-      });
-      setCombinedStatus("error");
-      setCombinedError(
-        "Не удалось определить продавца по одному из документов (ИНН получателя в отчёте о реализации или ИНН покупателя в УПД). Проверьте, что загружены оригинальные файлы Ozon."
-      );
-      return;
-    }
-    if (xlsxRes.report.recipientInn !== updSrvRes.report.buyerInn) {
-      console.warn("[upload-docs] seller-identity mismatch:", {
-        recipientInn: xlsxRes.report.recipientInn,
-        buyerInn: updSrvRes.report.buyerInn,
-      });
-      setCombinedStatus("error");
-      setCombinedError(
-        "Отчёт о реализации и УПД относятся к разным продавцам (ИНН не совпадает). Проверьте, что оба документа — из одного магазина Ozon."
-      );
-      return;
-    }
-
-    // ---- Совместимость документов: период отчёта и период УПД ----
-    // Оба периода надёжно определены И различаются → однозначно разные
-    // отчётные месяцы → отклоняем. Если хотя бы один период не определён —
-    // НЕ блокируем (та же консервативная политика, что и у дубль-гарда ниже).
-    const uploadMonth = resolveReportMonth(
-      xlsxRes.report.period,
-      slotXlsx?.name ?? null
-    );
-    const updMonth = updSrvRes.report.documentDate
-      ? updSrvRes.report.documentDate.slice(0, 7)
-      : null;
-    if (uploadMonth && updMonth && uploadMonth.slice(0, 7) !== updMonth) {
-      console.warn("[upload-docs] period mismatch:", {
-        uploadMonth,
-        updMonth,
-      });
-      setCombinedStatus("error");
-      setCombinedError(
-        `Период отчёта (${uploadMonth.slice(
-          0,
-          7
-        )}) и период УПД (${updMonth}) не совпадают. Проверьте, что оба документа за один месяц.`
-      );
-      return;
-    }
-
-    // PR #25: дубль-гард ДО списания. «Отмена» → откатываем статус в idle и
-    // выходим ДО consumeCalculation (попытка НЕ списывается).
-    if (
-      !(await confirmNoMonthDuplicate(
-        uploadMonth ? uploadMonth.slice(0, 7) : null,
-        "ozon"
-      ))
-    ) {
-      setCombinedStatus("idle");
-      return;
-    }
-
-    // Все парсы прошли. Списываем расчёт server-authoritative ДО построения и
-    // сохранения результата — кредит не сгорает на ошибке парсинга файлов.
-    const consumed = await consumeCalculation();
-    if (!consumed.ok) {
-      // eslint-disable-next-line no-console
-      console.warn("[upload-docs] consume blocked → paywall", consumed.reason);
-      setCombinedStatus("idle");
-      setSelectedTier(null);
-      setTariffModalOpen(true);
-      return;
-    }
-
-    const revenue = revenueFromTotals;
-
-    const profitBeforeCost =
-      revenue + loyaltyPayouts - updServicesTotal - updCommissionTotal;
-
-    // eslint-disable-next-line no-console
-    console.log("[upload-docs] FORMULA:", {
-      revenue,
-      loyaltyPayouts,
-      updServicesTotal,
-      updCommissionTotal,
-      profitBeforeCost,
-    });
-
-    setCombinedResult({
-      revenue,
-      loyaltyPayouts,
-      updServicesTotal,
-      updCommissionTotal,
-      profitBeforeCost,
-      period: xlsxRes.report.period,
-      // Имя файла Ozon — fallback для определения месяца, если период из
-      // содержимого XLSX не распознан (приоритет 2 в resolveReportMonth).
-      sourceFileName: slotXlsx?.name ?? null,
-      docFormat: "single-upd",
-      commissionKnown,
-    });
-
-    // Per-SKU слой из XLSX-отчёта — для блока «Чистая прибыль по товарам».
-    setReportProducts(xlsxRes.report.products);
-    setReportProductDetailComplete(true);
-    setReportLoyaltyPayoutPerSkuKnown(xlsxRes.report.loyaltyPayoutPerSkuKnown);
-    setReportEstimate(xlsxRes.report.estimate);
-
-    // Автозаполнение блока «Дополнительные расходы».
-    // ads — единственное поле, которое безопасно брать из отчёта: estimate.ads
-    // информационное и НЕ входит в profitBeforeCost, поэтому двойного учёта нет.
-    // Остальные поля остаются ручными: estimate.other = возвраты + лояльность,
-    // которые уже учтены в profitBeforeCost; estimate.cost всегда 0. costPrice
-    // заполняется отдельным эффектом из суммарной себестоимости каталога
-    // (onCogsTotal → reportCogsTotal). tax остаётся ручным процентом (0% по умолч.).
-    const adsFromReport = xlsxRes.report.estimate.ads;
-    setProfitInputs({
-      ...EMPTY_PROFIT,
-      ads: adsFromReport > 0 ? String(Math.round(adsFromReport)) : "",
-    });
-    // Новый отчёт → график выплат снова стандартный (0%).
-    setPayoutSchedule({ ...DEFAULT_PAYOUT_SCHEDULE });
-    // Новый отчёт → поле «Себестоимость товара» снова под автосинком с COGS.
-    setCostPriceTouched(false);
-
-    // Автозаполнение формы в manual mode (для last-mile проверки/правок).
-    // Объединяем доход (revenue + loyaltyPayouts) и расходы (Ozon-комиссии).
-    setForm({
-      ...EMPTY,
-      revenue: String((revenue + loyaltyPayouts).toFixed(2)),
-      commission: String(updServicesTotal.toFixed(2)),
-      logistics: String(updCommissionTotal.toFixed(2)),
-    });
-
-    // Сохраняем результат doc-based flow в историю + Supabase как calculation (mode='upload').
-    // Все доп. расходы = 0, поэтому identity profit = revenue − total_expenses (= profitBeforeCost).
-    {
-      const now = new Date();
-      const incomeRevenue = revenue + loyaltyPayouts;
-      const upExpenses = updServicesTotal + updCommissionTotal;
-      const upMargin =
-        incomeRevenue > 0 ? (profitBeforeCost / incomeRevenue) * 100 : 0;
-
-      // Разбор для ai_insights — чтобы клик по истории мог восстановить
-      // combinedResult и (после ввода себестоимости) форму чистой прибыли.
-      // На этом этапе все доп. расходы = 0 (черновик до ввода себестоимости).
-      const breakdown: NetProfitBreakdown = {
-        kind: "net-profit-3file",
-        roi: 0,
-        taxPercent: 0,
-        costPrice: 0,
-        tax: 0,
-        ads: 0,
-        packaging: 0,
-        deliveryToWarehouse: 0,
-        salary: 0,
-        other: 0,
-        updServicesTotal,
-        updCommissionTotal,
-        revenueOzon: revenue,
-        loyaltyPayouts,
-        profitBeforeCost,
-        reportPeriod: xlsxRes.report.period,
-        // Сохраняем per-SKU строки + estimate в snapshot, чтобы клик по истории
-        // мог пересчитать себестоимость по актуальному каталогу товаров.
-        products: xlsxRes.report.products,
-        // Свежий парсинг — returnsAmount/loyaltyPayout по строкам достоверны.
-        productDetailComplete: true,
-        loyaltyPayoutPerSkuKnown: xlsxRes.report.loyaltyPayoutPerSkuKnown,
-        estimate: xlsxRes.report.estimate,
-        docFormat: "single-upd",
-        commissionKnown,
-      };
-
-      const canPersist = !!user?.id;
-      let cloudCalcId: string | null = null;
-      let cloudCreatedAt: string | null = null;
-      let synced = false;
-      let calcErrMsg: string | null = null;
-
-      if (canPersist) {
-        const saveRes = await saveCalculationToCloud(
-          {
-            marketplace: "ozon",
-            mode: "upload" as CloudCalcMode,
-            revenue: incomeRevenue,
-            commission: updServicesTotal,
-            logistics: updCommissionTotal,
-            ads: 0,
-            storage: 0,
-            tax: 0,
-            cost: 0,
-            other_expenses: 0,
-            total_expenses: upExpenses,
-            profit: profitBeforeCost,
-            margin: upMargin,
-            ai_insights: breakdown,
-          },
-          user!.id
-        );
-        if (saveRes.error) {
-          calcErrMsg = saveRes.error.message;
-        } else if (saveRes.data?.id) {
-          cloudCalcId = saveRes.data.id;
-          cloudCreatedAt = saveRes.data.created_at;
-          synced = true;
-        }
-      }
-
-      const res: CalcResult = {
-        id: cloudCalcId ?? makeLocalId(),
-        marketplace: "ozon",
-        revenue: incomeRevenue,
-        commission: updServicesTotal,
-        logistics: updCommissionTotal,
-        storage: 0,
-        ads: 0,
-        cost: 0,
-        tax: 0,
-        other: 0,
-        expenses: upExpenses,
-        profit: profitBeforeCost,
-        margin: upMargin,
-        aiInsights: breakdown,
-        date: now.toLocaleString("ru-RU", {
-          day: "2-digit",
-          month: "short",
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-        createdAt: cloudCreatedAt ?? now.toISOString(),
-        synced,
-      };
-
-      setHistory((prev) => [res, ...prev].slice(0, 50));
-      // Запоминаем эту строку — «Сохранить результат» обновит ИМЕННО её.
-      setLastUploadCalc({ id: res.id, synced });
-
-      if (synced) {
-        showToast("Расчёт сохранён", "ok");
-      } else if (canPersist && calcErrMsg) {
-        showToast("Облако: " + calcErrMsg, "warn");
-      } else {
-        showToast("Расчёт сохранён локально", "warn");
-      }
-    }
-
-    setCombinedStatus("success");
-  };
   const [tariffModalOpen, setTariffModalOpen] = useState(false);
   const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
   const [isCalculating, setIsCalculating] = useState(false);
@@ -5328,6 +4879,66 @@ export default function AppPage() {
     loaded: entitlementsLoaded,
     consumeCalculation,
   } = useEntitlements();
+
+  // Прежний документальный расчёт (реализация + УПД), восстановленный из истории.
+  const legacyDocView = combinedStatus === "success" && !!combinedResult;
+
+  // Строка истории для только что сохранённого расчёта по «Отчёту по начислениям»:
+  // колонки — из снимка (см. accrual/columns.ts), ai_insights — сам снимок.
+  const handleAccrualSaved = (e: AccrualSavedEvent) => {
+    const now = new Date();
+    const c = e.columns;
+    const res: CalcResult = {
+      id: e.row.id,
+      marketplace: "ozon",
+      revenue: c.revenue,
+      commission: c.commission,
+      logistics: c.logistics,
+      storage: c.storage,
+      ads: c.ads,
+      cost: c.cost,
+      tax: c.tax,
+      other: c.other_expenses,
+      expenses: c.total_expenses,
+      profit: c.profit,
+      margin: c.margin,
+      aiInsights: c.ai_insights,
+      date: now.toLocaleString("ru-RU", {
+        day: "2-digit",
+        month: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      createdAt: e.row.createdAt,
+      synced: e.row.synced,
+      mode: "upload",
+    };
+    setHistory((prev) => {
+      const idx = prev.findIndex((h) => h.id === res.id);
+      if (idx === -1) return [res, ...prev].slice(0, 50);
+      const next = [...prev];
+      next[idx] = { ...res, date: prev[idx].date, createdAt: prev[idx].createdAt };
+      return next;
+    });
+    if (e.historyRecorded) setHistoryRefresh((k) => k + 1);
+  };
+
+  // Сессия загрузки «Отчёта по начислениям»: разбор файла, каталог, расчёт,
+  // граница списания и сохранение. consume — ровно один раз на расчёт.
+  const accrualSession = useAccrualUploadSession({
+    userId: user?.id ?? null,
+    canCalculate,
+    consumeCalculation,
+    confirmNoMonthDuplicate: (monthKey) =>
+      confirmNoMonthDuplicate(monthKey, "ozon"),
+    onPaywall: () => {
+      setSelectedTier(null);
+      setTariffModalOpen(true);
+    },
+    onSaved: handleAccrualSaved,
+    isRowPresent: (id) => history.some((h) => h.id === id),
+    showToast,
+  });
 
   // Баннер статуса «Безлимит» можно скрыть крестиком; выбор запоминаем в
   // localStorage. Скрытие касается ТОЛЬКО unlimited-баннера и не влияет на показ
@@ -10934,201 +10545,40 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
           />
         )}
 
-        {calcMode === "upload" && !accrualView && (
-          <div className="card upload-card" role="region" aria-label="Загрузка отчёта (2 файла)">
+        {/* Новый расчёт: один слот XLSX «Отчёт по начислениям». Состояние живёт в
+            useAccrualUploadSession (page), поэтому переживает переход в «Каталог». */}
+        {calcMode === "upload" && !accrualView && !legacyDocView && (
+          <AccrualUploadFlow
+            session={accrualSession}
+            onOpenCatalog={() => setMainTab("catalog")}
+            signedIn={!!user}
+          />
+        )}
+
+        {/* Сохранённый ПРЕЖНИЙ расчёт по документам (реализация + УПД), открытый из
+            истории: результат, форма чистой прибыли, график выплат и PDF работают как
+            раньше. Загрузки документов здесь больше нет. */}
+        {calcMode === "upload" && !accrualView && legacyDocView && (
+          <div className="card upload-card" role="region" aria-label="Сохранённый расчёт по документам Ozon">
             <div className="upload-3-head">
               <div className="upload-3-title">
-                Расчёт по документам Ozon
+                Сохранённый расчёт по документам Ozon
               </div>
               <p className="upload-3-sub">
-                Загрузите отчёт о реализации Ozon (XLSX) и УПД на услуги и
-                вознаграждение Ozon (PDF). Сайт считает прибыль на основе
-                выручки Ozon, выплат от партнёров и расходов по УПД.
+                Этот расчёт создан прежним способом — по отчёту о реализации и
+                УПД — и открыт из истории. Новые расчёты выполняются по одному
+                файлу: XLSX «Отчёт по начислениям».
               </p>
-            </div>
-
-            <div className="mode-note" role="note">
-              <div className="mode-note-title">Расчёт по документам Ozon</div>
-              <p className="mode-note-text">
-                Расчёт по загруженным документам.
-                <span className="mode-note-sub">
-                  Может отличаться от API и личного кабинета Ozon, если в месяце
-                  есть баллы за скидки, компенсации, программы партнёров или
-                  прочие начисления.
-                </span>
-              </p>
-            </div>
-
-            {/* Золотой блок «Какие файлы нужны для точного расчёта» убран:
-                подписи к каждому файлу теперь внутри ячеек загрузки
-                (см. upload-slot-desc в каждом слоте ниже). */}
-
-            <div className="upload-3-slots">
-              {/* Slot 1: XLSX */}
-              <div
-                className={
-                  "upload-slot " +
-                  (slotXlsx ? "is-ready " : "") +
-                  (dragOverSlot === "xlsx" ? "is-drag" : "")
-                }
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setDragOverSlot("xlsx");
-                }}
-                onDragLeave={(e) => {
-                  e.preventDefault();
-                  setDragOverSlot(null);
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setDragOverSlot(null);
-                  acceptDroppedFile(
-                    e.dataTransfer.files?.[0] ?? null,
-                    "xlsx"
-                  );
-                }}
-              >
-                <div className="upload-slot-num" aria-hidden="true">1</div>
-                <div className="upload-slot-body">
-                  <div className="upload-slot-label">
-                    Отчёт о реализации Ozon
-                  </div>
-                  <div className="upload-slot-desc">
-                    Основной Excel-файл с выручкой и товарами
-                  </div>
-                  <div className="upload-slot-meta">XLSX или CSV</div>
-                  {slotXlsx ? (
-                    <div className="upload-slot-file" title={slotXlsx.name}>
-                      <span className="upload-slot-file-name">{slotXlsx.name}</span>
-                      <button
-                        type="button"
-                        className="upload-slot-remove"
-                        onClick={() => setSlotXlsx(null)}
-                        aria-label="Удалить файл"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="upload-slot-pick"
-                      onClick={() => xlsxInputRef.current?.click()}
-                    >
-                      Выбрать файл
-                    </button>
-                  )}
-                  <input
-                    ref={xlsxInputRef}
-                    type="file"
-                    accept=".xlsx,.csv"
-                    style={{ display: "none" }}
-                    onChange={(e) =>
-                      acceptSlot("xlsx", e.target.files?.[0] ?? null)
-                    }
-                  />
-                </div>
-              </div>
-
-              {/* Slot 2: UPD services */}
-              <div
-                className={
-                  "upload-slot " +
-                  (slotUpdServices ? "is-ready " : "") +
-                  (dragOverSlot === "updServices" ? "is-drag" : "")
-                }
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setDragOverSlot("updServices");
-                }}
-                onDragLeave={(e) => {
-                  e.preventDefault();
-                  setDragOverSlot(null);
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setDragOverSlot(null);
-                  acceptDroppedFile(
-                    e.dataTransfer.files?.[0] ?? null,
-                    "updServices"
-                  );
-                }}
-              >
-                <div className="upload-slot-num" aria-hidden="true">2</div>
-                <div className="upload-slot-body">
-                  <div className="upload-slot-label">
-                    УПД на услуги и вознаграждение Ozon
-                  </div>
-                  <div className="upload-slot-desc">
-                    PDF: единый документ с комиссией и услугами Ozon
-                  </div>
-                  <div className="upload-slot-meta">PDF</div>
-                  {slotUpdServices ? (
-                    <div className="upload-slot-file" title={slotUpdServices.name}>
-                      <span className="upload-slot-file-name">
-                        {slotUpdServices.name}
-                      </span>
-                      <button
-                        type="button"
-                        className="upload-slot-remove"
-                        onClick={() => setSlotUpdServices(null)}
-                        aria-label="Удалить файл"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="upload-slot-pick"
-                      onClick={() => updServicesInputRef.current?.click()}
-                    >
-                      Выбрать файл
-                    </button>
-                  )}
-                  <input
-                    ref={updServicesInputRef}
-                    type="file"
-                    accept=".pdf"
-                    style={{ display: "none" }}
-                    onChange={(e) =>
-                      acceptSlot("updServices", e.target.files?.[0] ?? null)
-                    }
-                  />
-                </div>
-              </div>
             </div>
 
             <div className="upload-3-actions">
               <button
                 type="button"
                 className="upload-3-btn primary"
-                onClick={analyzeAllThree}
-                disabled={
-                  combinedStatus === "processing" ||
-                  !slotXlsx ||
-                  !slotUpdServices
-                }
+                onClick={resetCombinedFlow}
               >
-                {combinedStatus === "processing"
-                  ? "Анализируем документы…"
-                  : "Проанализировать документы"}
+                Новый расчёт по отчёту начислений
               </button>
-              {(slotXlsx || slotUpdServices ||
-                combinedStatus !== "idle") && (
-                <button
-                  type="button"
-                  className="upload-3-btn ghost"
-                  onClick={resetCombinedFlow}
-                  disabled={combinedStatus === "processing"}
-                >
-                  Сбросить
-                </button>
-              )}
             </div>
 
             {combinedStatus === "success" && combinedResult && (
@@ -11996,16 +11446,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
                     </button>
                   </div>
                 )}
-              </div>
-            )}
-
-            {combinedStatus === "error" && (
-              <div className="upload-3-error" role="alert">
-                <div className="upload-3-error-title">Ошибка анализа</div>
-                <p className="upload-3-error-sub">
-                  {combinedError ||
-                    "Не удалось разобрать один из файлов. Проверьте формат."}
-                </p>
               </div>
             )}
           </div>

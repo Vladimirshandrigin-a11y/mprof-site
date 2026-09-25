@@ -157,6 +157,12 @@ interface Props {
   precomputedRows?: ReadonlyArray<
     ProductBreakdownRow & { serviceOnly?: boolean; costRequired?: boolean }
   >;
+  /**
+   * Только вместе с precomputedRows: своё пояснение под заголовком (например, для
+   * несохранённого расчёта: «после правки каталога нажмите «Проверить снова»»).
+   * По умолчанию — текст для сохранённого расчёта.
+   */
+  precomputedNote?: string;
 }
 
 /** Строка только с услугами (нет продаж/возвратов): себестоимость не нужна. */
@@ -223,6 +229,7 @@ export function OzonProductBreakdown({
   onKeyProducts,
   onCostCoverage,
   precomputedRows,
+  precomputedNote,
 }: Props) {
   // Режим просмотра сохранённого расчёта по начислениям: готовые строки, без каталога.
   const precomputed = precomputedRows !== undefined;
@@ -462,10 +469,14 @@ export function OzonProductBreakdown({
     // Сохранённый расчёт по начислениям: покрытие — только по товарам, где
     // себестоимость НУЖНА (нетто-количество ≠ 0); «только услуги» отдельно.
     const needed = rows.filter((r) => !isServiceOnlyRow(r));
+    const withoutCost = needed.filter((r) => !r.hasCost).length;
     return {
       ...t,
       withCost: needed.filter((r) => r.hasCost).length,
-      withoutCost: needed.filter((r) => !r.hasCost).length,
+      withoutCost,
+      // Сумма прибыли по товарам с себестоимостью — не итог: пока у части товаров
+      // её нет, «Чистая прибыль» честно «Недоступно» (как в прежнем режиме).
+      profitKnown: t.profitKnown && withoutCost === 0,
     };
   }, [rows, precomputed]);
   const serviceOnlyCount = useMemo(
@@ -680,7 +691,8 @@ export function OzonProductBreakdown({
 
       <div className="pb-note">
         {precomputed
-          ? "Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной реализации. Результат сохранён на момент расчёта — текущий каталог его не меняет."
+          ? precomputedNote ??
+            "Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной реализации. Результат сохранён на момент расчёта — текущий каталог его не меняет."
           : "Общие расходы распределяются по товарам пропорционально выручке. Это позволяет оценить чистую прибыль по каждому SKU."}
       </div>
 

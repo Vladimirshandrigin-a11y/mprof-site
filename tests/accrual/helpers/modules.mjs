@@ -32,6 +32,9 @@ export const analytics = req("./accrual/product-analytics.js");
 export const snapshot = req("./accrual/snapshot.js");
 export const pdfModel = req("./accrual/pdf-model.js");
 export const format = req("./accrual/format.js");
+export const columns = req("./accrual/columns.js");
+export const session = req("./accrual/upload-session.js");
+export const saveFlow = req("./accrual/save-flow.js");
 export const XLSX = req("xlsx");
 
 /** Разбор XLSX-буфера настоящим парсером проекта. */
