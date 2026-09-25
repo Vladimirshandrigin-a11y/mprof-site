@@ -87,6 +87,126 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
   const ok = ev && ev.status === "ok" ? ev : null;
   const fieldErrors = ev && ev.status === "input_error" ? ev.errors : {};
   const period = s.parsed?.period;
+  const access = s.access;
+
+  // Проверка готовности — бесплатна и видна ДО списания; сохранение = расчёт (списание + запись).
+  const readiness = ok ? (
+    <div className="calc-check">
+      <div className="calc-check-title">Проверка расчёта</div>
+      <div className="calc-check-list">
+        <div className="calc-check-row ok">
+          <span className="calc-check-ico">✓</span>
+          <div className="calc-check-body">
+            <div className="calc-check-line">
+              <span className="calc-check-label">Отчёт по начислениям прочитан</span>
+              <span className="calc-check-val">{s.parsed?.rowCount} строк</span>
+            </div>
+          </div>
+        </div>
+        <div className={"calc-check-row " + (ok.snapshot.period.periodComplete ? "ok" : "warn")}>
+          <span className="calc-check-ico">{ok.snapshot.period.periodComplete ? "✓" : "⚠"}</span>
+          <div className="calc-check-body">
+            <div className="calc-check-line">
+              <span className="calc-check-label">Период: {fmtMonthLabel(ok.snapshot.period.month)}</span>
+            </div>
+            {!ok.snapshot.period.periodComplete && (
+              <div className="calc-check-hint">отчёт охватывает не весь месяц — итоги неполные</div>
+            )}
+          </div>
+        </div>
+        <div className={"calc-check-row " + (ok.blockers.length === 0 ? "ok" : "warn")}>
+          <span className="calc-check-ico">{ok.blockers.length === 0 ? "✓" : "⚠"}</span>
+          <div className="calc-check-body">
+            <div className="calc-check-line">
+              <span className="calc-check-label">
+                {ok.blockers.length === 0
+                  ? "Себестоимость заполнена"
+                  : `У ${ok.calc.costCoverage.missingCost} ${pluralRu(ok.calc.costCoverage.missingCost, "товара", "товаров", "товаров")} нет себестоимости`}
+              </span>
+              <span className="calc-check-val">
+                {ok.calc.costCoverage.withCost} / {ok.calc.costCoverage.requiredProducts}
+              </span>
+            </div>
+            {ok.blockers.length > 0 && (
+              <div className="calc-check-hint">
+                {access.showResult
+                  ? "результат предварительный — его нельзя сохранить как готовый"
+                  : "расчёт станет доступен, когда себестоимость будет у всех товаров"}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className={"calc-check-row " + (ok.calc.taxRatePercent === 0 ? "warn" : "ok")}>
+          <span className="calc-check-ico">{ok.calc.taxRatePercent === 0 ? "⚠" : "✓"}</span>
+          <div className="calc-check-body">
+            <div className="calc-check-line">
+              <span className="calc-check-label">{ok.calc.taxRatePercent === 0 ? "Налог не указан" : "Налог указан"}</span>
+              {ok.calc.taxRatePercent !== 0 && (
+                <span className="calc-check-val">
+                  {ok.calc.taxRatePercent.toLocaleString("ru-RU", { maximumFractionDigits: 2 })}%
+                </span>
+              )}
+            </div>
+            {ok.calc.taxRatePercent === 0 && <div className="calc-check-hint">итоговая прибыль может быть завышена</div>}
+          </div>
+        </div>
+      </div>
+      {ok.readyToSave ? (
+        <div className="calc-check-status ok">
+          <span className="calc-check-status-ico">✓</span>
+          <span>
+            <b>{access.showResult ? "Расчёт готов к сохранению" : "Готово к расчёту"}</b>
+            <em>Все себестоимости на месте.</em>
+          </span>
+        </div>
+      ) : (
+        <div className="calc-check-status warn">
+          <span className="calc-check-status-ico">⚠</span>
+          <span>
+            <b>{access.showResult ? "Сохранить как готовый результат нельзя" : "Рассчитать нельзя — попытка не списывается"}</b>
+            <em>{ok.blockers.map((b) => b.message).join(" ")}</em>
+          </span>
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  const saveSection = ok ? (
+    <div className="accr-save">
+      <p className="accr-save-hint">
+        {s.saved
+          ? "Расчёт уже в истории. Повторное нажатие без изменений ничего не пишет; после правки значений запись обновится без нового списания."
+          : s.creditHeld
+          ? "Попытка по этому файлу уже списана, но расчёт не записан — повторное сохранение не спишет её снова."
+          : "Расчёт списывает одну попытку по вашему тарифу (при безлимите попытки не расходуются), затем открывает результат и сохраняет его в историю. Отмена, ошибка файла и неполная себестоимость попытку не списывают."}
+      </p>
+      <button
+        type="button"
+        className="upload-3-btn primary accr-save-btn"
+        onClick={() => void s.save()}
+        disabled={s.saving || !ok.readyToSave || (s.saved && !s.dirty && !s.needsRetry)}
+        aria-busy={s.saving}
+      >
+        {s.saving
+          ? "Сохраняем…"
+          : s.needsRetry
+          ? "Повторить сохранение"
+          : s.saved
+          ? s.dirty
+            ? "Сохранить изменения"
+            : "Расчёт сохранён ✓"
+          : "Рассчитать и сохранить"}
+      </button>
+      {!ok.readyToSave && (
+        <p className="accr-save-hint warn">Расчёт станет доступен, когда у всех товаров будет указана себестоимость.</p>
+      )}
+      {s.saveNote && (
+        <div className={"accr-save-note " + s.saveNote.kind} role={s.saveNote.kind === "err" ? "alert" : "status"}>
+          {s.saveNote.text}
+        </div>
+      )}
+    </div>
+  ) : null;
 
   return (
     <div className="card upload-card accr-flow" role="region" aria-label="Расчёт по отчёту начислений Ozon">
@@ -331,123 +451,30 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
         </>
       )}
 
-      {ok && (
+      {ok && access.showResult && (
         <AccrualSnapshotView
           live
           view={{ status: "ok", snapshot: ok.snapshot }}
           onDownloadPdf={() => void s.downloadPdf()}
           pdfBusy={s.pdfBusy}
         >
-          <div className="calc-check">
-            <div className="calc-check-title">Проверка расчёта</div>
-            <div className="calc-check-list">
-              <div className="calc-check-row ok">
-                <span className="calc-check-ico">✓</span>
-                <div className="calc-check-body">
-                  <div className="calc-check-line">
-                    <span className="calc-check-label">Отчёт по начислениям прочитан</span>
-                    <span className="calc-check-val">{s.parsed?.rowCount} строк</span>
-                  </div>
-                </div>
-              </div>
-              <div className={"calc-check-row " + (ok.snapshot.period.periodComplete ? "ok" : "warn")}>
-                <span className="calc-check-ico">{ok.snapshot.period.periodComplete ? "✓" : "⚠"}</span>
-                <div className="calc-check-body">
-                  <div className="calc-check-line">
-                    <span className="calc-check-label">Период: {fmtMonthLabel(ok.snapshot.period.month)}</span>
-                  </div>
-                  {!ok.snapshot.period.periodComplete && (
-                    <div className="calc-check-hint">отчёт охватывает не весь месяц — итоги неполные</div>
-                  )}
-                </div>
-              </div>
-              <div className={"calc-check-row " + (ok.blockers.length === 0 ? "ok" : "warn")}>
-                <span className="calc-check-ico">{ok.blockers.length === 0 ? "✓" : "⚠"}</span>
-                <div className="calc-check-body">
-                  <div className="calc-check-line">
-                    <span className="calc-check-label">
-                      {ok.blockers.length === 0
-                        ? "Себестоимость заполнена"
-                        : `У ${ok.calc.costCoverage.missingCost} ${pluralRu(ok.calc.costCoverage.missingCost, "товара", "товаров", "товаров")} нет себестоимости`}
-                    </span>
-                    <span className="calc-check-val">
-                      {ok.calc.costCoverage.withCost} / {ok.calc.costCoverage.requiredProducts}
-                    </span>
-                  </div>
-                  {ok.blockers.length > 0 && (
-                    <div className="calc-check-hint">результат предварительный — его нельзя сохранить как готовый</div>
-                  )}
-                </div>
-              </div>
-              <div className={"calc-check-row " + (ok.calc.taxRatePercent === 0 ? "warn" : "ok")}>
-                <span className="calc-check-ico">{ok.calc.taxRatePercent === 0 ? "⚠" : "✓"}</span>
-                <div className="calc-check-body">
-                  <div className="calc-check-line">
-                    <span className="calc-check-label">{ok.calc.taxRatePercent === 0 ? "Налог не указан" : "Налог указан"}</span>
-                    {ok.calc.taxRatePercent !== 0 && (
-                      <span className="calc-check-val">
-                        {ok.calc.taxRatePercent.toLocaleString("ru-RU", { maximumFractionDigits: 2 })}%
-                      </span>
-                    )}
-                  </div>
-                  {ok.calc.taxRatePercent === 0 && <div className="calc-check-hint">итоговая прибыль может быть завышена</div>}
-                </div>
-              </div>
-            </div>
-            {ok.readyToSave ? (
-              <div className="calc-check-status ok">
-                <span className="calc-check-status-ico">✓</span>
-                <span>
-                  <b>Расчёт готов к сохранению</b>
-                  <em>Все себестоимости на месте.</em>
-                </span>
-              </div>
-            ) : (
-              <div className="calc-check-status warn">
-                <span className="calc-check-status-ico">⚠</span>
-                <span>
-                  <b>Сохранить как готовый результат нельзя</b>
-                  <em>{ok.blockers.map((b) => b.message).join(" ")}</em>
-                </span>
-              </div>
-            )}
-          </div>
-
-          <div className="accr-save">
-            <p className="accr-save-hint">
-              {s.saved
-                ? "Расчёт уже в истории. Повторное нажатие без изменений ничего не пишет; после правки значений запись обновится без нового списания."
-                : s.creditHeld
-                ? "Попытка по этому файлу уже списана, но расчёт не записан — повторное сохранение не спишет её снова."
-                : "Сохранение засчитывается как один расчёт по вашему тарифу (при безлимите попытки не расходуются). Отмена и ошибки до сохранения попытку не списывают."}
-            </p>
-            <button
-              type="button"
-              className="upload-3-btn primary accr-save-btn"
-              onClick={() => void s.save()}
-              disabled={s.saving || !ok.readyToSave || (s.saved && !s.dirty && !s.needsRetry)}
-              aria-busy={s.saving}
-            >
-              {s.saving
-                ? "Сохраняем…"
-                : s.needsRetry
-                ? "Повторить сохранение"
-                : s.saved
-                ? s.dirty
-                  ? "Сохранить изменения"
-                  : "Расчёт сохранён ✓"
-                : "Рассчитать и сохранить"}
-            </button>
-            {!ok.readyToSave && (
-              <p className="accr-save-hint warn">Сохранение станет доступно, когда у всех товаров будет указана себестоимость.</p>
-            )}
-            {s.saveNote && (
-              <div className={"accr-save-note " + s.saveNote.kind} role={s.saveNote.kind === "err" ? "alert" : "status"}>
-                {s.saveNote.text}
-              </div>
-            )}
-          </div>
+          {readiness}
+          {saveSection}
         </AccrualSnapshotView>
+      )}
+
+      {ok && !access.showResult && (
+        <div className="accr-locked" role="region" aria-label="Результат откроется после расчёта">
+          <div className="accr-locked-kicker">Результат откроется после расчёта</div>
+          <p className="accr-locked-text">
+            Чистая прибыль, разбивка начислений и аналитика по товарам появятся после расчёта — он списывает одну
+            попытку по вашему тарифу (при безлимите попытки не расходуются). Проверка файла и поиск товаров без
+            себестоимости бесплатны и попытку не списывают.
+            {!ok.readyToSave && " Пока себестоимость указана не у всех товаров, расчёт не выполняется."}
+          </p>
+          {readiness}
+          {saveSection}
+        </div>
       )}
       {/* Литерал прямо в теге: styled-jsx считает id стиля по тексту на этапе сборки. Константа-идентификатор
           получает общий id «undefined» и молча вытесняется стилем AccrualSnapshotView. */}
@@ -483,6 +510,10 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
   .accr-st.err{color:#f0a4a4}
   .accr-file-actions{display:flex;flex-wrap:wrap;gap:.5rem;justify-content:center;margin-top:.3rem}
   .accr-noconsume{color:var(--gold2)}
+  .accr-locked{margin-top:1.2rem;padding:1.1rem 1.1rem 1.2rem;border-radius:16px;border:1px solid rgba(201,168,76,.28);
+    background:linear-gradient(180deg,rgba(201,168,76,.06),rgba(255,255,255,.02))}
+  .accr-locked-kicker{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;letter-spacing:.09em;color:var(--gold2)}
+  .accr-locked-text{margin:.55rem 0 1rem;font-size:.84rem;line-height:1.5;color:var(--txt2)}
   .accr-held-note{margin:.7rem 0 0;padding:.6rem .8rem;border-radius:10px;font-size:.76rem;line-height:1.45;
     color:#f0cd84;border:1px solid rgba(232,176,75,.32);background:rgba(232,176,75,.07)}
   .accr-notes{list-style:none;margin:.8rem 0 0;padding:0;display:flex;flex-direction:column;gap:.4rem}

@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { scenario } from "./helpers/fixtures.mjs";
 import { CAT, EXPECTED_BASIC as E } from "./helpers/expected.mjs";
-import { makeMockCloud } from "./helpers/mock-cloud.mjs";
+import { makeEntitlements, makeMockCloud } from "./helpers/mock-cloud.mjs";
 import { columns as COL, parseBuf, pdfModel as P, saveFlow as SF, session as SES, snapshot as S } from "./helpers/modules.mjs";
 
 const viaJson = (x) => JSON.parse(JSON.stringify(x));
@@ -723,6 +723,216 @@ describe("жизненный цикл: отметка «списано» при�
     const out = await ctl.save(req(a));
     assert.equal(out.created, true);
     assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 2, inserts: 2, updateTry: 0, updates: 0, historyTry: 2, histories: 2, calcRows: 2 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Доступ к результату и списание: платный РАСЧЁТ, а не платная запись в историю.
+// БЕСПЛАТНО: проверка файла, период, покрытие себестоимости, список товаров без неё.
+// ПОСЛЕ списания попытки ЭТОГО файла: чистая прибыль, разбивка, товарная аналитика, PDF.
+// Права — мок модели из lib/entitlements.ts (1 бесплатный + кредиты 149 ₽; безлимит 449 ₽).
+// ---------------------------------------------------------------------------
+describe("доступ к результату: пока попытка файла не списана, результат и PDF закрыты", () => {
+  const LOCKED = { unlocked: false, showResult: false, pdfAllowed: false };
+  const OPEN = { unlocked: true, showResult: true, pdfAllowed: true };
+  const fpOf = (p) =>
+    SES.reportFingerprint({ rows: p.parsed.report.rows, period: p.parsed.report.period, rowCount: p.parsed.report.summary.rowCount });
+  const A = () => pipeline({ buf: basicBuf() });
+  const B = () => pipeline({ buf: scenario("incomplete_month") });
+  const C = () => pipeline({ buf: basicBuf(), catalog: [CAT[0]] }); // у товара Б нет себестоимости
+  const req = (p) => ({ snapshot: p.evaluation.snapshot, ready: p.evaluation.readyToSave, userId: "u1" });
+  const view = (ctl, p) => SES.resultAccess(ctl.state.paid, p.evaluation);
+  const open = (ctl, p) => {
+    assert.equal(ctl.beginAttempt(null), true);
+    assert.equal(ctl.beginAttempt(fpOf(p)), true);
+  };
+  const setup = (rights) => {
+    const ent = makeEntitlements(rights);
+    const cloud = makeMockCloud({ entitlement: ent });
+    return { ent, cloud, ctl: new SF.AccrualSaveController(cloud.deps) };
+  };
+  const ZERO_WRITES = { inserts: 0, updates: 0, histories: 0, calcRows: 0 };
+  const writes = (cloud) => {
+    const c = cloud.counts();
+    return { inserts: c.inserts, updates: c.updates, histories: c.histories, calcRows: c.calcRows };
+  };
+
+  it("правило resultAccess: результат и PDF = попытка оплачена И расчёт корректен; ошибка файла/ввода/расчёта результата не открывает", () => {
+    const ok = A().evaluation;
+    assert.deepEqual(SES.resultAccess(false, ok), LOCKED);
+    assert.deepEqual(SES.resultAccess(true, ok), OPEN);
+    assert.deepEqual(SES.resultAccess(false, null), LOCKED);
+    assert.deepEqual(SES.resultAccess(true, null), { unlocked: true, showResult: false, pdfAllowed: false }); // файла нет
+    const inputErr = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, packaging: "-1" } }).evaluation;
+    const calcErr = pipeline({ buf: scenario("tax_zero") }).evaluation;
+    for (const bad of [inputErr, calcErr]) {
+      assert.equal(SES.resultAccess(true, bad).showResult, false);
+      assert.equal(SES.resultAccess(true, bad).pdfAllowed, false);
+    }
+  });
+
+  it("бесплатно и без списания: любое число файлов можно открыть и проверить — результата и PDF нет, consume 0, записей 0 (даже у пользователя с кредитами)", async () => {
+    const { ent, cloud, ctl } = setup({ used: 0, credits: 5 });
+    for (const p of [A(), B(), C(), A(), B()]) {
+      open(ctl, p);
+      assert.deepEqual(view(ctl, p), LOCKED, "результат закрыт до расчёта");
+      // бесплатная часть доступна: готовность и список товаров без себестоимости
+      assert.equal(typeof p.evaluation.readyToSave, "boolean");
+    }
+    assert.equal(C().evaluation.problemProducts.length, 1);
+    assert.equal(C().evaluation.problemProducts[0].article, "ART-B");
+    assert.deepEqual([ent.st.consumeCalls, cloud.log.consume, cloud.log.dup], [0, 0, 0]);
+    assert.deepEqual(writes(cloud), ZERO_WRITES);
+  });
+
+  it("неполная себестоимость не списывает и не открывает результат — даже при безлимите", async () => {
+    const { ent, cloud, ctl } = setup({ unlimited: true });
+    const c = C();
+    open(ctl, c);
+    const out = await ctl.save(req(c));
+    assert.equal(out.status, "not_ready");
+    assert.deepEqual(view(ctl, c), LOCKED);
+    assert.deepEqual([ent.st.consumeCalls, cloud.log.dup], [0, 0]);
+    assert.deepEqual(writes(cloud), ZERO_WRITES);
+  });
+
+  describe("сценарий 1: бесплатная попытка исчерпана, кредитов и подписки нет", () => {
+    it("результат и PDF недоступны ни для одного файла; расчёт → paywall без списания, без дубль-гарда и без записей", async () => {
+      const { ent, cloud, ctl } = setup({ used: 1, credits: 0 });
+      assert.equal(ent.canCalculate(), false);
+      for (const p of [A(), B(), A()]) {
+        open(ctl, p);
+        assert.deepEqual(view(ctl, p), LOCKED);
+        const out = await ctl.save(req(p));
+        assert.equal(out.status, "paywall");
+        assert.equal(out.reason, undefined, "отказ по клиентской проверке, до сервера");
+        assert.equal(SES.saveOutcomeUi(out).openPaywall, true);
+        assert.deepEqual(view(ctl, p), LOCKED, "после отказа результат по-прежнему закрыт");
+      }
+      assert.deepEqual([ent.st.consumeCalls, cloud.log.consume, cloud.log.dup, ent.st.used], [0, 0, 0, 1]);
+      assert.deepEqual(writes(cloud), ZERO_WRITES);
+    });
+
+    it("клиентская проверка устарела (права ещё не загрузились), но сервер отказывает: consume не проходит, результат закрыт, отметки «списано» нет", async () => {
+      const { ent, cloud, ctl } = setup({ used: 1, credits: 0 });
+      ent.canCalculate = () => true; // клиент думает, что попытка есть
+      const a = A();
+      open(ctl, a);
+      const out = await ctl.save(req(a));
+      assert.equal(out.status, "paywall");
+      assert.equal(out.reason, "limit_reached");
+      assert.deepEqual([ent.st.consumeCalls, ent.st.refused, ent.st.granted, ent.st.used], [1, 1, 0, 1]);
+      assert.deepEqual(view(ctl, a), LOCKED);
+      assert.equal(ctl.state.paid, false);
+      assert.equal(ctl.state.dupConfirmed, false, "подтверждение дубля откатывается — следующая попытка спросит заново");
+      assert.deepEqual(writes(cloud), ZERO_WRITES);
+    });
+  });
+
+  describe("сценарий 2: один кредит 149 ₽ (1 бесплатная уже израсходована)", () => {
+    it("первый расчёт списывает кредит и открывает результат/PDF; правки без списания; другой файл закрыт и уходит в paywall; после покупки — снова доступен", async () => {
+      const { ent, cloud, ctl } = setup({ used: 1, credits: 1 });
+      const a = A();
+      open(ctl, a);
+      assert.deepEqual(view(ctl, a), LOCKED, "до расчёта результата нет");
+      const saved = await ctl.save(req(a));
+      assert.equal(saved.status, "saved");
+      assert.deepEqual(view(ctl, a), OPEN, "после списания открыт результат и PDF");
+      assert.deepEqual([ent.st.consumeCalls, ent.st.used, ent.canCalculate()], [1, 2, false]);
+      assert.deepEqual(writes(cloud), { inserts: 1, updates: 0, histories: 1, calcRows: 1 });
+
+      // правка расходов внутри оплаченного расчёта — без нового списания, результат остаётся открытым
+      const edited = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, taxPercent: "10" } });
+      assert.equal((await ctl.save(req(edited))).calculationWrite, "update");
+      assert.deepEqual([ent.st.consumeCalls, view(ctl, edited).showResult], [1, true]);
+
+      // другой файл: оплата не наследуется, кредита больше нет → закрыт, paywall
+      const b = B();
+      open(ctl, b);
+      assert.deepEqual(view(ctl, b), LOCKED);
+      assert.equal((await ctl.save(req(b))).status, "paywall");
+      assert.deepEqual(view(ctl, b), LOCKED);
+      // тот же файл после сохранения — новый расчёт: снова закрыт и без кредита в paywall
+      open(ctl, a);
+      assert.deepEqual(view(ctl, a), LOCKED);
+      assert.equal((await ctl.save(req(a))).status, "paywall");
+      assert.deepEqual([ent.st.consumeCalls, ent.st.used], [1, 2]);
+      assert.equal(cloud.counts().calcRows, 1);
+
+      // покупка ещё одного кредита → B открывается своим списанием
+      ent.st.credits++;
+      open(ctl, b);
+      assert.equal((await ctl.save(req(b))).status, "saved");
+      assert.deepEqual([view(ctl, b), ent.st.consumeCalls, ent.st.used], [OPEN, 2, 3]);
+      assert.equal(cloud.counts().calcRows, 2);
+    });
+  });
+
+  describe("сценарий 3: доступна первая бесплатная попытка", () => {
+    it("файлы можно проверять без списания; первый расчёт использует бесплатную попытку и открывает результат; второй файл — paywall", async () => {
+      const { ent, cloud, ctl } = setup({ used: 0, credits: 0 });
+      for (const p of [A(), B(), C()]) {
+        open(ctl, p);
+        assert.deepEqual(view(ctl, p), LOCKED);
+      }
+      assert.equal(ent.st.consumeCalls, 0, "проверка файлов и нехватка себестоимости не списывают");
+      const a = A();
+      open(ctl, a);
+      assert.equal((await ctl.save(req(a))).status, "saved");
+      assert.deepEqual([view(ctl, a), ent.st.consumeCalls, ent.st.used, ent.canCalculate()], [OPEN, 1, 1, false]);
+      const b = B();
+      open(ctl, b);
+      assert.deepEqual(view(ctl, b), LOCKED);
+      assert.equal((await ctl.save(req(b))).status, "paywall");
+      assert.deepEqual([ent.st.consumeCalls, cloud.counts().calcRows], [1, 1]);
+    });
+
+    it("списание прошло, запись упала: результат уже открыт (оплачено), повтор без второго списания; другой файл остаётся закрытым и платит сам", async () => {
+      const { ent, cloud, ctl } = setup({ used: 0, credits: 1 });
+      cloud.cfg.insertError = "502";
+      const a = A();
+      const b = B();
+      open(ctl, a);
+      assert.equal((await ctl.save(req(a))).status, "save_failed");
+      assert.deepEqual([view(ctl, a), ent.st.consumeCalls], [OPEN, 1]);
+      assert.equal((await ctl.save(req(a))).status, "save_failed");
+      assert.equal(ent.st.consumeCalls, 1, "повтор не списывает");
+
+      open(ctl, b); // другой файл: отметка не наследуется
+      assert.deepEqual(view(ctl, b), LOCKED);
+      cloud.cfg.insertError = null;
+      assert.equal((await ctl.save(req(b))).status, "saved"); // кредит 149 ₽ → свой расчёт
+      assert.deepEqual([ent.st.consumeCalls, ent.st.used, view(ctl, b)], [2, 2, OPEN]);
+
+      open(ctl, a); // вернулись к A: его оплаченная попытка возвращается вместе с результатом
+      assert.deepEqual(view(ctl, a), OPEN);
+      assert.equal((await ctl.save(req(a))).status, "saved");
+      assert.deepEqual([ent.st.consumeCalls, cloud.counts().calcRows], [2, 2]);
+    });
+  });
+
+  describe("сценарий 4: активен безлимит 449 ₽", () => {
+    it("каждый новый файл открывается СВОИМ расчётом (consume без роста счётчика), результат не наследуется; повтор сохранения не списывает", async () => {
+      const { ent, cloud, ctl } = setup({ unlimited: true });
+      const a = A();
+      const b = B();
+      open(ctl, a);
+      assert.deepEqual(view(ctl, a), LOCKED, "и у безлимита результат открывается расчётом, а не сам по себе");
+      assert.equal((await ctl.save(req(a))).status, "saved");
+      assert.deepEqual([view(ctl, a), ent.st.consumeCalls, ent.st.used], [OPEN, 1, 0]);
+      assert.equal((await ctl.save(req(a))).status, "unchanged");
+      assert.equal(ent.st.consumeCalls, 1);
+
+      open(ctl, b);
+      assert.deepEqual(view(ctl, b), LOCKED);
+      assert.equal((await ctl.save(req(b))).status, "saved");
+      assert.deepEqual([view(ctl, b), ent.st.consumeCalls, ent.st.used], [OPEN, 2, 0]);
+
+      open(ctl, a); // тот же файл заново — новый расчёт
+      assert.deepEqual(view(ctl, a), LOCKED);
+      assert.equal((await ctl.save(req(a))).status, "saved");
+      assert.deepEqual([ent.st.consumeCalls, cloud.counts().calcRows, cloud.log.dup], [3, 3, 3]);
+    });
   });
 });
 

@@ -354,3 +354,28 @@ export function saveOutcomeUi(out: SaveOutcome): SaveOutcomeUi {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Доступ к результату: платный РАСЧЁТ, а не платная запись
+// ---------------------------------------------------------------------------
+
+/**
+ * Что видно пользователю. БЕЗ списания (бесплатно): проверка файла, период, покрытие
+ * себестоимости и список товаров без себестоимости. ПОСЛЕ списания попытки этого файла
+ * (consume прошёл — отметка paid у попытки): чистая прибыль, разбивка по категориям,
+ * товарная аналитика, лучшие/убыточные и PDF. Неоплаченная попытка (в том числе
+ * «другой файл» после оплаченного) результата не видит — отметку paid она не наследует.
+ */
+export interface ResultAccess {
+  /** Попытка этого файла оплачена. */
+  unlocked: boolean;
+  /** Показывать чистую прибыль, разбивку, товарные строки. */
+  showResult: boolean;
+  /** Можно скачать PDF. */
+  pdfAllowed: boolean;
+}
+
+export function resultAccess(attemptPaid: boolean, evaluation: AccrualEvaluation | null): ResultAccess {
+  const calculated = attemptPaid && evaluation !== null && evaluation.status === "ok";
+  return { unlocked: attemptPaid, showResult: calculated, pdfAllowed: calculated };
+}

@@ -28,12 +28,14 @@ import {
   evaluateAccrual,
   formatParseErrors,
   reportFingerprint,
+  resultAccess,
   saveOutcomeUi,
   validateAccrualFile,
   type AccrualEvaluation,
   type AccrualParsedReport,
   type AccrualUploadInputs,
   type InputField,
+  type ResultAccess,
 } from "./upload-session";
 import type { AccrualSnapshotV1 } from "./snapshot";
 import type { CatalogEntry } from "../product-breakdown-calc";
@@ -152,6 +154,11 @@ export interface AccrualUploadSession {
   dirty: boolean;
   /** Последнее сохранение не завершилось полностью (ошибка записи или сводки) — доступен повтор. */
   needsRetry: boolean;
+  /**
+   * Что открыто пользователю: полный результат и PDF — только после списания попытки
+   * ЭТОГО файла (consume прошёл). Проверка файла и себестоимости — без списания.
+   */
+  access: ResultAccess;
   /** Попытка ЭТОГО файла списана, но расчёт не записан (повтор сохранения не спишет снова). */
   creditHeld: boolean;
   /** Сколько списанных, но не записанных попыток ждут ДРУГИХ файлов (эти файлы не наследуют списание). */
@@ -198,6 +205,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   const [saveNote, setSaveNote] = useState<SaveNote | null>(null);
   const [savedKey, setSavedKey] = useState<string | null>(null);
   const [creditHeld, setCreditHeld] = useState(false);
+  const [attemptPaid, setAttemptPaid] = useState(false);
   const [otherHeldCredits, setOtherHeldCredits] = useState(0);
   const [needsRetry, setNeedsRetry] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
@@ -230,6 +238,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   /** Подтянуть в состояние экрана то, что известно контроллеру о текущей и «чужих» попытках. */
   const syncAttemptState = (controller: AccrualSaveController): void => {
     const st = controller.state;
+    setAttemptPaid(st.paid);
     setCreditHeld(st.paid && st.saved === null);
     setOtherHeldCredits(controller.heldElsewhere);
   };
@@ -342,9 +351,9 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     savingRef.current = true;
     setSaving(true);
     setSaveNote(null);
+    const controller = getController();
     try {
       const o = optsRef.current;
-      const controller = getController();
       const st = controller.state;
       if (st.saved && !o.isRowPresent(st.saved.id)) controller.forgetSaved();
       const out = await controller.save({ snapshot: ev.snapshot, ready: ev.readyToSave, userId: o.userId });
@@ -365,14 +374,27 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
         });
       }
       if (ui.toast) toast(ui.toast.text, ui.toast.type);
+    } catch (e) {
+      // Исключение из сервиса не должно оставить экран «закрытым» при уже списанной попытке.
+      console.error("[accrual] save", e);
+      setNeedsRetry(true);
+      setSaveNote({
+        kind: "err",
+        text: "Не удалось выполнить сохранение. Если попытка уже списана, повтор не спишет её снова.",
+      });
     } finally {
+      syncAttemptState(controller);
       savingRef.current = false;
       setSaving(false);
     }
   };
 
+  const access = resultAccess(attemptPaid, evaluation);
+
   const downloadPdf = async (): Promise<void> => {
+    // PDF — часть готового результата: без списанной попытки этого файла не выдаём.
     if (!evaluation || evaluation.status !== "ok" || pdfBusy) return;
+    if (!resultAccess(getController().state.paid, evaluation).pdfAllowed) return;
     setPdfBusy(true);
     try {
       await resolveServices(optsRef.current).downloadPdf(evaluation.snapshot);
@@ -403,6 +425,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     saved,
     dirty,
     needsRetry,
+    access,
     creditHeld,
     otherHeldCredits,
     downloadPdf,

@@ -4,6 +4,35 @@
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Мок прав пользователя по модели, описанной в app/lib/entitlements.ts (расчёты, не платежи):
+ *   canCalculate = безлимит || израсходовано < 1 бесплатный + N кредитов (149 ₽ = +1);
+ *   consume      = server-authoritative: безлимит — ok без счётчика; иначе ok и +1, пока есть остаток,
+ *                  иначе { ok:false, reason:"limit_reached" }.
+ * Реального RPC/Supabase здесь нет: мок лишь считает вызовы и остаток. Живых списаний нет.
+ */
+export function makeEntitlements({ used = 0, credits = 0, unlimited = false } = {}) {
+  const st = { used, credits, unlimited, consumeCalls: 0, granted: 0, refused: 0 };
+  return {
+    st,
+    canCalculate: () => st.unlimited || st.used < 1 + st.credits,
+    consume: async () => {
+      st.consumeCalls++;
+      if (st.unlimited) {
+        st.granted++;
+        return { ok: true };
+      }
+      if (st.used < 1 + st.credits) {
+        st.used++;
+        st.granted++;
+        return { ok: true };
+      }
+      st.refused++;
+      return { ok: false, reason: "limit_reached" };
+    },
+  };
+}
+
 export function makeMockCloud(over = {}) {
   // inserts/updates/histories — только УСПЕШНЫЕ записи; *Try — все обращения, включая отказы.
   const log = { consume: 0, canCalc: 0, dup: 0, insertTry: 0, updateTry: 0, historyTry: 0, inserts: [], updates: [], histories: [] };
@@ -24,7 +53,7 @@ export function makeMockCloud(over = {}) {
   const deps = {
     canCalculate: () => {
       log.canCalc++;
-      return cfg.canCalculate;
+      return cfg.entitlement ? cfg.entitlement.canCalculate() : cfg.canCalculate;
     },
     confirmNoMonthDuplicate: async (monthKey) => {
       log.dup++;
@@ -34,6 +63,7 @@ export function makeMockCloud(over = {}) {
     consume: async () => {
       log.consume++;
       if (cfg.delayMs) await sleep(cfg.delayMs);
+      if (cfg.entitlement) return cfg.entitlement.consume();
       return cfg.consumeOk ? { ok: true } : { ok: false, reason: "limit_reached" };
     },
     insertCalculation: async (cols) => {
