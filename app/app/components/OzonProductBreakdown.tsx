@@ -144,6 +144,24 @@ interface Props {
    * Ничего не пересчитывает и не меняет поведение блока.
    */
   onCostCoverage?: (data: CostCoverageSnapshot) => void;
+  /**
+   * Готовые строки СОХРАНЁННОГО расчёта по «Отчёту по начислениям» (снимок
+   * истории, kind "ozon-accrual-xlsx-v1"; accrual/snapshot.ts). Когда переданы:
+   *   • каталог НЕ загружается и НЕ используется — исторический результат не
+   *     пересчитывается по сегодняшним ценам (products/opts/user игнорируются);
+   *   • инлайн-ввод себестоимости и выгрузка «Товары без себестоимости» скрыты;
+   *   • покрытие считается по «нужна ли себестоимость» (costRequired), товары
+   *     только с услугами помечены «только услуги» и не считаются «без себестоимости».
+   * Без пропа компонент работает как раньше (старый режим не затронут).
+   */
+  precomputedRows?: ReadonlyArray<
+    ProductBreakdownRow & { serviceOnly?: boolean; costRequired?: boolean }
+  >;
+}
+
+/** Строка только с услугами (нет продаж/возвратов): себестоимость не нужна. */
+function isServiceOnlyRow(r: unknown): boolean {
+  return !!r && (r as { serviceOnly?: boolean }).serviceOnly === true;
 }
 
 /**
@@ -204,7 +222,10 @@ export function OzonProductBreakdown({
   onCogsTotal,
   onKeyProducts,
   onCostCoverage,
+  precomputedRows,
 }: Props) {
+  // Режим просмотра сохранённого расчёта по начислениям: готовые строки, без каталога.
+  const precomputed = precomputedRows !== undefined;
   // false ТОЛЬКО для восстановленного снапшота старого формата (см. Props
   // doc-comment) — гейтит и баннер, и честность «Возвратов»/рейтингов, не
   // только «Чистую прибыль» (которая дополнительно гейтится per-row через
@@ -241,7 +262,7 @@ export function OzonProductBreakdown({
   // Загружаем каталог при появлении товаров в отчёте / смене пользователя.
   useEffect(() => {
     let cancelled = false;
-    if (!user) {
+    if (precomputed || !user) {
       setCatalog([]);
       setLoading(false);
       setLoadError(null);
@@ -262,7 +283,7 @@ export function OzonProductBreakdown({
     return () => {
       cancelled = true;
     };
-  }, [user, products]);
+  }, [user, products, precomputed]);
 
   // ===== Матчинг + расчёт чистой прибыли по SKU =====
   // Нераспределяемые сверху суммы основного расчёта (props) распределяются
@@ -271,7 +292,9 @@ export function OzonProductBreakdown({
   // каждому товару из каталога (cost_price × quantity проданных единиц).
   const rows = useMemo<BreakdownRow[]>(
     () =>
-      computeProductBreakdownRows(products, catalog, {
+      precomputedRows
+        ? [...precomputedRows]
+        : computeProductBreakdownRows(products, catalog, {
         distributableExpenses,
         loyaltyPayoutsTotal,
         loyaltyPayoutPerSkuKnown,
@@ -279,6 +302,7 @@ export function OzonProductBreakdown({
         productDetailComplete,
       }),
     [
+      precomputedRows,
       products,
       catalog,
       distributableExpenses,
@@ -331,7 +355,7 @@ export function OzonProductBreakdown({
   // неточной). Производная выборка из rows — общий расчёт не меняет.
   const missing = useMemo(
     () =>
-      rows
+      (precomputed ? [] : rows)
         .filter((r) => !r.hasCost)
         // Порядок отображения = как в Excel-выгрузке: сначала по названию,
         // затем по артикулу (русская локаль). Похожие/одинаковые названия идут
@@ -343,7 +367,7 @@ export function OzonProductBreakdown({
             a.name.localeCompare(b.name, "ru") ||
             a.article.localeCompare(b.article, "ru")
         ),
-    [rows]
+    [rows, precomputed]
   );
 
   // ===== Инлайн-сохранение себестоимости =====
@@ -432,7 +456,22 @@ export function OzonProductBreakdown({
   }
 
   // ===== Итоги =====
-  const totals = useMemo(() => computeProductBreakdownTotals(rows), [rows]);
+  const totals = useMemo(() => {
+    const t = computeProductBreakdownTotals(rows);
+    if (!precomputed) return t;
+    // Сохранённый расчёт по начислениям: покрытие — только по товарам, где
+    // себестоимость НУЖНА (нетто-количество ≠ 0); «только услуги» отдельно.
+    const needed = rows.filter((r) => !isServiceOnlyRow(r));
+    return {
+      ...t,
+      withCost: needed.filter((r) => r.hasCost).length,
+      withoutCost: needed.filter((r) => !r.hasCost).length,
+    };
+  }, [rows, precomputed]);
+  const serviceOnlyCount = useMemo(
+    () => rows.filter((r) => isServiceOnlyRow(r)).length,
+    [rows]
+  );
 
   // Пробрасываем суммарную себестоимость каталога в родителя — для автозаполнения
   // поля «Себестоимость товара» в блоке «Дополнительные расходы».
@@ -628,13 +667,21 @@ export function OzonProductBreakdown({
                 себестоимости
               </>
             )}
+            {precomputed && serviceOnlyCount > 0 && (
+              <>
+                {" "}
+                · <b>{serviceOnlyCount}</b> только с услугами (себестоимость не
+                нужна)
+              </>
+            )}
           </p>
         </div>
       </div>
 
       <div className="pb-note">
-        Общие расходы распределяются по товарам пропорционально выручке. Это
-        позволяет оценить чистую прибыль по каждому SKU.
+        {precomputed
+          ? "Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной реализации. Результат сохранён на момент расчёта — текущий каталог его не меняет."
+          : "Общие расходы распределяются по товарам пропорционально выручке. Это позволяет оценить чистую прибыль по каждому SKU."}
       </div>
 
       {!detailComplete && (
@@ -650,7 +697,7 @@ export function OzonProductBreakdown({
         </div>
       )}
 
-      {!user && (
+      {!precomputed && !user && (
         <div className="pb-note">
           Войдите и заполните «Каталог товаров» — система подставит себестоимость
           и посчитает прибыль по каждому артикулу.
@@ -762,6 +809,9 @@ export function OzonProductBreakdown({
                     <span className="pb-cell pb-c-name" role="cell" data-label="Товар">
                       {r.name}
                       <i className="pb-qty">{r.quantity} шт</i>
+                      {isServiceOnlyRow(r) && (
+                        <i className="pb-qty">только услуги</i>
+                      )}
                     </span>
                     <span className="pb-cell pb-num" role="cell" data-label="Выручка">
                       {formatRub(r.revenue)}
@@ -771,7 +821,14 @@ export function OzonProductBreakdown({
                       role="cell"
                       data-label="Себестоимость"
                     >
-                      {r.hasCost ? (
+                      {isServiceOnlyRow(r) ? (
+                        <span
+                          className="pb-dash"
+                          title="Нет продаж и возвратов в периоде — себестоимость не нужна"
+                        >
+                          не нужна
+                        </span>
+                      ) : r.hasCost ? (
                         formatRub(r.cogs ?? 0)
                       ) : (
                         <span className="pb-nocost">Не указана</span>
