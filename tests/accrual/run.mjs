@@ -43,6 +43,7 @@ const SOURCES = [
   "app/app/lib/accrual/columns.ts",
   "app/app/lib/accrual/upload-session.ts",
   "app/app/lib/accrual/save-flow.ts",
+  "app/app/lib/accrual/download-guide.ts",
   "app/app/lib/product-breakdown-calc.ts",
 ];
 

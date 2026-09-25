@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import { scenario } from "./helpers/fixtures.mjs";
 import { CAT, EXPECTED_BASIC as E } from "./helpers/expected.mjs";
 import { makeEntitlements, makeMockCloud } from "./helpers/mock-cloud.mjs";
-import { columns as COL, parseBuf, pdfModel as P, saveFlow as SF, session as SES, snapshot as S } from "./helpers/modules.mjs";
+import { columns as COL, guide as GUIDE, parseBuf, pdfModel as P, saveFlow as SF, session as SES, snapshot as S } from "./helpers/modules.mjs";
 
 const viaJson = (x) => JSON.parse(JSON.stringify(x));
 const NOW = "2026-07-01T10:00:00.000Z";
@@ -1080,6 +1080,53 @@ describe("старые снимки продолжают открываться;
     const x = viaJson(pipeline({ buf: basicBuf() }).evaluation.snapshot);
     x.netProfitKopecks += 1;
     assert.equal(S.readAccrualSnapshot(x).status, "invalid");
+  });
+});
+
+describe("инструкция скачивания отчёта (путь подтверждён скриншотами владельца)", () => {
+  it("ровно 7 шагов в заданном порядке и формулировках", () => {
+    assert.deepEqual(
+      [...GUIDE.ACCRUAL_DOWNLOAD_STEPS],
+      [
+        "Откройте личный кабинет Ozon Seller → «Финансы» → «Начисления и документы».",
+        "На странице «Экономика магазина» откройте вкладку «Детализация начислений».",
+        "Нажмите «Скачать отчёт».",
+        "Выберите вариант «По начислениям».",
+        "В окне скачивания укажите полный календарный месяц: с первого по последнее число. Например, 01.06.2026–30.06.2026.",
+        "Нажмите «Скачать».",
+        "Прикрепите полученный XLSX в M-PROF: перетащите его в область загрузки или нажмите «Выбрать файл».",
+      ]
+    );
+  });
+  it("нет выдуманного шага про выбор формата (на скриншотах его нет); пример периода — полный месяц", () => {
+    const steps = GUIDE.ACCRUAL_DOWNLOAD_STEPS;
+    assert.ok(steps.every((t) => !/выберите\s+(формат|xlsx)|формат\s+xlsx/i.test(t)), "шага «выберите XLSX» быть не должно");
+    assert.match(steps[4], /01\.06\.2026–30\.06\.2026/);
+  });
+  it("пояснение рядом: нужен «По начислениям»; «По логистике», реализация и УПД не подходят", () => {
+    assert.equal(
+      GUIDE.ACCRUAL_REPORT_CHOICE_NOTE,
+      "Нужен отчёт «По начислениям». Отчёт «По логистике», отчёт реализации и УПД для этого способа расчёта не подходят."
+    );
+  });
+  it("файл другого отчёта (нет листа «Начисления» / нет колонок) — понятная ошибка с подсказкой про «По логистике»; обычные ошибки данных подсказки не получают", () => {
+    for (const name of ["wrong_sheet", "no_amount_column"]) {
+      const p = parseBuf(scenario(name));
+      assert.equal(p.ok, false, name);
+      const lines = SES.formatParseErrors(p.errors);
+      assert.ok(lines.some((l) => /«По начислениям» — не «По логистике», не отчёт реализации и не УПД/.test(l)), name);
+    }
+    const dataErr = SES.formatParseErrors(parseBuf(scenario("missing_amount")).errors);
+    assert.doesNotMatch(dataErr.join(" "), /По логистике/);
+  });
+  it("отказы по формату не просят «выбрать формат XLSX» в кабинете, а отсылают к инструкции и отчёту «По начислениям»", () => {
+    for (const name of ["a.xls", "a.csv", "noext"]) {
+      const r = SES.validateAccrualFile({ name, size: 5 });
+      assert.equal(r.ok, false);
+      assert.match(r.message, /«По начислениям»/);
+      assert.match(r.message, /инструкци/);
+      assert.doesNotMatch(r.message, /в формате XLSX/);
+    }
   });
 });
 

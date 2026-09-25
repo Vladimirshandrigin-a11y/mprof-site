@@ -11,24 +11,12 @@
 // страницы (upload-3-*, profit-calc, fld, calc-check).
 // ============================================================================
 
-import { useRef, useState, type DragEvent, type KeyboardEvent } from "react";
+import { useRef, useState, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
 import { AccrualSnapshotView } from "./AccrualSnapshotView";
 import type { AccrualUploadSession } from "../lib/accrual/useAccrualUploadSession";
 import type { InputField } from "../lib/accrual/upload-session";
 import { fmtDateRange, fmtMonthLabel, pluralRu } from "../lib/accrual/format";
-
-/**
- * Как получить отчёт. Только подтверждённое: название отчёта и формат файла
- * (по реальным файлам «Отчет по начислениям_ДД.ММ.ГГГГ-ДД.ММ.ГГГГ.xlsx», лист
- * «Начисления»), период — календарный месяц. Названия пунктов меню кабинета сюда
- * НЕ вписаны: официальный путь не подтверждён — без выдумывания разделов.
- */
-export const ACCRUAL_DOWNLOAD_STEPS: readonly string[] = [
-  "В личном кабинете Ozon Seller откройте подробный «Отчёт по начислениям».",
-  "Выберите период — один полный календарный месяц (с 1-го по последнее число).",
-  "Скачайте отчёт в формате XLSX. Имя файла выглядит так: «Отчет по начислениям_01.06.2026-30.06.2026.xlsx».",
-  "Перетащите файл в область ниже или нажмите «Выбрать файл».",
-];
+import { ACCRUAL_DOWNLOAD_STEPS, ACCRUAL_REPORT_CHOICE_NOTE } from "../lib/accrual/download-guide";
 
 const FIELDS: { key: InputField; label: string; unit: "₽" | "%"; hint?: string }[] = [
   { key: "taxPercent", label: "Налог", unit: "%", hint: "Ваша ставка налога. База — реализация после возвратов." },
@@ -45,6 +33,15 @@ const FIELDS: { key: InputField; label: string; unit: "₽" | "%"; hint?: string
 ];
 
 const PROBLEM_LIMIT = 10;
+
+/** «M-PROF» не переносим по дефису на узком экране. */
+function withBrand(text: string): ReactNode {
+  const parts = text.split("M-PROF");
+  if (parts.length === 1) return text;
+  return parts.flatMap((part, i) =>
+    i === 0 ? [part] : [<span className="accr-nobr" key={i}>M-PROF</span>, part]
+  );
+}
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} Б`;
@@ -223,12 +220,12 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
         <summary>Как получить отчёт</summary>
         <ol>
           {ACCRUAL_DOWNLOAD_STEPS.map((t, i) => (
-            <li key={i}>{t}</li>
+            <li key={i}>{withBrand(t)}</li>
           ))}
         </ol>
+        <p className="accr-guide-which">{ACCRUAL_REPORT_CHOICE_NOTE}</p>
         <p className="accr-guide-note">
-          Нужен только этот файл — отчёт о реализации и УПД не требуются. Файл читается в вашем
-          браузере, на сервере сохраняется только итог расчёта.
+          Файл читается в вашем браузере, на сервере сохраняется только итог расчёта.
         </p>
       </details>
 
@@ -487,6 +484,9 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
   .accr-guide li{display:list-item}
   .accr-guide li::marker{color:var(--gold2);font-family:var(--mono);font-size:.78rem}
   .accr-guide li{font-size:.82rem;line-height:1.5;color:var(--txt2)}
+  .accr-guide-which{margin:.7rem 0 .1rem;padding:.55rem .75rem;border-radius:9px;font-size:.8rem;line-height:1.5;
+    color:#f0cd84;border:1px solid rgba(232,176,75,.3);background:rgba(232,176,75,.07)}
+  .accr-nobr{white-space:nowrap}
   .accr-guide-note{margin:.6rem 0 .1rem;font-size:.75rem;line-height:1.45;color:var(--txt3)}
   .accr-drop{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;
     gap:.35rem;text-align:center;padding:1.5rem 1rem;border:1.5px dashed rgba(201,168,76,.35);border-radius:14px;

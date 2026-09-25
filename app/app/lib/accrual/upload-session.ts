@@ -26,24 +26,29 @@ export function validateAccrualFile(file: { name: string; size: number }): FileC
   const ext = /\.([a-z0-9]+)$/i.exec(name)?.[1]?.toLowerCase() ?? "";
   if (ext === "xlsx") return { ok: true };
   if (ext === "xls") {
-    return { ok: false, message: "Формат .xls не поддерживается. Скачайте отчёт по начислениям в формате XLSX." };
+    return { ok: false, message: "Формат .xls не поддерживается. Нужен XLSX из отчёта «По начислениям» — скачайте его по инструкции выше." };
   }
   if (ext === "csv") {
-    return { ok: false, message: "CSV не поддерживается. Скачайте отчёт по начислениям в формате XLSX." };
+    return { ok: false, message: "CSV не поддерживается. Нужен XLSX из отчёта «По начислениям» — скачайте его по инструкции выше." };
   }
   if (ext === "pdf") {
     return {
       ok: false,
-      message: "PDF для расчёта не нужен. Загрузите один файл — XLSX «Отчёт по начислениям».",
+      message: "PDF для расчёта не нужен. Загрузите XLSX из отчёта «По начислениям» — инструкция выше.",
     };
   }
-  return { ok: false, message: "Загрузите файл в формате XLSX — «Отчёт по начислениям» из личного кабинета Ozon." };
+  return { ok: false, message: "Загрузите XLSX из отчёта «По начислениям» личного кабинета Ozon — инструкция выше." };
 }
 
 /** Сообщения об ошибках разбора для показа пользователю (без товарных данных). */
+const WRONG_REPORT_CODES: ReadonlySet<string> = new Set(["sheet_not_found", "header_not_found", "missing_financial_columns"]);
+const WRONG_REPORT_HINT = "Проверьте, что скачан отчёт «По начислениям» — не «По логистике», не отчёт реализации и не УПД.";
+
 export function formatParseErrors(errors: readonly AccrualParseError[]): string[] {
   return errors.map((e) => {
     const parts = [e.message];
+    // Файл другого отчёта (например, «По логистике») ломается на листе/заголовках — подсказываем, что нужен другой.
+    if (WRONG_REPORT_CODES.has(e.code)) parts.push(WRONG_REPORT_HINT);
     if (e.rows && e.rows.length > 0) {
       parts.push(`Строки листа: ${e.rows.join(", ")}${e.count && e.count > e.rows.length ? " и др." : ""}.`);
     }
