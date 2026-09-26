@@ -656,6 +656,63 @@ export function buildRealizationDiagnostic(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Товары отчёта реализации, отсутствующие в каталоге — источник автодобавления
+// (единая точка импорта: cloud/_lib/catalog-import). ЧИСТАЯ функция: только читает
+// строки и каталог, ничего не пишет. Матч — тот же, что в диагностике выше:
+// нормализованный item.offer_id ↔ products.sku, без fuzzy.
+// ---------------------------------------------------------------------------
+
+/** Товар из строк реализации, которого нет в каталоге (одна запись на пару артикул+Ozon-SKU). */
+export type RealizationUnmatchedProduct = {
+  offerId: string;
+  /** Ozon SKU как строка ("" если нет). Нужен только для распознавания конфликтов. */
+  sku: string;
+  name: string;
+  /** Сколько строк реализации приходится на этот товар. */
+  rows: number;
+};
+
+export type RealizationUnmatchedSummary = {
+  products: RealizationUnmatchedProduct[];
+  /** Строки реализации без артикула — добавить в каталог нельзя. */
+  rowsWithoutOfferId: number;
+};
+
+export function collectUnmatchedRealizationProducts(
+  fetched: RealizationFetchResult,
+  catalog: CatalogRow[]
+): RealizationUnmatchedSummary {
+  if (!fetched.ok) return { products: [], rowsWithoutOfferId: 0 };
+  const inCatalog = new Set<string>();
+  for (const c of catalog) {
+    const key = normArticle(c.sku);
+    if (key) inCatalog.add(key);
+  }
+  const byPair = new Map<string, RealizationUnmatchedProduct>();
+  let rowsWithoutOfferId = 0;
+  for (const r of fetched.rows) {
+    const offerId = offerIdOf(r).trim();
+    const key = normArticle(offerId);
+    if (!key) {
+      rowsWithoutOfferId += 1;
+      continue;
+    }
+    if (inCatalog.has(key)) continue;
+    const skuNum = skuNumOf(r);
+    const sku = skuNum === null ? "" : String(skuNum);
+    const pairKey = `${key}|${sku}`;
+    const ex = byPair.get(pairKey);
+    if (ex) {
+      ex.rows += 1;
+      if (!ex.name) ex.name = productNameOf(r).trim();
+    } else {
+      byPair.set(pairKey, { offerId, sku, name: productNameOf(r).trim(), rows: 1 });
+    }
+  }
+  return { products: [...byPair.values()], rowsWithoutOfferId };
+}
+
 /**
  * Удобная обёртка: распарсить "YYYY-MM", получить отчёт и собрать диагностику.
  * Используется gated-роутом save-calculation ПОСЛЕ успешного списания/сохранения.
@@ -672,18 +729,35 @@ export async function loadRealizationDiagnostic(params: {
   catalog: CatalogRow[];
   deadlineMs?: number;
 }): Promise<RealizationDiagnostic> {
+  return (await loadRealizationDiagnosticWithProducts(params)).diagnostic;
+}
+
+/**
+ * То же, что loadRealizationDiagnostic (тот же запрос к Ozon, те же числа), плюс
+ * список товаров строк, которых нет в каталоге. Один запрос к Ozon — без повторов.
+ * Только чтение: запись в каталог делает вызывающий route (save-calculation),
+ * диагностики её не выполняют.
+ */
+export async function loadRealizationDiagnosticWithProducts(params: {
+  clientId: string;
+  apiKey: string;
+  month: string; // "YYYY-MM"
+  catalog: CatalogRow[];
+  deadlineMs?: number;
+}): Promise<{ diagnostic: RealizationDiagnostic; unmatched: RealizationUnmatchedSummary }> {
   const { clientId, apiKey, month, catalog, deadlineMs } = params;
   const m = /^(\d{4})-(\d{2})$/.exec(month);
   const year = m ? Number(m[1]) : 0;
   const monthNum = m ? Number(m[2]) : 0;
   if (!m || monthNum < 1 || monthNum > 12) {
-    return buildRealizationDiagnostic(
-      { ok: false, code: "bad_response" },
-      catalog,
-      monthNum,
-      year
-    );
+    return {
+      diagnostic: buildRealizationDiagnostic({ ok: false, code: "bad_response" }, catalog, monthNum, year),
+      unmatched: { products: [], rowsWithoutOfferId: 0 },
+    };
   }
   const fetched = await fetchRealizationReport(clientId, apiKey, monthNum, year, deadlineMs);
-  return buildRealizationDiagnostic(fetched, catalog, monthNum, year);
+  return {
+    diagnostic: buildRealizationDiagnostic(fetched, catalog, monthNum, year),
+    unmatched: collectUnmatchedRealizationProducts(fetched, catalog),
+  };
 }

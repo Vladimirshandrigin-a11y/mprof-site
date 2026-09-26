@@ -8,6 +8,7 @@
 import type { AccrualRow } from "./types";
 import type { AccrualPeriod, AccrualParseError, AccrualWarning } from "../report-parsers/accrual-xlsx-parser";
 import { computeAccrualProfit, type AccrualManualExpenses, type AccrualProfitCalc } from "./profit-calc";
+import { aggregateAccrualProducts } from "./product-analytics";
 import { buildAccrualSnapshot, type AccrualSnapshotV1 } from "./snapshot";
 import { pluralRu } from "./format";
 import type { CatalogEntry } from "../product-breakdown-calc";
@@ -236,6 +237,33 @@ export function evaluateAccrual(args: EvaluateArgs): AccrualEvaluation {
     notes,
     readyToSave: calc.readyToSave && blockers.length === 0,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Автодобавление отсутствующих товаров в каталог (единая серверная точка импорта)
+// ---------------------------------------------------------------------------
+
+/** Товар для автодобавления: только артикул, SKU и название — не весь отчёт. */
+export interface CatalogCandidate {
+  offerId: string;
+  sku: string;
+  name: string;
+}
+
+/**
+ * Товары отчёта, которых нет в каталоге и для которых себестоимость НУЖНА для расчёта
+ * (нетто-количество ≠ 0). Товары только с услугами и товары с нулевым нетто-количеством
+ * себестоимости не требуют — их в каталог не добавляем. Матч — тот же, что в расчёте
+ * (артикул ↔ products.sku, без fuzzy): используется сама агрегация ядра.
+ * Существующие товары (в том числе с нулевой стоимостью) сюда не попадают.
+ */
+export function accrualMissingCatalogCandidates(
+  rows: readonly AccrualRow[],
+  catalog: readonly CatalogEntry[]
+): CatalogCandidate[] {
+  return aggregateAccrualProducts(rows, catalog)
+    .products.filter((p) => p.costRequired && !p.matched)
+    .map((p) => ({ offerId: p.article, sku: p.sku, name: p.name }));
 }
 
 // ---------------------------------------------------------------------------

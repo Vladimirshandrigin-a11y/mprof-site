@@ -43,6 +43,13 @@ type ToastFn = (message: string, type?: "ok" | "warn" | "err") => void;
 interface Props {
   user: User;
   showToast: ToastFn;
+  /** Растёт, когда каталог изменён снаружи (автодобавление товаров) — список перечитывается. */
+  refreshKey?: number;
+}
+
+/** Текущее правило валидности себестоимости: конечное число > 0 (0 = «не указана»). */
+export function hasValidCost(costPrice: number | null | undefined): boolean {
+  return typeof costPrice === "number" && Number.isFinite(costPrice) && costPrice > 0;
 }
 
 interface Draft {
@@ -90,7 +97,7 @@ function pluralRows(n: number): string {
   return "строк";
 }
 
-export function ProductCatalog({ user, showToast }: Props) {
+export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -159,7 +166,7 @@ export function ProductCatalog({ user, showToast }: Props) {
 
   useEffect(() => {
     reload();
-  }, [reload]);
+  }, [reload, refreshKey]);
 
   function openAdd() {
     setEditingId(null);
@@ -513,8 +520,7 @@ export function ProductCatalog({ user, showToast }: Props) {
   // Считаем по полному products, чтобы цифры не зависели от поиска/фильтра.
   const withCostCount = useMemo(
     () =>
-      products.filter((p) => Number.isFinite(p.cost_price) && p.cost_price > 0)
-        .length,
+      products.filter((p) => hasValidCost(p.cost_price)).length,
     [products]
   );
   const withoutCostCount = products.length - withCostCount;
@@ -527,7 +533,7 @@ export function ProductCatalog({ user, showToast }: Props) {
   const visibleProducts = useMemo(() => {
     const q = search.trim().toLowerCase();
     return sortedProducts.filter((p) => {
-      const hasCost = Number.isFinite(p.cost_price) && p.cost_price > 0;
+      const hasCost = hasValidCost(p.cost_price);
       if (costFilter === "with" && !hasCost) return false;
       if (costFilter === "without" && hasCost) return false;
       if (q !== "") {
@@ -1162,9 +1168,15 @@ export function ProductCatalog({ user, showToast }: Props) {
                   Действия
                 </span>
               </div>
-              {visibleProducts.map((p) => (
+              {visibleProducts.map((p) => {
+                // Без корректной себестоимости — красная строка с подсказкой; исчезает после
+                // сохранения валидной стоимости (products обновляется точечно, без reload).
+                const needsCost = !hasValidCost(p.cost_price);
+                return (
                 <div
-                  className={"pc-row" + (selectedIds.has(p.id) ? " selected" : "")}
+                  className={
+                    "pc-row" + (selectedIds.has(p.id) ? " selected" : "") + (needsCost ? " no-cost" : "")
+                  }
                   role="row"
                   key={p.id}
                 >
@@ -1230,10 +1242,12 @@ export function ProductCatalog({ user, showToast }: Props) {
                         {costSavingId === p.id ? "…" : "Сохранить"}
                       </button>
                     </span>
-                    {costErr[p.id] && (
+                    {costErr[p.id] ? (
                       <span className="pc-cost-err" role="alert">
                         {costErr[p.id]}
                       </span>
+                    ) : (
+                      needsCost && <span className="pc-cost-need">Укажите себестоимость</span>
                     )}
                   </span>
                   <span className="pc-cell pc-c-act" role="cell">
@@ -1289,7 +1303,8 @@ export function ProductCatalog({ user, showToast }: Props) {
                     )}
                   </span>
                 </div>
-              ))}
+                );
+              })}
               </div>
             </>
           )}
@@ -1699,6 +1714,24 @@ export function ProductCatalog({ user, showToast }: Props) {
         }
         .pc-row.selected:hover {
           background: rgba(201, 168, 76, 0.1);
+        }
+        .pc-row.no-cost {
+          background: rgba(224, 85, 102, 0.07);
+          box-shadow: inset 3px 0 0 rgba(224, 85, 102, 0.75);
+        }
+        .pc-row.no-cost:hover {
+          background: rgba(224, 85, 102, 0.11);
+        }
+        .pc-row.no-cost .pc-cost-input {
+          border-color: rgba(224, 85, 102, 0.6);
+        }
+        .pc-cost-need {
+          display: block;
+          margin-top: 5px;
+          font-size: 0.74rem;
+          font-family: var(--sans);
+          font-weight: 600;
+          color: var(--red);
         }
         .pc-th-check,
         .pc-c-check {

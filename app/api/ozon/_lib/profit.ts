@@ -15,8 +15,9 @@ import {
   type ProfitCostDraft,
 } from "./postings";
 import {
-  loadRealizationDiagnostic,
+  loadRealizationDiagnosticWithProducts,
   type RealizationDiagnostic,
+  type RealizationUnmatchedSummary,
 } from "./realization";
 import {
   isAccrualFinanceEnabled,
@@ -606,6 +607,12 @@ export type ApiProfitLoaded =
       ok: false;
       kind: "realization_cost";
       resolution: Extract<RealizationCostResolution, { ok: false }>;
+      /**
+       * Товары строк реализации, которых нет в каталоге (только чтение). Загрузчик
+       * НИЧЕГО не записывает — автодобавление выполняет ТОЛЬКО пользовательский
+       * save-calculation; диагностики (fullCalcCheck) эти данные не используют.
+       */
+      unmatched: RealizationUnmatchedSummary;
       timings: ApiProfitTimings;
     };
 
@@ -709,14 +716,21 @@ export async function loadAndComputeApiProfit(
   //    (шаг 2) остаются ДО этого места намеренно — при их ошибке функция уже
   //    вышла раньше и не тратит лишние живые запросы к Ozon на realization/postings.
   const tParallel0 = Date.now();
-  const [realization, postings] = await Promise.all([
-    loadRealizationDiagnostic({ clientId, apiKey, month, catalog: catalogRows }),
+  const [realizationLoaded, postings] = await Promise.all([
+    loadRealizationDiagnosticWithProducts({ clientId, apiKey, month, catalog: catalogRows }),
     fetchMonthPostings(clientId, apiKey, range),
   ]);
+  const realization = realizationLoaded.diagnostic;
   realizationAndPostingsMs = Date.now() - tParallel0;
   const resolution = resolveRealizationProductionCost(realization);
   if (!resolution.ok) {
-    return { ok: false, kind: "realization_cost", resolution, timings: timingsNow() };
+    return {
+      ok: false,
+      kind: "realization_cost",
+      resolution,
+      unmatched: realizationLoaded.unmatched,
+      timings: timingsNow(),
+    };
   }
   const productionCost = resolution.productionCost;
   const realizationRevenueForTax = resolution.realizationRevenueForTax;

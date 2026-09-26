@@ -11,6 +11,7 @@ import {
   round2,
 } from "../_lib/profit";
 import { type RealizationDiagnostic } from "../_lib/realization";
+import { syncMissingRealizationProducts } from "../_lib/realization-catalog-sync";
 
 // ============================================================================
 // POST /api/ozon/save-calculation — ФИНАЛЬНОЕ сохранение API-расчёта Ozon в
@@ -42,7 +43,10 @@ import { type RealizationDiagnostic } from "../_lib/realization";
 //        • unmatched/no-cost → 400 incomplete_cost (пользователь заполняет каталог);
 //        • not_connected/no_rows/no_offer_id/zero_cost → 422 realization_unavailable;
 //      в обоих случаях БЕЗ сохранения и БЕЗ списания — некорректная прибыль НЕ
-//      показывается;
+//      показывается. Перед ответом incomplete_cost товары строк реализации, которых
+//      нет в каталоге, автоматически добавляются в каталог пользователя (единая
+//      функция cloud/_lib/catalog-import, cost_price = 0 = «не указана») — так что
+//      пользователю остаётся только заполнить стоимость и запустить расчёт снова;
 //   4. списываем РОВНО один API-расчёт СТРОГИМ RPC consume_api_calculation
 //      (PR #21): доступ ТОЛЬКО при активном безлимите 449₽ ИЛИ первом бесплатном
 //      пробном расчёте; 149₽ single-кредит API НЕ открывает. Списание — ПЕРЕД
@@ -210,14 +214,24 @@ export async function POST(req: NextRequest) {
     //         (отчёт не получен / пуст / без offer_id / нулевая себестоимость).
     const r = loaded.resolution;
     if (r.code === "unmatched" || r.code === "no_cost") {
+      // Автодобавление отсутствующих товаров — ДО consume и сохранения; здесь же
+      // расчёт останавливается (consume/calculations/report_history не трогаем).
+      // Ошибка импорта не скрывается: catalogImport.ok=false доходит до UI.
+      const sync = await syncMissingRealizationProducts({
+        admin,
+        userId,
+        resolution: r,
+        unmatched: loaded.unmatched,
+      });
       return NextResponse.json(
         {
           error:
             "Сохранение доступно только когда все товары из отчёта о реализации сопоставлены и у каждого заполнена себестоимость.",
           code: "incomplete_cost",
           status: "partial_cost",
-          unmatchedItems: r.unmatchedRows,
-          matchedNoCostCount: r.noCostRows,
+          unmatchedItems: sync.unmatchedItems,
+          matchedNoCostCount: sync.matchedNoCostCount,
+          catalogImport: sync.catalogImport,
         },
         { status: 400, headers: NO_STORE }
       );

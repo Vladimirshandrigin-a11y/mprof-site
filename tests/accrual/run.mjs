@@ -45,6 +45,12 @@ const SOURCES = [
   "app/app/lib/accrual/save-flow.ts",
   "app/app/lib/accrual/download-guide.ts",
   "app/app/lib/product-breakdown-calc.ts",
+  // Серверные модули (автодобавление товаров в каталог; загрузчик и маршруты — на моках).
+  "app/api/cloud/_lib/catalog-import.ts",
+  "app/api/cloud/products/import-missing/route.ts",
+  "app/api/ozon/_lib/realization-catalog-sync.ts",
+  "app/api/ozon/_lib/profit.ts",
+  "app/api/ozon/save-calculation/route.ts",
 ];
 
 rmSync(buildDir, { recursive: true, force: true });
@@ -56,7 +62,7 @@ const tsc = spawnSync(
   [
     tscBin,
     "--outDir", buildDir,
-    "--rootDir", "app/app/lib",
+    "--rootDir", "app",
     "--module", "commonjs",
     "--target", "es2019",
     "--moduleResolution", "node",

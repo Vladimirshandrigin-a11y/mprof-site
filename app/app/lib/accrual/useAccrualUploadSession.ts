@@ -8,8 +8,9 @@
 //
 // Вся арифметика — в ядре (upload-session.evaluateAccrual → computeAccrualProfit);
 // списание и запись — в AccrualSaveController (save-flow.ts). Хук только держит
-// состояние и связывает их с UI. Файл читается в браузере и на сервер не уходит:
-// сохраняется лишь снимок результата.
+// состояние и связывает их с UI. Файл читается в браузере и на сервер не уходит: на
+// сервер попадают снимок результата и — для автодобавления в каталог — только артикулы,
+// SKU и названия отсутствующих товаров (не строки отчёта и не суммы).
 // ============================================================================
 
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -27,6 +28,7 @@ import {
   EMPTY_ACCRUAL_INPUTS,
   evaluateAccrual,
   formatParseErrors,
+  accrualMissingCatalogCandidates,
   reportFingerprint,
   resultAccess,
   saveOutcomeUi,
@@ -39,6 +41,8 @@ import {
 } from "./upload-session";
 import type { AccrualSnapshotV1 } from "./snapshot";
 import type { CatalogEntry } from "../product-breakdown-calc";
+import type { CatalogCandidate } from "./upload-session";
+import type { CatalogImportOutcome } from "../supabase-cloud";
 import type { AccrualParseResult } from "../report-parsers/accrual-xlsx-parser";
 
 /** Внешние сервисы. По умолчанию — реальные (supabase-cloud, парсер, PDF); в preview/тестах подменяются. */
@@ -49,6 +53,8 @@ export interface AccrualUploadServices {
   updateCalculation(id: string, cols: AccrualCalculationColumns, userId: string): Promise<CloudResult<CloudRow>>;
   insertReportHistory(cols: AccrualReportHistoryColumns, userId: string): Promise<CloudResult<unknown>>;
   downloadPdf(snapshot: AccrualSnapshotV1): Promise<void>;
+  /** Добавить в каталог отсутствующие товары (сервер, единая точка импорта). */
+  importMissingProducts(items: readonly CatalogCandidate[]): Promise<{ data: CatalogImportOutcome | null; error: string | null }>;
 }
 
 export interface AccrualSavedEvent {
@@ -70,6 +76,8 @@ export interface AccrualUploadSessionOptions {
   /** Открыть окно тарифов (нет попытки / списание отклонено). */
   onPaywall: () => void;
   onSaved: (e: AccrualSavedEvent) => void;
+  /** Каталог изменился (автодобавление) — обновить открытые списки каталога. */
+  onCatalogChanged?: () => void;
   /** Строка с таким id ещё есть в истории (иначе следующая запись создаст новую). */
   isRowPresent: (id: string) => boolean;
   showToast?: (message: string, type: "ok" | "warn" | "err") => void;
@@ -83,6 +91,16 @@ export type CatalogState = {
 };
 
 export type SaveNote = { kind: "ok" | "warn" | "err"; text: string };
+
+/**
+ * Автодобавление отсутствующих товаров в каталог: состояние для экрана. «Успех» есть
+ * только когда сервер подтвердил запись; при ошибке показывается error, а не добавление.
+ */
+export type CatalogImportState =
+  | { status: "idle" }
+  | { status: "running" }
+  | { status: "done"; created: number; ambiguous: number }
+  | { status: "error"; message: string };
 
 // ---------------------------------------------------------------------------
 // Сервисы по умолчанию: реальные, но подключаются лениво (без Supabase в SSR/тестах).
@@ -119,6 +137,11 @@ const DEFAULT_SERVICES: AccrualUploadServices = {
     const { downloadAccrualPdf } = await import("./pdf-render");
     await downloadAccrualPdf(snapshot);
   },
+  async importMissingProducts(items) {
+    const { importMissingProductsToCloud } = await import("../supabase-cloud");
+    const r = await importMissingProductsToCloud(items);
+    return { data: r.data, error: r.error ? r.error.message : null };
+  },
 };
 
 /** Сервисы с учётом подмены из опций (preview/тесты). */
@@ -137,6 +160,8 @@ export interface AccrualUploadSession {
   errors: string[];
   parsed: AccrualParsedReport | null;
   catalog: CatalogState;
+  /** Автодобавление отсутствующих товаров в каталог (после разбора файла). */
+  catalogImport: CatalogImportState;
   inputs: AccrualUploadInputs;
   setInput: (field: InputField, value: string) => void;
   /** null — расчёта нет (нет файла, идёт загрузка каталога, ошибка каталога). */
@@ -200,6 +225,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   const [parsed, setParsed] = useState<AccrualParsedReport | null>(null);
   const [parsedAt, setParsedAt] = useState<string>("");
   const [catalog, setCatalog] = useState<CatalogState>({ status: "idle", entries: [], error: null });
+  const [catalogImport, setCatalogImport] = useState<CatalogImportState>({ status: "idle" });
   const [inputs, setInputs] = useState<AccrualUploadInputs>({ ...EMPTY_ACCRUAL_INPUTS });
   const [saving, setSaving] = useState(false);
   const [saveNote, setSaveNote] = useState<SaveNote | null>(null);
@@ -214,11 +240,11 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
 
   const toast = (m: string, t: "ok" | "warn" | "err") => optsRef.current.showToast?.(m, t);
 
-  const loadCatalogFor = async (req: number): Promise<void> => {
+  const loadCatalogFor = async (req: number): Promise<CatalogEntry[] | null> => {
     const userId = optsRef.current.userId;
     if (!userId) {
       setCatalog({ status: "idle", entries: [], error: null });
-      return;
+      return null;
     }
     setCatalog((c) => ({ ...c, status: "loading", error: null }));
     let res: { entries: CatalogEntry[]; error: string | null };
@@ -227,12 +253,53 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     } catch (e) {
       res = { entries: [], error: e instanceof Error ? e.message : "Не удалось загрузить каталог" };
     }
-    if (req !== reqRef.current) return;
+    if (req !== reqRef.current) return null;
     setCatalog(
       res.error
         ? { status: "error", entries: [], error: res.error }
         : { status: "ready", entries: res.entries, error: null }
     );
+    return res.error ? null : res.entries;
+  };
+
+  /**
+   * Автодобавление: товары, которых нет в каталоге и чья себестоимость нужна для расчёта,
+   * уходят на сервер ОДНИМ запросом (только артикул/SKU/название) и попадают в каталог без
+   * себестоимости. Затем каталог перечитывается — экран и повторная проверка видят обновлённый
+   * список. Ошибка не маскируется под успех; повтор («Проверить снова») безопасен: сервер не
+   * дублирует и не перезаписывает существующие товары. Расчёт при этом НЕ выполняется и НЕ
+   * списывается — неполная себестоимость по-прежнему блокирует расчёт и сохранение.
+   */
+  const autoImportFor = async (req: number, report: AccrualParsedReport, entries: CatalogEntry[]): Promise<void> => {
+    const o = optsRef.current;
+    if (!o.userId) return;
+    const items = accrualMissingCatalogCandidates(report.rows, entries);
+    if (items.length === 0) {
+      setCatalogImport((c) => (c.status === "error" ? { status: "idle" } : c));
+      return;
+    }
+    setCatalogImport({ status: "running" });
+    setCatalog({ status: "loading", entries, error: null });
+    let res: { data: CatalogImportOutcome | null; error: string | null };
+    try {
+      res = await resolveServices(o).importMissingProducts(items);
+    } catch (e) {
+      res = { data: null, error: e instanceof Error ? e.message : "Не удалось связаться с сервером" };
+    }
+    if (req !== reqRef.current) return;
+    if (res.error || !res.data) {
+      setCatalog({ status: "ready", entries, error: null });
+      setCatalogImport({ status: "error", message: res.error || "Сервер не подтвердил добавление товаров" });
+      return;
+    }
+    const outcome = res.data;
+    setCatalogImport((c) => ({
+      status: "done",
+      created: outcome.created + (c.status === "done" ? c.created : 0),
+      ambiguous: outcome.ambiguous,
+    }));
+    if (outcome.created > 0) optsRef.current.onCatalogChanged?.();
+    await loadCatalogFor(req);
   };
 
   /** Подтянуть в состояние экрана то, что известно контроллеру о текущей и «чужих» попытках. */
@@ -272,6 +339,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     setErrors([]);
     setPhase("reading");
     setCatalog({ status: "idle", entries: [], error: null });
+    setCatalogImport({ status: "idle" });
 
     let res: AccrualParseResult;
     try {
@@ -303,7 +371,8 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     setParsed(report);
     setParsedAt(new Date().toISOString());
     setPhase("ready");
-    await loadCatalogFor(req);
+    const entries = await loadCatalogFor(req);
+    if (entries) await autoImportFor(req, report, entries);
   };
 
   const clearFile = () => {
@@ -321,13 +390,18 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     setErrors([]);
     setPhase("idle");
     setCatalog({ status: "idle", entries: [], error: null });
+    setCatalogImport({ status: "idle" });
     setSavedKey(null);
     setSaveNote(null);
   };
 
   const refreshCatalog = async (): Promise<void> => {
     if (!parsed) return;
-    await loadCatalogFor(reqRef.current);
+    const req = reqRef.current;
+    const entries = await loadCatalogFor(req);
+    // Повторная проверка: каталог перечитан; если товары так и не добавлены (ошибка импорта) —
+    // пробуем ещё раз. Уже добавленные сервер пропустит.
+    if (entries) await autoImportFor(req, parsed, entries);
   };
 
   const setInput = (field: InputField, value: string) => setInputs((prev) => ({ ...prev, [field]: value }));
@@ -413,6 +487,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     errors,
     parsed,
     catalog,
+    catalogImport,
     inputs,
     setInput,
     evaluation,

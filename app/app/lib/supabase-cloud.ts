@@ -602,6 +602,43 @@ export async function addProductToCloud(
   }
 }
 
+/** Товар-кандидат для автодобавления в каталог: только товарные поля (не весь отчёт). */
+export interface CatalogImportItem {
+  /** Артикул продавца (offer_id). */
+  offerId: string;
+  /** Ozon SKU (если есть). */
+  sku?: string;
+  name?: string;
+}
+
+/** Итог серверного автодобавления (/api/cloud/products/import-missing). */
+export interface CatalogImportOutcome {
+  created: number;
+  alreadyInCatalog: number;
+  ambiguous: number;
+  noArticle: number;
+  invalid: number;
+  duplicatesRemoved: number;
+}
+
+/**
+ * Добавить в каталог ОТСУТСТВУЮЩИЕ товары (sku = артикул, себестоимость не указана).
+ * Идёт через сервер: он берёт user_id из токена и использует ту же функцию, что и
+ * API-расчёт. Существующие товары не перезаписываются, повторный вызов дублей не
+ * создаёт. При ошибке возвращает error — вызывающий НЕ должен показывать успех.
+ */
+export async function importMissingProductsToCloud(
+  items: readonly CatalogImportItem[]
+): Promise<CloudResult<CatalogImportOutcome>> {
+  return cloudSend<CatalogImportOutcome>("/api/cloud/products/import-missing", "POST", {
+    products: items.map((i) => ({
+      offerId: i.offerId,
+      ...(i.sku ? { sku: i.sku } : {}),
+      ...(i.name ? { name: i.name } : {}),
+    })),
+  });
+}
+
 export async function updateProductInCloud(
   productId: string,
   fields: ProductUpdateInput,
