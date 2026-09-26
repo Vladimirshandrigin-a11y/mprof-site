@@ -37,6 +37,16 @@
 // Результат части = прямые строки + доля общих начислений − себестоимость − налог −
 // ручные. Σ результатов частей = прибыль товара ДО КОПЕЙКИ; итог периода, себестоимость
 // и распределение между товарами не меняются.
+//
+// Неопределённость. Неразделённые операции могут относиться к продажам целиком, частично
+// или не относиться вовсе, причём противоположные по знаку операции — к разным частям.
+// Поэтому их вклад НЕ сворачивается в одно нетто: границы результата продаж строятся по
+// отдельным элементам — каждая строка отчёта вместе с себестоимостью ЕЁ единиц (единица
+// и её себестоимость неразделимы: «Выручка» − кол-во × себестоимость единицы, «Возврат
+// выручки» + кол-во × себестоимость единицы). Верхняя граница — все положительные
+// элементы в продажах, нижняя — все отрицательные; доли налога/ручных/общих начислений
+// неразделённой части — по своему знаку. Результат продаж ТОЧЕН, только если таких
+// элементов нет (нижняя граница = верхней).
 // ============================================================================
 
 import { ACCRUAL_BUCKETS, type AccrualBucketSums, type AccrualRow } from "./types";
@@ -75,9 +85,14 @@ export interface ProductSplit {
   unsplitReasons: Record<UnsplitReason, number>;
   /** Неразделённые строки по корзинам (Σ = parts.unsplit.directKopecks). */
   unsplitBuckets: AccrualBucketSums;
-  /** Σ положительных / отрицательных исходных строк неразделённой части. */
-  unsplitPositiveKopecks: number;
-  unsplitNegativeKopecks: number;
+  /**
+   * Σ положительных / отрицательных ЭЛЕМЕНТОВ неразделённой части: элемент — одна строка
+   * отчёта вместе с себестоимостью её единиц (см. шапку); строки между собой не
+   * сворачиваются. Без известной себестоимости единицы — только суммы строк.
+   * up ≥ 0, down ≤ 0, up + down = прямые строки − себестоимость неразделённой части.
+   */
+  unsplitUpKopecks: number;
+  unsplitDownKopecks: number;
 }
 
 /** Что нужно от товара (результат allocateAccrualProducts). */
@@ -179,8 +194,7 @@ function splitOne(rows: readonly AccrualRow[], p: SplitProductInput): ProductSpl
   const unsplitReasons = {} as Record<UnsplitReason, number>;
   for (const k of UNSPLIT_REASONS) unsplitReasons[k] = 0;
   const unsplitBuckets = emptyBucketSums();
-  let pos = 0;
-  let neg = 0;
+  const unsplitRows: AccrualRow[] = [];
 
   const add = (part: SplitPartKey, r: AccrualRow) => {
     const t = parts[part];
@@ -195,8 +209,7 @@ function splitOne(rows: readonly AccrualRow[], p: SplitProductInput): ProductSpl
     }
     if (part === "unsplit") {
       unsplitBuckets[r.bucket] += r.amountKopecks;
-      if (r.amountKopecks > 0) pos += r.amountKopecks;
-      else neg += r.amountKopecks;
+      unsplitRows.push(r);
     }
   };
 
@@ -250,6 +263,25 @@ function splitOne(rows: readonly AccrualRow[], p: SplitProductInput): ProductSpl
     }
   }
 
+  // Элементы неразделённой части: строка + себестоимость её единиц, без взаимозачёта.
+  // Копейки округления (себестоимость единицы с долями копейки) расширяют границу.
+  let up = 0;
+  let down = 0;
+  for (const r of unsplitRows) {
+    let cost = 0;
+    if (ucKnown && r.quantity) {
+      const c = Math.round(Math.abs(r.quantity) * (uc as number) * 100);
+      if (r.bucket === "salesRevenue") cost = -c;
+      else if (r.bucket === "returnsRevenue") cost = c;
+    }
+    const item = r.amountKopecks + cost;
+    if (item > 0) up += item;
+    else down += item;
+  }
+  const rest = parts.unsplit.directKopecks - (parts.unsplit.cogsKopecks ?? 0) - (up + down);
+  if (rest > 0) up += rest;
+  else down += rest;
+
   // Распределённые суммы товара → части по положительной выручке части.
   const weights = SPLIT_PARTS.map((k) => Math.max(parts[k].revenueKopecks, 0));
   const tie = SPLIT_PARTS.map((k, i) => String(i));
@@ -274,8 +306,8 @@ function splitOne(rows: readonly AccrualRow[], p: SplitProductInput): ProductSpl
     groups,
     unsplitReasons,
     unsplitBuckets,
-    unsplitPositiveKopecks: pos,
-    unsplitNegativeKopecks: neg,
+    unsplitUpKopecks: up + 0,
+    unsplitDownKopecks: down + 0,
   };
 }
 
@@ -298,13 +330,16 @@ export interface SalesLossAssessment {
   /** Диапазон результата продаж, если неразделённые операции отнести к продажам по-разному. */
   lowerKopecks: number | null;
   upperKopecks: number | null;
+  /** true — результат продаж точен (неразделённые операции на него повлиять не могут). */
+  exact: boolean;
 }
 
 /**
  * Вывод об убыточности продаж товара. «loss» — только если результат продаж
- * отрицателен ПРИ ЛЮБОМ отнесении неразделённых операций (их положительные суммы
+ * отрицателен ПРИ ЛЮБОМ отнесении неразделённых операций (их положительные элементы
  * не могут вывести его в плюс). «undetermined» — неразделённые операции могут
- * изменить знак: товар не ранжируется как доказанно убыточный.
+ * изменить знак: товар не ранжируется как доказанно убыточный. Доказанный знак и
+ * известная величина — разные вещи: exact=true только при нижней границе = верхней.
  */
 export function assessSalesLoss(split: ProductSplit): SalesLossAssessment {
   const sales = split.parts.sales;
@@ -312,6 +347,7 @@ export function assessSalesLoss(split: ProductSplit): SalesLossAssessment {
     salesRevenueKopecks: sales.revenueKopecks,
     lowerKopecks: null,
     upperKopecks: null,
+    exact: false,
   };
   if (split.groups.sales === 0) {
     return { status: "no_sales", salesResultKopecks: null, salesMarginPercent: null, ...base };
@@ -321,9 +357,10 @@ export function assessSalesLoss(split: ProductSplit): SalesLossAssessment {
   if (result === null || u.cogsKopecks === null) {
     return { status: "no_cost", salesResultKopecks: null, salesMarginPercent: null, ...base };
   }
-  const items = [u.generalKopecks, -u.cogsKopecks, -u.taxKopecks, -u.manualKopecks];
-  let upSum = split.unsplitPositiveKopecks;
-  let downSum = split.unsplitNegativeKopecks;
+  // Себестоимость неразделённой части уже внутри элементов (строка + её единицы).
+  const items = [u.generalKopecks, -u.taxKopecks, -u.manualKopecks];
+  let upSum = split.unsplitUpKopecks;
+  let downSum = split.unsplitDownKopecks;
   for (const v of items) {
     if (v > 0) upSum += v;
     else downSum += v;
@@ -338,6 +375,7 @@ export function assessSalesLoss(split: ProductSplit): SalesLossAssessment {
     salesMarginPercent: ratioPercent(result, sales.revenueKopecks),
     lowerKopecks: lower,
     upperKopecks: upper,
+    exact: lower === upper,
   };
 }
 
@@ -374,8 +412,9 @@ export function splitMatchesProduct(split: ProductSplit, p: SplitProductInput): 
     tax === p.allocatedTaxKopecks &&
     manual === p.allocatedManualKopecks &&
     buckets === split.parts.unsplit.directKopecks &&
-    split.unsplitPositiveKopecks >= 0 &&
-    split.unsplitNegativeKopecks <= 0 &&
-    split.unsplitPositiveKopecks + split.unsplitNegativeKopecks === split.parts.unsplit.directKopecks
+    split.unsplitUpKopecks >= 0 &&
+    split.unsplitDownKopecks <= 0 &&
+    split.unsplitUpKopecks + split.unsplitDownKopecks ===
+      split.parts.unsplit.directKopecks - (split.parts.unsplit.cogsKopecks ?? 0)
   );
 }

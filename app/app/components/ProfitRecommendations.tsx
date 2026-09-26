@@ -32,6 +32,11 @@ interface ProductRef {
    * товара с возвратами (разделение недоступно). Не задано — прежние режимы.
    */
   basis?: "sales" | "full_profit";
+  /**
+   * Подпись охвата «самого убыточного по продажам», если позиция доказана только среди
+   * товаров с точным результатом (то же правило, что экран и PDF). Не задано — не нужна.
+   */
+  scopeNote?: string | null;
 }
 
 export interface ProfitRecommendationsProps {
@@ -355,7 +360,8 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
     if (worst.profit < 0) {
       const lossText =
         worst.basis === "sales"
-          ? `Убыток от продаж ${fmtRub(Math.abs(worst.profit))}, маржа продаж ${pctOrDash(worst.margin)}`
+          ? `Убыток от продаж ${fmtRub(Math.abs(worst.profit))}, маржа продаж ${pctOrDash(worst.margin)}` +
+            (worst.scopeNote ? ` (самый убыточный среди товаров с точно определённым результатом продаж)` : "")
           : worst.basis === "full_profit"
           ? `Убыток ${fmtRub(Math.abs(worst.profit))} по полной прибыли товара (включая возвраты), маржа ${pctOrDash(worst.margin)}`
           : `Убыток ${fmtRub(Math.abs(worst.profit))}, маржа ${pctOrDash(worst.margin)}`;

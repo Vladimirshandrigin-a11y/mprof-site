@@ -408,8 +408,8 @@ function readSplitRaw(v: unknown, w: string): ProductSplit {
     groups,
     unsplitReasons,
     unsplitBuckets,
-    unsplitPositiveKopecks: intGE0(v.unsplitPositiveKopecks, `${w}.unsplitPositiveKopecks`),
-    unsplitNegativeKopecks: int(v.unsplitNegativeKopecks, `${w}.unsplitNegativeKopecks`),
+    unsplitUpKopecks: intGE0(v.unsplitUpKopecks, `${w}.unsplitUpKopecks`),
+    unsplitDownKopecks: int(v.unsplitDownKopecks, `${w}.unsplitDownKopecks`),
   };
 }
 
@@ -879,12 +879,19 @@ export interface AccrualKeyProduct {
    * продаж (старый снимок / нет «ID начисления»). Подписи обязаны это различать.
    */
   basis: "sales" | "full_profit";
+  /**
+   * Только для basis «sales»: подпись охвата, если позиция «самый убыточный» доказана
+   * лишь среди товаров с точным результатом продаж (см. accrualWorstSalesText). null —
+   * позиция доказана среди всех товаров с продажами (или basis «full_profit»).
+   */
+  scopeNote: string | null;
 }
 
 /**
  * Лучший товар — по полной прибыли (как раньше). Самый убыточный — по расчётной
- * прибыли от продаж, если разделение доступно (только доказанный убыток продаж);
- * иначе — по полной прибыли с пометкой basis:"full_profit" (не выдаётся за продажи).
+ * прибыли от продаж, если разделение доступно: только товар с ТОЧНЫМ отрицательным
+ * результатом продаж (правило — accrualSalesSplitView); иначе — по полной прибыли с
+ * пометкой basis:"full_profit" (не выдаётся за продажи).
  */
 export function accrualKeyProducts(s: AccrualSnapshotV1): {
   best: AccrualKeyProduct | null;
@@ -899,6 +906,7 @@ export function accrualKeyProducts(s: AccrualSnapshotV1): {
     profitKopecks: p.profitKopecks ?? 0,
     marginPercent: p.marginPercent,
     basis: "full_profit",
+    scopeNote: null,
   });
   const best =
     scored.length === 0
@@ -910,15 +918,17 @@ export function accrualKeyProducts(s: AccrualSnapshotV1): {
     const w = view.worst;
     return {
       best,
-      worst: w
-        ? {
-            article: w.article,
-            name: w.name,
-            profitKopecks: w.salesResultKopecks,
-            marginPercent: w.salesMarginPercent,
-            basis: "sales",
-          }
-        : null,
+      worst:
+        w && w.salesResultKopecks !== null
+          ? {
+              article: w.article,
+              name: w.name,
+              profitKopecks: w.salesResultKopecks,
+              marginPercent: w.salesMarginPercent,
+              basis: "sales",
+              scopeNote: accrualWorstSalesText(view).note,
+            }
+          : null,
     };
   }
   if (scored.length === 0) return { best: null, worst: null };
@@ -933,21 +943,30 @@ export function accrualKeyProducts(s: AccrualSnapshotV1): {
 /** ok — разделение есть; legacy — снимок до разделения; no_ref_column — в отчёте нет «ID начисления»; invariant — не сошлось. */
 export type AccrualSplitAvailability = "ok" | "legacy" | "no_ref_column" | "invariant";
 
+/**
+ * Доказанно убыточные продажи (верхняя граница результата < 0). Доказанный знак ≠
+ * известная величина: при exact=false известен только диапазон, одно число прибыли и
+ * маржи не показывается (salesResultKopecks/salesMarginPercent = null).
+ */
 export interface AccrualSalesLossRow {
   article: string;
   name: string;
   /** Выручка продаж (строки «Выручка» групп продаж), > 0. */
   salesRevenueKopecks: number;
-  /** «Расчётная прибыль от продаж» (< 0 для строк рейтинга). */
-  salesResultKopecks: number;
+  /** Точная «Расчётная прибыль от продаж» (< 0); null — известен только диапазон. */
+  salesResultKopecks: number | null;
+  /** Маржа продаж; null — выручка ≤ 0 или результат известен только диапазоном. */
   salesMarginPercent: number | null;
+  exact: boolean;
+  /** Диапазон результата продаж; при exact lower = upper = результат. */
+  lowerKopecks: number;
+  upperKopecks: number;
 }
 
 export interface AccrualSalesExcludedRow {
   article: string;
   name: string;
-  salesResultKopecks: number;
-  /** Диапазон результата продаж при разном отнесении неразделённых операций. */
+  /** Диапазон результата продаж при разном отнесении неразделённых операций (lower < 0 ≤ upper). */
   lowerKopecks: number;
   upperKopecks: number;
 }
@@ -974,9 +993,24 @@ export interface AccrualUnsplitRow extends AccrualSplitBlockRow {
 
 export interface AccrualSalesSplitView {
   availability: AccrualSplitAvailability;
-  /** Доказанно убыточные продажи, по возрастанию результата. */
+  /**
+   * Доказанно убыточные продажи: сначала с точным результатом (по возрастанию), затем
+   * известные только диапазоном (по верхней границе) — их порядок позицией не является.
+   */
   losses: AccrualSalesLossRow[];
+  /**
+   * «Самый убыточный по продажам»: минимум среди товаров с ТОЧНЫМ отрицательным
+   * результатом. Товар с диапазоном в выбор не входит — его величина неизвестна.
+   */
   worst: AccrualSalesLossRow | null;
+  /**
+   * all — позиция доказана среди всех товаров с продажами (ни у кого нижняя граница не
+   * ниже, себестоимость известна у всех); exact_only — только среди товаров с точным
+   * результатом (подписывается охват). null — worst нет.
+   */
+  worstScope: "all" | "exact_only" | null;
+  /** Товаров с продажами и точным результатом продаж — охват выбора. */
+  exactSalesProducts: number;
   /** Не ранжированы: неразделённые операции могут изменить вывод об убыточности. */
   excluded: AccrualSalesExcludedRow[];
   /** Товаров с продажами, но без себестоимости (в рейтинг не входят). */
@@ -1007,6 +1041,8 @@ function emptyView(availability: AccrualSplitAvailability): AccrualSalesSplitVie
     availability,
     losses: [],
     worst: null,
+    worstScope: null,
+    exactSalesProducts: 0,
     excluded: [],
     salesWithoutCost: 0,
     sales: { totalKopecks: null, products: 0 },
@@ -1032,6 +1068,8 @@ export function accrualSalesSplitView(s: AccrualSnapshotV1): AccrualSalesSplitVi
   const unsplitRows: AccrualUnsplitRow[] = [];
   let allKnown = true;
   const totals = { sales: 0, returns: 0, noSale: 0, unsplit: 0, profit: 0 };
+  /** Нижние границы товаров с продажами, чей результат известен только диапазоном. */
+  const rangedLowers: number[] = [];
 
   for (const p of s.products) {
     const sp = p.split;
@@ -1041,19 +1079,25 @@ export function accrualSalesSplitView(s: AccrualSnapshotV1): AccrualSalesSplitVi
     if (sp.groups.sales > 0) {
       view.sales.products++;
       salesResults.push(a.salesResultKopecks);
+      if (a.status !== "no_cost" && a.status !== "no_sales") {
+        if (a.exact) view.exactSalesProducts++;
+        else rangedLowers.push(a.lowerKopecks as number);
+      }
       if (a.status === "loss") {
         view.losses.push({
           article: p.article,
           name,
           salesRevenueKopecks: a.salesRevenueKopecks,
-          salesResultKopecks: a.salesResultKopecks as number,
-          salesMarginPercent: a.salesMarginPercent,
+          salesResultKopecks: a.exact ? a.salesResultKopecks : null,
+          salesMarginPercent: a.exact ? a.salesMarginPercent : null,
+          exact: a.exact,
+          lowerKopecks: a.lowerKopecks as number,
+          upperKopecks: a.upperKopecks as number,
         });
       } else if (a.status === "undetermined") {
         view.excluded.push({
           article: p.article,
           name,
-          salesResultKopecks: a.salesResultKopecks as number,
           lowerKopecks: a.lowerKopecks as number,
           upperKopecks: a.upperKopecks as number,
         });
@@ -1101,9 +1145,24 @@ export function accrualSalesSplitView(s: AccrualSnapshotV1): AccrualSalesSplitVi
     }
   }
 
-  view.losses.sort((x, y) => x.salesResultKopecks - y.salesResultKopecks || (x.article < y.article ? -1 : 1));
-  view.excluded.sort((x, y) => x.salesResultKopecks - y.salesResultKopecks || (x.article < y.article ? -1 : 1));
-  view.worst = view.losses[0] ?? null;
+  const byArticle = (x: { article: string }, y: { article: string }) => (x.article < y.article ? -1 : 1);
+  view.losses.sort(
+    (x, y) =>
+      Number(y.exact) - Number(x.exact) ||
+      x.upperKopecks - y.upperKopecks ||
+      x.lowerKopecks - y.lowerKopecks ||
+      byArticle(x, y)
+  );
+  view.excluded.sort((x, y) => x.lowerKopecks - y.lowerKopecks || x.upperKopecks - y.upperKopecks || byArticle(x, y));
+  // Правило «самого убыточного»: только точный результат; позиция доказана для всех,
+  // если ни одна нижняя граница «диапазонных» товаров не ниже и себестоимость известна у всех.
+  const w = view.losses.find((l) => l.exact) ?? null;
+  view.worst = w;
+  view.worstScope = w
+    ? view.salesWithoutCost === 0 && rangedLowers.every((lo) => lo >= w.lowerKopecks)
+      ? "all"
+      : "exact_only"
+    : null;
   const byResult = (x: AccrualSplitBlockRow, y: AccrualSplitBlockRow) =>
     (x.resultKopecks ?? 0) - (y.resultKopecks ?? 0) || (x.article < y.article ? -1 : 1);
   view.sales.totalKopecks = sumOrNull(salesResults);
@@ -1130,8 +1189,27 @@ export function accrualSalesSplitView(s: AccrualSnapshotV1): AccrualSalesSplitVi
 export interface AccrualSalesLossRanking {
   salesBasis: boolean;
   note: string | null;
-  rows: { article: string; name: string; revenue: number; profit: number | null; margin: number | null }[];
+  /**
+   * profit/margin — только при точном результате; range — известен лишь диапазон (рубли),
+   * тогда profit и margin = null и показывается «от … до …».
+   */
+  rows: {
+    article: string;
+    name: string;
+    revenue: number;
+    profit: number | null;
+    margin: number | null;
+    range: { lower: number; upper: number } | null;
+  }[];
   excluded: { article: string; name: string; reason: string }[];
+  /** «Самый убыточный по продажам» (только точный результат) — то же правило, что PDF и рекомендации. */
+  worst: AccrualSalesLossRanking["rows"][number] | null;
+  /** Подпись охвата под карточкой; null — не нужна. */
+  worstNote: string | null;
+  /** Текст карточки без товара и его тон (ok — убытка нет; warn — есть неопределённость). */
+  worstEmpty: { text: string; tone: "ok" | "warn" };
+  /** Пояснение к строкам-диапазонам списка; null — таких строк нет. */
+  rangeNote: string | null;
 }
 
 export function accrualSalesLossRanking(s: AccrualSnapshotV1): AccrualSalesLossRanking {
@@ -1143,25 +1221,76 @@ export function accrualSalesLossRanking(s: AccrualSnapshotV1): AccrualSalesLossR
       note: "Рейтинг по полной прибыли товара, включая возвраты: разделение продаж и возвратов для этого расчёта недоступно (причина — ниже).",
       rows: [],
       excluded: [],
+      worst: null,
+      worstNote: null,
+      worstEmpty: { text: "Убыточных товаров не найдено", tone: "ok" },
+      rangeNote: null,
     };
   }
+  const toRow = (l: AccrualSalesLossRow): AccrualSalesLossRanking["rows"][number] => ({
+    article: l.article,
+    name: l.name,
+    revenue: kopecksToRub(l.salesRevenueKopecks),
+    profit: l.salesResultKopecks === null ? null : kopecksToRub(l.salesResultKopecks),
+    margin: l.salesMarginPercent,
+    range: l.exact ? null : { lower: kopecksToRub(l.lowerKopecks), upper: kopecksToRub(l.upperKopecks) },
+  });
+  const t = accrualWorstSalesText(v);
   return {
     salesBasis: true,
     note:
       "Рейтинг по расчётной прибыли от продаж: в него попадают товары с продажами, известной себестоимостью и доказанно отрицательным результатом продаж. Возвраты, расходы без продаж и неразделённые операции показаны ниже отдельно и учтены в полной прибыли товара.",
-    rows: v.losses.map((l) => ({
-      article: l.article,
-      name: l.name,
-      revenue: kopecksToRub(l.salesRevenueKopecks),
-      profit: kopecksToRub(l.salesResultKopecks),
-      margin: l.salesMarginPercent,
-    })),
+    rows: v.losses.map(toRow),
     excluded: v.excluded.map((x) => ({
       article: x.article,
       name: x.name,
-      reason: `результат продаж ${fmtRub(x.salesResultKopecks)}, но неразделённые операции могут изменить его знак (возможный диапазон от ${fmtRub(x.lowerKopecks)} до ${fmtRub(x.upperKopecks)})`,
+      reason: `результат продаж не определён: от ${fmtRub(x.lowerKopecks)} до ${fmtRub(x.upperKopecks)} — неразделённые операции могут изменить его знак`,
     })),
+    worst: v.worst ? toRow(v.worst) : null,
+    worstNote: t.note,
+    worstEmpty: { text: t.emptyText, tone: t.emptyTone },
+    rangeNote: v.losses.some((l) => !l.exact) ? ACCRUAL_RANGE_NOTE : null,
   };
+}
+
+/** Пояснение к строкам «от … до …» (экран и PDF). */
+export const ACCRUAL_RANGE_NOTE =
+  "«от … до …» — убыток от продаж доказан, но точная величина не определена: неразделённые операции товара (например, реклама или эквайринг под другим ID, частичный возврат) могут относиться к продажам полностью, частично или не относиться. Такие товары не участвуют в выборе самого убыточного, их порядок в списке — не позиция.";
+
+/**
+ * Тексты правила «самого убыточного по продажам» — одни для экрана, PDF и рекомендаций.
+ * note — подпись охвата, если позиция доказана только среди товаров с точным результатом;
+ * emptyText/emptyShort/emptyTone — карточка без товара (short — для узкой карточки PDF).
+ */
+export function accrualWorstSalesText(v: AccrualSalesSplitView): {
+  note: string | null;
+  emptyText: string;
+  emptyShort: string;
+  emptyTone: "ok" | "warn";
+} {
+  const ranged = v.losses.filter((l) => !l.exact).length;
+  const note =
+    v.worst && v.worstScope === "exact_only"
+      ? `Выбран только среди товаров с точно определённым результатом продаж (${v.exactSalesProducts} из ${v.sales.products} с продажами). ` +
+        `У остальных результат известен лишь диапазоном${v.salesWithoutCost > 0 ? " или неизвестна себестоимость" : ""} — доказать, кто из них убыточнее, нельзя.`
+      : null;
+  if (ranged > 0) {
+    return {
+      note,
+      emptyText: `Убыток от продаж доказан у ${ranged} ${pluralRu(ranged, "товара", "товаров", "товаров")}, но точная величина не определена — см. «Продажи в минус».`,
+      emptyShort: "Точный убыток не определён",
+      emptyTone: "warn",
+    };
+  }
+  if (v.excluded.length > 0) {
+    return {
+      note,
+      emptyText: `Доказанно убыточных продаж нет; у ${v.excluded.length} ${pluralRu(v.excluded.length, "товара", "товаров", "товаров")} знак результата продаж не определён.`,
+      emptyShort: "Доказанного убытка нет",
+      emptyTone: "warn",
+    };
+  }
+  return { note, emptyText: "Убыточных продаж не найдено", emptyShort: "Убыточных продаж не найдено", emptyTone: "ok" };
 }
 
 /**
@@ -1270,6 +1399,8 @@ export interface AccrualRecoProductRef {
   margin: number | null;
   /** sales — прибыль от продаж; full_profit — полная прибыль товара (с возвратами). */
   basis: "sales" | "full_profit";
+  /** Подпись охвата «самого убыточного» (то же правило, что экран и PDF); null — не нужна. */
+  scopeNote: string | null;
 }
 
 /**
@@ -1288,6 +1419,7 @@ export function accrualRecoProps(s: AccrualSnapshotV1) {
           profit: kopecksToRub(p.profitKopecks),
           margin: p.marginPercent,
           basis: p.basis,
+          scopeNote: p.scopeNote,
         }
       : null;
   return {

@@ -361,15 +361,16 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
       ctx.fillStyle = kind === "best" ? C.green : p ? C.red : C.txt2;
       ctx.fillText(kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : kp.worstTitle, x + 16, y + 22);
       if (!p) {
+        const warn = kind === "worst" && kp.worstEmptyTone === "warn";
         roundRect(ctx, x + 16, y + ch / 2 - 1, cw - 32, 30, 8);
-        ctx.fillStyle = "rgba(46,204,138,0.10)";
+        ctx.fillStyle = warn ? "rgba(232,176,75,0.10)" : "rgba(46,204,138,0.10)";
         ctx.fill();
-        ctx.strokeStyle = "rgba(46,204,138,0.30)";
+        ctx.strokeStyle = warn ? "rgba(232,176,75,0.35)" : "rgba(46,204,138,0.30)";
         roundRect(ctx, x + 16, y + ch / 2 - 1, cw - 32, 30, 8);
         ctx.stroke();
         ctx.textAlign = "center";
         ctx.font = `600 11px ${SANS}`;
-        ctx.fillStyle = C.green;
+        ctx.fillStyle = warn ? C.gold2 : C.green;
         ctx.fillText(kp.worstEmptyText, x + cw / 2, y + ch / 2 + 19);
         ctx.textAlign = "left";
         return;
@@ -403,6 +404,16 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
     card(ML, "best", kp.best);
     card(ML + cw + gap, "worst", kp.worst);
     y += ch + 14;
+    if (kp.worstNote) {
+      // Подпись охвата «самого убыточного» — то же правило, что на экране.
+      ctx.font = `400 10px ${SANS}`;
+      const lines = wrapText(ctx, kp.worstNote, CW);
+      ensure(lines.length * 14 + 6);
+      ctx.fillStyle = C.txt3;
+      ctx.textAlign = "left";
+      lines.forEach((ln, i) => ctx.fillText(ln, ML, y + 4 + i * 14));
+      y += lines.length * 14 + 8;
+    }
   }
 
   // ── Списки с переносом: предупреждения и пояснения ──

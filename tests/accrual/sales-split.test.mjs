@@ -100,14 +100,18 @@ describe("разделение: четыре основных сценария �
     assert.equal(calc.salesSplitAvailable, true);
   });
 
-  it("1) убыточная продажа без возврата: продажи −60 ₽, маржа продаж −60 %, товар в рейтинге", () => {
+  it("1) убыточная продажа без возврата: убыток продаж доказан, но реклама без связи делает величину диапазоном −75…−60 ₽", () => {
     const L = byArt(calc, "L");
     assert.equal(partResult(L, "sales"), -6000);
     assert.equal(partResult(L, "unsplit"), -1500); // реклама по номеру заказа — без связи
     assert.equal(L.split.unsplitReasons.no_sale_link, 1);
     assert.equal(L.profitKopecks, -7500);
     const row = view.losses.find((x) => x.article === "L");
-    assert.deepEqual([row.salesRevenueKopecks, row.salesResultKopecks, row.salesMarginPercent], [10000, -6000, -60]);
+    // Реклама может относиться к продаже: знак доказан, величина — нет → одно число не выдаётся.
+    assert.deepEqual(
+      [row.salesRevenueKopecks, row.salesResultKopecks, row.salesMarginPercent, row.exact, row.lowerKopecks, row.upperKopecks],
+      [10000, null, null, false, -7500, -6000]
+    );
   });
 
   it("2) полный возврат в периоде: результат возвратов −60 ₽, в рейтинг продаж не попадает", () => {
@@ -164,9 +168,11 @@ describe("разделение: четыре основных сценария �
     assert.equal(partResult(U, "unsplit"), 12000);
     assert.ok(!view.losses.some((x) => x.article === "U"));
     const ex = view.excluded.find((x) => x.article === "U");
-    assert.deepEqual([ex.salesResultKopecks, ex.lowerKopecks, ex.upperKopecks], [-4000, -22000, 26000]);
+    // Элементы U-2 (строка + себестоимость её единиц): +300 − 2×10 = +280; −150 + 10 = −140; −20.
+    assert.deepEqual([ex.lowerKopecks, ex.upperKopecks], [-4000 - 14000 - 2000, -4000 + 28000]);
     const ranking = S.accrualSalesLossRanking(S.asAccrualSnapshot(viaJson(snap)));
-    assert.match(ranking.excluded.find((x) => x.article === "U").reason, /могут изменить его знак/);
+    const reason = ranking.excluded.find((x) => x.article === "U").reason.replace(/[\u00a0\u202f]/g, " ");
+    assert.equal(reason, "результат продаж не определён: от −200,00 ₽ до 240,00 ₽ — неразделённые операции могут изменить его знак");
   });
 
   it("вывод об убыточности: без продаж — «нет продаж» (не отрицательный результат продаж из общих расходов)", () => {
@@ -200,13 +206,19 @@ describe("разделение: четыре основных сценария �
     assert.deepEqual([A.split.unsplitReasons.ambiguous_link, A.split.groups.sales, partResult(A, "unsplit")], [1, 0, 5000]);
   });
 
-  it("рейтинг «Продажи в минус»: только L; самый убыточный по продажам — L", () => {
+  it("рейтинг «Продажи в минус»: только L (диапазоном); «самого убыточного» с точной величиной нет", () => {
     assert.deepEqual(view.losses.map((x) => x.article), ["L"]);
     assert.deepEqual(view.excluded.map((x) => x.article), ["U"], "без продаж (P, A, R, S, K) не исключаются — они вне рейтинга");
     assert.equal(view.sales.products, 5, "товары с группой продаж: L, M, U, X1, E (у A связь неоднозначна)");
-    assert.equal(view.worst.article, "L");
+    assert.equal(view.exactSalesProducts, 2, "точный результат только у M и X1");
+    assert.deepEqual([view.worst, view.worstScope], [null, null]);
     const kp = S.accrualKeyProducts(S.asAccrualSnapshot(viaJson(snap)));
-    assert.deepEqual([kp.worst.article, kp.worst.profitKopecks, kp.worst.marginPercent, kp.worst.basis], ["L", -6000, -60, "sales"]);
+    assert.equal(kp.worst, null);
+    const t = S.accrualWorstSalesText(view);
+    assert.deepEqual(
+      [t.note, t.emptyText, t.emptyShort, t.emptyTone],
+      [null, "Убыток от продаж доказан у 1 товара, но точная величина не определена — см. «Продажи в минус».", "Точный убыток не определён", "warn"]
+    );
   });
 
   it("сумма частей = полная прибыль каждого товара; сверка по всем товарам = чистая прибыль", () => {
@@ -354,12 +366,15 @@ describe("единый смысл в PDF и рекомендациях", () => {
   const m = P.buildAccrualPdfModel(snap, new Date(2026, 6, 1, 10, 30));
   const nb = (s) => s.replace(/[\u00a0\u202f]/g, " ");
 
-  it("карточка «самый убыточный по продажам» = L; сводка частей и сверка в PDF", () => {
+  it("карточка PDF: точного «самого убыточного» нет — нейтральный текст, L диапазоном; сводка частей и сверка", () => {
     assert.equal(m.keyProducts.worstTitle, "САМЫЙ УБЫТОЧНЫЙ ПО ПРОДАЖАМ");
-    assert.equal(m.keyProducts.worst.article, "L");
-    assert.equal(nb(m.keyProducts.worst.profit), "−60,00 ₽");
-    assert.equal(nb(m.keyProducts.worst.margin), "−60,0 %");
+    assert.equal(m.keyProducts.worst, null);
+    assert.deepEqual([m.keyProducts.worstEmptyText, m.keyProducts.worstEmptyTone], ["Точный убыток не определён", "warn"]);
+    assert.equal(m.keyProducts.worstNote, "Убыток от продаж доказан у 1 товара, но точная величина не определена — см. «Продажи в минус».");
     const lines = m.splitLines.map(nb);
+    assert.ok(lines.includes("Продажи в минус (убыток доказан): 1, из них с точной величиной: 0, только диапазоном: 1; не включены в рейтинг — неразделённые операции могут изменить вывод: 1."));
+    assert.ok(lines.includes("L · Товар L: результат продаж от −75,00 ₽ до −60,00 ₽."));
+    assert.ok(lines.includes(S.ACCRUAL_RANGE_NOTE));
     assert.ok(lines.some((l) => /Расчётная прибыль от продаж/.test(l)));
     assert.ok(lines.some((l) => /Результат возвратов — по начислениям этого периода/.test(l)));
     assert.ok(lines.some((l) => /Неразделённые операции/.test(l)));
@@ -372,9 +387,8 @@ describe("единый смысл в PDF и рекомендациях", () => {
     assert.ok(lines.some((l) => /не включены в рейтинг — неразделённые операции могут изменить вывод: 1/.test(l)));
   });
 
-  it("рекомендации получают того же «худшего» с basis=sales", () => {
-    const reco = S.accrualRecoProps(snap);
-    assert.deepEqual([reco.worst.article, reco.worst.profit, reco.worst.margin, reco.worst.basis], ["L", -60, -60, "sales"]);
+  it("рекомендации: то же правило — без точного результата «худшего» нет", () => {
+    assert.equal(S.accrualRecoProps(snap).worst, null);
   });
 
   it("выручка без ведущего плюса, настоящий минус сохраняется", () => {
@@ -383,5 +397,152 @@ describe("единый смысл в PDF и рекомендациях", () => {
     assert.equal(nb(rev.value), "2 700,00 ₽");
     const ret = m.rows.find((x) => x.label === "Возвраты выручки");
     assert.match(nb(ret.value), /^−/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Неопределённость рейтинга: доказанный знак ≠ известная величина ≠ доказанная позиция.
+// Ожидания — ручной расчёт (копейки, налог 0, себестоимость единицы в каталоге):
+//   OA: +100 −150 − 10 = −60; реклама под своим ID −50 → диапазон −110…−60
+//   OB: +100 −140 − 10 = −50; эквайринг по номеру заказа −40 → −90…−50
+//   OC: +100 −170 − 10 = −80 точно;  OD: +100 −210 − 10 = −120 точно
+//   Y:  +100 −120 − 10 = −30; неразделённые +50 и −60 одной ссылкой (нетто −10) → −90…+20
+//   Z:  +200 −10 − 300 = −110; частичный возврат Z-2 (продано 2 за 100, возвращено 1 за −50,
+//       себестоимость 300): «Выручка» 100 − 2×300 = −500, «Возврат выручки» −50 + 300 = +250
+//       → −610…+140 (свёртка в нетто давала −460…−10 и ложный «доказанный убыток»)
+// ---------------------------------------------------------------------------
+describe("неопределённость рейтинга: пересекающиеся диапазоны и разнознаковые неразделённые", () => {
+  const COMP = ["Компенсации и декомпенсации", "Начисление по спору"];
+  const OA = [r(SALE, "OA", 1, "100.00", "OA-1"), r(LOG, "OA", 1, "-150.00", "OA-1"), r(ADS, "OA", 0, "-50.00", "ADS-OA")];
+  const OB = [r(SALE, "OB", 1, "100.00", "OB-1"), r(LOG, "OB", 1, "-140.00", "OB-1"), r(ACQ, "OB", 0, "-40.00", "ORD-OB")];
+  const OC = [r(SALE, "OC", 1, "100.00", "OC-1"), r(LOG, "OC", 1, "-170.00", "OC-1")];
+  const OD = [r(SALE, "OD", 1, "100.00", "OD-1"), r(LOG, "OD", 1, "-210.00", "OD-1")];
+  const NC = [r(SALE, "NC", 1, "100.00", "NC-1"), r(LOG, "NC", 1, "-500.00", "NC-1")];
+  const cat = (arts, extra = []) => [...arts.map((sku) => ({ sku, name: sku, cost_price: 10 })), ...extra];
+  const run = (rows, catalog) => {
+    const { snap } = calcFor(buildReport(rows), { catalog });
+    const s = S.asAccrualSnapshot(viaJson(S.serializeAccrualSnapshot(snap)));
+    return { s, v: S.accrualSalesSplitView(s), m: P.buildAccrualPdfModel(s, new Date(2026, 6, 1)) };
+  };
+  const nb = (x) => x.replace(/[\u00a0\u202f]/g, " ");
+  const bounds = (v) => v.losses.map((l) => [l.article, l.exact, l.salesResultKopecks, l.lowerKopecks, l.upperKopecks]);
+
+  it("два доказанных убытка с пересекающимися диапазонами: оба в списке диапазоном, «самый убыточный» не выбирается", () => {
+    const { s, v, m } = run([...OA, ...OB], cat(["OA", "OB"]));
+    assert.deepEqual(bounds(v), [["OA", false, null, -11000, -6000], ["OB", false, null, -9000, -5000]]);
+    assert.deepEqual([v.worst, v.worstScope, v.exactSalesProducts], [null, null, 0]);
+    assert.equal(S.accrualKeyProducts(s).worst, null);
+    assert.equal(S.accrualRecoProps(s).worst, null);
+    const rk = S.accrualSalesLossRanking(s);
+    assert.deepEqual(rk.rows.map((x) => [x.article, x.profit, x.margin, x.range]), [
+      ["OA", null, null, { lower: -110, upper: -60 }],
+      ["OB", null, null, { lower: -90, upper: -50 }],
+    ]);
+    assert.deepEqual([rk.worst, rk.worstEmpty.tone], [null, "warn"]);
+    assert.equal(rk.worstEmpty.text, "Убыток от продаж доказан у 2 товаров, но точная величина не определена — см. «Продажи в минус».");
+    assert.equal(rk.rangeNote, S.ACCRUAL_RANGE_NOTE);
+    assert.deepEqual([m.keyProducts.worst, m.keyProducts.worstEmptyText, m.keyProducts.worstEmptyTone], [null, "Точный убыток не определён", "warn"]);
+    const lines = m.splitLines.map(nb);
+    assert.ok(lines.includes("OA · Товар OA: результат продаж от −110,00 ₽ до −60,00 ₽."));
+    assert.ok(lines.includes("OB · Товар OB: результат продаж от −90,00 ₽ до −50,00 ₽."));
+  });
+
+  it("точный OC −80 внутри диапазона OA: выбран OC, но только «среди точных» — с подписью охвата везде", () => {
+    const { s, v, m } = run([...OA, ...OB, ...OC], cat(["OA", "OB", "OC"]));
+    assert.deepEqual(bounds(v), [["OC", true, -8000, -8000, -8000], ["OA", false, null, -11000, -6000], ["OB", false, null, -9000, -5000]]);
+    assert.deepEqual([v.worst.article, v.worstScope, v.exactSalesProducts], ["OC", "exact_only", 1]);
+    const note =
+      "Выбран только среди товаров с точно определённым результатом продаж (1 из 3 с продажами). " +
+      "У остальных результат известен лишь диапазоном — доказать, кто из них убыточнее, нельзя.";
+    const kp = S.accrualKeyProducts(s).worst;
+    assert.deepEqual([kp.article, kp.profitKopecks, kp.marginPercent, kp.basis, kp.scopeNote], ["OC", -8000, -80, "sales", note]);
+    const rk = S.accrualSalesLossRanking(s);
+    assert.deepEqual([rk.worst.article, rk.worst.profit, rk.worst.margin, rk.worstNote], ["OC", -80, -80, note]);
+    const reco = S.accrualRecoProps(s).worst;
+    assert.deepEqual([reco.article, reco.profit, reco.margin, reco.scopeNote], ["OC", -80, -80, note]);
+    assert.deepEqual([m.keyProducts.worst.article, nb(m.keyProducts.worst.profit), nb(m.keyProducts.worst.margin)], ["OC", "−80,00 ₽", "−80,0 %"]);
+    assert.equal(
+      m.keyProducts.worstNote,
+      "Самый убыточный по продажам: выбран только среди товаров с точно определённым результатом продаж (1 из 3 с продажами). " +
+        "У остальных результат известен лишь диапазоном — доказать, кто из них убыточнее, нельзя."
+    );
+  });
+
+  it("позиция доказана для всех: точный OD −120 ниже всех нижних границ, себестоимость известна у всех — подписи охвата нет", () => {
+    const { s, v, m } = run([...OA, ...OB, ...OD], cat(["OA", "OB", "OD"]));
+    assert.deepEqual([v.worst.article, v.worstScope], ["OD", "all"]);
+    assert.equal(S.accrualKeyProducts(s).worst.scopeNote, null);
+    assert.equal(S.accrualSalesLossRanking(s).worstNote, null);
+    assert.equal(m.keyProducts.worstNote, null);
+  });
+
+  it("товар с продажами без себестоимости может оказаться убыточнее — позиция только «среди точных»", () => {
+    const { v } = run([...OA, ...OB, ...OD, ...NC], cat(["OA", "OB", "OD"]));
+    assert.deepEqual([v.worst.article, v.worstScope, v.salesWithoutCost], ["OD", "exact_only", 1]);
+    assert.match(S.accrualWorstSalesText(v).note, /\(1 из 4 с продажами\)\. У остальных результат известен лишь диапазоном или неизвестна себестоимость/);
+  });
+
+  it("неразделённые +50 и −60 одной ссылкой не сворачиваются в нетто −10: знак не определён, товар исключён", () => {
+    const rows = [r(SALE, "Y", 1, "100.00", "Y-1"), r(LOG, "Y", 1, "-120.00", "Y-1"), r(COMP, "Y", 0, "50.00", "ORD-Y"), r(ACQ, "Y", 0, "-60.00", "ORD-Y")];
+    const { s, v } = run(rows, cat(["Y"]));
+    const y = s.products.find((p) => p.article === "Y");
+    assert.deepEqual([y.split.unsplitUpKopecks, y.split.unsplitDownKopecks], [5000, -6000]);
+    const a = SS.assessSalesLoss(y.split);
+    assert.deepEqual([a.status, a.exact, a.lowerKopecks, a.upperKopecks], ["undetermined", false, -9000, 2000]);
+    assert.deepEqual(v.losses, []);
+    assert.deepEqual(v.excluded.map((x) => [x.article, x.lowerKopecks, x.upperKopecks]), [["Y", -9000, 2000]]);
+    const t = S.accrualWorstSalesText(v);
+    assert.deepEqual([t.emptyText, t.emptyTone], ["Доказанно убыточных продаж нет; у 1 товара знак результата продаж не определён.", "warn"]);
+  });
+
+  it("частичный возврат: себестоимость не сворачивается по нетто-количеству — «доказанного убытка» нет", () => {
+    const rows = [
+      r(SALE, "Z", 1, "200.00", "Z-1"), r(LOG, "Z", 1, "-10.00", "Z-1"),
+      r(SALE, "Z", 2, "100.00", "Z-2"), r(RET, "Z", 1, "-50.00", "Z-2"),
+    ];
+    const { s, v } = run(rows, [{ sku: "Z", name: "Z", cost_price: 300 }]);
+    const z = s.products.find((p) => p.article === "Z");
+    assert.equal(z.profitKopecks, -36000, "полная прибыль не меняется: −110 + (100 − 50 − 300)");
+    assert.equal(z.split.unsplitReasons.partial_return, 1);
+    assert.deepEqual([z.split.unsplitUpKopecks, z.split.unsplitDownKopecks], [25000, -50000]);
+    const a = SS.assessSalesLoss(z.split);
+    assert.deepEqual([a.status, a.salesResultKopecks, a.lowerKopecks, a.upperKopecks], ["undetermined", -11000, -61000, 14000]);
+    assert.deepEqual(v.losses, []);
+    assert.deepEqual([v.worst, S.accrualKeyProducts(s).worst, S.accrualRecoProps(s).worst], [null, null, null]);
+    assert.equal(
+      nb(S.accrualSalesLossRanking(s).excluded[0].reason),
+      "результат продаж не определён: от −610,00 ₽ до 140,00 ₽ — неразделённые операции могут изменить его знак"
+    );
+  });
+
+  it("список: сначала точные (по величине), затем диапазоны — даже если верхняя граница диапазона ниже", () => {
+    const OE = [r(SALE, "OE", 1, "100.00", "OE-1"), r(LOG, "OE", 1, "-140.00", "OE-1")]; // −50 точно
+    const { v } = run([...OA, ...OE], cat(["OA", "OE"]));
+    assert.deepEqual(bounds(v), [["OE", true, -5000, -5000, -5000], ["OA", false, null, -11000, -6000]]);
+    assert.deepEqual([v.worst.article, v.worstScope], ["OE", "exact_only"]);
+  });
+
+  it("себестоимость единицы с долями копейки: копейка округления расширяет границу, а не сужает", () => {
+    // 0,334 ₽: «Выручка» 2 шт → 67 коп., «Возврат выручки» 1 шт → 33 коп.; себестоимость
+    // неразделённой части 33 коп. (копейка округления товара ушла в продажи): 67 − 33 = 34 ≠ 33.
+    const rows = [
+      r(SALE, "W", 1, "100.00", "W-1"),
+      r(SALE, "W", 2, "10.00", "W-2"), r(RET, "W", 1, "-5.00", "W-2"),
+    ];
+    const { s } = run(rows, [{ sku: "W", name: "W", cost_price: 0.334 }]);
+    const w = s.products.find((p) => p.article === "W");
+    assert.deepEqual([w.split.parts.sales.cogsKopecks, w.split.parts.unsplit.cogsKopecks, w.cogsKopecks], [34, 33, 67]);
+    // Элементы: 1000 − 67 = 933 и −500 + 33 = −467; остаток +1 → вверх.
+    assert.deepEqual([w.split.unsplitUpKopecks, w.split.unsplitDownKopecks], [934, -467]);
+  });
+
+  it("снимок: границы неразделённых проверяются при чтении", () => {
+    const { snap } = calcFor(buildReport([...OA, ...OB]), { catalog: cat(["OA", "OB"]) });
+    const bad = viaJson(S.serializeAccrualSnapshot(snap));
+    bad.products[0].split.unsplitUpKopecks += 100; // up + down ≠ прямые − себестоимость
+    assert.equal(S.readAccrualSnapshot(bad).status, "invalid");
+    const neg = viaJson(S.serializeAccrualSnapshot(snap));
+    neg.products[0].split.unsplitDownKopecks = 1;
+    assert.equal(S.readAccrualSnapshot(neg).status, "invalid");
   });
 });

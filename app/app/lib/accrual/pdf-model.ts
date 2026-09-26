@@ -16,6 +16,8 @@ import {
   accrualProfitLabel,
   accrualSalesSplitView,
   accrualSplitReconciliationText,
+  accrualWorstSalesText,
+  ACCRUAL_RANGE_NOTE,
   accrualSnapshotRoi,
   accrualSplitUnavailableText,
   type AccrualRowKind,
@@ -72,6 +74,10 @@ export interface AccrualPdfModel {
     worstProfitLabel: string;
     worstMarginLabel: string;
     worstEmptyText: string;
+    /** warn — убыток есть, но величина не определена / знак не доказан (не «всё хорошо»). */
+    worstEmptyTone: "ok" | "warn";
+    /** Подпись охвата под карточками (то же правило, что экран и рекомендации); null — нет. */
+    worstNote: string | null;
   } | null;
   /** Разделение результата товаров: продажи / возвраты / без продаж / неразделённые. */
   splitTitle: string;
@@ -97,6 +103,8 @@ function rowValue(kind: AccrualRowKind, kopecks: number): string {
       return fmtRub(kopecks);
   }
 }
+
+const lowerFirst = (t: string) => t.charAt(0).toLowerCase() + t.slice(1);
 
 export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date()): AccrualPdfModel {
   const dateStr = now.toLocaleString("ru-RU", {
@@ -127,6 +135,7 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
   const kp = accrualKeyProducts(s);
   const split = accrualSalesSplitView(s);
   const salesBasis = split.availability === "ok";
+  const worstText = salesBasis ? accrualWorstSalesText(split) : null;
   const splitLines: string[] = [];
   const unavailable = accrualSplitUnavailableText(split.availability);
   if (unavailable) splitLines.push(unavailable);
@@ -146,14 +155,22 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
     }
     const rec = accrualSplitReconciliationText(split);
     if (rec) splitLines.push(`Сверка: ${rec}.`);
+    const ranged = split.losses.filter((l) => !l.exact);
     splitLines.push(
-      `Продажи в минус: ${split.losses.length}` +
+      `Продажи в минус (убыток доказан): ${split.losses.length}` +
+        (ranged.length > 0 ? `, из них с точной величиной: ${split.losses.length - ranged.length}, только диапазоном: ${ranged.length}` : "") +
         (split.excluded.length > 0
           ? `; не включены в рейтинг — неразделённые операции могут изменить вывод: ${split.excluded.length}`
           : "") +
         (split.salesWithoutCost > 0 ? `; без себестоимости: ${split.salesWithoutCost}` : "") +
         "."
     );
+    for (const l of ranged) {
+      splitLines.push(
+        `${l.article}${l.name && l.name !== l.article ? ` · ${l.name}` : ""}: результат продаж от ${fmtRub(l.lowerKopecks)} до ${fmtRub(l.upperKopecks)}.`
+      );
+    }
+    if (ranged.length > 0) splitLines.push(ACCRUAL_RANGE_NOTE);
     splitLines.push(
       "Налог, ручные расходы и общие начисления без товара распределены внутри товара пропорционально положительной выручке части — это правило распределения, а не привязка расхода к отправлению."
     );
@@ -213,7 +230,15 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
           worstTitle: salesBasis ? "САМЫЙ УБЫТОЧНЫЙ ПО ПРОДАЖАМ" : "САМЫЙ УБЫТОЧНЫЙ (ПОЛНАЯ ПРИБЫЛЬ)",
           worstProfitLabel: salesBasis ? "ПРИБЫЛЬ ОТ ПРОДАЖ" : "ЧИСТАЯ ПРИБЫЛЬ",
           worstMarginLabel: salesBasis ? "МАРЖА ПРОДАЖ" : "МАРЖА",
-          worstEmptyText: salesBasis ? "Убыточных продаж не найдено" : "Убыточных товаров не найдено",
+          worstEmptyText: worstText ? worstText.emptyShort : "Убыточных товаров не найдено",
+          worstEmptyTone: worstText ? worstText.emptyTone : "ok",
+          worstNote: worstText
+            ? kp.worst
+              ? worstText.note && `Самый убыточный по продажам: ${lowerFirst(worstText.note)}`
+              : worstText.emptyTone === "warn"
+              ? worstText.emptyText
+              : null
+            : null,
         }
       : null,
     splitTitle: "РЕЗУЛЬТАТ ТОВАРОВ ПО ЧАСТЯМ",

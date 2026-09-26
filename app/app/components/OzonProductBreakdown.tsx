@@ -355,7 +355,7 @@ export function OzonProductBreakdown({
   // Рейтинг убыточных. С salesLoss.salesBasis — готовый список доказанно убыточных
   // ПРОДАЖ (расчётная прибыль от продаж); иначе — ТОП-10 по полной прибыли товара.
   const salesBasis = salesLoss?.salesBasis === true;
-  const topLosses = useMemo<LossRow[]>(
+  const topLosses = useMemo<(LossRow & { range?: SalesLossRanking["rows"][number]["range"] })[]>(
     () =>
       salesBasis && salesLoss
         ? salesLoss.rows
@@ -373,9 +373,10 @@ export function OzonProductBreakdown({
         : null,
     [scored]
   );
-  // Самый убыточный — минимум (по продажам при salesBasis), только если отрицательный.
+  // Самый убыточный — минимум, только если отрицательный. При salesBasis — готовый выбор
+  // (только товар с ТОЧНЫМ результатом продаж; правило общее с PDF и рекомендациями).
   const worstProduct = useMemo<LossRow | null>(() => {
-    if (salesBasis && salesLoss) return salesLoss.rows[0] ?? null;
+    if (salesBasis && salesLoss) return salesLoss.worst;
     if (!scored.length) return null;
     const min = scored.reduce((w, r) => ((r.profit ?? 0) < (w.profit ?? 0) ? r : w));
     return (min.profit ?? 0) < 0 ? min : null;
@@ -417,7 +418,7 @@ export function OzonProductBreakdown({
   const hasDashMargin =
     precomputed &&
     (rows.some((r) => r.margin === null) ||
-      topLosses.some((r) => r.margin === null) ||
+      topLosses.some((r) => r.margin === null && !r.range) ||
       (worstProduct !== null && worstProduct.margin === null));
 
   // Блок «Товары без себестоимости»: товары без пригодной cost_price — нет в
@@ -1072,7 +1073,12 @@ export function OzonProductBreakdown({
                           )}
                         </div>
                       </div>
+                      {salesBasis && salesLoss?.worstNote && (
+                        <p className="pba-hero-note">{salesLoss.worstNote}</p>
+                      )}
                     </>
+                  ) : salesBasis && salesLoss && salesLoss.worstEmpty.tone === "warn" ? (
+                    <div className="pba-hero-warn">{salesLoss.worstEmpty.text}</div>
                   ) : (
                     <div className="pba-hero-ok">
                       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1265,16 +1271,27 @@ export function OzonProductBreakdown({
                                 role="cell"
                                 data-label={salesBasis ? lossLabels.profit : "Чистая прибыль"}
                               >
-                                <span className="neg">
-                                  {formatSignedRub(r.profit ?? 0)}
-                                </span>
+                                {r.range ? (
+                                  <span className="neg pba-range" title="Убыток доказан, точная величина не определена">
+                                    от <span className="pba-nw">{formatSignedRub(r.range.lower)}</span> до{" "}
+                                    <span className="pba-nw">{formatSignedRub(r.range.upper)}</span>
+                                  </span>
+                                ) : (
+                                  <span className="neg">
+                                    {formatSignedRub(r.profit ?? 0)}
+                                  </span>
+                                )}
                               </span>
                               <span
                                 className="pba-cell pba-num"
                                 role="cell"
                                 data-label={salesBasis ? lossLabels.margin : "Чистая маржа"}
                               >
-                                {r.margin === null ? (
+                                {r.range ? (
+                                  <span className="pb-dash" title="Величина результата не определена — маржа не показывается">
+                                    не опр.
+                                  </span>
+                                ) : r.margin === null ? (
                                   <span
                                     className="pb-dash"
                                     title="Маржа не рассчитывается при нулевой или отрицательной выручке"
@@ -1291,6 +1308,9 @@ export function OzonProductBreakdown({
                       </div>
                     </div>
                   </>
+                )}
+                {salesBasis && salesLoss?.rangeNote && topLosses.length > 0 && (
+                  <p className="pba-loss-note pba-range-note">{salesLoss.rangeNote}</p>
                 )}
                 {salesBasis && salesLoss && salesLoss.excluded.length > 0 && (
                   <div className="pba-excluded" role="region" aria-label="Не включены в рейтинг">
@@ -2268,6 +2288,32 @@ export function OzonProductBreakdown({
           color: var(--green);
           font-size: 0.86rem;
           font-weight: 500;
+        }
+        .pba-hero-warn {
+          padding: 0.6rem 0.8rem;
+          border: 1px solid rgba(232, 176, 75, 0.32);
+          border-radius: 10px;
+          background: rgba(232, 176, 75, 0.06);
+          color: #f0cd84;
+          font-size: 0.82rem;
+          line-height: 1.45;
+        }
+        .pba-hero-note {
+          margin: 0.7rem 0 0;
+          font-size: 0.74rem;
+          line-height: 1.45;
+          color: var(--txt3);
+        }
+        .pba-range {
+          white-space: normal;
+        }
+        .pba-nw {
+          white-space: nowrap;
+        }
+        .pba-loss-note.pba-range-note {
+          margin: 0.8rem 0 0;
+          font-size: 0.76rem;
+          color: var(--txt3);
         }
         .pba-hero-ok svg {
           width: 18px;
