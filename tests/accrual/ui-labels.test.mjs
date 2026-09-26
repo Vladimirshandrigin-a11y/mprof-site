@@ -115,6 +115,35 @@ describe("«Самые прибыльные товары»: сначала от�
     assert.deepEqual(PC.pickProfitableRows([row("B", 7), row("A", 7)]).map((r) => r.article), ["A", "B"]);
   });
 
+  it("пустое состояние — по исходным товарам: неизвестная прибыль не считается нулём", () => {
+    const E = (rows) => PC.profitableEmptyState(rows);
+    assert.deepEqual(E([]), { kind: "no_products", text: "Нет данных о товарах", detail: null, unknownCount: 0 });
+    assert.deepEqual(E([row("A", null), row("B", 50, false)]), { kind: "all_unknown", text: "Прибыль товаров пока не рассчитана", detail: null, unknownCount: 2 });
+    assert.deepEqual(E([row("A", -5), row("B", null)]), {
+      kind: "known_none_positive",
+      text: "Среди товаров с известной прибылью прибыльных не найдено",
+      detail: "Без рассчитанной прибыли: 1 товар",
+      unknownCount: 1,
+    });
+    assert.equal(E([row("A", 0), row("B", null), row("C", null)]).detail, "Без рассчитанной прибыли: 2 товара");
+    assert.equal(E([row("A", 0), ...Array.from({ length: 5 }, (_, i) => row(`U${i}`, null))]).detail, "Без рассчитанной прибыли: 5 товаров");
+    assert.deepEqual(E([row("A", 0), row("B", -1)]), { kind: "none_positive", text: "Прибыльных товаров нет", detail: null, unknownCount: 0 });
+    assert.equal(E([row("A", 1), row("B", null)]), null, "прибыльные есть — пустого состояния нет");
+  });
+
+  it("PDF: часть прибыли неизвестна, среди известных прибыльных нет — не «прибыльных товаров нет»", () => {
+    // ART-A — огромная себестоимость (убыток), ART-B — без себестоимости (прибыль неизвестна),
+    // ART-C — только услуги (прибыль известна, отрицательна).
+    const s = snapFor(SCENARIOS.basic(), [{ sku: "ART-A", name: "A", cost_price: 100000 }]);
+    assert.equal(s.products.find((p) => p.article === "ART-B").profitKopecks, null);
+    const m = P.buildAccrualPdfModel(s, new Date(2026, 6, 1));
+    assert.deepEqual(
+      [m.keyProducts.best, m.keyProducts.bestEmptyText, m.keyProducts.bestEmptyDetail],
+      [null, "Среди товаров с известной прибылью прибыльных не найдено", "Без рассчитанной прибыли: 1 товар"]
+    );
+    assert.equal(S.accrualRecoProps(s).best, null, "рекомендации без «лучшего» ничего не утверждают");
+  });
+
   it("снимок без прибыльных товаров: «лучшего» нет (PDF и рекомендации), блок ключевых товаров остаётся", () => {
     const expensive = ["ART-A", "ART-B", "ART-C"].map((sku) => ({ sku, name: sku, cost_price: 100000 }));
     const s = snapFor(SCENARIOS.basic(), expensive);
@@ -124,7 +153,7 @@ describe("«Самые прибыльные товары»: сначала от�
     assert.ok(kp.scoredCount > 0);
     const m = P.buildAccrualPdfModel(s, new Date(2026, 6, 1));
     assert.ok(m.keyProducts, "блок ключевых товаров не пропадает");
-    assert.deepEqual([m.keyProducts.best, m.keyProducts.bestEmptyText], [null, "Прибыльных товаров нет"]);
+    assert.deepEqual([m.keyProducts.best, m.keyProducts.bestEmptyText, m.keyProducts.bestEmptyDetail], [null, "Прибыльных товаров нет", null]);
     assert.equal(S.accrualRecoProps(s).best, null);
   });
 

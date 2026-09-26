@@ -2326,21 +2326,40 @@ export default function AppPage() {
           x + 16,
           cy + 22
         );
-        // Прибыльных товаров нет — нейтральная строка вместо карточки (без
-        // подстановки убыточного товара в «самый прибыльный»).
+        // Прибыльных нет — нейтральная строка вместо карточки (без подстановки
+        // убыточного товара). Текст — по всем товарам: неизвестная прибыль ≠ 0.
         if (kind === "best" && !p) {
-          const pillY = cy + h / 2 - 1;
-          rr(x + 16, pillY, w - 32, 30, 8);
+          ctx.font = `600 11px ${SANS}`;
+          const empty = reportKeyProducts?.bestEmpty;
+          const wrapWords = (text: string, maxW: number) => {
+            const out: string[] = [];
+            let cur = "";
+            for (const word of text.split(" ")) {
+              const next = cur ? cur + " " + word : word;
+              if (cur && ctx.measureText(next).width > maxW) {
+                out.push(cur);
+                cur = word;
+              } else cur = next;
+            }
+            if (cur) out.push(cur);
+            return out;
+          };
+          const lines = [
+            ...wrapWords(empty?.text ?? "Прибыльных товаров нет", w - 48),
+            ...(empty?.detail ? wrapWords(empty.detail, w - 48) : []),
+          ].slice(0, 4);
+          const pillH = 16 + lines.length * 14;
+          const pillY = cy + 34 + Math.max(0, (h - 40 - pillH) / 2);
+          rr(x + 16, pillY, w - 32, pillH, 8);
           ctx.fillStyle = "rgba(232,176,75,0.10)";
           ctx.fill();
           ctx.lineWidth = 1;
           ctx.strokeStyle = "rgba(232,176,75,0.35)";
-          rr(x + 16, pillY, w - 32, 30, 8);
+          rr(x + 16, pillY, w - 32, pillH, 8);
           ctx.stroke();
           ctx.textAlign = "center";
-          ctx.font = `600 11px ${SANS}`;
           ctx.fillStyle = C.gold2;
-          ctx.fillText("Прибыльных товаров нет", x + w / 2, pillY + 20);
+          lines.forEach((ln, i) => ctx.fillText(ln, x + w / 2, pillY + 20 + i * 14));
           ctx.textAlign = "left";
           return;
         }

@@ -361,18 +361,28 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
       ctx.fillStyle = !p ? C.txt2 : kind === "best" ? C.green : C.red;
       ctx.fillText(kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : kp.worstTitle, x + 16, y + 22);
       if (!p) {
-        // «Самый прибыльный» без прибыльных товаров — нейтрально-предупреждающий тон.
+        // «Самый прибыльный» без прибыльных товаров — нейтрально-предупреждающий тон;
+        // длинный текст (и уточнение) переносится внутри карточки.
         const warn = kind === "best" || kp.worstEmptyTone === "warn";
-        roundRect(ctx, x + 16, y + ch / 2 - 1, cw - 32, 30, 8);
+        ctx.font = `600 11px ${SANS}`;
+        const lines =
+          kind === "best"
+            ? [
+                ...wrapText(ctx, kp.bestEmptyText, cw - 48),
+                ...(kp.bestEmptyDetail ? wrapText(ctx, kp.bestEmptyDetail, cw - 48) : []),
+              ].slice(0, 4)
+            : [kp.worstEmptyText];
+        const pillH = 16 + lines.length * 14;
+        const pillY = kind === "best" ? y + 34 + Math.max(0, (ch - 40 - pillH) / 2) : y + ch / 2 - 1;
+        roundRect(ctx, x + 16, pillY, cw - 32, pillH, 8);
         ctx.fillStyle = warn ? "rgba(232,176,75,0.10)" : "rgba(46,204,138,0.10)";
         ctx.fill();
         ctx.strokeStyle = warn ? "rgba(232,176,75,0.35)" : "rgba(46,204,138,0.30)";
-        roundRect(ctx, x + 16, y + ch / 2 - 1, cw - 32, 30, 8);
+        roundRect(ctx, x + 16, pillY, cw - 32, pillH, 8);
         ctx.stroke();
         ctx.textAlign = "center";
-        ctx.font = `600 11px ${SANS}`;
         ctx.fillStyle = warn ? C.gold2 : C.green;
-        ctx.fillText(kind === "best" ? kp.bestEmptyText : kp.worstEmptyText, x + cw / 2, y + ch / 2 + 19);
+        lines.forEach((ln, i) => ctx.fillText(ln, x + cw / 2, pillY + 20 + i * 14));
         ctx.textAlign = "left";
         return;
       }

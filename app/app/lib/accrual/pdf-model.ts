@@ -13,6 +13,7 @@ import {
   accrualNotices,
   accrualPeriodLabel,
   accrualPeriodRange,
+  accrualProductBreakdownRows,
   accrualProfitLabel,
   accrualSalesSplitView,
   accrualSplitReconciliationText,
@@ -24,6 +25,7 @@ import {
   type AccrualSnapshotV1,
 } from "./snapshot";
 import { fmtAmount, fmtPercent, fmtRub, fmtSignedRub, pluralRu } from "./format";
+import { profitableEmptyState } from "../product-breakdown-calc";
 
 export interface PdfRow {
   label: string;
@@ -70,6 +72,8 @@ export interface AccrualPdfModel {
     /** null — прибыльных товаров нет (правило pickProfitableRows), см. bestEmptyText. */
     best: PdfKeyProduct | null;
     bestEmptyText: string;
+    /** Уточнение к bestEmptyText (число товаров без рассчитанной прибыли); null — нет. */
+    bestEmptyDetail: string | null;
     worst: PdfKeyProduct | null;
     /** Подписи карточки убыточного: по продажам или по полной прибыли (старый снимок). */
     worstTitle: string;
@@ -135,6 +139,8 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
       : "");
 
   const kp = accrualKeyProducts(s);
+  // Пустое состояние «самого прибыльного» — по всем товарам (как на экране).
+  const profitableEmpty = profitableEmptyState(accrualProductBreakdownRows(s));
   const split = accrualSalesSplitView(s);
   const salesBasis = split.availability === "ok";
   const worstText = salesBasis ? accrualWorstSalesText(split) : null;
@@ -228,7 +234,8 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
     keyProducts: kp.scoredCount > 0
       ? {
           best: kp.best ? toPdf(kp.best) : null,
-          bestEmptyText: "Прибыльных товаров нет",
+          bestEmptyText: profitableEmpty?.text ?? "Прибыльных товаров нет",
+          bestEmptyDetail: profitableEmpty?.detail ?? null,
           worst: kp.worst ? toPdf(kp.worst) : null,
           worstTitle: salesBasis ? "САМЫЙ УБЫТОЧНЫЙ ПО ПРОДАЖАМ" : "САМЫЙ УБЫТОЧНЫЙ (ПОЛНАЯ ПРИБЫЛЬ)",
           worstProfitLabel: salesBasis ? "ПРИБЫЛЬ ОТ ПРОДАЖ" : "ЧИСТАЯ ПРИБЫЛЬ",
