@@ -9,7 +9,7 @@
 //   taxRevenueBase    = salesRevenue + returnsRevenue
 //   productionCost    = Σ_товаров round(netQuantity × cost),  netQuantity = продано − возвращено
 //   tax               = round-half-up(taxRevenueBase × ставка / 100)
-//   manualExpenses    = упаковка + доставка до склада + зарплата + прочие
+//   manualExpenses    = упаковка + доставка до склада + зарплата + прочие + реклама вне Ozon
 //   netProfit         = netOzonOperations − productionCost − tax − manualExpenses
 //   margin            = netProfit / taxRevenueBase × 100  (null, если не вычислить)
 //   taxRevenueBase ≤ 0 → ошибка no_tax_revenue (НЕ прибыль с нулевым налогом)
@@ -36,12 +36,18 @@ import {
 } from "./product-analytics";
 import type { CatalogEntry } from "../product-breakdown-calc";
 
-/** Ручные расходы, ₽ (те же ключи, что в ProfitInputs старого режима; без рекламы). */
+/**
+ * Ручные расходы, ₽ (те же ключи, что в ProfitInputs старого режима).
+ * adsOutsideOzon — «Реклама вне Ozon»: ТОЛЬКО расходы, не попавшие в загруженный
+ * отчёт (реклама Ozon уже внутри «Итога начислений»). Входит в ручные расходы
+ * РОВНО ОДИН РАЗ.
+ */
 export interface AccrualManualExpenses {
   packaging?: number;
   deliveryToWarehouse?: number;
   salary?: number;
   other?: number;
+  adsOutsideOzon?: number;
 }
 
 /** Минимум, который нужен ядру от результата парсера (rows + period). */
@@ -97,6 +103,9 @@ export interface AccrualProfitCalc {
     deliveryToWarehouseKopecks: number;
     salaryKopecks: number;
     otherKopecks: number;
+    /** «Реклама вне Ozon» (расходы, не включённые в отчёт). */
+    adsOutsideOzonKopecks: number;
+    /** Σ всех пяти статей ровно один раз. */
     totalKopecks: number;
   };
 
@@ -155,10 +164,17 @@ export function computeAccrualProfit(input: AccrualCalcInput): AccrualCalcResult
   const delivery = manualToKopecks(me.deliveryToWarehouse);
   const salary = manualToKopecks(me.salary);
   const other = manualToKopecks(me.other);
-  if (packaging === null || delivery === null || salary === null || other === null) {
+  const adsOutside = manualToKopecks(me.adsOutsideOzon);
+  if (
+    packaging === null ||
+    delivery === null ||
+    salary === null ||
+    other === null ||
+    adsOutside === null
+  ) {
     return err("invalid_manual_expenses", "Ручные расходы должны быть неотрицательными числами.");
   }
-  const manualTotal = packaging + delivery + salary + other;
+  const manualTotal = packaging + delivery + salary + other + adsOutside;
 
   // --- итоги из строк (ядро не доверяет чужим агрегатам) ---
   const summary = summarizeAccrualRows(rows);
@@ -215,6 +231,7 @@ export function computeAccrualProfit(input: AccrualCalcInput): AccrualCalcResult
         deliveryToWarehouseKopecks: delivery,
         salaryKopecks: salary,
         otherKopecks: other,
+        adsOutsideOzonKopecks: adsOutside,
         totalKopecks: manualTotal,
       },
       netProfitKopecks: netProfit,

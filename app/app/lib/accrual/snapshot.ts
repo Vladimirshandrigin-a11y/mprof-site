@@ -123,6 +123,11 @@ export interface AccrualSnapshotV1 {
     deliveryToWarehouseKopecks: number;
     salaryKopecks: number;
     otherKopecks: number;
+    /**
+     * «Реклама вне Ozon» — только расходы, не включённые в отчёт. Аддитивное поле
+     * v1 (PR-3): в снимках, сохранённых до него, отсутствует и читается как 0.
+     */
+    adsOutsideOzonKopecks: number;
     totalKopecks: number;
   };
   netProfitKopecks: number;
@@ -415,6 +420,11 @@ function parseStrict(v: Record<string, unknown>): AccrualSnapshotV1 {
     deliveryToWarehouseKopecks: intGE0(me.deliveryToWarehouseKopecks, "manualExpenses.deliveryToWarehouseKopecks"),
     salaryKopecks: intGE0(me.salaryKopecks, "manualExpenses.salaryKopecks"),
     otherKopecks: intGE0(me.otherKopecks, "manualExpenses.otherKopecks"),
+    // Аддитивное поле: у прежних v1-снимков его нет → 0 (сумма ниже всё равно сверяется).
+    adsOutsideOzonKopecks:
+      me.adsOutsideOzonKopecks === undefined
+        ? 0
+        : intGE0(me.adsOutsideOzonKopecks, "manualExpenses.adsOutsideOzonKopecks"),
     totalKopecks: intGE0(me.totalKopecks, "manualExpenses.totalKopecks"),
   };
   if (
@@ -422,7 +432,8 @@ function parseStrict(v: Record<string, unknown>): AccrualSnapshotV1 {
     manualExpenses.packagingKopecks +
       manualExpenses.deliveryToWarehouseKopecks +
       manualExpenses.salaryKopecks +
-      manualExpenses.otherKopecks
+      manualExpenses.otherKopecks +
+      manualExpenses.adsOutsideOzonKopecks
   ) {
     bad("ручные расходы не сходятся");
   }
@@ -643,7 +654,7 @@ export function accrualBreakdownRows(s: AccrualSnapshotV1): AccrualDisplayRow[] 
       label: "Ручные расходы",
       kopecks: s.manualExpenses.totalKopecks,
       kind: "expense",
-      note: "Упаковка, доставка до склада, зарплата и прочие расходы вне отчёта.",
+      note: "Упаковка, доставка до склада, зарплата, реклама вне Ozon и прочие расходы, не включённые в отчёт.",
     });
   }
   rows.push({
@@ -874,7 +885,7 @@ export function accrualRecoProps(s: AccrualSnapshotV1) {
     costPrice: kopecksToRub(s.productionCostKopecks),
     tax: kopecksToRub(s.tax.kopecks),
     taxPercent: s.tax.ratePercent,
-    ads: 0,
+    ads: kopecksToRub(s.manualExpenses.adsOutsideOzonKopecks),
     otherExpenses: kopecksToRub(s.manualExpenses.totalKopecks),
     coverage: {
       total: cov.withCost + cov.withoutCost,
