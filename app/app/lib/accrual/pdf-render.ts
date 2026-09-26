@@ -359,7 +359,7 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
       ctx.textAlign = "left";
       ctx.font = `700 9.5px ${MONO}`;
       ctx.fillStyle = kind === "best" ? C.green : p ? C.red : C.txt2;
-      ctx.fillText(kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : "САМЫЙ УБЫТОЧНЫЙ", x + 16, y + 22);
+      ctx.fillText(kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : kp.worstTitle, x + 16, y + 22);
       if (!p) {
         roundRect(ctx, x + 16, y + ch / 2 - 1, cw - 32, 30, 8);
         ctx.fillStyle = "rgba(46,204,138,0.10)";
@@ -370,7 +370,7 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
         ctx.textAlign = "center";
         ctx.font = `600 11px ${SANS}`;
         ctx.fillStyle = C.green;
-        ctx.fillText("Убыточных товаров не найдено", x + cw / 2, y + ch / 2 + 19);
+        ctx.fillText(kp.worstEmptyText, x + cw / 2, y + ch / 2 + 19);
         ctx.textAlign = "left";
         return;
       }
@@ -387,14 +387,14 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
       ctx.stroke();
       ctx.font = `600 8px ${MONO}`;
       ctx.fillStyle = C.txt3;
-      ctx.fillText("ЧИСТАЯ ПРИБЫЛЬ", x + 16, y + 92);
+      ctx.fillText(kind === "best" ? "ЧИСТАЯ ПРИБЫЛЬ" : kp.worstProfitLabel, x + 16, y + 92);
       ctx.font = `800 15px ${SANS}`;
       ctx.fillStyle = p.positive ? C.green : C.red;
       ctx.fillText(p.profit, x + 16, y + 106);
       ctx.textAlign = "right";
       ctx.font = `600 8px ${MONO}`;
       ctx.fillStyle = C.txt3;
-      ctx.fillText("МАРЖА", x + cw - 16, y + 92);
+      ctx.fillText(kind === "best" ? "МАРЖА" : kp.worstMarginLabel, x + cw - 16, y + 92);
       ctx.font = `700 14px ${SANS}`;
       ctx.fillStyle = p.marginNeg ? C.red : C.txt;
       ctx.fillText(p.margin, x + cw - 16, y + 106);
@@ -426,6 +426,7 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
       y += lines.length * 15 + 7;
     }
   };
+  bulletList(model.splitTitle, model.splitLines, C.gold2);
   bulletList(model.noticesTitle, model.notices, C.red);
   bulletList(model.explanationsTitle, model.explanations, C.gold2);
 

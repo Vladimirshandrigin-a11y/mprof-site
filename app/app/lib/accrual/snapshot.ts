@@ -15,6 +15,12 @@
 //               потребители обязаны показать «данные недоступны», а НЕ нули;
 //   • ok      — снимок прошёл проверку структуры и инвариантов.
 //
+// Разделение результата товаров (продажи / возвраты / расходы без продаж /
+// неразделённые, sales-split.ts) — АДДИТИВНЫЕ поля v1: salesSplit на верхнем уровне
+// и split у товара. Их отсутствие = «разделение недоступно» (снимок сохранён до
+// появления разделения), а НЕ нулевые возвраты. Ссылки «ID начисления» в снимок
+// НЕ пишутся — только суммы и счётчики.
+//
 // Деньги — целые копейки. Модуль чистый: без React, Supabase, сети, DOM.
 // Формулы расчёта здесь НЕ реализуются (они в profit-calc.ts); здесь только
 // сборка снимка из результата ядра, проверка целостности и отображение.
@@ -29,8 +35,19 @@ import {
 import type { AccrualProfitCalc } from "./profit-calc";
 import type { AccrualPeriod, AccrualWarning } from "../report-parsers/accrual-xlsx-parser";
 import { kopecksToRub, ratioPercent } from "./money";
-import { fmtDateRange, fmtMonthLabel, pluralRu } from "./format";
+import { fmtDateRange, fmtMonthLabel, fmtRub, pluralRu } from "./format";
 import { toBreakdownRow, type AccrualBreakdownRow } from "./product-analytics";
+import {
+  SPLIT_PARTS,
+  UNSPLIT_REASONS,
+  assessSalesLoss,
+  splitMatchesProduct,
+  splitPartResult,
+  type ProductSplit,
+  type SplitPart,
+  type SplitPartKey,
+  type UnsplitReason,
+} from "./sales-split";
 
 export const ACCRUAL_SNAPSHOT_KIND = "ozon-accrual-xlsx-v1" as const;
 export const ACCRUAL_SNAPSHOT_VERSION = 1 as const;
@@ -77,6 +94,8 @@ export interface AccrualSnapshotProduct {
   profitKopecks: number | null;
   /** null — прибыль неизвестна или реализация товара ≤ 0. */
   marginPercent: number | null;
+  /** Разделение результата товара; нет поля — разделение недоступно. */
+  split?: ProductSplit;
 }
 
 export interface AccrualSnapshotWarning {
@@ -145,6 +164,12 @@ export interface AccrualSnapshotV1 {
     profitComplete: boolean;
   };
   reconciliation: { productProfitSumKopecks: number; reconciles: boolean | null };
+  /**
+   * Разделение результата товаров. Нет поля — снимок сохранён до разделения
+   * («недоступно»). available:false — в отчёте не было «ID начисления» (или не
+   * сошёлся инвариант): split у товаров нет.
+   */
+  salesSplit?: { version: 1; available: boolean; reason: "no_ref_column" | "invariant" | null };
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +261,7 @@ export function buildAccrualSnapshot(input: BuildAccrualSnapshotInput): AccrualS
       cogsKopecks: p.cogsKopecks,
       profitKopecks: p.profitKopecks,
       marginPercent: p.marginPercent,
+      ...(calc.salesSplitAvailable && p.split ? { split: cloneSplit(p.split) } : {}),
     })),
     productTotals: {
       productCount: calc.productTotals.productCount,
@@ -247,8 +273,17 @@ export function buildAccrualSnapshot(input: BuildAccrualSnapshotInput): AccrualS
       productProfitSumKopecks: calc.reconciliation.productProfitSumKopecks,
       reconciles: calc.reconciliation.reconciles,
     },
+    salesSplit: {
+      version: 1,
+      available: calc.salesSplitAvailable,
+      reason: calc.salesSplitAvailable ? null : calc.salesSplitReason ?? "no_ref_column",
+    },
   };
   return snap;
+}
+
+function cloneSplit(sp: ProductSplit): ProductSplit {
+  return JSON.parse(JSON.stringify(sp)) as ProductSplit;
 }
 
 /** JSON-безопасная копия для записи в jsonb (ai_insights). Через неё же проверяется round-trip. */
@@ -334,7 +369,72 @@ function readProduct(v: unknown, i: number): AccrualSnapshotProduct {
     cogsKopecks: cogs,
     profitKopecks: profit,
     marginPercent: nullableNum(v.marginPercent, `${w}.marginPercent`),
+    ...(v.split !== undefined ? { split: readSplitRaw(v.split, `${w}.split`) } : {}),
   };
+}
+
+function readPart(v: unknown, w: string): SplitPart {
+  if (!isObj(v)) return bad(`${w}: ожидался объект`);
+  return {
+    directKopecks: int(v.directKopecks, `${w}.directKopecks`),
+    revenueKopecks: int(v.revenueKopecks, `${w}.revenueKopecks`),
+    quantity: int(v.quantity, `${w}.quantity`),
+    cogsKopecks: v.cogsKopecks === null ? null : int(v.cogsKopecks, `${w}.cogsKopecks`),
+    generalKopecks: int(v.generalKopecks, `${w}.generalKopecks`),
+    taxKopecks: intGE0(v.taxKopecks, `${w}.taxKopecks`),
+    manualKopecks: intGE0(v.manualKopecks, `${w}.manualKopecks`),
+    rows: intGE0(v.rows, `${w}.rows`),
+  };
+}
+
+function readSplitRaw(v: unknown, w: string): ProductSplit {
+  if (!isObj(v)) return bad(`${w}: ожидался объект`);
+  const rp = isObj(v.parts) ? v.parts : bad(`${w}.parts`);
+  const rg = isObj(v.groups) ? v.groups : bad(`${w}.groups`);
+  const rr = isObj(v.unsplitReasons) ? v.unsplitReasons : bad(`${w}.unsplitReasons`);
+  const rb = isObj(v.unsplitBuckets) ? v.unsplitBuckets : bad(`${w}.unsplitBuckets`);
+  const parts = {} as Record<SplitPartKey, SplitPart>;
+  const groups = {} as Record<SplitPartKey, number>;
+  for (const k of SPLIT_PARTS) {
+    parts[k] = readPart(rp[k], `${w}.parts.${k}`);
+    groups[k] = intGE0(rg[k], `${w}.groups.${k}`);
+  }
+  const unsplitReasons = {} as Record<UnsplitReason, number>;
+  for (const k of UNSPLIT_REASONS) unsplitReasons[k] = intGE0(rr[k], `${w}.unsplitReasons.${k}`);
+  const unsplitBuckets = {} as AccrualBucketSums;
+  for (const k of ACCRUAL_BUCKETS) unsplitBuckets[k] = int(rb[k], `${w}.unsplitBuckets.${k}`);
+  return {
+    parts,
+    groups,
+    unsplitReasons,
+    unsplitBuckets,
+    unsplitPositiveKopecks: intGE0(v.unsplitPositiveKopecks, `${w}.unsplitPositiveKopecks`),
+    unsplitNegativeKopecks: int(v.unsplitNegativeKopecks, `${w}.unsplitNegativeKopecks`),
+  };
+}
+
+/** Инварианты разделения против товара: Σ частей = товару до копейки. */
+function checkProductSplit(p: AccrualSnapshotProduct, i: number): void {
+  const sp = p.split;
+  if (!sp) return;
+  const ok = splitMatchesProduct(sp, {
+    key: "",
+    directKopecks: p.directKopecks,
+    revenueBaseKopecks: p.revenueBaseKopecks,
+    netQuantity: p.netQuantity,
+    unitCost: p.unitCost,
+    hasCost: p.hasCost,
+    cogsKopecks: p.cogsKopecks,
+    allocatedGeneralKopecks: p.allocatedGeneralKopecks,
+    allocatedTaxKopecks: p.allocatedTaxKopecks,
+    allocatedManualKopecks: p.allocatedManualKopecks,
+  });
+  if (!ok) bad(`products[${i}].split: части не сходятся с товаром`);
+  if (p.profitKopecks !== null && sp.parts.sales.cogsKopecks !== null) {
+    let sum = 0;
+    for (const k of SPLIT_PARTS) sum += splitPartResult(sp.parts[k]) as number;
+    if (sum !== p.profitKopecks) bad(`products[${i}].split: сумма частей не равна прибыли товара`);
+  }
 }
 
 function parseStrict(v: Record<string, unknown>): AccrualSnapshotV1 {
@@ -480,6 +580,23 @@ function parseStrict(v: Record<string, unknown>): AccrualSnapshotV1 {
   };
   if (productTotals.productCount !== products.length) bad("число товаров не сходится");
 
+  // Разделение: нет поля — снимок до разделения (у товаров split быть не должно).
+  let salesSplit: AccrualSnapshotV1["salesSplit"];
+  if (v.salesSplit === undefined) {
+    if (products.some((p) => p.split)) bad("split у товара без salesSplit");
+  } else {
+    const ss = isObj(v.salesSplit) ? v.salesSplit : bad("salesSplit: ожидался объект");
+    if (ss.version !== 1) bad("salesSplit.version");
+    const available = bool(ss.available, "salesSplit.available");
+    const reason = ss.reason;
+    if (available ? reason !== null : reason !== "no_ref_column" && reason !== "invariant") bad("salesSplit.reason");
+    if (available ? products.some((p) => !p.split) : products.some((p) => p.split)) {
+      bad("salesSplit.available противоречит товарам");
+    }
+    products.forEach(checkProductSplit);
+    salesSplit = { version: 1, available, reason: reason as "no_ref_column" | "invariant" | null };
+  }
+
   const rc = isObj(v.reconciliation) ? v.reconciliation : bad("reconciliation: ожидался объект");
   if (rc.reconciles !== null && typeof rc.reconciles !== "boolean") bad("reconciliation.reconciles");
   const reconciliation = {
@@ -511,6 +628,7 @@ function parseStrict(v: Record<string, unknown>): AccrualSnapshotV1 {
     products,
     productTotals,
     reconciliation,
+    ...(salesSplit ? { salesSplit } : {}),
   };
 }
 
@@ -618,7 +736,9 @@ export function accrualBreakdownRows(s: AccrualSnapshotV1): AccrualDisplayRow[] 
       key: k,
       label: ACCRUAL_BUCKET_LABELS[k],
       kopecks: v,
-      kind: v >= 0 ? "income" : "expense",
+      // Выручку показываем без ведущего «+» (настоящий минус сохраняется) —
+      // нейтральная строка; прочие категории — доход/расход со знаком.
+      kind: k === "salesRevenue" ? "neutral" : v >= 0 ? "income" : "expense",
     });
   }
   rows.push({
@@ -753,9 +873,19 @@ export interface AccrualKeyProduct {
   profitKopecks: number;
   /** null → «—». */
   marginPercent: number | null;
+  /**
+   * На чём основан показатель: «sales» — расчётная прибыль от продаж (разделение
+   * доступно); «full_profit» — полная прибыль товара с возвратами и расходами без
+   * продаж (старый снимок / нет «ID начисления»). Подписи обязаны это различать.
+   */
+  basis: "sales" | "full_profit";
 }
 
-/** Самый прибыльный / самый убыточный (только отрицательный) — как в существующей аналитике. */
+/**
+ * Лучший товар — по полной прибыли (как раньше). Самый убыточный — по расчётной
+ * прибыли от продаж, если разделение доступно (только доказанный убыток продаж);
+ * иначе — по полной прибыли с пометкой basis:"full_profit" (не выдаётся за продажи).
+ */
 export function accrualKeyProducts(s: AccrualSnapshotV1): {
   best: AccrualKeyProduct | null;
   worst: AccrualKeyProduct | null;
@@ -763,19 +893,305 @@ export function accrualKeyProducts(s: AccrualSnapshotV1): {
   const scored = s.products.filter(
     (p) => p.profitKopecks !== null && (p.costRequired ? p.hasCost : true)
   );
-  if (scored.length === 0) return { best: null, worst: null };
   const toKey = (p: AccrualSnapshotProduct): AccrualKeyProduct => ({
     article: p.article,
     name: p.name,
     profitKopecks: p.profitKopecks ?? 0,
     marginPercent: p.marginPercent,
+    basis: "full_profit",
   });
-  const best = scored.reduce((b, p) => ((p.profitKopecks ?? 0) > (b.profitKopecks ?? 0) ? p : b));
+  const best =
+    scored.length === 0
+      ? null
+      : toKey(scored.reduce((b, p) => ((p.profitKopecks ?? 0) > (b.profitKopecks ?? 0) ? p : b)));
+
+  const view = accrualSalesSplitView(s);
+  if (view.availability === "ok") {
+    const w = view.worst;
+    return {
+      best,
+      worst: w
+        ? {
+            article: w.article,
+            name: w.name,
+            profitKopecks: w.salesResultKopecks,
+            marginPercent: w.salesMarginPercent,
+            basis: "sales",
+          }
+        : null,
+    };
+  }
+  if (scored.length === 0) return { best: null, worst: null };
   const min = scored.reduce((w, p) => ((p.profitKopecks ?? 0) < (w.profitKopecks ?? 0) ? p : w));
+  return { best, worst: (min.profitKopecks ?? 0) < 0 ? toKey(min) : null };
+}
+
+// ---------------------------------------------------------------------------
+// Разделение результата товаров: единый вид для экрана, рекомендаций и PDF
+// ---------------------------------------------------------------------------
+
+/** ok — разделение есть; legacy — снимок до разделения; no_ref_column — в отчёте нет «ID начисления»; invariant — не сошлось. */
+export type AccrualSplitAvailability = "ok" | "legacy" | "no_ref_column" | "invariant";
+
+export interface AccrualSalesLossRow {
+  article: string;
+  name: string;
+  /** Выручка продаж (строки «Выручка» групп продаж), > 0. */
+  salesRevenueKopecks: number;
+  /** «Расчётная прибыль от продаж» (< 0 для строк рейтинга). */
+  salesResultKopecks: number;
+  salesMarginPercent: number | null;
+}
+
+export interface AccrualSalesExcludedRow {
+  article: string;
+  name: string;
+  salesResultKopecks: number;
+  /** Диапазон результата продаж при разном отнесении неразделённых операций. */
+  lowerKopecks: number;
+  upperKopecks: number;
+}
+
+export interface AccrualSplitBlockRow {
+  article: string;
+  name: string;
+  /** null — себестоимость неизвестна. */
+  resultKopecks: number | null;
+  rows: number;
+  groups: number;
+}
+
+export interface AccrualUnsplitComponent {
+  label: string;
+  kopecks: number;
+}
+
+export interface AccrualUnsplitRow extends AccrualSplitBlockRow {
+  reasons: { reason: UnsplitReason; label: string; count: number }[];
+  /** Конкретные суммы: строки отчёта по корзинам, себестоимость и распределённые суммы. */
+  components: AccrualUnsplitComponent[];
+}
+
+export interface AccrualSalesSplitView {
+  availability: AccrualSplitAvailability;
+  /** Доказанно убыточные продажи, по возрастанию результата. */
+  losses: AccrualSalesLossRow[];
+  worst: AccrualSalesLossRow | null;
+  /** Не ранжированы: неразделённые операции могут изменить вывод об убыточности. */
+  excluded: AccrualSalesExcludedRow[];
+  /** Товаров с продажами, но без себестоимости (в рейтинг не входят). */
+  salesWithoutCost: number;
+  sales: { totalKopecks: number | null; products: number };
+  returns: { totalKopecks: number | null; rows: AccrualSplitBlockRow[] };
+  noSale: { totalKopecks: number | null; rows: AccrualSplitBlockRow[] };
+  unsplit: { totalKopecks: number | null; rows: AccrualUnsplitRow[] };
+  /** Σ частей по всем товарам = прибыль товаров; null — у части товаров результат неизвестен. */
+  reconciliation: {
+    salesKopecks: number;
+    returnsKopecks: number;
+    noSaleKopecks: number;
+    unsplitKopecks: number;
+    productProfitKopecks: number;
+  } | null;
+}
+
+export const UNSPLIT_REASON_LABELS: Record<UnsplitReason, string> = {
+  partial_return: "частичный возврат по одному ID (затраты по единицам не разделить)",
+  ambiguous_link: "неоднозначная связь продажи и возврата",
+  no_sale_link: "операции без связи с продажей (реклама, эквайринг по номеру заказа, размещение)",
+  no_ref: "строки без «ID начисления»",
+};
+
+function emptyView(availability: AccrualSplitAvailability): AccrualSalesSplitView {
   return {
-    best: toKey(best),
-    worst: (min.profitKopecks ?? 0) < 0 ? toKey(min) : null,
+    availability,
+    losses: [],
+    worst: null,
+    excluded: [],
+    salesWithoutCost: 0,
+    sales: { totalKopecks: null, products: 0 },
+    returns: { totalKopecks: null, rows: [] },
+    noSale: { totalKopecks: null, rows: [] },
+    unsplit: { totalKopecks: null, rows: [] },
+    reconciliation: null,
   };
+}
+
+const sumOrNull = (vals: (number | null)[]): number | null =>
+  vals.some((v) => v === null) ? null : vals.reduce<number>((a, v) => a + (v as number), 0);
+
+/** Разделение результата товаров из снимка. Ничего не пересчитывает по каталогу. */
+export function accrualSalesSplitView(s: AccrualSnapshotV1): AccrualSalesSplitView {
+  if (!s.salesSplit) return emptyView("legacy");
+  if (!s.salesSplit.available) return emptyView(s.salesSplit.reason === "invariant" ? "invariant" : "no_ref_column");
+
+  const view = emptyView("ok");
+  const salesResults: (number | null)[] = [];
+  const retRows: AccrualSplitBlockRow[] = [];
+  const noSaleRows: AccrualSplitBlockRow[] = [];
+  const unsplitRows: AccrualUnsplitRow[] = [];
+  let allKnown = true;
+  const totals = { sales: 0, returns: 0, noSale: 0, unsplit: 0, profit: 0 };
+
+  for (const p of s.products) {
+    const sp = p.split;
+    if (!sp) continue;
+    const name = p.name || p.article;
+    const a = assessSalesLoss(sp);
+    if (sp.groups.sales > 0) {
+      view.sales.products++;
+      salesResults.push(a.salesResultKopecks);
+      if (a.status === "loss") {
+        view.losses.push({
+          article: p.article,
+          name,
+          salesRevenueKopecks: a.salesRevenueKopecks,
+          salesResultKopecks: a.salesResultKopecks as number,
+          salesMarginPercent: a.salesMarginPercent,
+        });
+      } else if (a.status === "undetermined") {
+        view.excluded.push({
+          article: p.article,
+          name,
+          salesResultKopecks: a.salesResultKopecks as number,
+          lowerKopecks: a.lowerKopecks as number,
+          upperKopecks: a.upperKopecks as number,
+        });
+      } else if (a.status === "no_cost") {
+        view.salesWithoutCost++;
+      }
+    }
+    const block = (k: SplitPartKey): AccrualSplitBlockRow => ({
+      article: p.article,
+      name,
+      resultKopecks: splitPartResult(sp.parts[k]),
+      rows: sp.parts[k].rows,
+      groups: sp.groups[k],
+    });
+    if (sp.parts.returns.rows > 0) retRows.push(block("returns"));
+    if (sp.parts.noSale.rows > 0) noSaleRows.push(block("noSale"));
+    if (sp.parts.unsplit.rows > 0) {
+      const u = sp.parts.unsplit;
+      const components: AccrualUnsplitComponent[] = [];
+      for (const b of ACCRUAL_BUCKETS) {
+        if (sp.unsplitBuckets[b] !== 0) components.push({ label: ACCRUAL_BUCKET_LABELS[b], kopecks: sp.unsplitBuckets[b] });
+      }
+      if (u.cogsKopecks !== null && u.cogsKopecks !== 0) components.push({ label: "Себестоимость", kopecks: -u.cogsKopecks });
+      if (u.generalKopecks !== 0) components.push({ label: "Доля общих начислений без товара", kopecks: u.generalKopecks });
+      if (u.taxKopecks !== 0) components.push({ label: "Доля налога", kopecks: -u.taxKopecks });
+      if (u.manualKopecks !== 0) components.push({ label: "Доля ручных расходов", kopecks: -u.manualKopecks });
+      unsplitRows.push({
+        ...block("unsplit"),
+        reasons: UNSPLIT_REASONS.filter((r) => sp.unsplitReasons[r] > 0).map((r) => ({
+          reason: r,
+          label: UNSPLIT_REASON_LABELS[r],
+          count: sp.unsplitReasons[r],
+        })),
+        components,
+      });
+    }
+    const parts = SPLIT_PARTS.map((k) => splitPartResult(sp.parts[k]));
+    if (p.profitKopecks === null || parts.some((v) => v === null)) allKnown = false;
+    else {
+      totals.sales += parts[0] as number;
+      totals.returns += parts[1] as number;
+      totals.noSale += parts[2] as number;
+      totals.unsplit += parts[3] as number;
+      totals.profit += p.profitKopecks;
+    }
+  }
+
+  view.losses.sort((x, y) => x.salesResultKopecks - y.salesResultKopecks || (x.article < y.article ? -1 : 1));
+  view.excluded.sort((x, y) => x.salesResultKopecks - y.salesResultKopecks || (x.article < y.article ? -1 : 1));
+  view.worst = view.losses[0] ?? null;
+  const byResult = (x: AccrualSplitBlockRow, y: AccrualSplitBlockRow) =>
+    (x.resultKopecks ?? 0) - (y.resultKopecks ?? 0) || (x.article < y.article ? -1 : 1);
+  view.sales.totalKopecks = sumOrNull(salesResults);
+  view.returns = { totalKopecks: sumOrNull(retRows.map((r) => r.resultKopecks)), rows: retRows.sort(byResult) };
+  view.noSale = { totalKopecks: sumOrNull(noSaleRows.map((r) => r.resultKopecks)), rows: noSaleRows.sort(byResult) };
+  view.unsplit = { totalKopecks: sumOrNull(unsplitRows.map((r) => r.resultKopecks)), rows: unsplitRows.sort(byResult) };
+  view.reconciliation = allKnown
+    ? {
+        salesKopecks: totals.sales,
+        returnsKopecks: totals.returns,
+        noSaleKopecks: totals.noSale,
+        unsplitKopecks: totals.unsplit,
+        productProfitKopecks: totals.profit,
+      }
+    : null;
+  return view;
+}
+
+/**
+ * Рейтинг убыточных для экрана (рубли). salesBasis=true — «Продажи в минус» по
+ * расчётной прибыли от продаж; false — разделение недоступно, рейтинг строит сам
+ * блок товаров по полной прибыли с подписью note.
+ */
+export interface AccrualSalesLossRanking {
+  salesBasis: boolean;
+  note: string | null;
+  rows: { article: string; name: string; revenue: number; profit: number | null; margin: number | null }[];
+  excluded: { article: string; name: string; reason: string }[];
+}
+
+export function accrualSalesLossRanking(s: AccrualSnapshotV1): AccrualSalesLossRanking {
+  const v = accrualSalesSplitView(s);
+  if (v.availability !== "ok") {
+    // Причина недоступности показана ниже блоком разделения — здесь только основание рейтинга.
+    return {
+      salesBasis: false,
+      note: "Рейтинг по полной прибыли товара, включая возвраты: разделение продаж и возвратов для этого расчёта недоступно (причина — ниже).",
+      rows: [],
+      excluded: [],
+    };
+  }
+  return {
+    salesBasis: true,
+    note:
+      "Рейтинг по расчётной прибыли от продаж: в него попадают товары с продажами, известной себестоимостью и доказанно отрицательным результатом продаж. Возвраты, расходы без продаж и неразделённые операции показаны ниже отдельно и учтены в полной прибыли товара.",
+    rows: v.losses.map((l) => ({
+      article: l.article,
+      name: l.name,
+      revenue: kopecksToRub(l.salesRevenueKopecks),
+      profit: kopecksToRub(l.salesResultKopecks),
+      margin: l.salesMarginPercent,
+    })),
+    excluded: v.excluded.map((x) => ({
+      article: x.article,
+      name: x.name,
+      reason: `результат продаж ${fmtRub(x.salesResultKopecks)}, но неразделённые операции могут изменить его знак (возможный диапазон от ${fmtRub(x.lowerKopecks)} до ${fmtRub(x.upperKopecks)})`,
+    })),
+  };
+}
+
+/**
+ * Сверка частей одной строкой (экран/PDF): «632,11 ₽ − 664,00 ₽ − 15,00 ₽ + 179,90 ₽ =
+ * 133,01 ₽» — знак операции берётся из знака части, без «+ −». Неразделённые — только
+ * если они есть. null — сверка недоступна (у части товаров нет себестоимости).
+ */
+export function accrualSplitReconciliationText(view: AccrualSalesSplitView): string | null {
+  const r = view.reconciliation;
+  if (!r) return null;
+  const parts = [r.salesKopecks, r.returnsKopecks, r.noSaleKopecks];
+  if (view.unsplit.rows.length > 0) parts.push(r.unsplitKopecks);
+  const expr = parts
+    .map((k, i) => (i === 0 ? fmtRub(k) : (k < 0 ? "− " : "+ ") + fmtRub(Math.abs(k))))
+    .join(" ");
+  return `${expr} = прибыль товаров ${fmtRub(r.productProfitKopecks)}`;
+}
+
+/** Короткое объяснение недоступности разделения (экран/PDF). null — доступно. */
+export function accrualSplitUnavailableText(a: AccrualSplitAvailability): string | null {
+  switch (a) {
+    case "ok":
+      return null;
+    case "legacy":
+      return "Разделение продаж, возвратов и расходов без продаж недоступно: расчёт сохранён до появления этого разделения. Рейтинг убыточных товаров ниже — по полной прибыли товара, включая возвраты.";
+    case "no_ref_column":
+      return "Разделение продаж и возвратов недоступно: в загруженном отчёте нет колонки «ID начисления», связать операции нельзя. Рейтинг убыточных товаров — по полной прибыли товара, включая возвраты.";
+    case "invariant":
+      return "Разделение продаж и возвратов недоступно: суммы частей не сошлись с прибылью товара. Рейтинг убыточных товаров — по полной прибыли товара, включая возвраты.";
+  }
 }
 
 /** Покрытие каталога на момент расчёта (для «Проверки расчёта» и подписей). */
@@ -852,6 +1268,8 @@ export interface AccrualRecoProductRef {
   name: string;
   profit: number;
   margin: number | null;
+  /** sales — прибыль от продаж; full_profit — полная прибыль товара (с возвратами). */
+  basis: "sales" | "full_profit";
 }
 
 /**
@@ -869,6 +1287,7 @@ export function accrualRecoProps(s: AccrualSnapshotV1) {
           name: p.name,
           profit: kopecksToRub(p.profitKopecks),
           margin: p.marginPercent,
+          basis: p.basis,
         }
       : null;
   return {

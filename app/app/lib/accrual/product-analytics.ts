@@ -28,6 +28,7 @@
 // ============================================================================
 
 import type { AccrualBucketSums, AccrualRow } from "./types";
+import type { ProductSplit } from "./sales-split";
 import { emptyBucketSums } from "./buckets";
 import { allocateLargestRemainder, kopecksToRub, ratioPercent } from "./money";
 import {
@@ -237,6 +238,12 @@ export function aggregateAccrualProducts(
 
 /** Товар после распределения: итоговая прибыль/маржа. */
 export interface AccrualProductRow extends AccrualProductAggregate {
+  /**
+   * Разделение результата товара (sales-split.ts): продажи, возвраты, расходы без
+   * продаж, неразделённые операции. undefined — разделение недоступно (нет колонки
+   * «ID начисления»). Прибыль/маржа товара ниже от него НЕ зависят.
+   */
+  split?: ProductSplit;
   /** Доля «общих» строк (без артикула), копейки со знаком. */
   allocatedGeneralKopecks: number;
   allocatedTaxKopecks: number;

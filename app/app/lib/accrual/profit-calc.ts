@@ -35,6 +35,7 @@ import {
   type AccrualProductTotals,
 } from "./product-analytics";
 import type { CatalogEntry } from "../product-breakdown-calc";
+import { splitAccrualProducts, splitMatchesProduct } from "./sales-split";
 
 /**
  * Ручные расходы, ₽ (те же ключи, что в ProfitInputs старого режима).
@@ -119,6 +120,13 @@ export interface AccrualProfitCalc {
   readyToSave: boolean;
 
   products: AccrualProductRow[];
+  /**
+   * Разделение результата товаров доступно (в отчёте есть «ID начисления» и все
+   * инварианты разделения сошлись). false — у товаров нет split.
+   */
+  salesSplitAvailable: boolean;
+  /** Почему недоступно: нет колонки «ID начисления» / не сошёлся инвариант; null — доступно. */
+  salesSplitReason: "no_ref_column" | "invariant" | null;
   productTotals: AccrualProductTotals;
   /**
    * Сверка «Σ прибыль товаров = чистая прибыль». reconciles = null, пока
@@ -211,6 +219,13 @@ export function computeAccrualProfit(input: AccrualCalcInput): AccrualCalcResult
   const complete = agg.coverage.complete;
   const productProfitSum = alloc.totals.profitKopecks;
 
+  // --- разделение результата товаров (только отображение; прибыль не меняет) ---
+  // Если какой-то инвариант не сошёлся (Σ частей ≠ товару), разделение целиком
+  // считается недоступным — основной расчёт при этом не блокируется.
+  const splits = splitAccrualProducts(rows, alloc.rows);
+  const splitOk = splits !== null && splits.every((sp, i) => splitMatchesProduct(sp, alloc.rows[i]));
+  const products = splitOk ? alloc.rows.map((r, i) => ({ ...r, split: splits[i] })) : alloc.rows;
+
   return {
     ok: true,
     calc: {
@@ -238,7 +253,9 @@ export function computeAccrualProfit(input: AccrualCalcInput): AccrualCalcResult
       marginPercent: margin,
       preliminary: !complete,
       readyToSave: complete,
-      products: alloc.rows,
+      products,
+      salesSplitAvailable: splitOk,
+      salesSplitReason: splitOk ? null : splits === null ? "no_ref_column" : "invariant",
       productTotals: alloc.totals,
       reconciliation: {
         productProfitSumKopecks: productProfitSum,

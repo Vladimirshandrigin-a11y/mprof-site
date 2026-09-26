@@ -26,6 +26,12 @@ interface ProductRef {
   profit: number;
   /** null — маржа товара не определена (показывается «—»). */
   margin: number | null;
+  /**
+   * Только для расчёта по «Отчёту по начислениям»: «sales» — расчётная прибыль от
+   * продаж (без возвратов и расходов без продаж), «full_profit» — полная прибыль
+   * товара с возвратами (разделение недоступно). Не задано — прежние режимы.
+   */
+  basis?: "sales" | "full_profit";
 }
 
 export interface ProfitRecommendationsProps {
@@ -347,12 +353,16 @@ export function ProfitRecommendations(props: ProfitRecommendationsProps) {
   if (worst) {
     const wName = shortName(worst.name || worst.article);
     if (worst.profit < 0) {
+      const lossText =
+        worst.basis === "sales"
+          ? `Убыток от продаж ${fmtRub(Math.abs(worst.profit))}, маржа продаж ${pctOrDash(worst.margin)}`
+          : worst.basis === "full_profit"
+          ? `Убыток ${fmtRub(Math.abs(worst.profit))} по полной прибыли товара (включая возвраты), маржа ${pctOrDash(worst.margin)}`
+          : `Убыток ${fmtRub(Math.abs(worst.profit))}, маржа ${pctOrDash(worst.margin)}`;
       prodCards.push({
         kind: "risk",
         name: wName,
-        line: `Убыток ${fmtRub(Math.abs(worst.profit))}, маржа ${pctOrDash(
-          worst.margin
-        )}. Главный кандидат на пересмотр: цена, закуп или вывод из ассортимента.`,
+        line: `${lossText}. Главный кандидат на пересмотр: цена, закуп или вывод из ассортимента.`,
       });
     } else if (worst.margin !== null && worst.margin < 10) {
       prodCards.push({

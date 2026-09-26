@@ -14,7 +14,10 @@ import {
   accrualPeriodLabel,
   accrualPeriodRange,
   accrualProfitLabel,
+  accrualSalesSplitView,
+  accrualSplitReconciliationText,
   accrualSnapshotRoi,
+  accrualSplitUnavailableText,
   type AccrualRowKind,
   type AccrualSnapshotV1,
 } from "./snapshot";
@@ -61,7 +64,18 @@ export interface AccrualPdfModel {
   rows: PdfRow[];
   coverageLine: string;
   /** null — товаров с себестоимостью нет: блок не рисуется (как в старом PDF). */
-  keyProducts: { best: PdfKeyProduct; worst: PdfKeyProduct | null } | null;
+  keyProducts: {
+    best: PdfKeyProduct;
+    worst: PdfKeyProduct | null;
+    /** Подписи карточки убыточного: по продажам или по полной прибыли (старый снимок). */
+    worstTitle: string;
+    worstProfitLabel: string;
+    worstMarginLabel: string;
+    worstEmptyText: string;
+  } | null;
+  /** Разделение результата товаров: продажи / возвраты / без продаж / неразделённые. */
+  splitTitle: string;
+  splitLines: string[];
   noticesTitle: string;
   notices: string[];
   explanationsTitle: string;
@@ -111,6 +125,39 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
       : "");
 
   const kp = accrualKeyProducts(s);
+  const split = accrualSalesSplitView(s);
+  const salesBasis = split.availability === "ok";
+  const splitLines: string[] = [];
+  const unavailable = accrualSplitUnavailableText(split.availability);
+  if (unavailable) splitLines.push(unavailable);
+  else {
+    const money = (v: number | null) => (v === null ? "не определено (нет себестоимости)" : fmtRub(v));
+    splitLines.push(
+      `Расчётная прибыль от продаж: ${money(split.sales.totalKopecks)} (товаров с продажами: ${split.sales.products}).`
+    );
+    splitLines.push(
+      `Результат возвратов — по начислениям этого периода (возврат может относиться к продаже прошлого периода): ${money(split.returns.totalKopecks)} (товаров: ${split.returns.rows.length}).`
+    );
+    splitLines.push(`Расходы без продаж в периоде: ${money(split.noSale.totalKopecks)} (товаров: ${split.noSale.rows.length}).`);
+    if (split.unsplit.rows.length > 0) {
+      splitLines.push(
+        `Неразделённые операции: ${money(split.unsplit.totalKopecks)} (товаров: ${split.unsplit.rows.length}) — частичные возвраты, неоднозначные связи и операции без связи с продажей; отнесены отдельно, в продажи и возвраты не включены.`
+      );
+    }
+    const rec = accrualSplitReconciliationText(split);
+    if (rec) splitLines.push(`Сверка: ${rec}.`);
+    splitLines.push(
+      `Продажи в минус: ${split.losses.length}` +
+        (split.excluded.length > 0
+          ? `; не включены в рейтинг — неразделённые операции могут изменить вывод: ${split.excluded.length}`
+          : "") +
+        (split.salesWithoutCost > 0 ? `; без себестоимости: ${split.salesWithoutCost}` : "") +
+        "."
+    );
+    splitLines.push(
+      "Налог, ручные расходы и общие начисления без товара распределены внутри товара пропорционально положительной выручке части — это правило распределения, а не привязка расхода к отправлению."
+    );
+  }
   const toPdf = (p: NonNullable<typeof kp.best>): PdfKeyProduct => ({
     name: p.name || p.article,
     article: p.article,
@@ -159,11 +206,29 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
     breakdownTitle: "РАЗБИВКА РАСЧЁТА",
     rows,
     coverageLine,
-    keyProducts: kp.best ? { best: toPdf(kp.best), worst: kp.worst ? toPdf(kp.worst) : null } : null,
+    keyProducts: kp.best
+      ? {
+          best: toPdf(kp.best),
+          worst: kp.worst ? toPdf(kp.worst) : null,
+          worstTitle: salesBasis ? "САМЫЙ УБЫТОЧНЫЙ ПО ПРОДАЖАМ" : "САМЫЙ УБЫТОЧНЫЙ (ПОЛНАЯ ПРИБЫЛЬ)",
+          worstProfitLabel: salesBasis ? "ПРИБЫЛЬ ОТ ПРОДАЖ" : "ЧИСТАЯ ПРИБЫЛЬ",
+          worstMarginLabel: salesBasis ? "МАРЖА ПРОДАЖ" : "МАРЖА",
+          worstEmptyText: salesBasis ? "Убыточных продаж не найдено" : "Убыточных товаров не найдено",
+        }
+      : null,
+    splitTitle: "РЕЗУЛЬТАТ ТОВАРОВ ПО ЧАСТЯМ",
+    splitLines,
     noticesTitle: "ПРЕДУПРЕЖДЕНИЯ",
     notices: accrualNotices(s).map((n) => n.text),
     explanationsTitle: "КАК СЧИТАЕМ",
-    explanations: accrualExplanations(s),
+    explanations: [
+      ...accrualExplanations(s),
+      ...(s.marginPercent === null ||
+      (kp.best && kp.best.marginPercent === null) ||
+      (kp.worst && kp.worst.marginPercent === null)
+        ? ["«—» в марже: выручка ≤ 0, маржа не определяется."]
+        : []),
+    ],
     footer: `Сформировано сервисом M-Prof · ${accrualProfitLabel(s).toLowerCase()} по отчёту начислений Ozon`,
   };
 }

@@ -15,6 +15,7 @@
 
 import type { ReactNode } from "react";
 import { OzonProductBreakdown } from "./OzonProductBreakdown";
+import { AccrualSalesSplitBlocks } from "./AccrualSalesSplitBlocks";
 import {
   accrualBreakdownRows,
   accrualExplanations,
@@ -23,6 +24,8 @@ import {
   accrualPeriodRange,
   accrualProductBreakdownRows,
   accrualProfitLabel,
+  accrualSalesLossRanking,
+  accrualSalesSplitView,
   accrualSnapshotRoi,
   type AccrualSnapshotV1,
 } from "../lib/accrual/snapshot";
@@ -134,6 +137,9 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy, liv
               >
                 {fmtPercent(s.marginPercent)}
               </span>
+              {s.marginPercent === null && (
+                <span className="accr-note">маржа не определяется: реализация ≤ 0</span>
+              )}
             </div>
             <div className="profit-stat">
               <span className="profit-stat-label">ROI</span>
@@ -205,12 +211,14 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy, liv
         products={[]}
         user={null}
         precomputedRows={accrualProductBreakdownRows(s)}
+        salesLoss={accrualSalesLossRanking(s)}
         precomputedNote={
           live
             ? "Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной реализации. Себестоимость берётся из вашего каталога; после её изменения нажмите «Проверить снова»."
             : undefined
         }
       />
+      <AccrualSalesSplitBlocks view={accrualSalesSplitView(s)} />
     </>
   );
 }
