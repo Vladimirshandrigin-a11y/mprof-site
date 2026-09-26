@@ -57,6 +57,7 @@ import type { OzonProductRow } from "../lib/report-parsers/ozon-parser";
 import {
   computeProductBreakdownRows,
   computeProductBreakdownTotals,
+  pickProfitableRows,
   type ProductBreakdownRow,
 } from "../lib/product-breakdown-calc";
 import type { AccrualSalesLossRanking } from "../lib/accrual/snapshot";
@@ -347,11 +348,9 @@ export function OzonProductBreakdown({
     () => rows.filter((r) => r.hasCost && r.profit !== null),
     [rows]
   );
-  // ТОП-10 прибыльных — по прибыли по убыванию.
-  const topProfitable = useMemo(
-    () => [...scored].sort((a, b) => (b.profit ?? 0) - (a.profit ?? 0)).slice(0, 10),
-    [scored]
-  );
+  // ТОП-10 прибыльных по чистой прибыли товара: сначала отбор прибыли > 0, затем
+  // сортировка и ограничение (общее правило pickProfitableRows — то же у PDF/рекомендаций).
+  const topProfitable = useMemo(() => pickProfitableRows(scored), [scored]);
   // Рейтинг убыточных. С salesLoss.salesBasis — готовый список доказанно убыточных
   // ПРОДАЖ (расчётная прибыль от продаж); иначе — ТОП-10 по полной прибыли товара.
   const salesBasis = salesLoss?.salesBasis === true;
@@ -365,14 +364,11 @@ export function OzonProductBreakdown({
             .slice(0, 10),
     [scored, salesBasis, salesLoss]
   );
-  // Лучший товар месяца — максимум прибыли.
-  const bestProduct = useMemo(
-    () =>
-      scored.length
-        ? scored.reduce((best, r) => ((r.profit ?? 0) > (best.profit ?? 0) ? r : best))
-        : null,
-    [scored]
-  );
+  // Лучший товар месяца — первый из списка прибыльных; прибыльных нет → null.
+  const bestProduct = useMemo(() => topProfitable[0] ?? null, [topProfitable]);
+  // Пустое состояние прибыльных: данных нет вовсе / есть, но прибыль у всех ≤ 0.
+  const profitableEmpty =
+    scored.length === 0 ? "Нет данных" : "Прибыльных товаров нет: у всех товаров с известной прибылью она нулевая или отрицательная";
   // Самый убыточный — минимум, только если отрицательный. При salesBasis — готовый выбор
   // (только товар с ТОЧНЫМ результатом продаж; правило общее с PDF и рекомендациями).
   const worstProduct = useMemo<LossRow | null>(() => {
@@ -1027,7 +1023,7 @@ export function OzonProductBreakdown({
                       </div>
                     </>
                   ) : (
-                    <div className="pba-hero-empty">Нет данных</div>
+                    <div className="pba-hero-empty">{profitableEmpty}</div>
                   )}
                 </div>
 
@@ -1094,7 +1090,7 @@ export function OzonProductBreakdown({
               <div className="pba-section">
                 <h3 className="pba-h3">Самые прибыльные товары</h3>
                 {topProfitable.length === 0 ? (
-                  <div className="pba-hero-empty">Нет данных</div>
+                  <div className="pba-hero-empty">{profitableEmpty}</div>
                 ) : (
                   <>
                     <button

@@ -67,7 +67,9 @@ export interface AccrualPdfModel {
   coverageLine: string;
   /** null — товаров с себестоимостью нет: блок не рисуется (как в старом PDF). */
   keyProducts: {
-    best: PdfKeyProduct;
+    /** null — прибыльных товаров нет (правило pickProfitableRows), см. bestEmptyText. */
+    best: PdfKeyProduct | null;
+    bestEmptyText: string;
     worst: PdfKeyProduct | null;
     /** Подписи карточки убыточного: по продажам или по полной прибыли (старый снимок). */
     worstTitle: string;
@@ -223,9 +225,10 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
     breakdownTitle: "РАЗБИВКА РАСЧЁТА",
     rows,
     coverageLine,
-    keyProducts: kp.best
+    keyProducts: kp.scoredCount > 0
       ? {
-          best: toPdf(kp.best),
+          best: kp.best ? toPdf(kp.best) : null,
+          bestEmptyText: "Прибыльных товаров нет",
           worst: kp.worst ? toPdf(kp.worst) : null,
           worstTitle: salesBasis ? "САМЫЙ УБЫТОЧНЫЙ ПО ПРОДАЖАМ" : "САМЫЙ УБЫТОЧНЫЙ (ПОЛНАЯ ПРИБЫЛЬ)",
           worstProfitLabel: salesBasis ? "ПРИБЫЛЬ ОТ ПРОДАЖ" : "ЧИСТАЯ ПРИБЫЛЬ",
@@ -251,7 +254,7 @@ export function buildAccrualPdfModel(s: AccrualSnapshotV1, now: Date = new Date(
       ...(s.marginPercent === null ||
       (kp.best && kp.best.marginPercent === null) ||
       (kp.worst && kp.worst.marginPercent === null)
-        ? ["«—» в марже: выручка ≤ 0, маржа не определяется."]
+        ? ["«—» в марже: выручка после возвратов ≤ 0, маржа не определяется."]
         : []),
     ],
     footer: `Сформировано сервисом M-Prof · ${accrualProfitLabel(s).toLowerCase()} по отчёту начислений Ozon`,

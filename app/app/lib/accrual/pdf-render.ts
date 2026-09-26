@@ -358,10 +358,11 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
       ctx.stroke();
       ctx.textAlign = "left";
       ctx.font = `700 9.5px ${MONO}`;
-      ctx.fillStyle = kind === "best" ? C.green : p ? C.red : C.txt2;
+      ctx.fillStyle = !p ? C.txt2 : kind === "best" ? C.green : C.red;
       ctx.fillText(kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : kp.worstTitle, x + 16, y + 22);
       if (!p) {
-        const warn = kind === "worst" && kp.worstEmptyTone === "warn";
+        // «Самый прибыльный» без прибыльных товаров — нейтрально-предупреждающий тон.
+        const warn = kind === "best" || kp.worstEmptyTone === "warn";
         roundRect(ctx, x + 16, y + ch / 2 - 1, cw - 32, 30, 8);
         ctx.fillStyle = warn ? "rgba(232,176,75,0.10)" : "rgba(46,204,138,0.10)";
         ctx.fill();
@@ -371,7 +372,7 @@ export function renderAccrualPages(model: AccrualPdfModel): HTMLCanvasElement[] 
         ctx.textAlign = "center";
         ctx.font = `600 11px ${SANS}`;
         ctx.fillStyle = warn ? C.gold2 : C.green;
-        ctx.fillText(kp.worstEmptyText, x + cw / 2, y + ch / 2 + 19);
+        ctx.fillText(kind === "best" ? kp.bestEmptyText : kp.worstEmptyText, x + cw / 2, y + ch / 2 + 19);
         ctx.textAlign = "left";
         return;
       }

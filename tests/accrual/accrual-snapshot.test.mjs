@@ -96,8 +96,9 @@ describe("детали, период и итоговые карточки из �
     assert.deepEqual(
       rows.map((r) => [r.label, r.value, r.kind]),
       [
-        ["Реализация (выручка)", 1500, "neutral"],
+        ["Продажи до возвратов", 1500, "neutral"],
         ["Возвраты выручки", 300, "expense"],
+        ["Выручка после возвратов (справочно, база маржи)", 1200, "neutral"],
         ["Программы партнёров", 5, "income"],
         ["Баллы за скидки", 25, "income"],
         ["Комиссия Ozon (вознаграждение)", 180, "expense"],
@@ -117,10 +118,11 @@ describe("детали, период и итоговые карточки из �
     const text = JSON.stringify([S.accrualHistDetailRows(s), S.accrualBreakdownRows(s), S.accrualExplanations(s), S.accrualNotices(s)]);
     assert.doesNotMatch(text, /УПД|агентск/i);
   });
-  it("пояснения: категории уже в итоге, налог от реализации после возвратов, не пересчитывается по каталогу", () => {
+  it("пояснения: категории уже в итоге, налог и маржа — от выручки после возвратов, не пересчитывается по каталогу", () => {
     const text = S.accrualExplanations(s).join(" ");
     assert.match(text, /уже входят в этот итог/);
-    assert.match(text, /реализации после возвратов/);
+    assert.match(text, /Выручка после возвратов = продажи до возвратов \+ возвраты/);
+    assert.match(text, /Маржа расчёта = прибыль \/ выручка после возвратов/);
     assert.match(text, /не пересчитываются по текущему каталогу/);
     assert.match(text, /«—»/);
   });

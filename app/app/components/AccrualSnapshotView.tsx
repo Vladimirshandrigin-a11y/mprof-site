@@ -27,6 +27,7 @@ import {
   accrualSalesLossRanking,
   accrualSalesSplitView,
   accrualSnapshotRoi,
+  ACCRUAL_MARGIN_BASE_NOTE,
   type AccrualSnapshotV1,
 } from "../lib/accrual/snapshot";
 import { fmtAmount, fmtPercent, fmtRub } from "../lib/accrual/format";
@@ -131,15 +132,17 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy, liv
                 className={"profit-stat-val" + (s.marginPercent !== null && s.marginPercent < 0 ? " neg" : "")}
                 title={
                   s.marginPercent === null
-                    ? "Маржа не определяется при нулевой или отрицательной реализации"
+                    ? "Маржа не определяется при нулевой или отрицательной выручке после возвратов"
                     : undefined
                 }
               >
                 {fmtPercent(s.marginPercent)}
               </span>
-              {s.marginPercent === null && (
-                <span className="accr-note">маржа не определяется: реализация ≤ 0</span>
-              )}
+              <span className="accr-note">
+                {s.marginPercent === null
+                  ? "маржа не определяется: выручка после возвратов ≤ 0"
+                  : ACCRUAL_MARGIN_BASE_NOTE}
+              </span>
             </div>
             <div className="profit-stat">
               <span className="profit-stat-label">ROI</span>
@@ -214,8 +217,8 @@ export function AccrualSnapshotView({ view, onClose, onDownloadPdf, pdfBusy, liv
         salesLoss={accrualSalesLossRanking(s)}
         precomputedNote={
           live
-            ? "Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной реализации. Себестоимость берётся из вашего каталога; после её изменения нажмите «Проверить снова»."
-            : undefined
+            ? "Выручка и маржа товара — после возвратов. Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной выручке товара после возвратов. Себестоимость берётся из вашего каталога; после её изменения нажмите «Проверить снова»."
+            : "Выручка и маржа товара — после возвратов. Начисления Ozon с артикулом (комиссия, логистика и др.) учтены по товару напрямую; общие начисления без товара, налог и ручные расходы распределены пропорционально положительной выручке товара после возвратов. Результат сохранён на момент расчёта — текущий каталог его не меняет."
         }
       />
       <AccrualSalesSplitBlocks view={accrualSalesSplitView(s)} />

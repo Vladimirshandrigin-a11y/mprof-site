@@ -80,6 +80,31 @@ export function normArticleKey(s: string | null | undefined): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+/** Размер списка «Самые прибыльные товары». */
+export const TOP_PROFITABLE_LIMIT = 10;
+
+/**
+ * «Самые прибыльные товары» и «лучший товар» — одно правило для экрана, PDF и
+ * рекомендаций. Показатель — полная чистая прибыль товара (`profit`), та же, что в
+ * колонке «Чистая прибыль». Сначала отбор: себестоимость известна и прибыль
+ * известна и строго > 0 (нулевая, отрицательная и неизвестная не попадают), затем
+ * сортировка по убыванию прибыли (при равенстве — по артикулу), затем ограничение.
+ * Пустой результат — «прибыльных товаров нет», без подстановки убыточных.
+ */
+export function pickProfitableRows<T extends { article: string; profit: number | null; hasCost: boolean }>(
+  rows: readonly T[],
+  limit: number = TOP_PROFITABLE_LIMIT
+): T[] {
+  return rows
+    .filter((r) => r.hasCost && r.profit !== null && Number.isFinite(r.profit) && r.profit > 0)
+    .sort(
+      (a, b) =>
+        (b.profit as number) - (a.profit as number) ||
+        (a.article < b.article ? -1 : a.article > b.article ? 1 : 0)
+    )
+    .slice(0, Math.max(0, limit));
+}
+
 /**
  * Считает per-SKU разбивку чистой прибыли. Единственная реализация формулы —
  * и React-компонент, и локальные тесты вызывают ИМЕННО эту функцию.
