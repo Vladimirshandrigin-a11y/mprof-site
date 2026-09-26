@@ -16,7 +16,7 @@ import { AccrualSnapshotView } from "./AccrualSnapshotView";
 import type { AccrualUploadSession } from "../lib/accrual/useAccrualUploadSession";
 import type { InputField } from "../lib/accrual/upload-session";
 import { fmtDateRange, fmtMonthLabel, pluralRu } from "../lib/accrual/format";
-import { ACCRUAL_DOWNLOAD_STEPS, ACCRUAL_REPORT_CHOICE_NOTE } from "../lib/accrual/download-guide";
+import { ACCRUAL_DOWNLOAD_STEPS } from "../lib/accrual/download-guide";
 
 const FIELDS: { key: InputField; label: string; unit: "₽" | "%"; hint?: string }[] = [
   { key: "taxPercent", label: "Налог", unit: "%", hint: "Ваша ставка налога. База — реализация после возвратов." },
@@ -223,7 +223,6 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
             <li key={i}>{withBrand(t)}</li>
           ))}
         </ol>
-        <p className="accr-guide-which">{ACCRUAL_REPORT_CHOICE_NOTE}</p>
         <p className="accr-guide-note">
           Файл читается в вашем браузере, на сервере сохраняется только итог расчёта.
         </p>
@@ -484,8 +483,6 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
   .accr-guide li{display:list-item}
   .accr-guide li::marker{color:var(--gold2);font-family:var(--mono);font-size:.78rem}
   .accr-guide li{font-size:.82rem;line-height:1.5;color:var(--txt2)}
-  .accr-guide-which{margin:.7rem 0 .1rem;padding:.55rem .75rem;border-radius:9px;font-size:.8rem;line-height:1.5;
-    color:#f0cd84;border:1px solid rgba(232,176,75,.3);background:rgba(232,176,75,.07)}
   .accr-nobr{white-space:nowrap}
   .accr-guide-note{margin:.6rem 0 .1rem;font-size:.75rem;line-height:1.45;color:var(--txt3)}
   .accr-drop{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;
