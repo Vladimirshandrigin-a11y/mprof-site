@@ -15,7 +15,7 @@ const FAQS: { q: string; a: string }[] = [
   },
   {
     q: "Чем отличается разовый расчёт от безлимита?",
-    a: "Разовый расчёт за 149₽ — для единичной проверки по загруженному отчёту или вручную, без Ozon API. Безлимит за 449₽ открывает расчёты по Ozon API и неограниченную аналитику в течение месяца.",
+    a: "Разовый расчёт за 149₽ — один расчёт по XLSX «Отчёт по начислениям» или вручную, без Ozon API. Безлимит за 449₽ — неограниченные расчёты в течение 30 дней всеми способами, включая Ozon API.",
   },
   {
     q: "Безопасно ли хранить API-ключи?",
@@ -859,8 +859,8 @@ a{color:inherit;text-decoration:none}
               <div className="ln-tariff-price">Бесплатно</div>
               <div className="ln-tariff-period">Первый расчёт</div>
               <ul className="ln-tariff-list">
-                <li>Один расчёт для оценки сервиса</li>
-                <li>Все функции калькулятора</li>
+                <li>Один бесплатный расчёт на аккаунт</li>
+                <li>Любой способ: XLSX «Отчёт по начислениям», вручную или по Ozon API</li>
                 <li>Сохранение результата в историю</li>
               </ul>
               <Link href="/app" className="ln-tariff-btn">
@@ -873,12 +873,12 @@ a{color:inherit;text-decoration:none}
               <div className="ln-tariff-price">
                 <em>149</em> ₽
               </div>
-              <div className="ln-tariff-period">Один платёж</div>
+              <div className="ln-tariff-period">Разовая оплата</div>
               <ul className="ln-tariff-list">
-                <li>Один расчёт по отчёту или вручную</li>
-                <li>Без Ozon API (только файл или ручной ввод)</li>
+                <li>Один расчёт: по XLSX «Отчёт по начислениям» или вручную</li>
+                <li>По XLSX — товарная аналитика и PDF‑отчёт</li>
                 <li>Сохранение результата в историю</li>
-                <li>Без подписки и автосписаний</li>
+                <li>Без Ozon API · без автосписаний</li>
               </ul>
               <button
                 type="button"
@@ -894,14 +894,14 @@ a{color:inherit;text-decoration:none}
               <span className="ln-tariff-badge">Выгодно</span>
               <div className="ln-tariff-name">Безлимит</div>
               <div className="ln-tariff-price">
-                <em>449</em> ₽<span className="per">/мес</span>
+                <em>449</em> ₽<span className="per">/30 дней</span>
               </div>
-              <div className="ln-tariff-period">Подписка на 30 дней</div>
+              <div className="ln-tariff-period">30 дней · без автопродления</div>
               <ul className="ln-tariff-list">
-                <li>Неограниченное число расчётов в месяц</li>
-                <li>Расчёты по Ozon API (автозагрузка данных)</li>
-                <li>AI-аналитика и рекомендации (в ближайших обновлениях)</li>
-                <li>Полная история и графики без ограничений</li>
+                <li>Неограниченное число расчётов в течение 30 дней</li>
+                <li>XLSX «Отчёт по начислениям», вручную и по Ozon API</li>
+                <li>По XLSX — товарная аналитика и PDF‑отчёт</li>
+                <li>Для API — подключение Ozon и себестоимость товаров</li>
               </ul>
               <button
                 type="button"
@@ -921,9 +921,9 @@ a{color:inherit;text-decoration:none}
               </svg>
             </span>
             <div className="ln-pay-note-txt">
-              После оплаты доступ активируется автоматически. Разовый тариф
-              предоставляет один расчёт. Тариф «Безлимитный» предоставляет доступ
-              на 30 дней.
+              Оплата через ЮKassa, тариф включается автоматически после
+              подтверждения платежа. Разовый тариф — один расчёт, «Безлимит» — 30
+              дней с момента активации. Статус и срок видны в «Личном кабинете».
             </div>
           </div>
         </div>

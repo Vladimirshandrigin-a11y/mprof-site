@@ -21,29 +21,32 @@ const TIER_DATA: Record<
     perks: string[];
   }
 > = {
+  // Условия сверены с кодом: цены — PLAN_PRICING; 449 ₽ — premium_until = +30 дней
+  // от активации (webhook), разовый платёж без сохранения карты (автосписаний нет);
+  // 149 ₽ — +1 расчёт, Ozon API не открывает (consume_api_calculation). PDF и
+  // товарная аналитика есть только у расчёта по XLSX «Отчёт по начислениям».
   single: {
     name: "Разовый расчёт",
     priceNumber: 149,
     isSub: false,
-    period: "Один платёж",
+    period: "Разовая оплата · без автосписаний",
     perks: [
-      "Один расчёт по загруженному отчёту или вручную",
-      "Без Ozon API-расчёта (только файл или ручной ввод)",
-      "Сохранение результата в историю",
-      "Без подписки и автосписаний",
+      "Один расчёт: по XLSX «Отчёт по начислениям» или вручную",
+      "По XLSX — результат, товарная аналитика и PDF‑отчёт",
+      "Результат сохраняется в историю",
+      "Без Ozon API — он входит в «Безлимит»",
     ],
   },
   unlimited: {
     name: "Безлимит",
     priceNumber: 449,
     isSub: true,
-    period: "Подписка на 30 дней",
+    period: "30 дней с момента активации · без автопродления",
     perks: [
-      "Неограниченное число расчётов в месяц",
-      "Расчёты по Ozon API (автозагрузка данных)",
-      "AI-аналитика и рекомендации (в ближайших обновлениях)",
-      "Полная история и графики без ограничений",
-      "Приоритетная поддержка",
+      "Неограниченное число расчётов в течение 30 дней",
+      "Все способы: XLSX «Отчёт по начислениям», вручную и Ozon API",
+      "По XLSX — товарная аналитика и PDF‑отчёт; расчёты сохраняются в историю",
+      "Для Ozon API — подключение Ozon в «Личном кабинете» и себестоимость товаров в каталоге",
     ],
   },
 };
@@ -84,6 +87,18 @@ export function TariffModal({ open, tier, onClose }: Props) {
   const dual = tier === null;
   const data = TIER_DATA[tier ?? "unlimited"];
   const plan: TariffTier = tier ?? "unlimited";
+  // Что будет после оплаты — одинаково для обоих тарифов и режимов окна.
+  const afterPayNote = (
+    <p className="tm-after">
+      После оплаты в ЮKassa вы вернётесь в M‑Prof: тариф включится автоматически,
+      как только ЮKassa подтвердит платёж. Статус и срок — в «Личном кабинете»; если
+      статус не обновился, обновите страницу. Оплачивая, вы принимаете{" "}
+      <a href="/offer" target="_blank" rel="noopener noreferrer">
+        условия оферты
+      </a>
+      .
+    </p>
+  );
 
   // Создаёт платёж на бэкенде и редиректит в ЮKassa. Сумма и провайдер —
   // на сервере (PLAN_PRICING); сюда приходит только confirmationUrl. Какой
@@ -139,7 +154,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
           background:rgba(4,6,14,.78);
           backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
           display:flex;align-items:center;justify-content:center;
-          padding:1.5rem;
+          padding:1.5rem;overflow-y:auto;overscroll-behavior:contain;
           animation:tmFadeIn .28s ease both;
           font-family:'Outfit',sans-serif;color:#E8EEF8
         }
@@ -158,7 +173,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
           -webkit-backdrop-filter:blur(22px) saturate(1.3);
           box-shadow:0 32px 90px rgba(0,0,0,.6),
             0 0 90px rgba(201,168,76,.16);
-          overflow:hidden;display:flex;flex-direction:column;
+          overflow:hidden;display:flex;flex-direction:column;margin:auto;
           animation:tmSlideIn .35s cubic-bezier(.22,1,.36,1) both
         }
         @keyframes tmSlideIn{
@@ -271,7 +286,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
         }
 
         .tm-perks{
-          list-style:none;padding:0;margin:0 0 1.8rem;
+          list-style:none;padding:0;margin:0 0 .4rem;
           display:flex;flex-direction:column;gap:.55rem
         }
         .tm-perks li{
@@ -380,6 +395,15 @@ export function TariffModal({ open, tier, onClose }: Props) {
         }
         .tm-tier .tm-btn{width:100%;min-width:0}
 
+        /* Что будет после оплаты — мелкая сноска, общая для обоих режимов */
+        /* :global — сноска объявлена переменной вне дерева с <style jsx> */
+        .tm-card :global(.tm-after){
+          font-size:.78rem;color:#8A9FBB;font-weight:300;line-height:1.5;
+          margin:1rem 0 1.2rem
+        }
+        .tm-card :global(.tm-after a){color:#E8C97A;text-decoration:underline;text-underline-offset:2px}
+        .tm-card :global(.tm-after a:hover){color:#F5DFA0}
+
         @media(max-width:640px){
           .tm-card{padding:2.1rem 1.45rem 1.6rem;border-radius:18px;min-height:340px}
           .tm-title{font-size:1.3rem}
@@ -450,8 +474,8 @@ export function TariffModal({ open, tier, onClose }: Props) {
                       </span>
                     </div>
                     <p className="tm-tier-desc">
-                      Один расчёт по отчёту или вручную · без Ozon API · без
-                      подписки и автосписаний.
+                      Один расчёт по XLSX «Отчёт по начислениям» или вручную ·
+                      без Ozon API · разовая оплата, без автосписаний.
                     </p>
                     <button
                       type="button"
@@ -474,8 +498,9 @@ export function TariffModal({ open, tier, onClose }: Props) {
                       </span>
                     </div>
                     <p className="tm-tier-desc">
-                      Неограниченные расчёты + Ozon API на 30 дней · полная
-                      история · приоритетная поддержка.
+                      Неограниченные расчёты 30 дней: XLSX, вручную и Ozon API ·
+                      без автопродления. Для API нужны подключение Ozon и
+                      себестоимость товаров.
                     </p>
                     <button
                       type="button"
@@ -495,6 +520,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
                     </button>
                   </div>
                 </div>
+                {afterPayNote}
               </>
             ) : (
               <>
@@ -506,7 +532,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
                   <div className="tm-price">
                     <em>{data.priceNumber}</em> ₽
                   </div>
-                  {data.isSub && <span className="tm-mo">/мес</span>}
+                  {data.isSub && <span className="tm-mo">/30 дней</span>}
                 </div>
                 <p className="tm-period">{data.period}</p>
 
@@ -523,6 +549,8 @@ export function TariffModal({ open, tier, onClose }: Props) {
                     </li>
                   ))}
                 </ul>
+
+                {afterPayNote}
 
                 {error && (
                   <p className="tm-error" role="alert">

@@ -252,7 +252,7 @@ export function AiAnalyticsV1({
         <p className="aiv1-state-title">AI-аналитика на тарифе Безлимит</p>
         <p className="aiv1-state-note">
           Персональный разбор прибыли по вашему отчёту доступен в тарифе
-          «Безлимит» (449&nbsp;₽/мес).
+          «Безлимит» (449&nbsp;₽ за 30&nbsp;дней).
         </p>
         {onOpenPremium ? (
           <button type="button" className="aiv1-cta" onClick={onOpenPremium}>
