@@ -19,7 +19,7 @@ import { fmtDateRange, fmtMonthLabel, pluralRu } from "../lib/accrual/format";
 import { ACCRUAL_DOWNLOAD_STEPS } from "../lib/accrual/download-guide";
 
 const FIELDS: { key: InputField; label: string; unit: "₽" | "%"; hint?: string }[] = [
-  { key: "taxPercent", label: "Налог", unit: "%", hint: "Ваша ставка налога. База — реализация после возвратов." },
+  { key: "taxPercent", label: "Налог", unit: "%", hint: "Ваша ставка налога. База — выручка после возвратов." },
   { key: "packaging", label: "Упаковка", unit: "₽" },
   { key: "deliveryToWarehouse", label: "Доставка до склада", unit: "₽" },
   { key: "salary", label: "Зарплата / подрядчики", unit: "₽" },

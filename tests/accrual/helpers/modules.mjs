@@ -37,6 +37,7 @@ export const session = req("./app/lib/accrual/upload-session.js");
 export const saveFlow = req("./app/lib/accrual/save-flow.js");
 export const salesSplit = req("./app/lib/accrual/sales-split.js");
 export const guide = req("./app/lib/accrual/download-guide.js");
+export const access = req("./app/lib/access-status.js");
 export const XLSX = req("xlsx");
 
 // Серверные модули (автодобавление товаров в каталог, загрузчик и маршруты на моках).

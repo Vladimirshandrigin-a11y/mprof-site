@@ -57,6 +57,8 @@ import type { OzonProductRow } from "../lib/report-parsers/ozon-parser";
 import {
   computeProductBreakdownRows,
   computeProductBreakdownTotals,
+  pickProfitableRows,
+  profitableEmptyState,
   type ProductBreakdownRow,
 } from "../lib/product-breakdown-calc";
 import type { AccrualSalesLossRanking } from "../lib/accrual/snapshot";
@@ -87,6 +89,8 @@ export interface KeyProduct {
 export interface KeyProductsSnapshot {
   best: KeyProduct | null;
   worst: KeyProduct | null;
+  /** Когда best = null: что сказать вместо него (по всем товарам, неизвестная прибыль ≠ 0). */
+  bestEmpty?: { text: string; detail: string | null } | null;
 }
 
 /**
@@ -347,11 +351,9 @@ export function OzonProductBreakdown({
     () => rows.filter((r) => r.hasCost && r.profit !== null),
     [rows]
   );
-  // ТОП-10 прибыльных — по прибыли по убыванию.
-  const topProfitable = useMemo(
-    () => [...scored].sort((a, b) => (b.profit ?? 0) - (a.profit ?? 0)).slice(0, 10),
-    [scored]
-  );
+  // ТОП-10 прибыльных по чистой прибыли товара: сначала отбор прибыли > 0, затем
+  // сортировка и ограничение (общее правило pickProfitableRows — то же у PDF/рекомендаций).
+  const topProfitable = useMemo(() => pickProfitableRows(scored), [scored]);
   // Рейтинг убыточных. С salesLoss.salesBasis — готовый список доказанно убыточных
   // ПРОДАЖ (расчётная прибыль от продаж); иначе — ТОП-10 по полной прибыли товара.
   const salesBasis = salesLoss?.salesBasis === true;
@@ -365,14 +367,17 @@ export function OzonProductBreakdown({
             .slice(0, 10),
     [scored, salesBasis, salesLoss]
   );
-  // Лучший товар месяца — максимум прибыли.
-  const bestProduct = useMemo(
-    () =>
-      scored.length
-        ? scored.reduce((best, r) => ((r.profit ?? 0) > (best.profit ?? 0) ? r : best))
-        : null,
-    [scored]
-  );
+  // Лучший товар месяца — первый из списка прибыльных; прибыльных нет → null.
+  const bestProduct = useMemo(() => topProfitable[0] ?? null, [topProfitable]);
+  // Пустое состояние прибыльных — по ВСЕМ исходным товарам (до отбора): неизвестная
+  // прибыль не считается нулём и не превращает «не рассчитано» в «прибыльных нет».
+  const profitableEmpty = useMemo(() => profitableEmptyState(rows), [rows]);
+  const profitableEmptyNode = profitableEmpty ? (
+    <>
+      {profitableEmpty.text}
+      {profitableEmpty.detail && <span className="pba-empty-detail">{profitableEmpty.detail}</span>}
+    </>
+  ) : null;
   // Самый убыточный — минимум, только если отрицательный. При salesBasis — готовый выбор
   // (только товар с ТОЧНЫМ результатом продаж; правило общее с PDF и рекомендациями).
   const worstProduct = useMemo<LossRow | null>(() => {
@@ -568,8 +573,12 @@ export function OzonProductBreakdown({
             margin: r.margin ?? 0,
           }
         : null;
-    onKeyProducts({ best: toKey(bestProduct), worst: toKey(worstProduct) });
-  }, [bestProduct, worstProduct, onKeyProducts]);
+    onKeyProducts({
+      best: toKey(bestProduct),
+      worst: toKey(worstProduct),
+      bestEmpty: profitableEmpty ? { text: profitableEmpty.text, detail: profitableEmpty.detail } : null,
+    });
+  }, [bestProduct, worstProduct, profitableEmpty, onKeyProducts]);
 
   // Пробрасываем покрытие себестоимостью (всего/с/без) в родителя — ТОЛЬКО для
   // блока «Проверка расчёта». Read-only: используем уже посчитанные totals,
@@ -1027,7 +1036,7 @@ export function OzonProductBreakdown({
                       </div>
                     </>
                   ) : (
-                    <div className="pba-hero-empty">Нет данных</div>
+                    <div className="pba-hero-empty">{profitableEmptyNode}</div>
                   )}
                 </div>
 
@@ -1094,7 +1103,7 @@ export function OzonProductBreakdown({
               <div className="pba-section">
                 <h3 className="pba-h3">Самые прибыльные товары</h3>
                 {topProfitable.length === 0 ? (
-                  <div className="pba-hero-empty">Нет данных</div>
+                  <div className="pba-hero-empty">{profitableEmptyNode}</div>
                 ) : (
                   <>
                     <button
@@ -2274,6 +2283,13 @@ export function OzonProductBreakdown({
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
+        }
+        /* :global — уточнение объявлено переменной вне дерева с <style jsx> */
+        .pba-hero-empty :global(.pba-empty-detail) {
+          display: block;
+          margin-top: 0.3rem;
+          font-size: 0.76rem;
+          color: var(--txt3);
         }
         .pba-hero-empty {
           font-size: 0.82rem;

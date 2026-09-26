@@ -154,7 +154,7 @@ describe("разделение: четыре основных сценария �
     const u = view.unsplit.rows.find((x) => x.article === "P");
     assert.equal(u.resultKopecks, 7000);
     assert.deepEqual(u.components.map((c) => [c.label, c.kopecks]), [
-      ["Реализация (выручка)", 40000],
+      ["Продажи до возвратов", 40000],
       ["Возвраты выручки", -20000],
       ["Комиссия Ozon (вознаграждение)", -2000],
       ["Доставка и связанные услуги", -3000],
@@ -392,7 +392,7 @@ describe("единый смысл в PDF и рекомендациях", () => {
   });
 
   it("выручка без ведущего плюса, настоящий минус сохраняется", () => {
-    const rev = m.rows.find((x) => x.label === "Реализация (выручка)");
+    const rev = m.rows.find((x) => x.label === "Продажи до возвратов");
     assert.equal(rev.kind, "neutral");
     assert.equal(nb(rev.value), "2 700,00 ₽");
     const ret = m.rows.find((x) => x.label === "Возвраты выручки");

@@ -40,8 +40,9 @@ describe("PDF нового формата: полный расчёт", () => {
     assert.deepEqual(
       m.rows.map((r) => [r.label, r.value, r.kind]),
       [
-        ["Реализация (выручка)", "1 500,00 ₽", "neutral"],
+        ["Продажи до возвратов", "1 500,00 ₽", "neutral"],
         ["Возвраты выручки", "−300,00 ₽", "expense"],
+        ["Выручка после возвратов", "1 200,00 ₽", "neutral"],
         ["Программы партнёров", "+5,00 ₽", "income"],
         ["Баллы за скидки", "+25,00 ₽", "income"],
         ["Комиссия Ozon (вознаграждение)", "−180,00 ₽", "expense"],
@@ -82,7 +83,7 @@ describe("PDF нового формата: полный расчёт", () => {
       name: "Товар В", article: "ART-C", profit: "−7,00 ₽", margin: "—", positive: false, marginNeg: false,
     });
     assert.equal(legacy.keyProducts.worstTitle, "САМЫЙ УБЫТОЧНЫЙ (ПОЛНАЯ ПРИБЫЛЬ)");
-    assert.ok(legacy.explanations.includes("«—» в марже: выручка ≤ 0, маржа не определяется."));
+    assert.ok(legacy.explanations.includes("«—» в марже: выручка после возвратов ≤ 0, маржа не определяется."));
     assert.match(legacy.splitLines[0], /Разделение продаж, возвратов и расходов без продаж недоступно/);
   });
   it("предупреждения и пояснения присутствуют; нет упоминаний УПД", () => {

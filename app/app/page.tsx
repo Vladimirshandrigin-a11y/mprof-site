@@ -24,6 +24,7 @@ import {
 } from "./components/OzonProductBreakdown"
 import { TariffModal, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
+import { accessStatus } from "./lib/access-status"
 import {
   parseOzonFinanceTaxonomy,
   hasFinanceTaxonomyObject,
@@ -31,6 +32,8 @@ import {
   type OzonTaxonomyView,
 } from "./lib/ozon-finance-taxonomy-view"
 import {
+  ACCRUAL_MARGIN_BASE_NOTE,
+  ACCRUAL_REVENUE_LABELS,
   accrualHistDetailRows,
   accrualPeriodLabel,
   accrualPeriodRange,
@@ -2317,12 +2320,49 @@ export default function AppPage() {
         const accent = kind === "best" ? C.green : C.red;
         ctx.textAlign = "left";
         ctx.font = `700 9.5px ${MONO}`;
-        ctx.fillStyle = kind === "best" ? C.green : p ? C.red : C.txt2;
+        ctx.fillStyle = !p ? C.txt2 : kind === "best" ? C.green : C.red;
         ctx.fillText(
           kind === "best" ? "САМЫЙ ПРИБЫЛЬНЫЙ" : "САМЫЙ УБЫТОЧНЫЙ",
           x + 16,
           cy + 22
         );
+        // Прибыльных нет — нейтральная строка вместо карточки (без подстановки
+        // убыточного товара). Текст — по всем товарам: неизвестная прибыль ≠ 0.
+        if (kind === "best" && !p) {
+          ctx.font = `600 11px ${SANS}`;
+          const empty = reportKeyProducts?.bestEmpty;
+          const wrapWords = (text: string, maxW: number) => {
+            const out: string[] = [];
+            let cur = "";
+            for (const word of text.split(" ")) {
+              const next = cur ? cur + " " + word : word;
+              if (cur && ctx.measureText(next).width > maxW) {
+                out.push(cur);
+                cur = word;
+              } else cur = next;
+            }
+            if (cur) out.push(cur);
+            return out;
+          };
+          const lines = [
+            ...wrapWords(empty?.text ?? "Прибыльных товаров нет", w - 48),
+            ...(empty?.detail ? wrapWords(empty.detail, w - 48) : []),
+          ].slice(0, 4);
+          const pillH = 16 + lines.length * 14;
+          const pillY = cy + 34 + Math.max(0, (h - 40 - pillH) / 2);
+          rr(x + 16, pillY, w - 32, pillH, 8);
+          ctx.fillStyle = "rgba(232,176,75,0.10)";
+          ctx.fill();
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = "rgba(232,176,75,0.35)";
+          rr(x + 16, pillY, w - 32, pillH, 8);
+          ctx.stroke();
+          ctx.textAlign = "center";
+          ctx.fillStyle = C.gold2;
+          lines.forEach((ln, i) => ctx.fillText(ln, x + w / 2, pillY + 20 + i * 14));
+          ctx.textAlign = "left";
+          return;
+        }
         // Убыточных товаров нет — аккуратная зелёная строка вместо карточки.
         if (kind === "worst" && !p) {
           const pillY = cy + h / 2 - 1;
@@ -2375,7 +2415,7 @@ export default function AppPage() {
         ctx.textAlign = "left";
       };
       const keyProducts = reportKeyProducts;
-      if (keyProducts?.best) {
+      if (keyProducts?.best || keyProducts?.worst) {
         yAfter += 30;
         ctx.textAlign = "left";
         ctx.font = `700 12px ${MONO}`;
@@ -7933,6 +7973,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .cab-muted{font-size:.86rem;color:var(--txt2);line-height:1.55;margin:0}
 .cab-badge{display:inline-flex;align-items:center;padding:.18rem .6rem;border-radius:999px;font-size:.72rem;font-weight:600;letter-spacing:.02em;background:rgba(255,255,255,.06);border:1px solid var(--edge2);color:var(--txt2)}
 .cab-badge.ok{background:rgba(46,204,138,.1);border-color:rgba(46,204,138,.34);color:var(--green)}
+.cab-badge.warn{background:rgba(232,176,75,.08);border-color:rgba(232,176,75,.34);color:#f0cd84}
 .cab-tariff-status{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap}
 .cab-tariff-name{font-family:var(--display);font-size:1.05rem;font-weight:600;color:var(--gold2)}
 .cab-tariff-actions{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-top:1.2rem}
@@ -11048,7 +11089,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                             : "Месяц расчёта: не указан"}
                         </div>
                         <div className="hist-revenue">
-                          Выручка: {fmt(h.revenue)} ₽
+                          {/* Расчёт по начислениям: в строке — выручка после возвратов
+                              (база маржи); продажи до возвратов и возвраты — в деталях. */}
+                          {accrualRead.status !== "absent"
+                            ? ACCRUAL_REVENUE_LABELS.afterReturns
+                            : "Выручка"}
+                          : {fmt(h.revenue)} ₽
                         </div>
                         <div className="hist-date">Создан: {createdDate}</div>
                       </div>
@@ -11063,7 +11109,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           {h.profit >= 0 ? "+" : "−"}
                           {fmt(Math.abs(h.profit))} ₽
                         </span>
-                        <span className="hm">
+                        <span
+                          className="hm"
+                          title={
+                            accrualRead.status !== "absent"
+                              ? `Маржа расчёта — ${ACCRUAL_MARGIN_BASE_NOTE}`
+                              : undefined
+                          }
+                        >
                           Маржа:{" "}
                           {marginValue === null
                             ? "—"
@@ -11152,17 +11205,17 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {user &&
           mainTab === "cabinet" &&
           (() => {
-            const remaining = Math.max(
-              0,
-              freeCalculationsLimit + singleCredits - calcCount,
-            );
-            const planLabel = !entitlementsLoaded
-              ? "…"
-              : hasPremium
-              ? "Безлимит"
-              : singleCredits > 0
-              ? "Разовые расчёты"
-              : "Бесплатный";
+            // Статус доступа — только отображение прав из useEntitlements
+            // (загрузка → безлимит → бесплатный/разовые → нет доступных расчётов).
+            const access = accessStatus({
+              loaded: entitlementsLoaded,
+              hasPremium,
+              premiumUntil,
+              calcCount,
+              freeLimit: freeCalculationsLimit,
+              singleCredits,
+            });
+            const planLabel = access.planLabel;
             return (
               <div className="cab-wrap">
                 <div className="cab-head">
@@ -11195,19 +11248,21 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </div>
                       <div className="cab-row">
                         <span className="cab-k">Доступно расчётов</span>
-                        <span className="cab-v">
-                          {!entitlementsLoaded
-                            ? "…"
-                            : hasPremium
-                            ? "Без ограничений"
-                            : String(remaining)}
-                        </span>
+                        <span className="cab-v">{access.available}</span>
                       </div>
                       {hasPremium && formatRuDate(premiumUntil) && (
                         <div className="cab-row">
                           <span className="cab-k">Безлимит до</span>
                           <span className="cab-v">
                             {formatRuDate(premiumUntil)}
+                          </span>
+                        </div>
+                      )}
+                      {access.expiredUntil && formatRuDate(access.expiredUntil) && (
+                        <div className="cab-row">
+                          <span className="cab-k">Безлимит закончился</span>
+                          <span className="cab-v">
+                            {formatRuDate(access.expiredUntil)}
                           </span>
                         </div>
                       )}
@@ -11258,19 +11313,16 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     ) : (
                       <>
                         <div className="cab-tariff-status">
-                          <span className="cab-badge">
-                            {singleCredits > 0 ? "Разовые" : "Бесплатный"}
+                          <span className={"cab-badge" + (access.kind === "none" ? " warn" : "")}>
+                            {access.badge}
                           </span>
-                          <span className="cab-tariff-name">
-                            {singleCredits > 0
-                              ? "Разовые расчёты"
-                              : "Бесплатный доступ"}
-                          </span>
+                          <span className="cab-tariff-name">{access.planLabel}</span>
                         </div>
                         <p className="cab-muted" style={{ marginTop: ".7rem" }}>
-                          {remaining > 0
-                            ? `Доступно расчётов: ${remaining}`
-                            : "Лимит расчётов исчерпан — оформите тариф ниже."}
+                          {access.expiredUntil && formatRuDate(access.expiredUntil)
+                            ? `Безлимит закончился ${formatRuDate(access.expiredUntil)}. `
+                            : ""}
+                          {access.detail}
                         </p>
                         <div className="cab-tariff-actions">
                           <button

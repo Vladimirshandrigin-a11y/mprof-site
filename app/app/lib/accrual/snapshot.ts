@@ -37,6 +37,7 @@ import type { AccrualPeriod, AccrualWarning } from "../report-parsers/accrual-xl
 import { kopecksToRub, ratioPercent } from "./money";
 import { fmtDateRange, fmtMonthLabel, fmtRub, pluralRu } from "./format";
 import { toBreakdownRow, type AccrualBreakdownRow } from "./product-analytics";
+import { pickProfitableRows } from "../product-breakdown-calc";
 import {
   SPLIT_PARTS,
   UNSPLIT_REASONS,
@@ -698,9 +699,23 @@ export function accrualProfitLabel(s: AccrualSnapshotV1): string {
   return s.preliminary ? "Предварительная прибыль" : "Чистая прибыль";
 }
 
+/**
+ * Однозначные названия выручки в расчёте по начислениям (экран, история, PDF):
+ * продажи до возвратов, возвраты со своим знаком и их сумма — выручка после
+ * возвратов, от которой считаются налог и маржа расчёта.
+ */
+export const ACCRUAL_REVENUE_LABELS = {
+  sales: "Продажи до возвратов",
+  returns: "Возвраты выручки",
+  afterReturns: "Выручка после возвратов",
+} as const;
+
+/** Короткая подпись базы маржи расчёта (экран, история). */
+export const ACCRUAL_MARGIN_BASE_NOTE = "от выручки после возвратов";
+
 export const ACCRUAL_BUCKET_LABELS: Record<AccrualBucket, string> = {
-  salesRevenue: "Реализация (выручка)",
-  returnsRevenue: "Возвраты выручки",
+  salesRevenue: ACCRUAL_REVENUE_LABELS.sales,
+  returnsRevenue: ACCRUAL_REVENUE_LABELS.returns,
   partnerPrograms: "Программы партнёров",
   discountPoints: "Баллы за скидки",
   commission: "Комиссия Ozon (вознаграждение)",
@@ -741,6 +756,16 @@ export function accrualBreakdownRows(s: AccrualSnapshotV1): AccrualDisplayRow[] 
       kind: k === "salesRevenue" ? "neutral" : v >= 0 ? "income" : "expense",
     });
   }
+  // Выручка после возвратов (= продажи до возвратов + возвраты) — справочная строка
+  // сразу после продаж/возвратов: база налога и маржи, в итог отдельно не входит.
+  const afterIdx = rows.reduce((at, r, i) => (r.key === "salesRevenue" || r.key === "returnsRevenue" ? i + 1 : at), 0);
+  rows.splice(afterIdx, 0, {
+    key: "revenueAfterReturns",
+    label: ACCRUAL_REVENUE_LABELS.afterReturns,
+    kopecks: s.taxRevenueBaseKopecks,
+    kind: "neutral",
+    note: "Продажи до возвратов + возвраты. От неё считаются налог и маржа расчёта; справочная строка — в итог начислений отдельно не добавляется.",
+  });
   rows.push({
     key: "net",
     label: "Итог начислений Ozon",
@@ -766,7 +791,7 @@ export function accrualBreakdownRows(s: AccrualSnapshotV1): AccrualDisplayRow[] 
         : "Налог",
     kopecks: s.tax.kopecks,
     kind: "expense",
-    note: "Считается от реализации после возвратов.",
+    note: "Считается от выручки после возвратов.",
   });
   if (s.manualExpenses.totalKopecks > 0) {
     rows.push({
@@ -795,7 +820,12 @@ export interface AccrualHistRow {
 
 export function accrualHistDetailRows(s: AccrualSnapshotV1): AccrualHistRow[] {
   return accrualBreakdownRows(s).map((r) => ({
-    label: r.key === "net" ? "Итог начислений Ozon (включает все категории выше)" : r.label,
+    label:
+      r.key === "net"
+        ? "Итог начислений Ozon (включает все категории выше)"
+        : r.key === "revenueAfterReturns"
+        ? `${r.label} (справочно, база маржи)`
+        : r.label,
     value: kopecksToRub(r.kind === "income" || r.kind === "expense" ? Math.abs(r.kopecks) : r.kopecks),
     kind: r.kind,
   }));
@@ -841,9 +871,9 @@ export function accrualExplanations(s: AccrualSnapshotV1): string[] {
   return [
     "Итог начислений Ozon — сумма всех строк отчёта «Сумма итого, руб.». Комиссия, логистика, реклама, компенсации и остальные категории уже входят в этот итог и второй раз не вычитаются.",
     `${accrualProfitLabel(s)} = итог начислений − себестоимость − налог − ручные расходы.`,
-    "Налог считается от реализации после возвратов (продажи − возвраты). Себестоимость — по нетто-количеству (продано − возвращено) из каталога на момент расчёта.",
-    "Маржа = прибыль / реализация после возвратов; если реализация ≤ 0, маржа не определяется и показывается «—».",
-    "По товарам: начисления с артикулом учтены напрямую; общие начисления без товара (реклама, компенсации), налог и ручные расходы распределены пропорционально положительной реализации.",
+    "Выручка после возвратов = продажи до возвратов + возвраты (возвраты — со своим знаком). От неё считается налог. Себестоимость — по нетто-количеству (продано − возвращено) из каталога на момент расчёта.",
+    "Маржа расчёта = прибыль / выручка после возвратов; если выручка после возвратов ≤ 0, маржа не определяется и показывается «—».",
+    "По товарам: начисления с артикулом учтены напрямую; общие начисления без товара (реклама, компенсации), налог и ручные расходы распределены пропорционально положительной выручке товара после возвратов.",
     "Это сохранённый результат: значения не пересчитываются по текущему каталогу и ценам.",
   ];
 }
@@ -888,7 +918,9 @@ export interface AccrualKeyProduct {
 }
 
 /**
- * Лучший товар — по полной прибыли (как раньше). Самый убыточный — по расчётной
+ * Лучший товар — по полной прибыли, только среди прибыльных (profit > 0; правило
+ * pickProfitableRows — то же, что у списка «Самые прибыльные товары»); прибыльных нет
+ * → null. Самый убыточный — по расчётной
  * прибыли от продаж, если разделение доступно: только товар с ТОЧНЫМ отрицательным
  * результатом продаж (правило — accrualSalesSplitView); иначе — по полной прибыли с
  * пометкой basis:"full_profit" (не выдаётся за продажи).
@@ -896,6 +928,8 @@ export interface AccrualKeyProduct {
 export function accrualKeyProducts(s: AccrualSnapshotV1): {
   best: AccrualKeyProduct | null;
   worst: AccrualKeyProduct | null;
+  /** Товаров с известной прибылью (есть что показывать в блоке ключевых товаров). */
+  scoredCount: number;
 } {
   const scored = s.products.filter(
     (p) => p.profitKopecks !== null && (p.costRequired ? p.hasCost : true)
@@ -908,16 +942,19 @@ export function accrualKeyProducts(s: AccrualSnapshotV1): {
     basis: "full_profit",
     scopeNote: null,
   });
-  const best =
-    scored.length === 0
-      ? null
-      : toKey(scored.reduce((b, p) => ((p.profitKopecks ?? 0) > (b.profitKopecks ?? 0) ? p : b)));
+  const top = pickProfitableRows(
+    scored.map((p, i) => ({ article: p.article, profit: p.profitKopecks, hasCost: true, i })),
+    1
+  )[0];
+  const best = top ? toKey(scored[top.i]) : null;
+  const scoredCount = scored.length;
 
   const view = accrualSalesSplitView(s);
   if (view.availability === "ok") {
     const w = view.worst;
     return {
       best,
+      scoredCount,
       worst:
         w && w.salesResultKopecks !== null
           ? {
@@ -931,9 +968,9 @@ export function accrualKeyProducts(s: AccrualSnapshotV1): {
           : null,
     };
   }
-  if (scored.length === 0) return { best: null, worst: null };
+  if (scored.length === 0) return { best: null, worst: null, scoredCount };
   const min = scored.reduce((w, p) => ((p.profitKopecks ?? 0) < (w.profitKopecks ?? 0) ? p : w));
-  return { best, worst: (min.profitKopecks ?? 0) < 0 ? toKey(min) : null };
+  return { best, worst: (min.profitKopecks ?? 0) < 0 ? toKey(min) : null, scoredCount };
 }
 
 // ---------------------------------------------------------------------------

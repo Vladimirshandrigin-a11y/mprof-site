@@ -80,6 +80,84 @@ export function normArticleKey(s: string | null | undefined): string {
   return (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+/** Прибыль товара известна: себестоимость есть и прибыль посчитана (неизвестная ≠ 0). */
+export function isKnownProfit(r: { profit: number | null; hasCost: boolean }): boolean {
+  return r.hasCost && r.profit !== null && Number.isFinite(r.profit);
+}
+
+export type ProfitableEmptyKind = "no_products" | "all_unknown" | "known_none_positive" | "none_positive";
+
+export interface ProfitableEmptyState {
+  kind: ProfitableEmptyKind;
+  /** Главная фраза пустого состояния. */
+  text: string;
+  /** Уточнение (сколько товаров без рассчитанной прибыли); null — не нужно. */
+  detail: string | null;
+  unknownCount: number;
+}
+
+const tovar = (n: number): string => {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return "товар";
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return "товара";
+  return "товаров";
+};
+
+/**
+ * Пустое состояние «Самых прибыльных» и «лучшего товара» — по ВСЕМ исходным товарам,
+ * до отбора. null — прибыльные есть. Неизвестная прибыль не считается нулём:
+ *   нет товаров → «Нет данных о товарах»; прибыль неизвестна у всех → «Прибыль товаров
+ *   пока не рассчитана»; часть неизвестна, среди известных прибыльных нет → «Среди
+ *   товаров с известной прибылью прибыльных не найдено» + число без прибыли; все
+ *   известны и ни одна не > 0 → «Прибыльных товаров нет».
+ */
+export function profitableEmptyState(
+  rows: readonly { profit: number | null; hasCost: boolean }[]
+): ProfitableEmptyState | null {
+  if (rows.length === 0) return { kind: "no_products", text: "Нет данных о товарах", detail: null, unknownCount: 0 };
+  const known = rows.filter(isKnownProfit);
+  if (known.some((r) => (r.profit as number) > 0)) return null;
+  const unknownCount = rows.length - known.length;
+  if (known.length === 0) {
+    return { kind: "all_unknown", text: "Прибыль товаров пока не рассчитана", detail: null, unknownCount };
+  }
+  if (unknownCount > 0) {
+    return {
+      kind: "known_none_positive",
+      text: "Среди товаров с известной прибылью прибыльных не найдено",
+      detail: `Без рассчитанной прибыли: ${unknownCount} ${tovar(unknownCount)}`,
+      unknownCount,
+    };
+  }
+  return { kind: "none_positive", text: "Прибыльных товаров нет", detail: null, unknownCount: 0 };
+}
+
+/** Размер списка «Самые прибыльные товары». */
+export const TOP_PROFITABLE_LIMIT = 10;
+
+/**
+ * «Самые прибыльные товары» и «лучший товар» — одно правило для экрана, PDF и
+ * рекомендаций. Показатель — полная чистая прибыль товара (`profit`), та же, что в
+ * колонке «Чистая прибыль». Сначала отбор: себестоимость известна и прибыль
+ * известна и строго > 0 (нулевая, отрицательная и неизвестная не попадают), затем
+ * сортировка по убыванию прибыли (при равенстве — по артикулу), затем ограничение.
+ * Пустой результат — «прибыльных товаров нет», без подстановки убыточных.
+ */
+export function pickProfitableRows<T extends { article: string; profit: number | null; hasCost: boolean }>(
+  rows: readonly T[],
+  limit: number = TOP_PROFITABLE_LIMIT
+): T[] {
+  return rows
+    .filter((r) => isKnownProfit(r) && (r.profit as number) > 0)
+    .sort(
+      (a, b) =>
+        (b.profit as number) - (a.profit as number) ||
+        (a.article < b.article ? -1 : a.article > b.article ? 1 : 0)
+    )
+    .slice(0, Math.max(0, limit));
+}
+
 /**
  * Считает per-SKU разбивку чистой прибыли. Единственная реализация формулы —
  * и React-компонент, и локальные тесты вызывают ИМЕННО эту функцию.
