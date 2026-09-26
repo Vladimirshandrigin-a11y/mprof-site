@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:accrual": "node tests/accrual/run.mjs"
+    "test:accrual": "node tests/accrual/run.mjs",
+    "test:db": "node tests/db/run.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.10.3",
@@ -27,6 +28,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
+    "pg": "^8.23.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }

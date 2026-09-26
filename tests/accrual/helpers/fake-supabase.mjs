@@ -1,13 +1,22 @@
 // Минимальная in-memory замена service-role клиента Supabase для тестов серверных
 // модулей: только те вызовы, которые реально делают catalog-import и save-calculation
-// (from().select/insert/update/delete/eq/in/order/range/single/maybeSingle).
+// (from().select/insert/upsert/update/delete/eq/in/order/range/single/maybeSingle).
+// products.upsert(onConflict "user_id,sku_key", ignoreDuplicates) эмулирует уникальный
+// индекс из миграции (ключ — нормализация расчёта); migrationApplied=false — как в БД
+// без миграции (42703). ЭТО МОК: конкурентную гарантию БД доказывает только tests/db.
 // Каждая операция асинхронна (уступает event loop), поэтому одновременные запросы
 // действительно чередуются. Журнал ops считает ВСЕ обращения по таблицам.
 // Сети и реального Supabase нет.
 
 const tick = () => new Promise((r) => setImmediate(r));
 
-export function makeFakeSupabase(seed = {}) {
+const normKey = (s) => {
+  const k = (s ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  return k === "" ? null : k;
+};
+
+export function makeFakeSupabase(seed = {}, opts = {}) {
+  const state = { migrationApplied: opts.migrationApplied !== false };
   const tables = { products: [], calculations: [], report_history: [], ozon_connections: [], ...seed };
   /** @type {{table:string, op:string, count:number}[]} */
   const ops = [];
@@ -38,6 +47,13 @@ export function makeFakeSupabase(seed = {}) {
     insert(rows) {
       this.op = "insert";
       this.payload = Array.isArray(rows) ? rows : [rows];
+      return this;
+    }
+    upsert(rows, o = {}) {
+      this.op = "insert";
+      this.payload = Array.isArray(rows) ? rows : [rows];
+      this.onConflict = o.onConflict ?? null;
+      this.ignoreDuplicates = o.ignoreDuplicates === true;
       return this;
     }
     update(patch) {
@@ -80,18 +96,43 @@ export function makeFakeSupabase(seed = {}) {
       await tick();
       const fi = faults.findIndex((f) => f.table === this.t && f.op === this.op);
       const fault = fi >= 0 ? faults[fi] : null;
-      if (fault && !fault.persist && !fault.short) faults.splice(fi, 1);
-      if (fault && !fault.short) {
+      if (fault && !fault.persist && !fault.short && !fault.drop) faults.splice(fi, 1);
+      if (fault && !fault.short && !fault.drop) {
         ops.push({ table: this.t, op: this.op, count: 0, failed: true });
-        return { data: null, error: { message: fault.message } };
+        return { data: null, error: { message: fault.message, ...(fault.code ? { code: fault.code } : {}) } };
       }
       const rows = (tables[this.t] ??= []);
       const match = (r) => this.filters.every((f) => f(r));
       let data;
       let count = 0;
+      if (this.op === "insert" && this.onConflict) {
+        if (this.t !== "products" || this.onConflict !== "user_id,sku_key" || !this.ignoreDuplicates) {
+          ops.push({ table: this.t, op: "insert", count: 0, failed: true });
+          return { data: null, error: { code: "42P10", message: "unsupported upsert in fake" } };
+        }
+        if (!state.migrationApplied) {
+          ops.push({ table: this.t, op: "insert", count: 0, failed: true });
+          return { data: null, error: { code: "42703", message: 'column "sku_key" does not exist' } };
+        }
+      }
       if (this.op === "insert") {
         if (hooks.beforeInsert) await hooks.beforeInsert(this.t, this.payload, tables, { nowIso, nextId: () => `id-${String(++idSeq).padStart(6, "0")}` });
-        const inserted = this.payload.map((p) => ({
+        let payload = this.payload;
+        // drop: БД «молча» не вставила последнюю строку и не вернула её (для проверки подтверждения).
+        if (fault && fault.drop) payload = payload.slice(0, Math.max(0, payload.length - 1));
+        if (this.onConflict) {
+          // ON CONFLICT (user_id, sku_key) DO NOTHING: пропускаем совпадения с таблицей и внутри пачки.
+          const taken = new Set(rows.map((r) => `${r.user_id}|${normKey(r.sku)}`));
+          payload = payload.filter((p) => {
+            const k = normKey(p.sku);
+            if (k === null) return true;
+            const key = `${p.user_id}|${k}`;
+            if (taken.has(key)) return false;
+            taken.add(key);
+            return true;
+          });
+        }
+        const inserted = payload.map((p) => ({
           id: p.id ?? `id-${String(++idSeq).padStart(6, "0")}`,
           created_at: nowIso(),
           ...(this.t === "products" ? { cost_price: 0, name: "" } : {}),
@@ -140,6 +181,7 @@ export function makeFakeSupabase(seed = {}) {
     ops,
     faults,
     hooks,
+    state,
     /** Число обращений (не сбоев) заданного вида к таблице. */
     count: (table, op) => ops.filter((o) => o.table === table && o.op === op && !o.failed).length,
     /** Число записывающих операций (insert/update/delete) по таблице. */

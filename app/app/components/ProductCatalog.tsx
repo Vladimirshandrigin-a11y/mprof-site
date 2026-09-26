@@ -37,6 +37,7 @@ import {
   deleteProductFromCloud,
   type Product,
 } from "../lib/supabase-cloud";
+import { normArticleKey } from "../lib/product-breakdown-calc";
 
 type ToastFn = (message: string, type?: "ok" | "warn" | "err") => void;
 
@@ -399,9 +400,13 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
         setImporting(false);
         return;
       }
+      // Ключ — та же нормализация, что у расчёта и у уникального индекса БД
+      // (регистр и лишние пробелы не различаются), иначе «Art  1» и «ART 1» дали бы
+      // вторую строку артикула.
       const bySku = new Map<string, Product>();
       for (const p of existing ?? []) {
-        if (p.sku) bySku.set(p.sku.trim().toLowerCase(), p);
+        const k = normArticleKey(p.sku);
+        if (k && !bySku.has(k)) bySku.set(k, p);
       }
 
       let added = 0;
@@ -434,7 +439,7 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
           continue;
         }
 
-        const key = sku.toLowerCase();
+        const key = normArticleKey(sku);
         const found = bySku.get(key);
         if (found) {
           const { error } = await updateProductInCloud(

@@ -12,7 +12,8 @@ import { importMissingCatalogProducts, type CatalogImportCandidate } from "../..
 //
 // Вся логика — в общей функции cloud/_lib/catalog-import (та же, что у API-расчёта):
 // добавляются только отсутствующие товары (sku = артикул, cost_price = 0), существующие
-// не перезаписываются, повторный и одновременный запрос дублей не создаёт.
+// не меняются и не удаляются; дубли исключает уникальный индекс БД (user_id, sku_key) —
+// без миграции 20260926_products_article_unique ничего не вставляется (503 + код).
 // user_id — ТОЛЬКО из проверенного токена.
 // ============================================================================
 export const runtime = "nodejs";
@@ -61,8 +62,12 @@ export async function POST(req: NextRequest) {
   if (!res.ok) {
     console.error("[api/cloud/products/import-missing] import failed", res.error);
     return NextResponse.json(
-      { error: res.error || "Не удалось добавить товары в каталог", data: { created: res.created.length } },
-      { status: 502, headers: NO_STORE }
+      {
+        error: res.error || "Не удалось добавить товары в каталог",
+        ...(res.code ? { code: res.code } : {}),
+        data: { created: res.created.length },
+      },
+      { status: res.code === "migration_missing" ? 503 : 502, headers: NO_STORE }
     );
   }
   return NextResponse.json(
@@ -73,7 +78,6 @@ export async function POST(req: NextRequest) {
         ambiguous: res.ambiguous.length,
         noArticle: res.noArticle,
         invalid: res.invalid,
-        duplicatesRemoved: res.duplicatesRemoved,
       },
     },
     { headers: NO_STORE }

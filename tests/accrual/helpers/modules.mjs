@@ -48,7 +48,10 @@ export const importRoute = req("./api/cloud/products/import-missing/route.js");
 export const saveCalcRoute = req("./api/ozon/save-calculation/route.js");
 export const realizationLib = req("./api/ozon/_lib/realization.js");
 export const product = req("./app/lib/product-breakdown-calc.js");
+export const apiCostGap = req("./app/lib/api-cost-gap.js");
+export const cloudClient = req("./app/lib/supabase-cloud.js");
 export const nextServer = req("next/server");
+export const supabaseJs = req("@supabase/supabase-js");
 export const diagnosticRoutePath = path.join(REPO_ROOT, "app", "api", "ozon", "accrual-migration-diagnostic", "route.ts");
 
 /** Разбор XLSX-буфера настоящим парсером проекта. */

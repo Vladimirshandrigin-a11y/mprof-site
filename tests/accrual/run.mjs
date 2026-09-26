@@ -45,6 +45,8 @@ const SOURCES = [
   "app/app/lib/accrual/save-flow.ts",
   "app/app/lib/accrual/download-guide.ts",
   "app/app/lib/product-breakdown-calc.ts",
+  "app/app/lib/api-cost-gap.ts",
+  "app/app/lib/supabase-cloud.ts",
   // Серверные модули (автодобавление товаров в каталог; загрузчик и маршруты — на моках).
   "app/api/cloud/_lib/catalog-import.ts",
   "app/api/cloud/products/import-missing/route.ts",

@@ -23,6 +23,9 @@ import {
   realizationLib,
   saveCalcRoute,
   saveFlow as SF,
+  apiCostGap as GAP,
+  cloudClient,
+  supabaseJs,
   session as SES,
   product as PB,
 } from "./helpers/modules.mjs";
@@ -118,7 +121,7 @@ describe("общая точка импорта: запись в каталог (
     ]);
     assert.equal(fake.rowsOf("products", "u1").length, 1);
   });
-  it("другой процесс (без сериализации), оба видели пустой каталог: остаётся одна строка на артикул, лишняя удалена", async () => {
+  it("другой процесс (без очереди), оба видели пустой каталог: вторая вставка — DO NOTHING, одна строка на артикул, ничего не удаляется", async () => {
     const fake = makeFakeSupabase();
     const items = [cand("R1"), cand("R2")];
     const [a, b] = await Promise.all([
@@ -127,47 +130,39 @@ describe("общая точка импорта: запись в каталог (
     ]);
     assert.ok(a.ok && b.ok);
     assert.deepEqual(skusOf(fake, "u1"), ["R1", "R2"]);
-    assert.equal(a.duplicatesRemoved + b.duplicatesRemoved, 2);
     assert.equal(a.created.length + b.created.length, 2, "каждая строка засчитана ровно одному из запросов");
+    assert.equal(a.alreadyInCatalog + b.alreadyInCatalog, 2, "проигравший видит строки как уже существующие");
+    assert.deepEqual([fake.count("products", "delete"), fake.count("products", "update")], [0, 0]);
   });
-  it("параллельно созданная пользователем строка с введённой стоимостью (старше нашей) остаётся; наша нулевая удаляется", async () => {
+  it("параллельно созданная пользователем строка со стоимостью: наша вставка ничего не делает, стоимость и название сохраняются, удалений нет", async () => {
     const fake = makeFakeSupabase();
     fake.hooks.beforeInsert = async (table, rows, tables, h) => {
       // «другой писатель» успел вставить тот же артикул раньше нас и уже указал стоимость
-      if (table === "products" && !tables.products.some((r) => r.sku === "RACE")) {
-        tables.products.push({ id: h.nextId(), created_at: "2026-01-01T00:00:00.000Z", user_id: "u1", sku: "RACE", name: "пользовательская", cost_price: 120 });
+      if (table === "products" && !tables.products.some((r) => r.sku === "race")) {
+        tables.products.push({ id: h.nextId(), created_at: "2026-01-01T00:00:00.000Z", user_id: "u1", sku: "race", name: "пользовательская", cost_price: 120 });
       }
     };
     const res = await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("RACE", "из отчёта")]);
     assert.ok(res.ok);
-    assert.equal(res.duplicatesRemoved, 1);
-    assert.deepEqual(fake.rowsOf("products", "u1").map((r) => [r.sku, r.name, r.cost_price]), [["RACE", "пользовательская", 120]]);
     assert.deepEqual(res.created, [], "созданной эту строку не объявляем");
+    assert.equal(res.alreadyInCatalog, 1);
+    assert.deepEqual(fake.rowsOf("products", "u1").map((r) => [r.sku, r.name, r.cost_price]), [["race", "пользовательская", 120]]);
+    assert.equal(fake.count("products", "delete"), 0);
   });
-  it("строки с уже указанной стоимостью при очистке дублей не удаляются", async () => {
-    const fake = makeFakeSupabase();
-    fake.hooks.beforeInsert = async (table, rows, tables, h) => {
-      if (table === "products" && !tables.products.some((r) => r.sku === "KEEP")) {
-        tables.products.push({ id: h.nextId(), created_at: "2026-01-01T00:00:00.000Z", user_id: "u1", sku: "KEEP", name: "старая", cost_price: 10 });
-      }
+  it("стоимость, сохранённая пользователем во время импорта, не теряется; автоимпорт не содержит update/delete вовсе", async () => {
+    const fake = makeFakeSupabase({ products: [{ id: "a-1", created_at: "2026-01-01T00:00:00.000Z", ...prod("u1", "ART-A", 0) }] });
+    fake.hooks.beforeInsert = async (table, rows, tables) => {
+      // пока идёт импорт, пользователь сохранил стоимость ранее добавленного товара
+      const row = tables.products.find((r) => r.id === "a-1");
+      if (row) row.cost_price = 55;
     };
-    // пока идёт запись, пользователь уже выставил стоимость новой строке
-    const realExec = fake.admin.from.bind(fake.admin);
-    fake.admin.from = (t) => {
-      const q = realExec(t);
-      if (t !== "products") return q;
-      const orig = q.exec.bind(q);
-      q.exec = async () => {
-        const r = await orig();
-        if (q.op === "insert") for (const row of fake.tables.products) if (row.sku === "KEEP" && row.cost_price === 0) row.cost_price = 33;
-        return r;
-      };
-      return q;
-    };
-    const res = await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("KEEP")]);
+    const res = await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("ART-A"), cand("NEW-1")]);
     assert.ok(res.ok);
-    assert.deepEqual(fake.rowsOf("products", "u1").map((r) => r.cost_price).sort((x, y) => x - y), [10, 33]);
-    assert.equal(res.duplicatesRemoved, 0);
+    assert.deepEqual(bySku(fake, "u1")["ART-A"].cost_price, 55);
+    assert.deepEqual(res.created.map((c) => c.sku), ["NEW-1"]);
+    const src = readFileSync(new URL("../../app/api/cloud/_lib/catalog-import.ts", import.meta.url), "utf8");
+    assert.doesNotMatch(src, /from\("products"\)[\s\S]{0,200}?\.(delete|update)\(/, "в общей функции нет ни update, ни delete по products");
+    assert.equal((src.match(/from\("products"\)/g) || []).length, 2, "к products только чтение каталога и вставка");
   });
   it("изоляция: у разных пользователей каталоги независимы — импорт одного не читает и не меняет строки другого", async () => {
     const fake = makeFakeSupabase({ products: [prod("u2", "SHARED", 500, "чужой")] });
@@ -199,12 +194,71 @@ describe("общая точка импорта: запись в каталог (
     assert.deepEqual([good.ok, good.created.length], [true, 2]);
     assert.equal(fake.rowsOf("products").length, 2);
   });
-  it("БД подтвердила не все строки (например, политика) — не выдаём за успех", async () => {
+  it("строка не вставлена и не появилась в каталоге (БД считает ключ занятым иначе) — не выдаём за созданную: catalog_conflict", async () => {
     const fake = makeFakeSupabase();
-    fake.faults.push({ table: "products", op: "insert", short: true, persist: true });
+    fake.faults.push({ table: "products", op: "insert", drop: true, persist: true });
     const res = await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("S1"), cand("S2")]);
-    assert.equal(res.ok, false);
-    assert.match(res.error, /не все/);
+    assert.ok(res.ok);
+    assert.deepEqual(res.created.map((c) => c.sku), ["S1"]);
+    assert.deepEqual(res.ambiguous, [{ article: "S2", reason: "catalog_conflict" }]);
+  });
+  it("вставка идёт в порядке канонического ключа (одинаковый порядок блокировок у всех писателей)", async () => {
+    const fake = makeFakeSupabase();
+    const seen = [];
+    fake.hooks.beforeInsert = async (table, rows) => {
+      if (table === "products") seen.push(rows.map((r) => r.sku));
+    };
+    await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("b-2"), cand("A-3"), cand(" a-1"), cand("B-1")]);
+    assert.deepEqual(seen, [["a-1", "A-3", "B-1", "b-2"]]);
+  });
+  it("deadlock/serialization failure при вставке повторяется (DO NOTHING идемпотентен); другие ошибки — нет", async () => {
+    const fake = makeFakeSupabase();
+    fake.faults.push({ table: "products", op: "insert", message: "deadlock detected", code: "40P01" });
+    const res = await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("D1"), cand("D2")]);
+    assert.deepEqual([res.ok, res.created.length], [true, 2]);
+    const fake2 = makeFakeSupabase();
+    fake2.faults.push({ table: "products", op: "insert", message: "deadlock detected", code: "40P01", persist: true });
+    const bad = await CI.importMissingCatalogProducts(fake2.admin, "u1", [cand("D1")]);
+    assert.deepEqual([bad.ok, bad.error], [false, "deadlock detected"]);
+    assert.equal(fake2.ops.filter((o) => o.op === "insert").length, 3, "не более трёх попыток");
+    const fake3 = makeFakeSupabase();
+    fake3.faults.push({ table: "products", op: "insert", message: "boom", code: "XX000", persist: true });
+    await CI.importMissingCatalogProducts(fake3.admin, "u1", [cand("D1")]);
+    assert.equal(fake3.ops.filter((o) => o.op === "insert").length, 1, "прочие ошибки не повторяются");
+  });
+  it("миграция уникальности не применена: ничего не вставляется, явная ошибка migration_missing (без приблизительной защиты)", async () => {
+    const fake = makeFakeSupabase({}, { migrationApplied: false });
+    const res = await CI.importMissingCatalogProducts(fake.admin, "u1", [cand("M1"), cand("M2")]);
+    assert.deepEqual([res.ok, res.code, res.created], [false, "migration_missing", []]);
+    assert.match(res.error, /миграция уникальности артикулов/);
+    assert.equal(fake.rowsOf("products").length, 0);
+  });
+  it("запрос, который строит supabase-js: POST с on_conflict=user_id,sku_key и Prefer resolution=ignore-duplicates (INSERT … ON CONFLICT DO NOTHING)", async () => {
+    const seen = [];
+    const client = supabaseJs.createClient("http://supabase.test", "service-key", {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: {
+        fetch: async (url, init = {}) => {
+          const method = init.method ?? "GET";
+          const headers = Object.fromEntries(new Headers(init.headers).entries());
+          seen.push({ url: String(url), method, headers, body: init.body ? JSON.parse(String(init.body)) : null });
+          if (method === "GET") return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+          const rows = JSON.parse(String(init.body)).map((r, i) => ({ id: `x-${i}`, created_at: "2026-01-01T00:00:00Z", ...r }));
+          return new Response(JSON.stringify(rows), { status: 201, headers: { "content-type": "application/json" } });
+        },
+      },
+    });
+    const res = await CI.importMissingCatalogProducts(client, "u1", [cand("Q1", "кв")]);
+    assert.ok(res.ok, JSON.stringify(res));
+    const post = seen.find((r) => r.method === "POST");
+    assert.ok(post, "был POST");
+    const u = new URL(post.url);
+    assert.equal(u.pathname, "/rest/v1/products");
+    assert.equal(u.searchParams.get("on_conflict"), "user_id,sku_key");
+    assert.match(post.headers.prefer, /resolution=ignore-duplicates/);
+    assert.match(post.headers.prefer, /return=representation/);
+    assert.deepEqual(post.body, [{ user_id: "u1", sku: "Q1", name: "кв", cost_price: 0 }], "в теле нет sku_key (его вычисляет БД)");
+    assert.ok(seen.every((r) => r.method === "GET" || r.method === "POST"), "ни PATCH, ни DELETE");
   });
   it("ошибка чтения каталога → ok=false без записи", async () => {
     const fake = makeFakeSupabase();
@@ -284,7 +338,7 @@ describe("сценарий XLSX: файл → сопоставление → а�
     const res = await importRoute.POST(nextReq("http://localhost/api/cloud/products/import-missing", { products: SES.accrualMissingCatalogCandidates(fileRows(), []) }));
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(body.data, { created: 2, alreadyInCatalog: 0, ambiguous: 0, noArticle: 0, invalid: 0, duplicatesRemoved: 0 });
+    assert.deepEqual(body.data, { created: 2, alreadyInCatalog: 0, ambiguous: 0, noArticle: 0, invalid: 0 });
     assert.deepEqual(skusOf(fake, "u1"), ["ART-A", "ART-B"]);
 
     // повторная проверка того же файла: каталог обновлён, кандидатов больше нет
@@ -343,6 +397,16 @@ describe("сценарий XLSX: файл → сопоставление → а�
     fake.faults.length = 0;
     const ok = await importRoute.POST(nextReq("http://localhost/x", { products }));
     assert.equal((await ok.json()).data.created, 2);
+  });
+
+  it("без миграции уникальности маршрут XLSX отвечает 503 migration_missing и ничего не вставляет", async () => {
+    const fake = makeFakeSupabase({}, { migrationApplied: false });
+    asUser(fake, "u1");
+    const res = await quietly(() => importRoute.POST(nextReq("http://localhost/x", { products: SES.accrualMissingCatalogCandidates(fileRows(), []) })));
+    assert.equal(res.status, 503);
+    const body = await res.json();
+    assert.equal(body.code, "migration_missing");
+    assert.equal(fake.rowsOf("products").length, 0);
   });
 
   it("user_id из тела игнорируется: строки создаются только владельцу токена; изоляция каталогов", async () => {
@@ -537,6 +601,18 @@ describe("сценарий API: автодобавление в save-calculation
     assert.equal(good.json.catalogImport.created, 3);
   });
 
+  it("без миграции уникальности API-расчёт честно сообщает ошибку автодобавления; consume 0, записей 0", async () => {
+    const { fake, rpc, post } = setupApi({ extraTables: {} });
+    fake.state.migrationApplied = false;
+    const { status, json } = await post();
+    assert.equal(status, 400);
+    assert.equal(json.catalogImport.ok, false);
+    assert.match(json.catalogImport.error, /миграция уникальности артикулов/);
+    assert.equal(fake.rowsOf("products").length, 0);
+    assert.deepEqual(rpc, []);
+    assert.deepEqual(noCalcWrites(fake), [0, 0, 0, 0]);
+  });
+
   it("строки без артикула не добавляются и явно посчитаны; неоднозначные не сливаются", async () => {
     const rows = [...REALIZATION, rzRow("", 999, "без артикула", 1, 50)];
     const { fake, post } = setupApi({ rows });
@@ -551,6 +627,42 @@ describe("сценарий API: автодобавление в save-calculation
     const r2 = await x.post();
     assert.equal(r2.json.catalogImport.ambiguous, 1);
     assert.equal(x.fake.rowsOf("products").length, 0, "разные Ozon SKU под одним артикулом не объединяем наугад");
+  });
+});
+
+describe("ручные пути записи каталога после миграции уникальности", () => {
+  it("дубль артикула (23505) при добавлении и при правке товара → понятное сообщение вместо технического", async () => {
+    const dup = { code: "23505", message: 'duplicate key value violates unique constraint "products_user_sku_key_uq"' };
+    const builder = { insert: () => builder, update: () => builder, eq: () => builder, select: () => builder, single: async () => ({ data: null, error: dup }) };
+    patch(cloudClient.supabase, "from", () => builder);
+    const add = await cloudClient.addProductToCloud({ sku: " art-a", name: "a", cost_price: 1 }, "u1");
+    assert.equal(add.error.message, "Товар с таким артикулом уже есть в каталоге");
+    assert.equal(add.error.code, "23505");
+    const upd = await cloudClient.updateProductInCloud("id-1", { sku: "ART-A" }, "u1");
+    assert.equal(upd.error.message, "Товар с таким артикулом уже есть в каталоге");
+    const other = { insert: () => other, select: () => other, single: async () => ({ data: null, error: { code: "42501", message: "permission denied" } }) };
+    patch(cloudClient.supabase, "from", () => other);
+    assert.equal((await cloudClient.addProductToCloud({ sku: "B", name: "b", cost_price: 1 }, "u1")).error.message, "permission denied");
+  });
+});
+
+describe("разбор ответа incomplete_cost для экрана API (parseApiCostGap)", () => {
+  it("ответ сервера save-calculation разбирается в то, что показывает блок: добавлено N, неоднозначные, без артикула", async () => {
+    const { post } = setupApi({ rows: [...REALIZATION, rzRow("", 999, "без артикула", 1, 50)] });
+    const { json } = await post();
+    assert.deepEqual(GAP.parseApiCostGap(json), {
+      status: "partial_cost",
+      unmatchedItems: 1,
+      matchedNoCostCount: 3,
+      catalogImport: { attempted: true, ok: true, created: 3, alreadyInCatalog: 0, ambiguous: 0, rowsWithoutOfferId: 1 },
+    });
+  });
+  it("ошибка импорта → ok=false с текстом; чужая/пустая форма → «импорт не выполнялся», нули", () => {
+    const err = GAP.parseApiCostGap({ status: "partial_cost", unmatchedItems: 2, catalogImport: { attempted: true, ok: false, error: "нет миграции", created: 0 } });
+    assert.deepEqual(err.catalogImport, { attempted: true, ok: false, error: "нет миграции", created: 0 });
+    assert.deepEqual(GAP.parseApiCostGap({}), { status: undefined, unmatchedItems: 0, matchedNoCostCount: 0, catalogImport: { attempted: false } });
+    assert.deepEqual(GAP.parseApiCostGap({ unmatchedItems: "5", catalogImport: { attempted: "yes" } }).catalogImport, { attempted: false });
+    assert.equal(GAP.parseApiCostGap({ catalogImport: { attempted: true, ok: false } }).catalogImport.error, "Сервер не подтвердил добавление");
   });
 });
 

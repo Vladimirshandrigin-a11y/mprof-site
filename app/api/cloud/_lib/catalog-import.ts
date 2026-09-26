@@ -12,8 +12,9 @@
 //   • добавляем ТОЛЬКО отсутствующие товары: sku = артикул (как в отчёте), name =
 //     название из источника (иначе артикул), cost_price = 0 — по текущему контракту
 //     каталога (NOT NULL default 0; «не указана» = 0, валидна только > 0);
-//   • существующие строки не читаются на запись: ни update, ни upsert; их
-//     себестоимость и название не перезаписываются;
+//   • существующие строки НИКОГДА не меняются и не удаляются: вставка идёт как
+//     INSERT … ON CONFLICT (user_id, sku_key) DO NOTHING — при совпадении ключа
+//     строка просто не вставляется; update/delete здесь нет вовсе;
 //   • не объединяем «наугад»: если в каталоге УЖЕ несколько строк с этим артикулом
 //     или в запросе под одним артикулом разные Ozon-SKU — товар НЕ добавляется и
 //     не сливается, он попадает в ambiguous с причиной; без артикула добавить
@@ -21,17 +22,20 @@
 //   • user_id — ТОЛЬКО параметр вызывающего route (из проверенного токена), тело
 //     запроса его не несёт и не влияет.
 //
-// ДУБЛИКАТЫ. В таблице нет уникального индекса (user_id, sku), поэтому защита
-// прикладная, в два слоя:
-//   1) сериализация: запросы одного пользователя в этом процессе выполняются
-//      строго по очереди, внутри очереди каталог перечитывается ЗАНОВО — повторный
-//      и одновременный запрос видит строки предыдущего и ничего не добавляет;
-//   2) проверка после вставки: каталог перечитывается, и если под тем же артикулом
-//      оказалась параллельно созданная строка (другой процесс / другой писатель),
-//      остаётся самая ранняя (created_at, затем id), а наши свежие строки с
-//      cost_price = 0 удаляются. Остаточный риск — только при нескольких инстансах
-//      и пересечении коммитов в узком окне; полностью закрывается уникальным
-//      индексом в БД (это отдельная миграция, здесь не применяется).
+// ДУБЛИКАТЫ — гарантия БД (миграция supabase/migrations/20260926_products_article_unique.sql):
+//   колонка products.sku_key = canonical_article(sku) (та же нормализация, что у
+//   расчёта) + уникальный индекс (user_id, sku_key). Одновременные запросы из разных
+//   инстансов и любые другие пути записи не могут создать вторую строку артикула;
+//   проигравший INSERT … ON CONFLICT DO NOTHING ждёт победителя и ничего не вставляет.
+//   После вставки каталог перечитывается ТОЛЬКО для подтверждения: каждый товар плана
+//   либо вставлен нами, либо уже есть (создан параллельно) — иначе это не успех.
+//   Очередь запросов пользователя внутри процесса — лишь оптимизация (меньше пустых
+//   конфликтов), а не защита.
+//   Без миграции автодобавление НЕ выполняется: ошибка «миграция не применена»,
+//   приблизительной защиты вместо гарантии БД нет.
+//
+// Существующие дубликаты каталога (если есть) не чистятся и не объединяются: это
+// решение владельца по данным (см. supabase/checks/products_article_conflicts.sql).
 //
 // Ничего не считает, consume не вызывает, calculations/report_history не трогает.
 // ============================================================================
@@ -48,7 +52,13 @@ export type CatalogImportCandidate = {
   name?: string;
 };
 
-export type AmbiguousReason = "catalog_duplicates" | "conflicting_sku";
+/**
+ * catalog_duplicates — в каталоге уже несколько строк с этим артикулом;
+ * conflicting_sku — в источнике у артикула разные Ozon SKU;
+ * catalog_conflict — БД считает артикул уже существующим, а расчётная нормализация его
+ *   не находит (расхождение регистра на экзотических символах): не добавляем и не сливаем.
+ */
+export type AmbiguousReason = "catalog_duplicates" | "conflicting_sku" | "catalog_conflict";
 
 export type CatalogImportPlan = {
   toCreate: Array<{ sku: string; name: string }>;
@@ -60,21 +70,20 @@ export type CatalogImportPlan = {
 
 export type CatalogImportOk = {
   ok: true;
-  /** Реально созданные строки (после проверки на гонки). */
+  /** Строки, которые вставил именно этот запрос. */
   created: Array<{ sku: string; name: string }>;
+  /** Уже были в каталоге (в том числе созданные параллельным запросом). */
   alreadyInCatalog: number;
   ambiguous: Array<{ article: string; reason: AmbiguousReason }>;
   noArticle: number;
   invalid: number;
-  /** Сколько наших строк удалено как дубликат параллельно созданной. */
-  duplicatesRemoved: number;
-  /** Не удалось убрать найденные дубликаты (данные целы, но строк больше одной). */
-  cleanupFailed: boolean;
 };
 
 export type CatalogImportFail = {
   ok: false;
   error: string;
+  /** Код ошибки: migration_missing — не применена миграция уникальности (ничего не вставлено). */
+  code?: "migration_missing";
   /** Что успело записаться до сбоя (повтор безопасен — существующие пропускаются). */
   created: Array<{ sku: string; name: string }>;
 };
@@ -86,6 +95,26 @@ const MAX_ARTICLE_LEN = 200;
 const MAX_NAME_LEN = 300;
 const INSERT_CHUNK = 500;
 const PAGE = 1000;
+const INSERT_ATTEMPTS = 3;
+/** deadlock_detected / serialization_failure — повтор вставки безопасен (DO NOTHING идемпотентен). */
+const RETRYABLE = new Set(["40P01", "40001"]);
+
+/** Колонки конфликта для ON CONFLICT — уникальный индекс из миграции. */
+export const PRODUCTS_CONFLICT_TARGET = "user_id,sku_key";
+
+export const MIGRATION_MISSING_MESSAGE =
+  "в базе не применена миграция уникальности артикулов (20260926_products_article_unique), автодобавление отключено";
+
+/**
+ * Ошибка PostgREST/PostgreSQL означает «нет колонки sku_key или уникального индекса под
+ * ON CONFLICT» — т.е. миграция не применена (42703 undefined_column, 42P10 нет подходящего
+ * ограничения, PGRST204 колонка не найдена в кэше схемы).
+ */
+function isMigrationMissing(err: { code?: string; message?: string } | null): boolean {
+  if (!err) return false;
+  if (err.code === "42703" || err.code === "42P10" || err.code === "PGRST204") return true;
+  return /sku_key|no unique or exclusion constraint/i.test(err.message ?? "");
+}
 
 /** Нормализация артикула для матчинга — ровно как в расчётах (normArticleKey / normArticle). */
 export function normArticle(s: string | null | undefined): string {
@@ -194,14 +223,6 @@ async function readCatalog(admin: SupabaseClient, userId: string): Promise<Produ
   return rows;
 }
 
-/** Самая ранняя строка группы: по created_at, затем по id — одинаково для всех писателей. */
-function earlier(a: ProductRow, b: ProductRow): boolean {
-  const ta = a.created_at ? Date.parse(a.created_at) : Number.POSITIVE_INFINITY;
-  const tb = b.created_at ? Date.parse(b.created_at) : Number.POSITIVE_INFINITY;
-  if (ta !== tb) return ta < tb;
-  return a.id < b.id;
-}
-
 async function importLocked(
   admin: SupabaseClient,
   userId: string,
@@ -215,93 +236,84 @@ async function importLocked(
   }
 
   const plan = planCatalogImport(candidates, catalog);
-  const insertedIds = new Set<string>();
-  const insertedByKey = new Map<string, { sku: string; name: string }>();
+  const insertedKeys = new Set<string>();
 
-  // ---- вставка только новых строк (sku = артикул, cost_price = 0) ----
-  for (let i = 0; i < plan.toCreate.length; i += INSERT_CHUNK) {
-    const chunk = plan.toCreate.slice(i, i + INSERT_CHUNK);
+  // ---- вставка только новых строк: ON CONFLICT (user_id, sku_key) DO NOTHING ----
+  // Существующие строки (в том числе созданные параллельно) не меняются; в ответе
+  // возвращаются ТОЛЬКО реально вставленные строки.
+  // Порядок строк — по каноническому ключу: одновременные вставки пересекающихся наборов
+  // берут блокировки уникального индекса в одном порядке и не образуют взаимоблокировку
+  // (проверено на настоящей PostgreSQL: без сортировки — deadlock detected). Если БД всё же
+  // прервёт вставку как deadlock/serialization failure, её безопасно повторить: DO NOTHING
+  // идемпотентен.
+  const ordered = [...plan.toCreate].sort((x, y) => {
+    const a = normArticle(x.sku);
+    const b = normArticle(y.sku);
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  for (let i = 0; i < ordered.length; i += INSERT_CHUNK) {
+    const chunk = ordered.slice(i, i + INSERT_CHUNK);
     const rows = chunk.map((p) => ({ user_id: userId, sku: p.sku, name: p.name, cost_price: 0 }));
     let inserted: ProductRow[] = [];
-    let insErr: { message?: string } | null = null;
-    try {
-      const res = await admin.from("products").insert(rows).select("id, sku, name, cost_price, created_at");
-      insErr = res.error;
-      inserted = (res.data ?? []) as ProductRow[];
-    } catch (e) {
-      insErr = { message: e instanceof Error ? e.message : "Ошибка записи" };
+    let insErr: { code?: string; message?: string } | null = null;
+    for (let attempt = 1; attempt <= INSERT_ATTEMPTS; attempt++) {
+      inserted = [];
+      insErr = null;
+      try {
+        const res = await admin
+          .from("products")
+          .upsert(rows, { onConflict: PRODUCTS_CONFLICT_TARGET, ignoreDuplicates: true })
+          .select("id, sku, name, cost_price, created_at");
+        insErr = res.error;
+        inserted = (res.data ?? []) as ProductRow[];
+      } catch (e) {
+        insErr = { message: e instanceof Error ? e.message : "Ошибка записи" };
+      }
+      if (!insErr || !RETRYABLE.has(insErr.code ?? "")) break;
     }
+    const createdSoFar = () =>
+      plan.toCreate.filter((p) => insertedKeys.has(normArticle(p.sku))).map((p) => ({ sku: p.sku, name: p.name }));
     if (insErr) {
-      // Уже вставленные чанки остаются (это новые товары с cost 0); повтор их пропустит.
-      // Проверка гонок здесь не нужна: ошибка честно возвращается вызывающему.
-      const created = plan.toCreate.slice(0, i).filter((p) => insertedByKey.has(normArticle(p.sku)));
-      return { ok: false, error: insErr.message || "Не удалось добавить товары в каталог", created };
+      if (isMigrationMissing(insErr)) {
+        return { ok: false, code: "migration_missing", error: MIGRATION_MISSING_MESSAGE, created: createdSoFar() };
+      }
+      // Уже вставленные чанки остаются (новые товары без стоимости); повтор их пропустит.
+      return { ok: false, error: insErr.message || "Не удалось добавить товары в каталог", created: createdSoFar() };
     }
-    for (const r of inserted) {
-      if (r.id) insertedIds.add(r.id);
-      if (r.sku) insertedByKey.set(normArticle(r.sku), { sku: r.sku, name: r.name ?? "" });
-    }
-    // Если БД вернула меньше строк, чем вставили (RLS/политики) — не выдаём за успех.
-    if (inserted.length !== chunk.length) {
+    for (const r of inserted) if (r.sku) insertedKeys.add(normArticle(r.sku));
+  }
+
+  // ---- подтверждение (только чтение): каждый товар плана вставлен нами или уже есть ----
+  let alreadyInCatalog = plan.alreadyInCatalog;
+  const ambiguous = [...plan.ambiguous];
+  const notInserted = plan.toCreate.filter((p) => !insertedKeys.has(normArticle(p.sku)));
+  if (notInserted.length > 0) {
+    let after: ProductRow[];
+    try {
+      after = await readCatalog(admin, userId);
+    } catch (e) {
       return {
         ok: false,
-        error: "Каталог подтвердил не все добавленные товары",
-        created: plan.toCreate.slice(0, i + inserted.length).filter((p) => insertedByKey.has(normArticle(p.sku))),
+        error: e instanceof Error ? e.message : "Не удалось подтвердить добавление товаров",
+        created: plan.toCreate.filter((p) => insertedKeys.has(normArticle(p.sku))),
       };
     }
-  }
-
-  // ---- проверка после вставки: параллельно созданные дубликаты ----
-  let duplicatesRemoved = 0;
-  let cleanupFailed = false;
-  if (insertedIds.size > 0) {
-    try {
-      const after = await readCatalog(admin, userId);
-      const byKey = new Map<string, ProductRow[]>();
-      for (const r of after) {
-        const key = normArticle(r.sku);
-        if (!key) continue;
-        const arr = byKey.get(key);
-        if (arr) arr.push(r);
-        else byKey.set(key, [r]);
-      }
-      const toDelete: string[] = [];
-      for (const group of byKey.values()) {
-        if (group.length < 2 || !group.some((r) => insertedIds.has(r.id))) continue;
-        let survivor = group[0];
-        for (const r of group) if (earlier(r, survivor)) survivor = r;
-        for (const r of group) {
-          // Удаляем только СВОИ ещё нетронутые строки (cost 0), не самую раннюю в группе.
-          if (r.id !== survivor.id && insertedIds.has(r.id) && (r.cost_price ?? 0) === 0) toDelete.push(r.id);
-        }
-      }
-      if (toDelete.length > 0) {
-        const { error } = await admin.from("products").delete().in("id", toDelete).eq("user_id", userId).eq("cost_price", 0);
-        if (error) cleanupFailed = true;
-        else {
-          duplicatesRemoved = toDelete.length;
-          for (const id of toDelete) insertedIds.delete(id);
-          for (const r of after) if (toDelete.includes(r.id)) insertedByKey.delete(normArticle(r.sku));
-        }
-      }
-    } catch {
-      cleanupFailed = true;
+    const present = new Set(after.map((r) => normArticle(r.sku)).filter(Boolean));
+    for (const p of notInserted) {
+      // Есть в каталоге → создан параллельно (другой запрос/инстанс/пользователь вручную).
+      if (present.has(normArticle(p.sku))) alreadyInCatalog++;
+      // Нет ни вставки, ни строки: БД считает ключ занятым иначе, чем расчёт — не сливаем.
+      else ambiguous.push({ article: p.sku, reason: "catalog_conflict" });
     }
   }
-
-  const created = plan.toCreate
-    .filter((p) => insertedByKey.has(normArticle(p.sku)))
-    .map((p) => ({ sku: p.sku, name: p.name }));
 
   return {
     ok: true,
-    created,
-    alreadyInCatalog: plan.alreadyInCatalog,
-    ambiguous: plan.ambiguous,
+    created: plan.toCreate.filter((p) => insertedKeys.has(normArticle(p.sku))),
+    alreadyInCatalog,
+    ambiguous,
     noArticle: plan.noArticle,
     invalid: plan.invalid,
-    duplicatesRemoved,
-    cleanupFailed,
   };
 }
 

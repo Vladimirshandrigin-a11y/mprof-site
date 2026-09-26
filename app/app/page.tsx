@@ -6,7 +6,8 @@ import type { User } from "@supabase/supabase-js"
 import appLoaderStyles from "./app-loader.module.css"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { AccrualUploadFlow } from "./components/AccrualUploadFlow"
-import { pluralRu } from "./lib/accrual/format"
+import { ApiCostGapNotice } from "./components/ApiCostGapNotice"
+import { parseApiCostGap, type ApiCostGap } from "./lib/api-cost-gap"
 import {
   useAccrualUploadSession,
   type AccrualSavedEvent,
@@ -1187,44 +1188,6 @@ type RealizationDiagnostic = {
   warnings: string[];
 };
 
-// Итог автодобавления отсутствующих товаров в каталог, который save-calculation
-// присылает вместе с 400 incomplete_cost (ДО consume и сохранения). ok=false — запись
-// не состоялась (успех не показываем). Названия и артикулы товаров в ответ не входят.
-type ApiCatalogImport =
-  | { attempted: false }
-  | {
-      attempted: true;
-      ok: true;
-      created: number;
-      alreadyInCatalog: number;
-      ambiguous: number;
-      rowsWithoutOfferId: number;
-    }
-  | { attempted: true; ok: false; error: string; created: number };
-
-/** Мягкий разбор catalogImport из ответа сервера (чужая форма → «не выполнялось»). */
-function parseApiCatalogImport(raw: unknown): ApiCatalogImport {
-  const r = raw as Record<string, unknown> | null;
-  if (!r || r.attempted !== true) return { attempted: false };
-  const n = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-  if (r.ok === true) {
-    return {
-      attempted: true,
-      ok: true,
-      created: n(r.created),
-      alreadyInCatalog: n(r.alreadyInCatalog),
-      ambiguous: n(r.ambiguous),
-      rowsWithoutOfferId: n(r.rowsWithoutOfferId),
-    };
-  }
-  return {
-    attempted: true,
-    ok: false,
-    error: typeof r.error === "string" && r.error ? r.error : "Сервер не подтвердил добавление",
-    created: n(r.created),
-  };
-}
-
 // Месяц по умолчанию для черновика — ПРОШЛЫЙ месяц (за него данные уже полные).
 // Формат "YYYY-MM" для нативного <input type="month">. Считаем в UTC, без смещения.
 function defaultDraftMonth(): string {
@@ -1469,12 +1432,7 @@ export default function AppPage() {
   // списания и без цифр расчёта. Держим их отдельно от profitError, чтобы показать
   // понятный блок с действиями (перейти в каталог / добавить несопоставленные),
   // а не сухой текст. null — блок скрыт.
-  const [apiCostGap, setApiCostGap] = useState<{
-    status?: string;
-    unmatchedItems: number;
-    matchedNoCostCount: number;
-    catalogImport: ApiCatalogImport;
-  } | null>(null);
+  const [apiCostGap, setApiCostGap] = useState<ApiCostGap | null>(null);
   // Счётчик обновления каталога: растёт, когда товары добавлены автоматически (XLSX или
   // API-расчёт), — открытый список каталога перечитывается без перезагрузки страницы.
   const [catalogRefresh, setCatalogRefresh] = useState(0);
@@ -4335,19 +4293,10 @@ export default function AppPage() {
       // показывается их число или явная ошибка добавления. Ошибку-текст не ставим —
       // блок сам всё объясняет.
       if (res.status === 400 && data.code === "incomplete_cost") {
-        const catalogImport = parseApiCatalogImport(data.catalogImport);
-        setApiCostGap({
-          status: data.status,
-          unmatchedItems:
-            typeof data.unmatchedItems === "number" ? data.unmatchedItems : 0,
-          matchedNoCostCount:
-            typeof data.matchedNoCostCount === "number"
-              ? data.matchedNoCostCount
-              : 0,
-          catalogImport,
-        });
+        const gap = parseApiCostGap(data);
+        setApiCostGap(gap);
         // Товары уже добавлены сервером в каталог — обновляем открытые списки.
-        if (catalogImport.attempted && catalogImport.created > 0) {
+        if (gap.catalogImport.attempted && gap.catalogImport.created > 0) {
           setCatalogRefresh((k) => k + 1);
         }
         return;
@@ -9362,79 +9311,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 
                 {/* Не хватает себестоимости — структурированный блок с действиями.
                     Расчёт не сделан, попытка не списана. */}
-                {apiCostGap && (
-                  <div className="api-costgap" role="alert">
-                    <div className="api-costgap-title">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18, flexShrink: 0 }}>
-                        <circle cx="12" cy="12" r="9" />
-                        <path d="M12 8v5" />
-                        <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
-                      </svg>
-                      Не хватает себестоимости у товаров
-                    </div>
-                    <p className="api-costgap-sub">
-                      Чтобы рассчитать чистую прибыль, заполните себестоимость всех
-                      товаров в каталоге. Сейчас расчёт не сделан и попытка не
-                      списана.
-                    </p>
-                    <div className="api-costgap-stats">
-                      {apiCostGap.unmatchedItems > 0 && (
-                        <span className="api-costgap-chip">
-                          Не сопоставлено с каталогом: {fmt(apiCostGap.unmatchedItems)}
-                        </span>
-                      )}
-                      {apiCostGap.matchedNoCostCount > 0 && (
-                        <span className="api-costgap-chip">
-                          Без себестоимости (0 ₽): {fmt(apiCostGap.matchedNoCostCount)}
-                        </span>
-                      )}
-                      {apiCostGap.status === "no_cost" &&
-                        apiCostGap.unmatchedItems === 0 &&
-                        apiCostGap.matchedNoCostCount === 0 && (
-                          <span className="api-costgap-chip">
-                            Себестоимость не найдена
-                          </span>
-                        )}
-                    </div>
-                    <div className="api-costgap-actions">
-                      <button type="button" className="api-pro-btn" onClick={goToCatalog}>
-                        Перейти в каталог товаров
-                      </button>
-                    </div>
-                    {apiCostGap.catalogImport.attempted &&
-                      apiCostGap.catalogImport.ok &&
-                      apiCostGap.catalogImport.created > 0 && (
-                        <p className="api-pro-msg ok" style={{ marginTop: ".8rem" }}>
-                          Добавлено в каталог: {fmt(apiCostGap.catalogImport.created)}{" "}
-                          {pluralRu(apiCostGap.catalogImport.created, "товар", "товара", "товаров")} без
-                          себестоимости. Укажите её в каталоге товаров и повторите расчёт.
-                        </p>
-                      )}
-                    {apiCostGap.catalogImport.attempted &&
-                      apiCostGap.catalogImport.ok &&
-                      apiCostGap.catalogImport.ambiguous > 0 && (
-                        <p className="api-pro-msg" style={{ marginTop: ".8rem" }}>
-                          Не добавлено из-за неоднозначного сопоставления:{" "}
-                          {fmt(apiCostGap.catalogImport.ambiguous)}. Проверьте каталог и добавьте такие
-                          товары вручную.
-                        </p>
-                      )}
-                    {apiCostGap.catalogImport.attempted &&
-                      apiCostGap.catalogImport.ok &&
-                      apiCostGap.catalogImport.rowsWithoutOfferId > 0 && (
-                        <p className="api-pro-msg" style={{ marginTop: ".8rem" }}>
-                          Строк отчёта без артикула: {fmt(apiCostGap.catalogImport.rowsWithoutOfferId)} —
-                          их нельзя добавить в каталог автоматически.
-                        </p>
-                      )}
-                    {apiCostGap.catalogImport.attempted && !apiCostGap.catalogImport.ok && (
-                      <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
-                        Не удалось добавить товары в каталог: {apiCostGap.catalogImport.error}. Товары не
-                        добавлены — повторите расчёт или добавьте их вручную.
-                      </p>
-                    )}
-                  </div>
-                )}
+                {apiCostGap && <ApiCostGapNotice gap={apiCostGap} onOpenCatalog={goToCatalog} />}
 
                 {/* Успех — чистый результат. Показываем только после сохранения. */}
                 {profitResult && apiSaved && (

@@ -584,6 +584,19 @@ export async function loadProductsFromCloud(
   return { data: res.data ?? [], error: null };
 }
 
+/**
+ * Уникальность артикула в каталоге (миграция 20260926_products_article_unique): БД
+ * отклоняет вторую строку с тем же артикулом (без учёта регистра и лишних пробелов)
+ * кодом 23505. Показываем понятный текст вместо технического.
+ */
+function productWriteError(error: unknown): CloudErrorInfo {
+  const info = fmtError(error);
+  if (info.code === "23505") {
+    return { ...info, message: "Товар с таким артикулом уже есть в каталоге" };
+  }
+  return info;
+}
+
 export async function addProductToCloud(
   input: ProductInsertInput,
   userId: string
@@ -595,7 +608,7 @@ export async function addProductToCloud(
       .insert([payload])
       .select()
       .single();
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) return { data: null, error: productWriteError(error) };
     return { data: (data as Product | null) ?? null, error: null };
   } catch (e) {
     return { data: null, error: fmtError(e) };
@@ -618,7 +631,6 @@ export interface CatalogImportOutcome {
   ambiguous: number;
   noArticle: number;
   invalid: number;
-  duplicatesRemoved: number;
 }
 
 /**
@@ -652,7 +664,7 @@ export async function updateProductInCloud(
       .eq("user_id", userId)
       .select()
       .single();
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) return { data: null, error: productWriteError(error) };
     return { data: (data as Product | null) ?? null, error: null };
   } catch (e) {
     return { data: null, error: fmtError(e) };
