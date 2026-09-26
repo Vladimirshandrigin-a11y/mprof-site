@@ -7936,6 +7936,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .cab-tariff-status{display:flex;align-items:center;gap:.65rem;flex-wrap:wrap}
 .cab-tariff-name{font-family:var(--display);font-size:1.05rem;font-weight:600;color:var(--gold2)}
 .cab-tariff-actions{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-top:1.2rem}
+.cab-tariff-hint{margin-top:.8rem;font-size:.78rem;color:var(--txt3)}
 .cab-quick{display:grid;grid-template-columns:repeat(3,1fr);gap:.7rem}
 .cab-quick .api-pro-btn{width:100%}
 @media(max-width:760px){
@@ -10696,12 +10697,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <div className="tariff-price">
                     <em>149</em> ₽
                   </div>
-                  <div className="tariff-period">Один платёж</div>
+                  <div className="tariff-period">Разовая оплата</div>
                   <ul className="tariff-list">
-                    <li>Один расчёт по отчёту или вручную</li>
-                    <li>Без Ozon API-расчёта (только файл или ручной ввод)</li>
+                    <li>Один расчёт: по XLSX «Отчёт по начислениям» или вручную</li>
+                    <li>По XLSX — товарная аналитика и PDF‑отчёт</li>
                     <li>Сохранение результата в историю</li>
-                    <li>Без подписки и автосписаний</li>
+                    <li>Без Ozon API · без автосписаний</li>
                   </ul>
                   <button
                     type="button"
@@ -10719,14 +10720,14 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <span className="tariff-badge">Выгодно</span>
                   <div className="tariff-name">Безлимит</div>
                   <div className="tariff-price">
-                    <em>449</em> ₽<span className="tariff-month">/мес</span>
+                    <em>449</em> ₽<span className="tariff-month">/30 дней</span>
                   </div>
-                  <div className="tariff-period">Подписка на 30 дней</div>
+                  <div className="tariff-period">30 дней · без автопродления</div>
                   <ul className="tariff-list">
-                    <li>Неограниченное число расчётов в месяц</li>
-                    <li>Расчёты по Ozon API (автозагрузка данных)</li>
-                    <li>AI-аналитика и рекомендации (в ближайших обновлениях)</li>
-                    <li>Полная история и графики без ограничений</li>
+                    <li>Неограниченное число расчётов в течение 30 дней</li>
+                    <li>XLSX «Отчёт по начислениям», вручную и по Ozon API</li>
+                    <li>По XLSX — товарная аналитика и PDF‑отчёт</li>
+                    <li>Для API — подключение Ozon и себестоимость товаров</li>
                   </ul>
                   <button
                     type="button"
@@ -11204,7 +11205,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </div>
                       {hasPremium && formatRuDate(premiumUntil) && (
                         <div className="cab-row">
-                          <span className="cab-k">Подписка до</span>
+                          <span className="cab-k">Безлимит до</span>
                           <span className="cab-v">
                             {formatRuDate(premiumUntil)}
                           </span>
@@ -11246,11 +11247,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           </span>
                         </div>
                         <p className="cab-muted" style={{ marginTop: ".7rem" }}>
-                          Неограниченное количество расчётов
+                          Неограниченное количество расчётов всеми способами,
+                          включая Ozon API
                           {formatRuDate(premiumUntil)
-                            ? ` до ${formatRuDate(premiumUntil)}`
+                            ? `, до ${formatRuDate(premiumUntil)}`
                             : ""}
-                          .
+                          . Без автопродления.
                         </p>
                       </>
                     ) : (
@@ -11286,6 +11288,12 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                             Безлимит — 449&nbsp;₽
                           </button>
                         </div>
+                        <p className="cab-muted cab-tariff-hint">
+                          149&nbsp;₽ — один расчёт по XLSX «Отчёт по начислениям»
+                          или вручную, без Ozon API. 449&nbsp;₽ — 30 дней без
+                          ограничений, включая Ozon API. После оплаты тариф
+                          появится здесь.
+                        </p>
                       </>
                     )}
                   </div>
