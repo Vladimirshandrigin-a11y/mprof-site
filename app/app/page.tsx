@@ -6,6 +6,8 @@ import type { User } from "@supabase/supabase-js"
 import appLoaderStyles from "./app-loader.module.css"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { AccrualUploadFlow } from "./components/AccrualUploadFlow"
+import { ApiCostGapNotice } from "./components/ApiCostGapNotice"
+import { parseApiCostGap, type ApiCostGap } from "./lib/api-cost-gap"
 import {
   useAccrualUploadSession,
   type AccrualSavedEvent,
@@ -1048,62 +1050,6 @@ type AdsSpendResult = {
   error?: string;
 };
 
-// Ответ /api/ozon/postings-match-diagnostic — read-only диагностика сопоставления
-// товаров Ozon (FBO+FBS) с каталогом себестоимости. Прибыль здесь НЕ считается.
-type OzonPostingsMatchResponse = {
-  period: { month: string; dateFrom: string; dateTo: string };
-  source: string;
-  totals: {
-    postingCount: number;
-    itemRows: number;
-    uniqueOzonItems: number;
-    matchedItems: number;
-    unmatchedItems: number;
-    matchedQuantity: number;
-    unmatchedQuantity: number;
-  };
-  matched: Array<{
-    offerId?: string;
-    sku?: string;
-    name?: string;
-    quantity: number;
-    price?: number;
-    catalogProductName?: string;
-    catalogCost?: number;
-    matchBy: "offer_id" | "sku" | "article";
-  }>;
-  unmatched: Array<{
-    offerId?: string;
-    sku?: string;
-    name?: string;
-    quantity: number;
-    price?: number;
-    reason: string;
-  }>;
-  // Диагностика (read-only): разбивка сопоставленной себестоимости по статусам
-  // отправлений Ozon. Боевой расчёт не меняет — только объясняет расхождение.
-  costByStatus?: {
-    totalMatchedCost: number;
-    totalMatchedQuantity: number;
-    deliveredMatchedCost: number;
-    cancelledMatchedCost: number;
-    nonDeliveredMatchedCost: number;
-    rows: Array<{
-      status: string;
-      label: string;
-      postingCount: number;
-      itemsQuantity: number;
-      matchedQuantity: number;
-      unmatchedQuantity: number;
-      matchedCost: number;
-      shareOfMatchedCost: number;
-    }>;
-    notes: string[];
-  };
-  warnings: string[];
-  notes: string[];
-};
-
 // Ответ /api/ozon/profit-draft — ПРЕДВАРИТЕЛЬНАЯ прибыль (PR #16): операции Ozon
 // минус себестоимость ТОЛЬКО сопоставленных товаров. Это НЕ чистая прибыль и НЕ
 // финальный расчёт — ручные расходы не вычитаются, ничего не сохраняется.
@@ -1240,31 +1186,6 @@ type RealizationDiagnostic = {
   }>;
   notes: string[];
   warnings: string[];
-};
-
-// Ответ /api/ozon/import-missing-products — добавление НЕсопоставленных товаров
-// Ozon в каталог себестоимости (PR #17). Только INSERT новых товаров
-// (sku = offer_id, cost_price = 0). Себестоимость НЕ выдумывается, расчёт НЕ
-// запускается и НЕ сохраняется — пользователь заполняет cost вручную.
-type OzonImportMissingResponse = {
-  period: { month: string; dateFrom: string; dateTo: string };
-  source: string;
-  totals: {
-    unmatchedFromOzon: number;
-    eligibleToImport: number;
-    created: number;
-    skippedExisting: number;
-    skippedNoOfferId: number;
-  };
-  created: Array<{ sku: string; name: string; costPrice: number | null }>;
-  skipped: Array<{
-    offerId?: string;
-    sku?: string;
-    name?: string;
-    reason: string;
-  }>;
-  warnings: string[];
-  notes: string[];
 };
 
 // Месяц по умолчанию для черновика — ПРОШЛЫЙ месяц (за него данные уже полные).
@@ -1485,11 +1406,6 @@ export default function AppPage() {
   const [adsResult, setAdsResult] = useState<AdsSpendResult | null>(null);
   const [adsError, setAdsError] = useState("");
 
-  // Диагностика сопоставления товаров (PR #15) — read-only, ничего не сохраняет.
-  const [matchMonth, setMatchMonth] = useState<string>(() => defaultDraftMonth());
-  const [matchLoading, setMatchLoading] = useState(false);
-  const [matchError, setMatchError] = useState("");
-  const [matchResult, setMatchResult] = useState<OzonPostingsMatchResponse | null>(null);
 
   // Предварительная прибыль с себестоимостью (PR #16) — read-only API-черновик.
   const [profitMonth, setProfitMonth] = useState<string>(() => defaultDraftMonth());
@@ -1516,28 +1432,16 @@ export default function AppPage() {
   // списания и без цифр расчёта. Держим их отдельно от profitError, чтобы показать
   // понятный блок с действиями (перейти в каталог / добавить несопоставленные),
   // а не сухой текст. null — блок скрыт.
-  const [apiCostGap, setApiCostGap] = useState<{
-    status?: string;
-    unmatchedItems: number;
-    matchedNoCostCount: number;
-  } | null>(null);
+  const [apiCostGap, setApiCostGap] = useState<ApiCostGap | null>(null);
+  // Счётчик обновления каталога: растёт, когда товары добавлены автоматически (XLSX или
+  // API-расчёт), — открытый список каталога перечитывается без перезагрузки страницы.
+  const [catalogRefresh, setCatalogRefresh] = useState(0);
   // СПРАВОЧНАЯ диагностика отчёта о реализации Ozon (read-only): приходит довеском
   // к успешному save-calculation. candidate COGS НЕ влияет на прибыль/налог/COGS и
   // никуда не сохраняется — показываем, чтобы сверить источник себестоимости с
   // документальным расчётом. null — блок скрыт.
   const [realizationDiag, setRealizationDiag] = useState<RealizationDiagnostic | null>(null);
-  // PR #22 (UX) — свёрнутый второстепенный блок «Дополнительные действия и
-  // диагностика» (проверка/удаление подключения, диагностика сопоставления,
-  // добавление несопоставленных). По умолчанию закрыт, чтобы не мешать основному
-  // сценарию: подключить → выбрать месяц → ввести расходы → рассчитать.
-  const [apiDiagOpen, setApiDiagOpen] = useState(false);
 
-  // Добавление несопоставленных товаров в каталог (PR #17) — только INSERT новых,
-  // себестоимость НЕ выдумывается, расчёт НЕ запускается и НЕ сохраняется.
-  const [importMonth, setImportMonth] = useState<string>(() => defaultDraftMonth());
-  const [importLoading, setImportLoading] = useState(false);
-  const [importError, setImportError] = useState("");
-  const [importResult, setImportResult] = useState<OzonImportMissingResponse | null>(null);
   // Дефолт при первом открытии /app — вкладка «Авторасчёт Ozon API». Это только
   // активная вкладка/рендер: расчёт сам НЕ запускается (calculateAndSaveApi —
   // только по клику), consume/save/Ozon-запрос при mount не выполняются.
@@ -4295,48 +4199,6 @@ export default function AppPage() {
     }
   };
 
-  // POST /api/ozon/postings-match-diagnostic — read-only диагностика: какие товары
-  // из Ozon postings (FBO+FBS) есть в каталоге себестоимости. НИЧЕГО не сохраняет,
-  // не списывает расчёт и НЕ считает прибыль — только сопоставление по артикулу.
-  const loadPostingsMatch = async () => {
-    if (!user?.id) {
-      setMatchError("Войдите в аккаунт, чтобы проверить сопоставление");
-      return;
-    }
-    if (!ozonConn?.connected) {
-      setMatchError("Сначала подключите Ozon API");
-      return;
-    }
-    if (!/^\d{4}-\d{2}$/.test(matchMonth)) {
-      setMatchError("Выберите месяц");
-      return;
-    }
-    setMatchLoading(true);
-    setMatchError("");
-    setMatchResult(null);
-    try {
-      const headers = await ozonAuthHeaders();
-      const res = await fetch("/api/ozon/postings-match-diagnostic", {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ month: matchMonth }),
-        cache: "no-store",
-      });
-      const data = (await res.json()) as OzonPostingsMatchResponse & { error?: string };
-      if (!res.ok) {
-        setMatchError(data.error || "Не удалось проверить сопоставление");
-        return;
-      }
-      setMatchResult(data);
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("loadPostingsMatch error:", e);
-      setMatchError("Не удалось связаться с сервером");
-    } finally {
-      setMatchLoading(false);
-    }
-  };
-
   // PR #22 (UX) — быстрый переход в каталог товаров (заполнить себестоимость),
   // когда расчёт упёрся в неполную себестоимость. Просто переключаем верхний
   // раздел дашборда и скроллим вверх; никакой бизнес-логики/расчётов тут нет.
@@ -4408,6 +4270,7 @@ export default function AppPage() {
         status?: string;
         unmatchedItems?: number;
         matchedNoCostCount?: number;
+        catalogImport?: unknown;
         profit?: OzonProfitDraftResponse;
         realizationDiagnostic?: RealizationDiagnostic | null;
       };
@@ -4425,19 +4288,17 @@ export default function AppPage() {
       }
       // Себестоимость не полная → 400 ДО списания (сервер не присылает цифр).
       // Вместо сухого текста показываем структурированный блок «Не хватает
-      // себестоимости у товаров» с понятными действиями (перейти в каталог /
-      // добавить несопоставленные товары). Ошибку-текст не ставим — блок сам всё
-      // объясняет.
+      // себестоимости у товаров» с понятными действиями (перейти в каталог).
+      // Отсутствующие товары сервер уже добавил в каталог сам (catalogImport) — здесь
+      // показывается их число или явная ошибка добавления. Ошибку-текст не ставим —
+      // блок сам всё объясняет.
       if (res.status === 400 && data.code === "incomplete_cost") {
-        setApiCostGap({
-          status: data.status,
-          unmatchedItems:
-            typeof data.unmatchedItems === "number" ? data.unmatchedItems : 0,
-          matchedNoCostCount:
-            typeof data.matchedNoCostCount === "number"
-              ? data.matchedNoCostCount
-              : 0,
-        });
+        const gap = parseApiCostGap(data);
+        setApiCostGap(gap);
+        // Товары уже добавлены сервером в каталог — обновляем открытые списки.
+        if (gap.catalogImport.attempted && gap.catalogImport.created > 0) {
+          setCatalogRefresh((k) => k + 1);
+        }
         return;
       }
       if (!res.ok || data.ok !== true || !data.profit) {
@@ -4461,53 +4322,6 @@ export default function AppPage() {
       setProfitError("Не удалось связаться с сервером");
     } finally {
       setProfitLoading(false);
-    }
-  };
-
-  // POST /api/ozon/import-missing-products — добавить в каталог несопоставленные
-  // товары Ozon (sku = offer_id, cost_price = 0). ТОЛЬКО INSERT новых товаров:
-  // существующие не трогаем, себестоимость НЕ выдумываем, прибыль НЕ считаем,
-  // расчёт НЕ запускаем/НЕ сохраняем/НЕ списываем. После — заполнить cost вручную.
-  const importMissingProducts = async (monthArg?: string) => {
-    // monthArg позволяет вызвать импорт из блока «не хватает себестоимости»
-    // основного сценария (там используется profitMonth). По умолчанию — importMonth
-    // из второстепенного блока диагностики. Бэкенд и его поведение не меняются.
-    const month = monthArg ?? importMonth;
-    if (!user?.id) {
-      setImportError("Войдите в аккаунт, чтобы добавить товары");
-      return;
-    }
-    if (!ozonConn?.connected) {
-      setImportError("Сначала подключите Ozon API");
-      return;
-    }
-    if (!/^\d{4}-\d{2}$/.test(month)) {
-      setImportError("Выберите месяц");
-      return;
-    }
-    setImportLoading(true);
-    setImportError("");
-    setImportResult(null);
-    try {
-      const headers = await ozonAuthHeaders();
-      const res = await fetch("/api/ozon/import-missing-products", {
-        method: "POST",
-        headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ month }),
-        cache: "no-store",
-      });
-      const data = (await res.json()) as OzonImportMissingResponse & { error?: string };
-      if (!res.ok) {
-        setImportError(data.error || "Не удалось добавить товары в каталог");
-        return;
-      }
-      setImportResult(data);
-    } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error("importMissingProducts error:", e);
-      setImportError("Не удалось связаться с сервером");
-    } finally {
-      setImportLoading(false);
     }
   };
 
@@ -4936,6 +4750,7 @@ export default function AppPage() {
       setTariffModalOpen(true);
     },
     onSaved: handleAccrualSaved,
+    onCatalogChanged: () => setCatalogRefresh((k) => k + 1),
     isRowPresent: (id) => history.some((h) => h.id === id),
     showToast,
   });
@@ -5231,7 +5046,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .api-pro-head{padding:1.5rem 1.7rem 1.1rem;border-bottom:1px solid var(--edge)}
 .api-pro-title{font-family:var(--display);font-size:1.15rem;font-weight:700;color:var(--txt);
   margin-bottom:.35rem;letter-spacing:-.005em}
-.api-pro-sub{font-size:.85rem;color:var(--txt2);font-weight:300;line-height:1.5;margin:0}
 .api-pro-body{padding:1.5rem 1.7rem 1.7rem}
 .api-pro-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
 .api-pro-grid .api-fld.api-fld-full{grid-column:1 / -1}
@@ -5252,11 +5066,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   margin:0;flex:1;min-width:0}
 .api-pro-msg.ok{color:var(--green)}
 .api-pro-msg.err{color:var(--red)}
-.api-pro-hint{margin-top:1.2rem;padding:.9rem 1.1rem;background:var(--gold-bg);
-  border:1px solid rgba(201,168,76,.18);border-radius:11px;font-size:.78rem;
-  color:var(--txt2);font-weight:300;line-height:1.55;display:flex;gap:.7rem;align-items:flex-start}
-.api-pro-hint-ico{color:var(--gold2);flex-shrink:0;margin-top:1px;display:inline-flex}
-.api-pro-hint-ico svg{width:16px;height:16px;display:block}
 .api-pro-actions{display:grid;grid-template-columns:1fr 1fr;gap:.8rem;margin-top:1.6rem}
 .api-pro-actions .api-pro-btn{flex:none;min-width:0;width:100%}
 .api-pro-btn.ghost{background:rgba(255,255,255,.04);color:var(--txt);
@@ -5422,20 +5231,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   border:1px solid rgba(127,127,127,.2);color:var(--txt2);white-space:nowrap}
 .rz-code.ok{color:#7BE0A0;border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.08)}
 .rz-code.no{color:var(--txt3);opacity:.7}
-.api-extra-heading{margin-top:1.7rem;font-family:var(--display);font-size:.95rem;font-weight:600;
-  color:var(--txt2);letter-spacing:.01em}
-.api-extra-note{margin:.3rem 0 .9rem;font-size:.8rem;color:var(--txt3);line-height:1.5;max-width:62ch}
-.api-extra{opacity:.94}
-.api-extra-sum{position:relative;cursor:pointer;list-style:none;display:block;outline:none}
-.api-extra-sum::-webkit-details-marker{display:none}
-.api-extra-sum::after{content:"▸";position:absolute;right:1.7rem;top:1.55rem;color:var(--txt3);
-  transition:transform .2s ease;font-size:.85rem}
-details[open] > .api-extra-sum::after{transform:rotate(90deg)}
-.api-extra-sum:hover .api-pro-title{color:var(--gold2)}
 @media(max-width:640px){
   .api-costgap-actions .api-pro-btn{min-width:0;width:100%}
   .api-result-net{font-size:1.8rem}
-  .api-extra-sum::after{right:1.3rem}
 }
 
 .api-input:disabled,
@@ -9513,76 +9311,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
 
                 {/* Не хватает себестоимости — структурированный блок с действиями.
                     Расчёт не сделан, попытка не списана. */}
-                {apiCostGap && (
-                  <div className="api-costgap" role="alert">
-                    <div className="api-costgap-title">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ width: 18, height: 18, flexShrink: 0 }}>
-                        <circle cx="12" cy="12" r="9" />
-                        <path d="M12 8v5" />
-                        <circle cx="12" cy="16.4" r=".7" fill="currentColor" />
-                      </svg>
-                      Не хватает себестоимости у товаров
-                    </div>
-                    <p className="api-costgap-sub">
-                      Чтобы рассчитать чистую прибыль, заполните себестоимость всех
-                      товаров в каталоге. Сейчас расчёт не сделан и попытка не
-                      списана.
-                    </p>
-                    <div className="api-costgap-stats">
-                      {apiCostGap.unmatchedItems > 0 && (
-                        <span className="api-costgap-chip">
-                          Не сопоставлено с каталогом: {fmt(apiCostGap.unmatchedItems)}
-                        </span>
-                      )}
-                      {apiCostGap.matchedNoCostCount > 0 && (
-                        <span className="api-costgap-chip">
-                          Без себестоимости (0 ₽): {fmt(apiCostGap.matchedNoCostCount)}
-                        </span>
-                      )}
-                      {apiCostGap.status === "no_cost" &&
-                        apiCostGap.unmatchedItems === 0 &&
-                        apiCostGap.matchedNoCostCount === 0 && (
-                          <span className="api-costgap-chip">
-                            Себестоимость не найдена
-                          </span>
-                        )}
-                    </div>
-                    <div className="api-costgap-actions">
-                      <button type="button" className="api-pro-btn" onClick={goToCatalog}>
-                        Перейти в каталог товаров
-                      </button>
-                      {apiCostGap.unmatchedItems > 0 && (
-                        <button
-                          type="button"
-                          className="api-pro-btn ghost"
-                          onClick={() => importMissingProducts(profitMonth)}
-                          disabled={importLoading}
-                        >
-                          {importLoading ? (
-                            <>
-                              <span className="spin" />
-                              Добавляем…
-                            </>
-                          ) : (
-                            "Добавить несопоставленные товары в каталог"
-                          )}
-                        </button>
-                      )}
-                    </div>
-                    {importError && (
-                      <p className="api-pro-msg err" style={{ marginTop: ".8rem" }}>
-                        {importError}
-                      </p>
-                    )}
-                    {importResult && (
-                      <p className="api-pro-msg ok" style={{ marginTop: ".8rem" }}>
-                        Добавлено в каталог: {fmt(importResult.totals.created)}. Теперь
-                        заполните им себестоимость в каталоге товаров и повторите
-                        расчёт.
-                      </p>
-                    )}
-                  </div>
-                )}
+                {apiCostGap && <ApiCostGapNotice gap={apiCostGap} onOpenCatalog={goToCatalog} />}
 
                 {/* Успех — чистый результат. Показываем только после сохранения. */}
                 {profitResult && apiSaved && (
@@ -9887,638 +9616,6 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
             )}
           </div>
         </div>
-        )}
-
-        {calcMode === "api" && (
-        <>
-        <div className="api-extra-heading">Дополнительные действия и диагностика</div>
-        <p className="api-extra-note">
-          Эти инструменты не нужны для обычного расчёта. Откройте их, только если
-          часть товаров не сопоставлена с каталогом. Подключение и проверка Ozon
-          API — во вкладке «Личный кабинет». Прибыль здесь не считается и попытка
-          не списывается.
-        </p>
-        <details className="card api-pro-card api-extra">
-          <summary className="api-pro-head api-extra-sum">
-            <div className="api-pro-title">Диагностика сопоставления товаров</div>
-            <p className="api-pro-sub">
-              Проверяем, какие товары из Ozon API удалось найти в каталоге
-              себестоимости. Это ещё не расчёт прибыли — данные не сохраняются и не
-              списывают попытку.
-            </p>
-          </summary>
-
-          <div className="api-pro-body">
-            {!ozonConn?.connected ? (
-              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
-                Сначала подключите Ozon API
-              </p>
-            ) : (
-              <>
-                <div
-                  className="api-pro-grid"
-                  style={{ gridTemplateColumns: "minmax(0,1fr) auto", alignItems: "end" }}
-                >
-                  <div className="api-fld">
-                    <label htmlFor="ozon-match-month">Месяц</label>
-                    <input
-                      id="ozon-match-month"
-                      className="api-input"
-                      type="month"
-                      value={matchMonth}
-                      max={new Date().toISOString().slice(0, 7)}
-                      onChange={(e) => setMatchMonth(e.target.value)}
-                      disabled={matchLoading}
-                    />
-                  </div>
-                  <div className="api-fld">
-                    <button
-                      type="button"
-                      className="api-pro-btn"
-                      onClick={loadPostingsMatch}
-                      disabled={matchLoading}
-                    >
-                      {matchLoading ? (
-                        <>
-                          <span className="spin" />
-                          Проверяем…
-                        </>
-                      ) : (
-                        "Проверить сопоставление товаров"
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                {matchError && (
-                  <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
-                    {matchError}
-                  </p>
-                )}
-
-                {matchResult && (
-                  <div style={{ marginTop: "1rem" }}>
-                    {matchResult.warnings.map((w) => (
-                      <div
-                        key={w}
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(245,158,11,.10)",
-                          border: "1px solid rgba(245,158,11,.35)",
-                          marginBottom: ".5rem",
-                        }}
-                      >
-                        <span className="api-alert-text">{w}</span>
-                      </div>
-                    ))}
-
-                    <div
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-                        gap: ".6rem",
-                        marginTop: ".25rem",
-                      }}
-                    >
-                      {[
-                        { label: "Всего отправлений", value: fmt(matchResult.totals.postingCount) },
-                        { label: "Строк товаров", value: fmt(matchResult.totals.itemRows) },
-                        { label: "Уникальных товаров", value: fmt(matchResult.totals.uniqueOzonItems) },
-                        { label: "Сопоставлено", value: fmt(matchResult.totals.matchedItems) },
-                        { label: "Не сопоставлено", value: fmt(matchResult.totals.unmatchedItems) },
-                        { label: "Сопоставлено единиц", value: fmt(matchResult.totals.matchedQuantity) },
-                        { label: "Не сопоставлено единиц", value: fmt(matchResult.totals.unmatchedQuantity) },
-                      ].map((c) => (
-                        <div
-                          key={c.label}
-                          style={{
-                            border: "1px solid rgba(127,127,127,.25)",
-                            borderRadius: "12px",
-                            padding: ".6rem .8rem",
-                          }}
-                        >
-                          <div style={{ fontSize: ".78rem", opacity: 0.7 }}>{c.label}</div>
-                          <div
-                            style={{
-                              fontSize: "1.05rem",
-                              fontWeight: 700,
-                              marginTop: ".15rem",
-                            }}
-                          >
-                            {c.value}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    {(() => {
-                      const cbs = matchResult.costByStatus;
-                      if (!cbs || cbs.rows.length === 0) return null;
-                      const pct = (x: number) =>
-                        `${(x * 100).toLocaleString("ru-RU", {
-                          maximumFractionDigits: 1,
-                        })}%`;
-                      const highlights = [
-                        {
-                          label: "Себестоимость всего",
-                          value: cbs.totalMatchedCost,
-                          accent: false,
-                        },
-                        {
-                          label: "Доставлено",
-                          value: cbs.deliveredMatchedCost,
-                          accent: false,
-                        },
-                        {
-                          label: "Не доставлено",
-                          value: cbs.nonDeliveredMatchedCost,
-                          accent: true,
-                        },
-                        {
-                          label: "Отменено",
-                          value: cbs.cancelledMatchedCost,
-                          accent: true,
-                        },
-                      ];
-                      return (
-                        <div
-                          style={{
-                            marginTop: "1rem",
-                            border: "1px solid rgba(201,168,76,.3)",
-                            borderRadius: "14px",
-                            padding: ".85rem .9rem",
-                            background: "rgba(201,168,76,.05)",
-                          }}
-                        >
-                          <div style={{ fontWeight: 700, marginBottom: ".15rem" }}>
-                            Себестоимость по статусам отправлений
-                          </div>
-                          <p
-                            className="api-pro-sub"
-                            style={{ marginTop: 0, marginBottom: ".7rem" }}
-                          >
-                            Диагностика (все статусы): показывает, из каких статусов
-                            складывается себестоимость отправлений. В расчёт
-                            себестоимости включаются только доставленные отправления —
-                            отменённые и недоставленные не списываются.
-                          </p>
-
-                          <div
-                            style={{
-                              display: "grid",
-                              gridTemplateColumns:
-                                "repeat(auto-fit, minmax(140px, 1fr))",
-                              gap: ".6rem",
-                              marginBottom: ".85rem",
-                            }}
-                          >
-                            {highlights.map((h) => (
-                              <div
-                                key={h.label}
-                                style={{
-                                  border: h.accent
-                                    ? "1px solid rgba(245,158,11,.4)"
-                                    : "1px solid rgba(127,127,127,.25)",
-                                  borderRadius: "12px",
-                                  padding: ".6rem .8rem",
-                                  background: h.accent
-                                    ? "rgba(245,158,11,.07)"
-                                    : "transparent",
-                                }}
-                              >
-                                <div style={{ fontSize: ".78rem", opacity: 0.7 }}>
-                                  {h.label}
-                                </div>
-                                <div
-                                  style={{
-                                    fontSize: "1.05rem",
-                                    fontWeight: 700,
-                                    marginTop: ".15rem",
-                                  }}
-                                >
-                                  {fmt(h.value)} ₽
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-
-                          <div
-                            style={{
-                              display: "flex",
-                              flexDirection: "column",
-                              gap: ".4rem",
-                            }}
-                          >
-                            {cbs.rows.map((r) => (
-                              <div
-                                key={r.status || "(empty)"}
-                                style={{
-                                  display: "flex",
-                                  flexWrap: "wrap",
-                                  justifyContent: "space-between",
-                                  gap: ".5rem",
-                                  borderBottom:
-                                    "1px solid rgba(127,127,127,.12)",
-                                  paddingBottom: ".35rem",
-                                }}
-                              >
-                                <div style={{ minWidth: 0 }}>
-                                  <div
-                                    style={{ fontWeight: 600, fontSize: ".9rem" }}
-                                  >
-                                    {r.label}
-                                  </div>
-                                  <div
-                                    style={{ fontSize: ".76rem", opacity: 0.65 }}
-                                  >
-                                    {fmt(r.postingCount)} отпр. ·{" "}
-                                    {fmt(r.matchedQuantity)} ед. с себест.
-                                    {r.unmatchedQuantity > 0
-                                      ? ` · ${fmt(r.unmatchedQuantity)} ед. без`
-                                      : ""}
-                                  </div>
-                                </div>
-                                <div
-                                  style={{
-                                    textAlign: "right",
-                                    whiteSpace: "nowrap",
-                                  }}
-                                >
-                                  <div
-                                    style={{ fontWeight: 700, fontSize: ".95rem" }}
-                                  >
-                                    {fmt(r.matchedCost)} ₽
-                                  </div>
-                                  <div
-                                    style={{ fontSize: ".76rem", opacity: 0.65 }}
-                                  >
-                                    {pct(r.shareOfMatchedCost)}
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-
-                          {cbs.notes.length > 0 && (
-                            <ul
-                              style={{
-                                marginTop: ".7rem",
-                                marginBottom: 0,
-                                paddingLeft: "1.1rem",
-                                opacity: 0.75,
-                                fontSize: ".8rem",
-                              }}
-                            >
-                              {cbs.notes.map((n) => (
-                                <li key={n} style={{ marginBottom: ".2rem" }}>
-                                  {n}
-                                </li>
-                              ))}
-                            </ul>
-                          )}
-                        </div>
-                      );
-                    })()}
-
-                    {matchResult.totals.itemRows > 0 &&
-                      matchResult.totals.unmatchedItems === 0 && (
-                        <div
-                          className="api-alert ok"
-                          role="status"
-                          style={{ marginTop: "1rem" }}
-                        >
-                          <span className="api-alert-text">
-                            Все найденные товары сопоставлены с каталогом
-                            себестоимости.
-                          </span>
-                        </div>
-                      )}
-
-                    {matchResult.unmatched.length > 0 && (
-                      <div
-                        style={{
-                          marginTop: "1rem",
-                          border: "1px solid rgba(127,127,127,.2)",
-                          borderRadius: "12px",
-                          padding: ".75rem .9rem",
-                        }}
-                      >
-                        <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
-                          Несопоставленные товары
-                        </div>
-                        <p
-                          className="api-pro-sub"
-                          style={{ marginTop: 0, marginBottom: ".5rem" }}
-                        >
-                          Добавьте себестоимость/артикул в каталог, чтобы следующий
-                          API-расчёт смог учесть эти товары.
-                        </p>
-                        <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
-                          {matchResult.unmatched.map((u, i) => (
-                            <div
-                              key={(u.offerId || u.sku || u.name || "x") + i}
-                              style={{
-                                display: "flex",
-                                flexWrap: "wrap",
-                                justifyContent: "space-between",
-                                gap: ".5rem",
-                                borderBottom: "1px solid rgba(127,127,127,.12)",
-                                paddingBottom: ".35rem",
-                              }}
-                            >
-                              <div style={{ minWidth: 0 }}>
-                                <div style={{ fontWeight: 600, fontSize: ".9rem" }}>
-                                  {u.name || u.offerId || u.sku || "—"}
-                                </div>
-                                <div style={{ fontSize: ".76rem", opacity: 0.7 }}>
-                                  {u.offerId ? `Артикул: ${u.offerId}` : ""}
-                                  {u.offerId && u.sku ? " · " : ""}
-                                  {u.sku ? `SKU: ${u.sku}` : ""}
-                                </div>
-                                <div style={{ fontSize: ".76rem", opacity: 0.6 }}>
-                                  {u.reason}
-                                </div>
-                              </div>
-                              <div
-                                style={{
-                                  fontSize: ".82rem",
-                                  whiteSpace: "nowrap",
-                                  opacity: 0.85,
-                                }}
-                              >
-                                {fmt(u.quantity)} шт.
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {matchResult.notes.length > 0 && (
-                      <ul
-                        style={{
-                          marginTop: ".75rem",
-                          paddingLeft: "1.1rem",
-                          opacity: 0.75,
-                          fontSize: ".82rem",
-                        }}
-                      >
-                        {matchResult.notes.map((n) => (
-                          <li key={n} style={{ marginBottom: ".2rem" }}>
-                            {n}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-
-            <div className="api-pro-hint">
-              <span className="api-pro-hint-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 8v5" />
-                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
-                </svg>
-              </span>
-              Диагностика только сопоставляет товары с каталогом. Прибыль не
-              считается, ничего не сохраняется и не списывает расчёт.
-            </div>
-          </div>
-        </details>
-        </>
-        )}
-
-        {calcMode === "api" && (
-        <details className="card api-pro-card api-extra">
-          <summary className="api-pro-head api-extra-sum">
-            <div className="api-pro-title">Добавить несопоставленные товары в каталог</div>
-            <p className="api-pro-sub">
-              Сайт добавит товары из Ozon API, которых нет в каталоге.
-              Себестоимость не будет придумываться — после добавления заполните её
-              вручную в каталоге товаров.
-            </p>
-          </summary>
-
-          <div className="api-pro-body">
-            {!ozonConn?.connected ? (
-              <p className="api-pro-msg" style={{ marginTop: ".4rem" }}>
-                Сначала подключите Ozon API
-              </p>
-            ) : (
-              <>
-                <div
-                  className="api-pro-grid"
-                  style={{ gridTemplateColumns: "minmax(0,1fr) auto", alignItems: "end" }}
-                >
-                  <div className="api-fld">
-                    <label htmlFor="ozon-import-month">Месяц</label>
-                    <input
-                      id="ozon-import-month"
-                      className="api-input"
-                      type="month"
-                      value={importMonth}
-                      max={new Date().toISOString().slice(0, 7)}
-                      onChange={(e) => setImportMonth(e.target.value)}
-                      disabled={importLoading}
-                    />
-                  </div>
-                  <div className="api-fld">
-                    <button
-                      type="button"
-                      className="api-pro-btn"
-                      onClick={() => importMissingProducts()}
-                      disabled={importLoading}
-                    >
-                      {importLoading ? (
-                        <>
-                          <span className="spin" />
-                          Добавляем…
-                        </>
-                      ) : (
-                        "Добавить несопоставленные в каталог"
-                      )}
-                    </button>
-                  </div>
-                </div>
-
-                {importError && (
-                  <p className="api-pro-msg err" style={{ marginTop: "1rem" }}>
-                    {importError}
-                  </p>
-                )}
-
-                {importResult && (
-                  <div style={{ marginTop: "1rem" }}>
-                    {importResult.warnings.map((w) => (
-                      <div
-                        key={w}
-                        className="api-alert"
-                        role="alert"
-                        style={{
-                          background: "rgba(245,158,11,.10)",
-                          border: "1px solid rgba(245,158,11,.35)",
-                          marginBottom: ".5rem",
-                        }}
-                      >
-                        <span className="api-alert-text">{w}</span>
-                      </div>
-                    ))}
-
-                    <div
-                      style={{
-                        display: "grid",
-                        gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
-                        gap: ".6rem",
-                        marginTop: ".25rem",
-                      }}
-                    >
-                      {[
-                        { label: "Не сопоставлено (Ozon)", value: fmt(importResult.totals.unmatchedFromOzon) },
-                        { label: "Добавлено в каталог", value: fmt(importResult.totals.created) },
-                        { label: "Уже в каталоге", value: fmt(importResult.totals.skippedExisting) },
-                        { label: "Без артикула (не добавлены)", value: fmt(importResult.totals.skippedNoOfferId) },
-                      ].map((c) => (
-                        <div
-                          key={c.label}
-                          style={{
-                            border: "1px solid rgba(127,127,127,.25)",
-                            borderRadius: "12px",
-                            padding: ".6rem .8rem",
-                          }}
-                        >
-                          <div style={{ fontSize: ".78rem", opacity: 0.7 }}>{c.label}</div>
-                          <div
-                            style={{
-                              fontSize: "1.05rem",
-                              fontWeight: 700,
-                              marginTop: ".15rem",
-                            }}
-                          >
-                            {c.value}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-
-                    {importResult.totals.unmatchedFromOzon === 0 && (
-                      <div
-                        className="api-alert ok"
-                        role="status"
-                        style={{ marginTop: "1rem" }}
-                      >
-                        <span className="api-alert-text">
-                          Все товары уже есть в каталоге. Добавление не требуется.
-                        </span>
-                      </div>
-                    )}
-
-                    {importResult.totals.created > 0 && (
-                      <div
-                        className="api-alert ok"
-                        role="status"
-                        style={{ marginTop: "1rem" }}
-                      >
-                        <span className="api-alert-text">
-                          Товары добавлены в каталог. Теперь заполните себестоимость
-                          и повторите проверку сопоставления.
-                        </span>
-                      </div>
-                    )}
-
-                    {importResult.created.length > 0 && (
-                      <div
-                        style={{
-                          marginTop: "1rem",
-                          border: "1px solid rgba(127,127,127,.2)",
-                          borderRadius: "12px",
-                          padding: ".75rem .9rem",
-                        }}
-                      >
-                        <div style={{ fontWeight: 700, marginBottom: ".4rem" }}>
-                          Добавленные товары
-                        </div>
-                        <p
-                          className="api-pro-sub"
-                          style={{ marginTop: 0, marginBottom: ".5rem" }}
-                        >
-                          Себестоимость у этих товаров пока 0 — заполните её вручную
-                          в каталоге товаров, иначе следующий расчёт будет неполным.
-                        </p>
-                        <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
-                          {importResult.created.map((c, i) => (
-                            <div
-                              key={(c.sku || c.name || "x") + i}
-                              style={{
-                                display: "flex",
-                                flexWrap: "wrap",
-                                justifyContent: "space-between",
-                                gap: ".5rem",
-                                borderBottom: "1px solid rgba(127,127,127,.12)",
-                                paddingBottom: ".35rem",
-                              }}
-                            >
-                              <div style={{ minWidth: 0 }}>
-                                <div style={{ fontWeight: 600, fontSize: ".9rem" }}>
-                                  {c.name || c.sku || "—"}
-                                </div>
-                                <div style={{ fontSize: ".76rem", opacity: 0.7 }}>
-                                  {c.sku ? `Артикул: ${c.sku}` : ""}
-                                </div>
-                              </div>
-                              <div
-                                style={{
-                                  fontSize: ".82rem",
-                                  whiteSpace: "nowrap",
-                                  opacity: 0.85,
-                                }}
-                              >
-                                себестоимость 0 ₽
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-
-                    {importResult.notes.length > 0 && (
-                      <ul
-                        style={{
-                          marginTop: ".75rem",
-                          paddingLeft: "1.1rem",
-                          opacity: 0.75,
-                          fontSize: ".82rem",
-                        }}
-                      >
-                        {importResult.notes.map((n) => (
-                          <li key={n} style={{ marginBottom: ".2rem" }}>
-                            {n}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                )}
-              </>
-            )}
-
-            <div className="api-pro-hint">
-              <span className="api-pro-hint-ico">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="9" />
-                  <path d="M12 8v5" />
-                  <circle cx="12" cy="16.4" r=".6" fill="currentColor" />
-                </svg>
-              </span>
-              Добавляются только новые товары (артикул = offer_id, себестоимость 0).
-              Существующие товары не изменяются, прибыль не считается, расчёт не
-              сохраняется и не списывается.
-            </div>
-          </div>
-        </details>
         )}
 
         {/* Просмотр сохранённого расчёта по «Отчёту по начислениям» из истории
@@ -12010,7 +11107,7 @@ details[open] > .api-extra-sum::after{transform:rotate(90deg)}
         )}
 
         {user && mainTab === "catalog" && (
-          <ProductCatalog user={user} showToast={showToast} />
+          <ProductCatalog user={user} showToast={showToast} refreshKey={catalogRefresh} />
         )}
 
         {/* PR #26: вкладка «Личный кабинет». Гейтится по user (для гостя её нет —

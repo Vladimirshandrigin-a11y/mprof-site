@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../../cloud/_lib/auth";
+import { importMissingCatalogProducts } from "../../cloud/_lib/catalog-import";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import {
   isMonthInFuture,
@@ -24,8 +25,13 @@ import {
 // AI/PDF НЕ запускаются. Себестоимость НЕ выдумывается — её пользователь
 // заполняет вручную в каталоге уже после добавления.
 //
+// Запись в каталог выполняет ЕДИНАЯ функция cloud/_lib/catalog-import (та же, что у
+// автодобавления в API-расчёте и в сценарии XLSX): повторный и одновременный запрос
+// дублей не создаёт. Ручного UI для этого route больше нет; он сохранён как read/
+// write-инструмент на основе отправлений (postings) и для диагностики.
+//
 // Безопасность каталога:
-//   • только INSERT новых товаров (никаких update/upsert/delete);
+//   • только INSERT новых товаров (никаких update/upsert к существующим строкам);
 //   • существующие товары НЕ перезаписываются (ни cost_price, ни name);
 //   • дубли не создаём: товар, который уже сопоставляется с каталогом
 //     (offer_id↔products.sku или точное Ozon-sku↔products.sku, без fuzzy),
@@ -169,44 +175,25 @@ export async function POST(req: NextRequest) {
   const warnings = [...plan.warnings];
   const notes = [...plan.notes];
 
-  // ---- 4) INSERT только новых товаров (sku = offer_id, cost_price = 0) ----
-  // Никаких update/upsert/delete: существующие строки не трогаем.
+  // ---- 4) добавление только новых товаров через единую функцию (sku = offer_id, cost_price = 0) ----
+  // Никаких update/upsert существующих строк; дубли и гонки закрывает общая функция.
   const created: Array<{ sku: string; name: string; costPrice: number | null }> = [];
 
   if (plan.eligible.length > 0) {
-    const rows = plan.eligible.map((e) => ({
-      user_id: userId,
-      sku: e.offerId,
-      name: e.name,
-      cost_price: 0,
-    }));
-
-    const { data: inserted, error: insErr } = await admin
-      .from("products")
-      .insert(rows)
-      .select("sku, name, cost_price");
-
-    if (insErr) {
+    const imported = await importMissingCatalogProducts(
+      admin,
+      userId,
+      plan.eligible.map((e) => ({ offerId: e.offerId, name: e.name }))
+    );
+    if (!imported.ok) {
       // eslint-disable-next-line no-console
-      console.error("[api/ozon/import-missing-products] products insert error", insErr);
+      console.error("[api/ozon/import-missing-products] catalog import error", imported.error);
       return NextResponse.json(
         { error: "Не удалось добавить товары в каталог" },
         { status: 502, headers: NO_STORE }
       );
     }
-
-    const insertedRows = (inserted ?? []) as Array<{
-      sku: string | null;
-      name: string | null;
-      cost_price: number | null;
-    }>;
-    for (const r of insertedRows) {
-      created.push({
-        sku: typeof r.sku === "string" ? r.sku : "",
-        name: typeof r.name === "string" ? r.name : "",
-        costPrice: typeof r.cost_price === "number" ? r.cost_price : null,
-      });
-    }
+    for (const c of imported.created) created.push({ sku: c.sku, name: c.name, costPrice: 0 });
   }
 
   // ---- 5) skipped = уже в каталоге + без offer_id ----

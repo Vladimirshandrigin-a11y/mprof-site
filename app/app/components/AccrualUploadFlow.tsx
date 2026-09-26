@@ -224,7 +224,8 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
           ))}
         </ol>
         <p className="accr-guide-note">
-          Файл читается в вашем браузере, на сервере сохраняется только итог расчёта.
+          Файл читается в вашем браузере и на сервер не загружается. На сервер передаются только итог расчёта
+          и артикулы, SKU и названия товаров, которых ещё нет в вашем каталоге, — чтобы добавить их в каталог.
         </p>
       </details>
 
@@ -362,7 +363,13 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
           </div>
 
           <div className="accr-catalog" aria-live="polite">
-            {s.catalog.status === "loading" && <span className="accr-cat-line">Загружаем каталог себестоимости…</span>}
+            {s.catalog.status === "loading" && (
+              <span className="accr-cat-line">
+                {s.catalogImport.status === "running"
+                  ? "Добавляем недостающие товары в каталог…"
+                  : "Загружаем каталог себестоимости…"}
+              </span>
+            )}
             {s.catalog.status === "ready" && (
               <span className="accr-cat-line">
                 Каталог себестоимости: {s.catalog.entries.length}{" "}
@@ -388,6 +395,29 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
               Проверить снова
             </button>
           </div>
+
+          {s.catalogImport.status === "done" &&
+            s.catalogImport.created > 0 &&
+            (!ok || ok.problemProducts.length > 0) && (
+            <div className="accr-import-note" role="status">
+              Добавлено в каталог: {s.catalogImport.created}{" "}
+              {pluralRu(s.catalogImport.created, "товар", "товара", "товаров")} — без себестоимости. Укажите её в
+              каталоге и нажмите «Проверить снова».
+            </div>
+          )}
+          {s.catalogImport.status === "done" && s.catalogImport.ambiguous > 0 && (
+            <div className="accr-import-note warn" role="status">
+              Не добавлено из-за неоднозначного сопоставления: {s.catalogImport.ambiguous}{" "}
+              {pluralRu(s.catalogImport.ambiguous, "товар", "товара", "товаров")} (в каталоге несколько строк с
+              одним артикулом или у артикула разные Ozon SKU). Проверьте каталог и добавьте их вручную.
+            </div>
+          )}
+          {s.catalogImport.status === "error" && (
+            <div className="accr-import-note err" role="alert">
+              Не удалось добавить товары в каталог: {s.catalogImport.message}. Товары не добавлены — нажмите
+              «Проверить снова», чтобы повторить, или добавьте их вручную.
+            </div>
+          )}
 
           {ev && ev.status === "input_error" && (
             <div className="upload-3-error" role="alert">
@@ -511,6 +541,10 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
     background:linear-gradient(180deg,rgba(201,168,76,.06),rgba(255,255,255,.02))}
   .accr-locked-kicker{font-family:var(--mono);font-size:.68rem;text-transform:uppercase;letter-spacing:.09em;color:var(--gold2)}
   .accr-locked-text{margin:.55rem 0 1rem;font-size:.84rem;line-height:1.5;color:var(--txt2)}
+  .accr-import-note{margin:.7rem 0 0;padding:.6rem .8rem;border-radius:10px;font-size:.78rem;line-height:1.5;
+    color:#7be8b2;border:1px solid rgba(46,204,138,.3);background:rgba(46,204,138,.07)}
+  .accr-import-note.warn{color:#f0cd84;border-color:rgba(232,176,75,.32);background:rgba(232,176,75,.07)}
+  .accr-import-note.err{color:#f0b0b3;border-color:rgba(224,85,102,.4);background:rgba(224,85,102,.09)}
   .accr-held-note{margin:.7rem 0 0;padding:.6rem .8rem;border-radius:10px;font-size:.76rem;line-height:1.45;
     color:#f0cd84;border:1px solid rgba(232,176,75,.32);background:rgba(232,176,75,.07)}
   .accr-notes{list-style:none;margin:.8rem 0 0;padding:0;display:flex;flex-direction:column;gap:.4rem}

@@ -584,6 +584,19 @@ export async function loadProductsFromCloud(
   return { data: res.data ?? [], error: null };
 }
 
+/**
+ * Уникальность артикула в каталоге (миграция 20260926_products_article_unique): БД
+ * отклоняет вторую строку с тем же артикулом (без учёта регистра и лишних пробелов)
+ * кодом 23505. Показываем понятный текст вместо технического.
+ */
+function productWriteError(error: unknown): CloudErrorInfo {
+  const info = fmtError(error);
+  if (info.code === "23505") {
+    return { ...info, message: "Товар с таким артикулом уже есть в каталоге" };
+  }
+  return info;
+}
+
 export async function addProductToCloud(
   input: ProductInsertInput,
   userId: string
@@ -595,11 +608,47 @@ export async function addProductToCloud(
       .insert([payload])
       .select()
       .single();
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) return { data: null, error: productWriteError(error) };
     return { data: (data as Product | null) ?? null, error: null };
   } catch (e) {
     return { data: null, error: fmtError(e) };
   }
+}
+
+/** Товар-кандидат для автодобавления в каталог: только товарные поля (не весь отчёт). */
+export interface CatalogImportItem {
+  /** Артикул продавца (offer_id). */
+  offerId: string;
+  /** Ozon SKU (если есть). */
+  sku?: string;
+  name?: string;
+}
+
+/** Итог серверного автодобавления (/api/cloud/products/import-missing). */
+export interface CatalogImportOutcome {
+  created: number;
+  alreadyInCatalog: number;
+  ambiguous: number;
+  noArticle: number;
+  invalid: number;
+}
+
+/**
+ * Добавить в каталог ОТСУТСТВУЮЩИЕ товары (sku = артикул, себестоимость не указана).
+ * Идёт через сервер: он берёт user_id из токена и использует ту же функцию, что и
+ * API-расчёт. Существующие товары не перезаписываются, повторный вызов дублей не
+ * создаёт. При ошибке возвращает error — вызывающий НЕ должен показывать успех.
+ */
+export async function importMissingProductsToCloud(
+  items: readonly CatalogImportItem[]
+): Promise<CloudResult<CatalogImportOutcome>> {
+  return cloudSend<CatalogImportOutcome>("/api/cloud/products/import-missing", "POST", {
+    products: items.map((i) => ({
+      offerId: i.offerId,
+      ...(i.sku ? { sku: i.sku } : {}),
+      ...(i.name ? { name: i.name } : {}),
+    })),
+  });
 }
 
 export async function updateProductInCloud(
@@ -615,7 +664,7 @@ export async function updateProductInCloud(
       .eq("user_id", userId)
       .select()
       .single();
-    if (error) return { data: null, error: fmtError(error) };
+    if (error) return { data: null, error: productWriteError(error) };
     return { data: (data as Product | null) ?? null, error: null };
   } catch (e) {
     return { data: null, error: fmtError(e) };

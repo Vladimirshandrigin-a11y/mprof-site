@@ -489,6 +489,41 @@ create policy "products_delete_own"
   on public.products for delete
   using (auth.uid() = user_id);
 
+-- Уникальность артикула по КАНОНИЧЕСКОМУ ключу (PR #99). Применяется отдельной
+-- миграцией supabase/migrations/20260926_products_article_unique.sql — она же
+-- проверяет окружение и ОСТАНАВЛИВАЕТСЯ при существующих конфликтах (сначала
+-- read-only supabase/checks/products_article_conflicts.sql). Здесь — итоговое
+-- состояние схемы для полноты дампа.
+create or replace function public.canonical_article(s text)
+returns text
+language sql
+immutable
+parallel safe
+strict
+as $$
+  select nullif(
+    lower(
+      btrim(
+        regexp_replace(
+          s,
+          '[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]+',
+          ' ',
+          'g'
+        ),
+        ' '
+      )
+    ),
+    ''
+  )
+$$;
+
+alter table public.products
+  add column if not exists sku_key text
+  generated always as (public.canonical_article(sku)) stored;
+
+create unique index if not exists products_user_sku_key_uq
+  on public.products (user_id, sku_key);
+
 -- ============================================================================
 -- report_history — помесячная история расчётов для блока «Аналитика по месяцам»
 --
