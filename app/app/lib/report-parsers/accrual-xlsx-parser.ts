@@ -10,8 +10,11 @@
 //    полноценного расчёта себестоимости): «Артикул», «SKU», «Название товара»,
 //    «Количество» — при отсутствии структурированная ошибка со списком колонок;
 //  • суммы — ЦЕЛЫЕ КОПЕЙКИ; пустая/нечисловая сумма — ошибка, НЕ ноль;
-//  • строки НЕ дедуплицируются: «ID начисления» — номер отправления и у разных
-//    строк совпадает (193 разных на 1 220 заполненных в июньском отчёте);
+//  • строки НЕ дедуплицируются: «ID начисления» у разных строк совпадает (193
+//    разных на 1 220 заполненных в июньском отчёте). Колонка НЕобязательная и
+//    читается как ссылка операции (row.ref) — номер отправления у товарных строк,
+//    номер заказа у эквайринга, иные ID у рекламы/размещения; её наличие
+//    сообщается в report.refColumn (разделение результата товара без неё недоступно);
 //  • период — по «Дата начисления»; неполный календарный месяц →
 //    periodComplete:false + warning (сам по себе НЕ блокирует); отчёт за
 //    несколько месяцев — ошибка multiple_months (месячный расчёт неопределён);
@@ -94,6 +97,8 @@ export interface AccrualPeriod {
 
 export interface AccrualReport {
   sheetName: string;
+  /** В файле есть колонка «ID начисления» (ссылки операций в row.ref). */
+  refColumn: boolean;
   /** Номер строки заголовков (1-based). */
   headerRowNumber: number;
   rows: AccrualRow[];
@@ -131,9 +136,13 @@ const PRODUCT_COLUMNS = [
   { key: "quantity", label: "Количество" },
 ] as const;
 
+/** Необязательные колонки: отсутствие — не ошибка. */
+const OPTIONAL_COLUMNS = [{ key: "ref", label: "ID начисления" }] as const;
+
 type ColKey =
   | (typeof FINANCIAL_COLUMNS)[number]["key"]
-  | (typeof PRODUCT_COLUMNS)[number]["key"];
+  | (typeof PRODUCT_COLUMNS)[number]["key"]
+  | (typeof OPTIONAL_COLUMNS)[number]["key"];
 
 /** Нормализация заголовка: регистр, ё/е, пробелы + без знаков . , ; : */
 function normHeader(s: string): string {
@@ -142,7 +151,7 @@ function normHeader(s: string): string {
 
 const HEADER_NORM: Record<ColKey, string> = (() => {
   const o = {} as Record<ColKey, string>;
-  for (const c of [...FINANCIAL_COLUMNS, ...PRODUCT_COLUMNS]) o[c.key] = normHeader(c.label);
+  for (const c of [...FINANCIAL_COLUMNS, ...PRODUCT_COLUMNS, ...OPTIONAL_COLUMNS]) o[c.key] = normHeader(c.label);
   return o;
 })();
 
@@ -376,6 +385,7 @@ export function parseAccrualWorkbook(workbook: XLSX.WorkBook): AccrualParseResul
   if (errors.length > 0) return fail(...errors);
 
   const col = header.cols as Record<ColKey, number>;
+  const refIdx = header.cols.ref;
   const declared = findDeclaredPeriod(rows, header.rowIdx);
 
   // 3) Строки данных.
@@ -438,6 +448,7 @@ export function parseAccrualWorkbook(workbook: XLSX.WorkBook): AccrualParseResul
         name: cellText(row[col.name]),
         quantity,
         amountKopecks: amount.kopecks,
+        ...(refIdx !== undefined ? { ref: cellText(row[refIdx]) } : {}),
       });
     }
   }
@@ -565,6 +576,7 @@ export function parseAccrualWorkbook(workbook: XLSX.WorkBook): AccrualParseResul
     report: {
       sheetName,
       headerRowNumber: rowOffset + header.rowIdx + 1,
+      refColumn: refIdx !== undefined,
       rows: out,
       period: {
         month,

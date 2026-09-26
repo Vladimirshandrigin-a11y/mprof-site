@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { CAT, EXPECTED_BASIC as E } from "./helpers/expected.mjs";
-import { GENERATED_AT, buildSnapshotFor, viaJson } from "./helpers/snapshot-fixtures.mjs";
+import { GENERATED_AT, buildSnapshotFor, toLegacy, viaJson } from "./helpers/snapshot-fixtures.mjs";
 import { calc as C, format as F, snapshot as S } from "./helpers/modules.mjs";
 
 const read = (v) => S.readAccrualSnapshot(v);
@@ -33,7 +33,7 @@ describe("схема и сериализация → чтение", () => {
   it("снимок JSON-безопасен: нет undefined/NaN/Infinity, размер разумный", () => {
     const json = JSON.stringify(built);
     assert.doesNotMatch(json, /NaN|Infinity|undefined/);
-    assert.ok(json.length < 12_000, `размер ${json.length}`);
+    assert.ok(json.length < 16_000, `размер ${json.length}`);
   });
   it("источник: только тип, лист и число строк — исходный файл и операции не сохраняются", () => {
     assert.deepEqual(built.source, { type: "ozon-accrual-report-xlsx", sheet: "Начисления", rowCount: E.rowCount });
@@ -41,7 +41,7 @@ describe("схема и сериализация → чтение", () => {
     assert.deepEqual(Object.keys(built).sort(), [
       "buckets", "costCoverage", "generatedAt", "kind", "manualExpenses", "marginPercent", "netOzonOperationsKopecks",
       "netProfitKopecks", "period", "preliminary", "productTotals", "productionCostKopecks", "products", "quantities",
-      "reconciliation", "returnsRevenueKopecks", "salesRevenueKopecks", "source", "tax", "taxRevenueBaseKopecks",
+      "reconciliation", "returnsRevenueKopecks", "salesRevenueKopecks", "salesSplit", "source", "tax", "taxRevenueBaseKopecks",
       "unknownTaxonomy", "version", "warnings",
     ]);
     assert.doesNotMatch(JSON.stringify(built), /ID-\d/);
@@ -96,7 +96,7 @@ describe("детали, период и итоговые карточки из �
     assert.deepEqual(
       rows.map((r) => [r.label, r.value, r.kind]),
       [
-        ["Реализация (выручка)", 1500, "income"],
+        ["Реализация (выручка)", 1500, "neutral"],
         ["Возвраты выручки", 300, "expense"],
         ["Программы партнёров", 5, "income"],
         ["Баллы за скидки", 25, "income"],
@@ -209,16 +209,21 @@ describe("товарная аналитика сохраняется в сним
     assert.deepEqual([a.revenue, a.returnsAmount, a.quantity, a.cogs, a.profit, a.margin, a.unitCost], [700, 300, 2, 200, 267.49, 38.21, 100]);
     assert.equal(rows.find((r) => r.article === "ART-C").margin, null);
   });
-  it("лучший и худший товар (худший — только с отрицательной прибылью)", () => {
+  it("лучший — по полной прибыли; худший — по продажам: товар только с услугами (C) и частичный возврат (A) в рейтинг продаж не попадают", () => {
     const kp = S.accrualKeyProducts(s);
     assert.equal(kp.best.article, "ART-B");
     assert.equal(kp.best.profitKopecks, 32964);
+    assert.equal(kp.worst, null);
+  });
+  it("старый снимок (без разделения): худший — по полной прибыли и помечен basis=full_profit", () => {
+    const kp = S.accrualKeyProducts(okSnap(toLegacy(s)));
     assert.equal(kp.worst.article, "ART-C");
     assert.equal(kp.worst.profitKopecks, -700);
     assert.equal(kp.worst.marginPercent, null);
+    assert.equal(kp.worst.basis, "full_profit");
   });
-  it("нет убыточных → worst = null", () => {
-    const x = viaJson(s);
+  it("нет убыточных (старый снимок) → worst = null", () => {
+    const x = toLegacy(s);
     x.products = x.products.filter((q) => q.article !== "ART-C");
     x.productTotals.productCount = 2;
     x.productTotals.serviceOnlyCount = 0;
@@ -258,7 +263,9 @@ describe("данные для рекомендаций из снимка", () =>
     );
     assert.deepEqual(r.coverage, { total: 2, withCost: 2, withoutCost: 0 });
     assert.equal(r.best.article, "ART-B");
-    assert.equal(r.worst.margin, null);
+    assert.equal(r.worst, null, "убыточных продаж нет — старую полную прибыль за продажи не выдаём");
+    assert.equal(S.accrualRecoProps(okSnap(toLegacy(s))).worst.basis, "full_profit");
+    assert.equal(S.accrualRecoProps(okSnap(toLegacy(s))).worst.margin, null);
     assert.equal(r.marginKnown, true);
     assert.equal(r.ready, true);
   });

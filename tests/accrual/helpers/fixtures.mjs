@@ -80,6 +80,16 @@ const PREAMBLE_FULL = [["Период: 01.06.2026-30.06.2026"]];
 const build = (rows, { header = HEADER16, preamble = PREAMBLE_FULL, ...opts } = {}) =>
   buildOzonStyleXlsx([...preamble, header, ...rows], opts);
 
+/** Сборка XLSX из произвольных строк (для сценариев разделения результата). */
+export const buildReport = (rows, opts) => build(rows, opts);
+
+/** Тот же отчёт без колонки «ID начисления» (первая колонка HEADER16). */
+export const buildReportWithoutRef = (rows, opts = {}) =>
+  build(
+    rows.map((r) => r.slice(1)),
+    { ...opts, header: HEADER16.slice(1) }
+  );
+
 /** Копия строк с заменой значения одной ячейки. */
 const withCell = (rows, rowIdx, colIdx, value) =>
   rows.map((r, i) => (i === rowIdx ? r.map((v, j) => (j === colIdx ? value : v)) : r));

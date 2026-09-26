@@ -27,3 +27,11 @@ export function buildSnapshotFor(
 
 /** Как из БД: сериализация в JSON и обратно. */
 export const viaJson = (obj) => JSON.parse(JSON.stringify(obj));
+
+/** Снимок «как сохранённый до разделения результата»: без salesSplit и split у товаров. */
+export function toLegacy(snap) {
+  const x = viaJson(snap);
+  delete x.salesSplit;
+  for (const p of x.products) delete p.split;
+  return x;
+}

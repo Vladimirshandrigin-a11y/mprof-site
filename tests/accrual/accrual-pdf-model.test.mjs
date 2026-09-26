@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildSnapshotFor, viaJson } from "./helpers/snapshot-fixtures.mjs";
+import { buildSnapshotFor, toLegacy, viaJson } from "./helpers/snapshot-fixtures.mjs";
 import { pdfModel as P, snapshot as S } from "./helpers/modules.mjs";
 
 const NOW = new Date(2026, 6, 1, 10, 30); // 01.07.2026 10:30 (локальное время)
@@ -40,7 +40,7 @@ describe("PDF нового формата: полный расчёт", () => {
     assert.deepEqual(
       m.rows.map((r) => [r.label, r.value, r.kind]),
       [
-        ["Реализация (выручка)", "+1 500,00 ₽", "income"],
+        ["Реализация (выручка)", "1 500,00 ₽", "neutral"],
         ["Возвраты выручки", "−300,00 ₽", "expense"],
         ["Программы партнёров", "+5,00 ₽", "income"],
         ["Баллы за скидки", "+25,00 ₽", "income"],
@@ -71,9 +71,19 @@ describe("PDF нового формата: полный расчёт", () => {
     assert.deepEqual(m.keyProducts.best, {
       name: "Товар Б", article: "ART-B", profit: "+329,64 ₽", margin: "65,9 %", positive: true, marginNeg: false,
     });
-    assert.deepEqual(m.keyProducts.worst, {
+    // Разделение доступно: худший — только по доказанно убыточным продажам; их нет.
+    assert.equal(m.keyProducts.worst, null);
+    assert.equal(m.keyProducts.worstTitle, "САМЫЙ УБЫТОЧНЫЙ ПО ПРОДАЖАМ");
+    assert.equal(m.keyProducts.worstEmptyText, "Убыточных продаж не найдено");
+  });
+  it("старый снимок: худший по полной прибыли, подписан; «—» у маржи с видимым пояснением", () => {
+    const legacy = model(S.asAccrualSnapshot(toLegacy(snapshot)));
+    assert.deepEqual(legacy.keyProducts.worst, {
       name: "Товар В", article: "ART-C", profit: "−7,00 ₽", margin: "—", positive: false, marginNeg: false,
     });
+    assert.equal(legacy.keyProducts.worstTitle, "САМЫЙ УБЫТОЧНЫЙ (ПОЛНАЯ ПРИБЫЛЬ)");
+    assert.ok(legacy.explanations.includes("«—» в марже: выручка ≤ 0, маржа не определяется."));
+    assert.match(legacy.splitLines[0], /Разделение продаж, возвратов и расходов без продаж недоступно/);
   });
   it("предупреждения и пояснения присутствуют; нет упоминаний УПД", () => {
     assert.equal(m.noticesTitle, "ПРЕДУПРЕЖДЕНИЯ");
