@@ -4886,7 +4886,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   -webkit-backdrop-filter:blur(16px) saturate(1.2);
   border-bottom:1px solid var(--edge)}
 .dash-top-inner{width:100%;max-width:none;margin:0;box-sizing:border-box;
-  display:grid;grid-template-columns:minmax(160px,1fr) auto minmax(160px,1fr);align-items:center;
+  display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;
   gap:1rem;padding:.8rem 2rem}
 .dash-brand{grid-column:1;justify-self:start;font-family:var(--display);font-size:1.15rem;font-weight:700;letter-spacing:.01em;color:var(--txt);text-decoration:none}
 .dash-brand em{font-style:italic;color:var(--gold)}
@@ -4897,10 +4897,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   animation:pulse 2s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.6)}}
 
-.dash-user{grid-column:3;justify-self:end;display:flex;align-items:center;justify-content:flex-end;gap:10px}
+/* Блок аккаунта не шире своей колонки: длинный email сжимается с многоточием,
+   а не наезжает на вкладки и не растягивает шапку. */
+.dash-user{grid-column:3;justify-self:end;display:flex;align-items:center;justify-content:flex-end;gap:10px;
+  min-width:0;max-width:100%}
 .dash-user-email{font-family:var(--mono);font-size:.63rem;color:var(--txt2);letter-spacing:.04em;
-  max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dash-signout{font-family:var(--sans);font-size:.75rem;font-weight:500;background:transparent;
+  max-width:180px;min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dash-signout{flex-shrink:0;font-family:var(--sans);font-size:.75rem;font-weight:500;background:transparent;
   border:1px solid var(--edge2);color:var(--txt2);padding:5px 13px;border-radius:8px;
   cursor:pointer;transition:all .18s;line-height:1}
 .dash-signout:hover{border-color:rgba(224,85,102,.4);color:var(--red)}
@@ -5072,12 +5075,22 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .main-tab-ico{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px}
 .main-tab-ico svg{width:16px;height:16px;display:block}
 @media(max-width:900px){
-  .dash-nav{order:3;flex-basis:100%;width:100%}
-  .main-tab{flex:1 1 auto}
+  /* Вкладки — отдельной строкой на всю ширину; если не помещаются, переносятся,
+     а не растягивают страницу. Зона нажатия на сенсорных экранах ≥44px. */
+  .dash-nav{order:3;flex-basis:100%;width:100%;flex-wrap:wrap}
+  .main-tab{flex:1 1 auto;min-height:44px}
 }
-@media(max-width:560px){
-  .dash-nav{gap:4px;padding:4px}
-  .main-tab{flex:1 1 calc(50% - 3px);font-size:.8rem;padding:9px 8px;gap:6px}
+/* Узкий экран: сетка 2×2 (одна строка вкладок требует ~595px ширины окна).
+   Длинные подписи переносятся внутри вкладки. */
+@media(max-width:640px){
+  .dash-nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;padding:4px}
+  .main-tab{min-width:0;font-size:.8rem;padding:6px 8px;gap:6px;
+    white-space:normal;text-align:center;line-height:1.2}
+}
+/* Иконка слева и «Каталог товаров» в одну строку требуют ~147px на вкладку
+   (~347px окна); уже — иконка над подписью, чтобы подпись не переносилась. */
+@media(max-width:350px){
+  .main-tab{flex-direction:column;gap:3px;padding:6px 4px}
 }
 
 .api-pro-card{margin-bottom:.25rem;position:relative;overflow:hidden;
