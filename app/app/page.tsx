@@ -3113,6 +3113,9 @@ export default function AppPage() {
   // Компактный дропдаун выбора месяца (в панели фильтров истории). Только UI.
   const [monthMenuOpen, setMonthMenuOpen] = useState(false);
   const monthMenuRef = useRef<HTMLDivElement | null>(null);
+  // Весь блок «Последние расчёты» сворачивается; по умолчанию свёрнут. Только UI:
+  // поиск/фильтры/история не сбрасываются и не перезагружаются; не сохраняется.
+  const [histOpen, setHistOpen] = useState(false);
   // Раскрытые строки «Последних расчётов» (мини-разбивка). Множественное
   // раскрытие — каждая строка независима. Только UI, данные не пересчитываются.
   const [expandedHist, setExpandedHist] = useState<Set<string>>(
@@ -7650,6 +7653,24 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .empty-sub{font-size:.8rem;font-weight:300}
 
 .hist-card{margin-top:.65rem}
+/* «Последние расчёты» сворачивается: заголовок-кнопка в стиле .card-title */
+.hist-card .card-head{flex-wrap:wrap;gap:.6rem}
+.hist-card.hist-collapsed .card-head{border-bottom-color:transparent}
+.hist-collapse{
+  display:inline-flex;align-items:center;gap:.55rem;min-width:0;
+  padding:0;margin:0;background:none;border:0;border-radius:8px;
+  color:var(--txt);font:inherit;text-align:left;cursor:pointer;
+  -webkit-appearance:none;appearance:none
+}
+.hist-collapse:focus-visible{outline:2px solid var(--gold);outline-offset:4px}
+.hist-collapse-chev{
+  width:18px;height:18px;flex-shrink:0;
+  stroke:var(--txt3);stroke-width:2;fill:none;stroke-linecap:round;stroke-linejoin:round;
+  transition:transform .2s ease,stroke .2s ease
+}
+.hist-collapse:hover .hist-collapse-chev{stroke:var(--gold2)}
+.hist-collapse[aria-expanded="true"] .hist-collapse-chev{transform:rotate(180deg)}
+.hist-collapse-note{font-family:var(--mono);font-size:.7rem;color:var(--red)}
 .hist-list{display:flex;flex-direction:column}
 .hist-item{
   display:flex;
@@ -10727,71 +10748,32 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {user && mainTab === "reports" && (
           <>
 
-        {isLoadingHistory && (
-          <div className="card hist-card">
-            <div className="card-head">
-              <div className="card-title">Последние расчёты</div>
-            </div>
-            <div className="card-body" role="status" aria-live="polite">
-              <div
-                style={{ display: "flex", alignItems: "center", gap: "10px" }}
-              >
-                <span className="auth-loading-ring" aria-hidden="true" />
-                <span>Загружаем историю расчётов…</span>
-              </div>
-              {historySlow && (
-                <p
-                  style={{
-                    margin: "10px 0 0",
-                    fontSize: "13px",
-                    color: "var(--txt3)",
-                    lineHeight: 1.5,
-                  }}
-                >
-                  История загружается дольше обычного. Проверьте интернет или
-                  попробуйте обновить страницу.
-                </p>
+        {/* «Последние расчёты» — один сворачиваемый блок, по умолчанию свёрнут.
+            Заголовок — кнопка раскрытия; скрывается всё содержимое (загрузка,
+            ошибка, пустой список, поиск, фильтры, «Очистить историю», список).
+            Поиск и фильтры — состояние страницы: при сворачивании не
+            сбрасываются, история не перезагружается. Настройка не сохраняется. */}
+        <div className={"card hist-card" + (histOpen ? "" : " hist-collapsed")}>
+          <div className="card-head">
+            <button
+              type="button"
+              className="hist-collapse"
+              aria-expanded={histOpen}
+              aria-controls="hist-body"
+              onClick={() => {
+                setHistOpen((o) => !o);
+                setMonthMenuOpen(false);
+              }}
+            >
+              <span className="card-title">Последние расчёты</span>
+              {!histOpen && !isLoadingHistory && historyError && history.length === 0 && (
+                <span className="hist-collapse-note">{" "}не загружены</span>
               )}
-            </div>
-          </div>
-        )}
-
-        {!isLoadingHistory && historyError && history.length === 0 && (
-          <div className="card hist-card">
-            <div className="card-head">
-              <div className="card-title">Последние расчёты</div>
-            </div>
-            <div className="hist-filter-empty" role="alert">
-              <p style={{ margin: "0 0 12px" }}>
-                Не удалось загрузить историю расчётов. Проверьте интернет и
-                попробуйте ещё раз.
-              </p>
-              <button
-                type="button"
-                className="auth-reset-btn"
-                onClick={retryLoadHistory}
-              >
-                Повторить
-              </button>
-            </div>
-          </div>
-        )}
-
-        {!isLoadingHistory && !historyError && history.length === 0 && (
-          <div className="card hist-card">
-            <div className="card-head">
-              <div className="card-title">Последние расчёты</div>
-            </div>
-            <div className="hist-filter-empty">
-              Здесь появятся ваши расчёты после первого сохранения
-            </div>
-          </div>
-        )}
-
-        {!isLoadingHistory && history.length > 0 && (
-          <div className="card hist-card">
-            <div className="card-head">
-              <div className="card-title">Последние расчёты</div>
+              <svg className="hist-collapse-chev" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M6 9l6 6 6-6" />
+              </svg>
+            </button>
+            {histOpen && !isLoadingHistory && history.length > 0 && (
               <button
                 type="button"
                 className="hist-clear"
@@ -10808,8 +10790,58 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 </svg>
                 Очистить историю
               </button>
-            </div>
+            )}
+          </div>
 
+          <div id="hist-body" hidden={!histOpen}>
+            {isLoadingHistory && (
+              <div className="card-body" role="status" aria-live="polite">
+                <div
+                  style={{ display: "flex", alignItems: "center", gap: "10px" }}
+                >
+                  <span className="auth-loading-ring" aria-hidden="true" />
+                  <span>Загружаем историю расчётов…</span>
+                </div>
+                {historySlow && (
+                  <p
+                    style={{
+                      margin: "10px 0 0",
+                      fontSize: "13px",
+                      color: "var(--txt3)",
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    История загружается дольше обычного. Проверьте интернет или
+                    попробуйте обновить страницу.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {!isLoadingHistory && historyError && history.length === 0 && (
+              <div className="hist-filter-empty" role="alert">
+                <p style={{ margin: "0 0 12px" }}>
+                  Не удалось загрузить историю расчётов. Проверьте интернет и
+                  попробуйте ещё раз.
+                </p>
+                <button
+                  type="button"
+                  className="auth-reset-btn"
+                  onClick={retryLoadHistory}
+                >
+                  Повторить
+                </button>
+              </div>
+            )}
+
+            {!isLoadingHistory && !historyError && history.length === 0 && (
+              <div className="hist-filter-empty">
+                Здесь появятся ваши расчёты после первого сохранения
+              </div>
+            )}
+
+            {!isLoadingHistory && history.length > 0 && (
+            <>
             <div className="hist-tools">
               <div className="hist-search">
                 <svg
@@ -11101,8 +11133,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               })}
             </div>
             )}
+            </>
+            )}
           </div>
-        )}
+        </div>
           </>
         )}
 
