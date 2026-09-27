@@ -22,9 +22,10 @@ import {
   type KeyProductsSnapshot,
   type CostCoverageSnapshot,
 } from "./components/OzonProductBreakdown"
-import { TariffModal, type TariffTier } from "../components/TariffModal"
+import { TariffModal, type TariffContext, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
 import { accessStatus } from "./lib/access-status"
+import { apiCalcAccess } from "./lib/api-access"
 import {
   parseOzonFinanceTaxonomy,
   hasFinanceTaxonomyObject,
@@ -2744,8 +2745,7 @@ export default function AppPage() {
       console.warn(
         "[upload] analyzeUpload blocked by paywall (canCalculate=false)"
       );
-      setSelectedTier(null);
-      setTariffModalOpen(true);
+      openTariffModal(null);
       return;
     }
 
@@ -2821,8 +2821,7 @@ export default function AppPage() {
       // eslint-disable-next-line no-console
       console.warn("[upload] consume blocked → paywall", consumed.reason);
       setUploadStatus("ready");
-      setSelectedTier(null);
-      setTariffModalOpen(true);
+      openTariffModal(null);
       return;
     }
 
@@ -3055,6 +3054,14 @@ export default function AppPage() {
 
   const [tariffModalOpen, setTariffModalOpen] = useState(false);
   const [selectedTier, setSelectedTier] = useState<TariffTier | null>(null);
+  const [tariffContext, setTariffContext] = useState<TariffContext | null>(null);
+  // Единственный способ открыть окно оплаты: тариф и контекст задаются вместе,
+  // поэтому контекст прошлого открытия (например, API) не переходит в следующее.
+  const openTariffModal = (tier: TariffTier | null, context: TariffContext | null = null) => {
+    setSelectedTier(tier);
+    setTariffContext(context);
+    setTariffModalOpen(true);
+  };
   const [isCalculating, setIsCalculating] = useState(false);
   const [analysisStage, setAnalysisStage] = useState(0);
 
@@ -4274,6 +4281,11 @@ export default function AppPage() {
       setProfitError("Выберите месяц");
       return;
     }
+    // Защита: без доступа к API UI показывает предложение безлимита вместо кнопки.
+    if (apiAccess === "needs_unlimited") {
+      openTariffModal("unlimited", "api");
+      return;
+    }
     // PR #25: дубль-гард ДО любого запроса/списания. profitMonth уже 'YYYY-MM'.
     // «Отмена» → выходим сразу: /api/ozon/save-calculation НЕ вызывается, поэтому
     // попытка НЕ списывается (для API это критично — списание на сервере в save).
@@ -4318,15 +4330,15 @@ export default function AppPage() {
         realizationDiagnostic?: RealizationDiagnostic | null;
       };
 
-      // Нет доступа (free/149₽ исчерпан) → окно тарифа, как в обычном расчёте.
-      // Ничего не списано/сохранено; цифры НЕ пришли.
+      // Нет доступа к API (бесплатная попытка израсходована, безлимита нет;
+      // 149 ₽ API не открывает) → окно только с безлимитом. Ничего не списано и
+      // не сохранено; цифры НЕ пришли.
       if (
         res.status === 402 ||
         data.code === "limit_reached" ||
         data.code === "calculation_required"
       ) {
-        setSelectedTier(null);
-        setTariffModalOpen(true);
+        openTariffModal("unlimited", "api");
         return;
       }
       // Себестоимость не полная → 400 ДО списания (сервер не присылает цифр).
@@ -4572,8 +4584,7 @@ export default function AppPage() {
     if (isCalculating) return;
     // Защита: UI подменяет кнопку на paywall, но на всякий случай.
     if (!canCalculate) {
-      setSelectedTier(null);
-      setTariffModalOpen(true);
+      openTariffModal(null);
       return;
     }
     // PR #25: дубль-гард. Ручной расчёт всегда относится к ТЕКУЩЕМУ месяцу
@@ -4595,8 +4606,7 @@ export default function AppPage() {
       if (!consumed.ok) {
         // eslint-disable-next-line no-console
         console.warn("[calc] consume blocked → paywall", consumed.reason);
-        setSelectedTier(null);
-        setTariffModalOpen(true);
+        openTariffModal(null);
         return;
       }
 
@@ -4720,8 +4730,7 @@ export default function AppPage() {
   };
 
   const handleTariff = (tier: "single" | "unlimited") => {
-    setSelectedTier(tier);
-    setTariffModalOpen(true);
+    openTariffModal(tier);
   };
 
   // Единый источник про премиум-доступ и лимит бесплатных расчётов.
@@ -4734,8 +4743,20 @@ export default function AppPage() {
     calcCount,
     freeCalculationsLimit,
     loaded: entitlementsLoaded,
+    checking: entitlementsChecking,
+    checkFailed: entitlementsCheckFailed,
+    recheck: recheckEntitlements,
     consumeCalculation,
   } = useEntitlements();
+  // Доступ к расчёту через Ozon API (только отображение; решает сервер).
+  const apiAccess = apiCalcAccess({
+    loaded: entitlementsLoaded,
+    hasPremium,
+    calcCount,
+    freeLimit: freeCalculationsLimit,
+    checking: entitlementsChecking,
+    checkFailed: entitlementsCheckFailed,
+  });
 
   // Прежний документальный расчёт (реализация + УПД), восстановленный из истории.
   const legacyDocView = combinedStatus === "success" && !!combinedResult;
@@ -4789,8 +4810,7 @@ export default function AppPage() {
     confirmNoMonthDuplicate: (monthKey) =>
       confirmNoMonthDuplicate(monthKey, "ozon"),
     onPaywall: () => {
-      setSelectedTier(null);
-      setTariffModalOpen(true);
+      openTariffModal(null);
     },
     onSaved: handleAccrualSaved,
     onCatalogChanged: () => setCatalogRefresh((k) => k + 1),
@@ -4822,8 +4842,7 @@ export default function AppPage() {
 
   // AI PRO «Открыть Premium» — открываем тот же payment flow с тарифом «Безлимит»
   const openPremium = () => {
-    setSelectedTier("unlimited");
-    setTariffModalOpen(true);
+    openTariffModal("unlimited");
   };
 
   const clearForm = () => {
@@ -5122,6 +5141,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   margin:0;flex:1;min-width:0}
 .api-pro-msg.ok{color:var(--green)}
 .api-pro-msg.err{color:var(--red)}
+/* Нет доступа к API — пояснение над кнопкой «Оформить безлимит». */
+.api-need-unlimited .api-pro-msg{font-family:var(--sans);font-size:.88rem;line-height:1.5;
+  letter-spacing:0;margin-bottom:.9rem}
+.api-recheck{display:block;margin:.7rem auto 0;min-height:44px;padding:0 .6rem;background:none;border:0;
+  color:var(--txt2);font-family:var(--sans);font-size:.85rem;text-decoration:underline;
+  text-underline-offset:3px;cursor:pointer}
+.api-recheck:hover{color:var(--txt)}
 .api-pro-actions{display:grid;grid-template-columns:1fr 1fr;gap:.8rem;margin-top:1.6rem}
 .api-pro-actions .api-pro-btn{flex:none;min-width:0;width:100%}
 .api-pro-btn.ghost{background:rgba(255,255,255,.04);color:var(--txt);
@@ -9357,7 +9383,55 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   </div>
                 </div>
 
-                {/* Главная кнопка — расчёт и сохранение */}
+                {/* Главная кнопка — расчёт и сохранение. Без доступа к API (бесплатная
+                    попытка израсходована, безлимита нет; разовые кредиты API не
+                    открывают) — вместо неё предложение безлимита. Пока права
+                    загружаются — обычная кнопка; пока права перепроверяются или
+                    проверка не удалась — без предложения покупки. */}
+                {apiAccess === "needs_unlimited" ? (
+                <div className="api-field-block api-need-unlimited" role="region" aria-label="Доступ к Ozon API">
+                  <p className="api-pro-msg">
+                    Расчёты через Ozon API доступны на безлимите. Разовый тариф
+                    подходит для XLSX и ручного расчёта.
+                  </p>
+                  <button
+                    type="button"
+                    className="api-pro-btn api-main-cta"
+                    onClick={() => openTariffModal("unlimited", "api")}
+                  >
+                    Оформить безлимит — 449 ₽
+                  </button>
+                  <button
+                    type="button"
+                    className="api-recheck"
+                    onClick={() => void recheckEntitlements()}
+                  >
+                    Уже оплатили? Проверить доступ
+                  </button>
+                </div>
+                ) : apiAccess === "checking" ? (
+                <div className="api-field-block api-need-unlimited" role="status">
+                  <p className="api-pro-msg">Проверяем доступ к Ozon API…</p>
+                  <button type="button" className="api-pro-btn api-main-cta" disabled>
+                    <span className="spin" />
+                    Проверяем…
+                  </button>
+                </div>
+                ) : apiAccess === "check_failed" ? (
+                <div className="api-field-block api-need-unlimited" role="region" aria-label="Доступ к Ozon API">
+                  <p className="api-pro-msg">
+                    Не удалось проверить доступ к Ozon API. Это не значит, что
+                    доступа нет — проверьте ещё раз.
+                  </p>
+                  <button
+                    type="button"
+                    className="api-pro-btn api-main-cta"
+                    onClick={() => void recheckEntitlements()}
+                  >
+                    Проверить снова
+                  </button>
+                </div>
+                ) : (
                 <div className="api-field-block">
                   <button
                     type="button"
@@ -9377,6 +9451,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     )}
                   </button>
                 </div>
+                )}
 
                 {/* Общая ошибка (не «нет тарифа» и не «нет себестоимости») */}
                 {profitError && (
@@ -11954,6 +12029,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
       <TariffModal
         open={tariffModalOpen}
         tier={selectedTier}
+        context={tariffContext}
         onClose={() => setTariffModalOpen(false)}
       />
 
