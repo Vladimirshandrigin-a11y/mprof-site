@@ -637,7 +637,7 @@ describe("миграция, read-only проверки и порядок вып�
     assert.equal(afterRow[0].activations, "0");
     assert.deepEqual(afterStats, beforeStats, "сводка по тарифам и статусам не изменилась");
 
-    // Выдачи новым кодом → раздел «ПОСЛЕ ДЕПЛОЯ» без расхождений.
+    // Выдачи новым кодом → раздел «СОГЛАСОВАННОСТЬ» без расхождений.
     const s = await db.sub(u);
     await grant(await db.service(), s.id, s.paymentId);
     assert.equal((await grant(await db.service(), legacy.id, legacy.paymentId)).granted, false);
