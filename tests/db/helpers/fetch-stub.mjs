@@ -1,10 +1,11 @@
-// Подмена сети для тестов webhook-обработчика: globalThis.fetch.
+// Подмена сети для тестов серверных обработчиков: globalThis.fetch.
 //
 //   • https://api.yookassa.ru/…      → ответ, заданный тестом (настоящей ЮKassa нет);
 //   • http://supabase.test/rest/v1/… → минимальная эмуляция PostgREST поверх НАСТОЯЩЕЙ
 //     PostgreSQL: каждый HTTP-запрос — своё соединение из пула и своя транзакция от имени
-//     service_role (как PostgREST с service-ключом). Покрыто ровно то, что вызывает
-//     обработчик через supabase-js: GET/PATCH таблицы с фильтрами eq, upsert
+//     service_role (service-ключ) или authenticated с auth.uid() из JWT пользователя
+//     (user-scoped клиент). Покрыто ровно то, что вызывают обработчики через supabase-js:
+//     GET/PATCH таблицы с фильтрами eq, upsert
 //     (POST … on_conflict, Prefer: resolution=merge-duplicates) и POST /rpc/<функция>;
 //   • любой другой адрес — ошибка (сеть в тестах запрещена).
 // Журнал всех запросов (метод, адрес, заголовки, тело) доступен тесту.
@@ -12,6 +13,23 @@
 export const SUPABASE_URL = "http://supabase.test";
 export const SERVICE_KEY = "test-service-role-key";
 const YOOKASSA = "https://api.yookassa.ru/";
+
+/** Полезная нагрузка JWT без проверки подписи (тестовые токены). */
+function jwtClaims(token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  try {
+    return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Тестовый JWT пользователя (без подписи): sub = userId, role = authenticated. */
+export function userJwt(userId) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  return `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ sub: userId, role: "authenticated", aud: "authenticated" })}.test`;
+}
 
 const ident = (s) => {
   if (!/^[a-z_]+$/.test(s)) throw new Error(`идентификатор ${s}`);
@@ -65,7 +83,16 @@ export function installFetch() {
     let response;
     try {
       await c.query("begin");
-      await c.query("set local role service_role");
+      // Роль как у PostgREST: service-ключ → service_role; JWT пользователя → authenticated
+      // с auth.uid() = sub (подпись не проверяется — только локальная тестовая БД).
+      const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+      const claims = jwtClaims(bearer);
+      if (bearer === SERVICE_KEY || !claims) {
+        await c.query(`set local role ${bearer === SERVICE_KEY ? "service_role" : "anon"}`);
+      } else {
+        await c.query("set local role authenticated");
+        await c.query("select set_config('request.jwt.claim.sub', $1, true)", [claims.sub ?? ""]);
+      }
       if (rest.startsWith("rpc/")) {
         const fn = ident(rest.slice(4));
         const args = req.body ?? {};

@@ -289,6 +289,29 @@ function hash53(str: string, seed = 0): number {
  * (то же содержимое строк и период) даёт тот же отпечаток; другой файл — другой.
  * Ручные вводы и каталог в отпечаток НЕ входят: их правка остаётся в рамках попытки.
  */
+/** Хеш содержимого снимка (snapshotContentKey) для сверки с сохранённой операцией. */
+export function contentFingerprint(contentKey: string): string {
+  return `${contentKey.length}:${hash53(contentKey).toString(36)}:${hash53(contentKey, 7).toString(36)}`;
+}
+
+/**
+ * Кнопка сохранения: сохранён ли расчёт и изменён ли он после сохранения. savedKey —
+ * ключ содержимого, сохранённого в этой вкладке; adoptedHash — отпечаток расчёта,
+ * восстановленного с сервера после перезагрузки (ключа снимка тогда нет).
+ */
+export function savedState(
+  savedKey: string | null,
+  adoptedHash: string | null,
+  currentKey: string | null
+): { saved: boolean; dirty: boolean } {
+  const saved = savedKey !== null || adoptedHash !== null;
+  const dirty =
+    saved &&
+    currentKey !== null &&
+    (savedKey !== null ? currentKey !== savedKey : contentFingerprint(currentKey) !== adoptedHash);
+  return { saved, dirty };
+}
+
 export function reportFingerprint(report: Pick<AccrualParsedReport, "rows" | "period" | "rowCount">): string {
   const body = JSON.stringify([report.period, report.rows]);
   return `${report.period.month}:${report.rowCount}:${hash53(body).toString(36)}:${hash53(body, 7).toString(36)}`;
@@ -350,7 +373,12 @@ export function saveOutcomeUi(out: SaveOutcome): SaveOutcomeUi {
         needsRetry: true,
         note: {
           kind: "err",
-          text: `Не удалось сохранить расчёт: ${out.error}. Попытка расчёта уже списана и закреплена за этим расчётом — повторное сохранение не спишет её снова.`,
+          text:
+            out.charge === "none"
+              ? `Не удалось сохранить расчёт: ${out.error}. Попытка расчёта не списана.`
+              : out.charge === "unknown"
+              ? `Сервер не подтвердил сохранение (${out.error}). Расчёт мог успеть сохраниться — повторите: если он уже сохранён, повтор вернёт его без повторного списания.`
+              : `Не удалось сохранить изменения: ${out.error}. Попытка расчёта уже списана за этот файл — повторное сохранение не спишет её снова.`,
         },
         toast: { text: "Не удалось сохранить расчёт", type: "err" },
       };
@@ -371,6 +399,8 @@ export function saveOutcomeUi(out: SaveOutcome): SaveOutcomeUi {
         ? "Расчёт сохранён в историю."
         : out.calculationWrite === "update"
         ? "Изменения сохранены. Попытка не списывалась повторно."
+        : out.replay
+        ? "Расчёт уже был сохранён — повторной записи и списания нет."
         : "Сводка по месяцам дописана. Расчёт уже был сохранён — повторной записи и списания нет.";
       return {
         note: { kind: out.local || historyFailed ? "warn" : "ok", text },

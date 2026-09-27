@@ -144,9 +144,10 @@ export function payTestEnv() {
 
   /**
    * Новая временная база: схема ДО миграции + миграция (migrated=false — без неё;
-   * migration — другой текст миграции; fullSchema — весь schema.sql).
+   * migration — другой текст миграции; extraMigrations — следующие миграции по порядку;
+   * fullSchema — весь schema.sql).
    */
-  async function freshDb({ migrated = true, fullSchema = false, migration = MIGRATION } = {}) {
+  async function freshDb({ migrated = true, fullSchema = false, migration = MIGRATION, extraMigrations = [] } = {}) {
     const name = `${prefix}_${++dbCount}`;
     await server.query(`create database ${name} encoding 'UTF8' template template0`);
     databases.push(name);
@@ -157,6 +158,7 @@ export function payTestEnv() {
     await main.query(SUPABASE_LIKE);
     await main.query(fullSchema ? SCHEMA : SCHEMA_BEFORE);
     if (migrated) await runScript(main, migration);
+    for (const sql of extraMigrations) await runScript(main, sql);
     return {
       url,
       main,

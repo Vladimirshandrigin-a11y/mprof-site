@@ -23,24 +23,26 @@
 //   3. нет попытки (paywall) и нет списанной попытки → paywall: без списания;
 //   4. дубль месяца: подтверждение ДО списания; «Отмена» → cancelled: без
 //      списания и записи;
-//   5. consume — РОВНО ОДИН РАЗ на попытку: повтор сохранения (после ошибки
-//      записи или при правке ставки) НЕ списывает снова;
-//   6. calculations: insert (первый раз) / update (содержимое изменилось) / ничего
-//      (содержимое уже записано — например, при повторе после сбоя сводки);
-//   7. report_history — best-effort: сбой даёт предупреждение и НЕ отменяет
-//      сохранённый расчёт; повтор дописывает ТОЛЬКО недостающую запись.
+//   5. аккаунт, первое сохранение попытки — ОДНА серверная операция
+//      (saveOperation → /api/cloud/calculation-operations → одна транзакция БД):
+//      списание + calculations + report_history + отметка операции. Сбой до COMMIT
+//      не оставляет ни списания, ни частичных записей. Ключ операции (UUID) хранится
+//      у страницы (operationIdFor) до подтверждения: потерянный ответ, двойной клик
+//      или перезагрузка → повтор с ТЕМ ЖЕ ключом возвращает уже сохранённый расчёт
+//      без нового списания. Ключ привязан к пользователю и файлу (requestHash =
+//      отпечаток попытки): с другим файлом сервер отвечает конфликтом;
+//   6. после сохранения — обновление той же строки calculations без списания
+//      (правка ставки/расходов), ничего (содержимое уже записано);
+//   7. report_history при обновлении — best-effort: сбой даёт предупреждение и НЕ
+//      отменяет сохранённый расчёт; повтор дописывает ТОЛЬКО недостающую запись.
+// Аноним: списание через consume (localStorage у страницы), запись только локальная.
 //
-// Чтение файла, ошибка формата и отмена дубля происходят ДО consume — они его не
+// Чтение файла, ошибка формата и отмена дубля происходят ДО операции — они её не
 // вызывают. Двойной клик: пока идёт сохранение, повторный вызов возвращает busy;
 // сменить попытку (файл) во время сохранения нельзя (beginAttempt → false).
-//
-// ОГРАНИЧЕНИЕ АРХИТЕКТУРЫ (существовало и в прежнем document flow, не устранено
-// здесь): consume (/api/cloud/consume) и запись (/api/cloud/calculations) — два
-// независимых HTTP-вызова без общей серверной транзакции; прежний flow тоже сначала
-// списывал, затем писал. Если вкладку закрыли или страницу перезагрузили после
-// списания, но до записи, попытка потеряна: отметка «списано» живёт только в
-// памяти вкладки. Хранение состояния в памяти это НЕ исправляет — оно лишь даёт
-// повторить сохранение, пока вкладка жива.
+// После перезагрузки тот же файл находит свою незавершённую операцию по ключу:
+// страница спрашивает статус у сервера и, если расчёт уже сохранён, передаёт его
+// в adoptSaved — без дубль-гарда, без списания и без повторной записи.
 // ============================================================================
 
 import {
@@ -66,13 +68,52 @@ export interface CloudResult<T> {
   error: { message: string } | null;
 }
 
+/** Операция расчёта: списание + сохранение одной транзакцией на сервере. */
+export interface CalculationOperationRequest {
+  operationId: string;
+  /** Отпечаток файла попытки: операция привязана к нему. */
+  requestHash: string;
+  /** Хеш содержимого снимка: при повторе показывает, то ли содержимое сохранено. */
+  contentHash: string;
+  calculation: AccrualCalculationColumns;
+  history: AccrualReportHistoryColumns;
+}
+
+export type CalculationOperationResult =
+  /** Сохранено (replay — уже было сохранено этой операцией раньше; row = null — строку удалили). */
+  | { kind: "ok"; replay: boolean; row: CloudRow | null; contentHash: string | null }
+  /** Сервер отказал в списании (нет попытки / нет сессии): ничего не записано. */
+  | { kind: "refused"; reason: string }
+  /** Ключ операции не совпадает с файлом или пользователем: ничего не записано. */
+  | { kind: "conflict" }
+  /** Сохранение недоступно (например, не применена миграция): ничего не записано. */
+  | { kind: "unavailable"; message: string }
+  /** Нет подтверждения: операция могла успеть сохраниться — повторять с тем же ключом. */
+  | { kind: "failed"; message: string };
+
+export type CalculationOperationStatus =
+  | { kind: "done"; row: CloudRow | null; contentHash: string | null }
+  | { kind: "none" }
+  | { kind: "conflict" }
+  | { kind: "failed"; message: string };
+
 export interface AccrualSaveDeps {
   /** Право на ещё один расчёт (paywall). Вычисляется в момент вызова. */
   canCalculate(): boolean;
   /** Подтверждение повторного месяца; false = «Отмена». */
   confirmNoMonthDuplicate(monthKey: string | null): Promise<boolean>;
-  /** Server-authoritative списание одной попытки. */
+  /** Списание одной попытки — только для анонима (локальный счётчик страницы). */
   consume(): Promise<ConsumeResult>;
+  /** Аккаунт: списание и сохранение одной транзакцией на сервере (идемпотентно по ключу). */
+  saveOperation(req: CalculationOperationRequest): Promise<CalculationOperationResult>;
+  /** Ключ операции попытки: тот же до подтверждения (переживает перезагрузку). */
+  operationIdFor(attemptId: string): string;
+  /** Сервер подтвердил операцию попытки — ключ больше не нужен. */
+  operationSettled(attemptId: string): void;
+  /** У попытки есть неподтверждённая операция (решает сервер, а не клиентский paywall). */
+  hasPendingOperation(attemptId: string): boolean;
+  /** Хеш содержимого снимка (snapshotContentKey). */
+  contentHash(contentKey: string): string;
   insertCalculation(cols: AccrualCalculationColumns): Promise<CloudResult<CloudRow>>;
   updateCalculation(id: string, cols: AccrualCalculationColumns): Promise<CloudResult<CloudRow>>;
   insertReportHistory(cols: AccrualReportHistoryColumns): Promise<CloudResult<unknown>>;
@@ -128,8 +169,19 @@ export type SaveOutcome =
       historyWrite: HistoryWrite;
       historyWarning: string | null;
       columns: AccrualCalculationColumns;
+      /** Расчёт уже был сохранён этой операцией (повтор после потерянного ответа). */
+      replay?: boolean;
     }
-  | { status: "save_failed"; error: string };
+  | {
+      status: "save_failed";
+      error: string;
+      /**
+       * Что с попыткой: none — точно не списана; unknown — нет подтверждения (могла
+       * сохраниться, повтор с тем же ключом не спишет дважды); kept — списана раньше,
+       * не удалось сохранить изменения.
+       */
+      charge: "none" | "unknown" | "kept";
+    };
 
 export interface SaveRequest {
   snapshot: AccrualSnapshotV1;
@@ -151,6 +203,8 @@ interface Attempt {
   saved: SavedRef | null;
   calcKey: string | null;
   historyKey: string | null;
+  /** Хеш содержимого расчёта, восстановленного с сервера (сверяется при сохранении). */
+  adoptedHash: string | null;
 }
 
 const freshAttempt = (id: string | null): Attempt => ({
@@ -160,6 +214,7 @@ const freshAttempt = (id: string | null): Attempt => ({
   saved: null,
   calcKey: null,
   historyKey: null,
+  adoptedHash: null,
 });
 
 export class AccrualSaveController {
@@ -211,6 +266,23 @@ export class AccrualSaveController {
     return true;
   }
 
+  /**
+   * Операция этой попытки уже выполнена на сервере (восстановление после перезагрузки
+   * или потерянного ответа): попытка оплачена и сохранена — без дубль-гарда, списания
+   * и записи. Содержимое сверяется по хешу при следующем «Сохранить».
+   */
+  adoptSaved(attemptId: string, done: { row: CloudRow | null; contentHash: string | null }): boolean {
+    const a = this.cur;
+    if (this.inFlight || a.id !== attemptId || a.paid) return false;
+    a.paid = true;
+    a.dupConfirmed = true;
+    a.saved = done.row ? { id: done.row.id, synced: true, createdAt: done.row.created_at } : null;
+    a.calcKey = null;
+    a.historyKey = null;
+    a.adoptedHash = done.contentHash;
+    return true;
+  }
+
   /** Сохранённая строка удалена из истории — следующая запись создаст новую (без нового списания). */
   forgetSaved(): void {
     const a = this.cur;
@@ -231,13 +303,24 @@ export class AccrualSaveController {
 
       const key = snapshotContentKey(snapshot);
 
+      // Расчёт, восстановленный с сервера: то же содержимое → считаем записанным.
+      if (at.saved && at.calcKey === null && at.adoptedHash !== null) {
+        if (this.deps.contentHash(key) === at.adoptedHash) {
+          at.calcKey = key;
+          at.historyKey = key;
+        }
+        at.adoptedHash = null;
+      }
+
       // Идемпотентность: то же содержимое уже записано (и в calculations, и — для
       // аккаунта — в report_history) → не пишем и не списываем ничего.
       if (at.saved && at.calcKey === key && (!userId || (at.saved.synced && at.historyKey === key))) {
         return { status: "unchanged", row: at.saved };
       }
 
-      if (!at.paid && !this.deps.canCalculate()) return { status: "paywall" };
+      // Незавершённая операция попытки: решает сервер (повтор вернёт уже сохранённое).
+      const pendingOp = !!userId && at.id !== null && !at.paid && this.deps.hasPendingOperation(at.id);
+      if (!at.paid && !pendingOp && !this.deps.canCalculate()) return { status: "paywall" };
 
       if (!at.saved && !at.dupConfirmed) {
         const proceed = await this.deps.confirmNoMonthDuplicate(snapshot.period.month);
@@ -245,19 +328,18 @@ export class AccrualSaveController {
         at.dupConfirmed = true;
       }
 
-      if (!at.paid) {
-        const consumed = await this.deps.consume();
-        if (!consumed.ok) {
-          at.dupConfirmed = false;
-          return { status: "paywall", reason: consumed.reason };
-        }
-        at.paid = true;
-      }
-
       const columns = accrualSnapshotToCalculationColumns(snapshot);
 
-      // Аноним: только локально (как прежний document flow), без облака.
+      // Аноним: списание локальным счётчиком страницы, запись только локальная.
       if (!userId) {
+        if (!at.paid) {
+          const consumed = await this.deps.consume();
+          if (!consumed.ok) {
+            at.dupConfirmed = false;
+            return { status: "paywall", reason: consumed.reason };
+          }
+          at.paid = true;
+        }
         const created = at.saved === null;
         const row: SavedRef = at.saved ?? {
           id: this.deps.newLocalId(),
@@ -278,6 +360,62 @@ export class AccrualSaveController {
         };
       }
 
+      // Аккаунт, первое сохранение попытки: ОДНА операция на сервере — списание,
+      // calculations, report_history и отметка операции в одной транзакции.
+      if (!at.paid) {
+        // Попытка без отпечатка файла (в интерфейсе не бывает): своя уникальная привязка,
+        // чтобы ключ операции не совпал с другой попыткой.
+        if (at.id === null) at.id = `unbound-${this.deps.newLocalId()}`;
+        const contentHash = this.deps.contentHash(key);
+        const op = await this.deps.saveOperation({
+          operationId: this.deps.operationIdFor(at.id),
+          requestHash: at.id,
+          contentHash,
+          calculation: columns,
+          history: accrualSnapshotToReportHistoryColumns(snapshot),
+        });
+        switch (op.kind) {
+          case "refused":
+            at.dupConfirmed = false;
+            return { status: "paywall", reason: op.reason };
+          case "conflict":
+            // Сохранённый ключ относится к другому файлу: следующий раз — новый ключ.
+            this.deps.operationSettled(at.id);
+            return {
+              status: "save_failed",
+              error: "ключ операции не совпадает с этим файлом",
+              charge: "none",
+            };
+          case "unavailable":
+            return { status: "save_failed", error: op.message, charge: "none" };
+          case "failed":
+            return { status: "save_failed", error: op.message, charge: "unknown" };
+        }
+        at.paid = true;
+        this.deps.operationSettled(at.id);
+        if (op.row) {
+          at.saved = { id: op.row.id, synced: true, createdAt: op.row.created_at };
+          if (!op.replay || op.contentHash === contentHash) {
+            at.calcKey = key;
+            at.historyKey = key;
+            return {
+              status: "saved",
+              row: at.saved,
+              created: !op.replay,
+              local: false,
+              calculationWrite: op.replay ? "none" : "insert",
+              historyWrite: "written",
+              historyWarning: null,
+              columns,
+              replay: op.replay,
+            };
+          }
+          // Повтор после правки ввода: сохранено прежнее содержимое — обновим ниже.
+        }
+        // op.row = null: сохранённую строку удалили из истории — ниже создаётся новая
+        // без нового списания.
+      }
+
       let row: SavedRef;
       let calculationWrite: CalculationWrite;
       if (at.saved?.synced && at.calcKey === key) {
@@ -287,14 +425,14 @@ export class AccrualSaveController {
       } else if (at.saved?.synced) {
         const up = await this.deps.updateCalculation(at.saved.id, columns);
         if (up.error || !up.data) {
-          return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт" };
+          return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт", charge: "kept" };
         }
         row = { id: up.data.id, synced: true, createdAt: up.data.created_at };
         calculationWrite = "update";
       } else {
         const ins = await this.deps.insertCalculation(columns);
         if (ins.error || !ins.data) {
-          return { status: "save_failed", error: ins.error?.message ?? "Не удалось сохранить расчёт" };
+          return { status: "save_failed", error: ins.error?.message ?? "Не удалось сохранить расчёт", charge: "kept" };
         }
         row = { id: ins.data.id, synced: true, createdAt: ins.data.created_at };
         calculationWrite = "insert";
