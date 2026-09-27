@@ -4,10 +4,14 @@ import { useEffect, useState } from "react";
 import { supabase } from "../app/lib/supabase-cloud";
 
 export type TariffTier = "single" | "unlimited";
+/** Откуда открыто окно. "api" — расчёт через Ozon API: предлагаем только безлимит. */
+export type TariffContext = "api";
 
 interface Props {
   open: boolean;
   tier: TariffTier | null;
+  /** Не задан — обычные режимы (выбор из двух тарифов или один тариф). */
+  context?: TariffContext | null;
   onClose: () => void;
 }
 
@@ -51,7 +55,7 @@ const TIER_DATA: Record<
   },
 };
 
-export function TariffModal({ open, tier, onClose }: Props) {
+export function TariffModal({ open, tier, context = null, onClose }: Props) {
   // Реальная оплата через POST /api/payment/create → redirect в ЮKassa.
   const [loadingPlan, setLoadingPlan] = useState<TariffTier | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -62,7 +66,7 @@ export function TariffModal({ open, tier, onClose }: Props) {
       setLoadingPlan(null);
       setError(null);
     }
-  }, [open, tier]);
+  }, [open, tier, context]);
 
   // Esc + body-lock
   useEffect(() => {
@@ -81,10 +85,12 @@ export function TariffModal({ open, tier, onClose }: Props) {
 
   if (!open) return null;
 
-  // tier === null → режим выбора: показываем оба тарифа сразу (после
-  // бесплатного расчёта). tier !== null → карточка одного тарифа (клик по
-  // конкретному тарифу в прайсинге).
-  const dual = tier === null;
+  // context === "api" → расчёт через Ozon API: только безлимит (149 ₽ API не
+  // открывает), оплачивается всегда unlimited. Иначе: tier === null → режим
+  // выбора — оба тарифа сразу (после бесплатного расчёта); tier !== null →
+  // карточка одного тарифа (клик по конкретному тарифу в прайсинге).
+  const apiOnly = context === "api";
+  const dual = !apiOnly && tier === null;
   const data = TIER_DATA[tier ?? "unlimited"];
   const plan: TariffTier = tier ?? "unlimited";
   // Что будет после оплаты — одинаково для обоих тарифов и режимов окна.
@@ -449,7 +455,56 @@ export function TariffModal({ open, tier, onClose }: Props) {
               </svg>
               PRO
             </span>
-            {dual ? (
+            {apiOnly ? (
+              <>
+                <h3 id="tm-title" className="tm-title">
+                  Расчёт через <em>Ozon API</em>
+                </h3>
+                <p className="tm-sub">
+                  Расчёты через Ozon API доступны на безлимите. Разовый тариф
+                  подходит для XLSX и ручного расчёта.
+                </p>
+
+                {error && (
+                  <p className="tm-error" role="alert">
+                    {error}
+                  </p>
+                )}
+
+                <div className="tm-tiers">
+                  <div className="tm-tier tm-tier-hot">
+                    <div className="tm-tier-head">
+                      <span className="tm-tier-name">Безлимит</span>
+                      <span className="tm-tier-price">
+                        <em>449</em> ₽<span className="per">/30 дней</span>
+                      </span>
+                    </div>
+                    <p className="tm-tier-desc">
+                      30 дней неограниченных расчётов, включая Ozon API · без
+                      автопродления. Для API нужны подключение Ozon и себестоимость
+                      товаров.
+                    </p>
+                    <button
+                      type="button"
+                      className="tm-btn tm-btn-gold"
+                      onClick={() => handlePay("unlimited")}
+                      disabled={loadingPlan !== null}
+                      aria-busy={loadingPlan === "unlimited"}
+                    >
+                      {loadingPlan === "unlimited" ? (
+                        "Создаём платёж…"
+                      ) : (
+                        <>
+                          Оформить безлимит — 449 ₽
+                          <span className="arr" aria-hidden="true">→</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+                {afterPayNote}
+              </>
+            ) : dual ? (
               <>
                 <h3 id="tm-title" className="tm-title">
                   Выберите <em>тариф</em>
