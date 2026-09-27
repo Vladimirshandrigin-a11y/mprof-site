@@ -298,13 +298,21 @@ export async function getUserProfile(
  * RLS subscriptions_select_own отдаёт только свои строки. Сбой → 0 (fail-closed).
  */
 export async function countActiveSingleCredits(userId: string): Promise<number> {
+  return (await readActiveSingleCredits(userId)) ?? 0;
+}
+
+/**
+ * То же, но сбой отличим от нуля: null — число кредитов узнать не удалось (для
+ * повторной проверки прав, где сбой не должен выглядеть как «кредитов нет»).
+ */
+export async function readActiveSingleCredits(userId: string): Promise<number | null> {
   // userId сохранён в сигнатуре для совместимости; сервер фильтрует по user_id
   // из токена. Идём через cloud-proxy (Timeweb), а не напрямую в Supabase.
   // eslint-disable-next-line no-console
   console.log("[cloud] countActiveSingleCredits", { userId });
   try {
     const token = await getAccessToken();
-    if (!token) return 0;
+    if (!token) return null;
     const count = await withReadTimeout<number>(
       (async () => {
         const res = await fetch("/api/cloud/single-credits", {
@@ -324,8 +332,9 @@ export async function countActiveSingleCredits(userId: string): Promise<number> 
     );
     return count;
   } catch {
-    // fail-closed: любой сбой/таймаут → 0 кредитов (не выдаём лишних расчётов).
-    return 0;
+    // Любой сбой/таймаут → null; countActiveSingleCredits превращает его в 0
+    // (fail-closed: не выдаём лишних расчётов).
+    return null;
   }
 }
 

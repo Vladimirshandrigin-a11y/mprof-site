@@ -4743,6 +4743,9 @@ export default function AppPage() {
     calcCount,
     freeCalculationsLimit,
     loaded: entitlementsLoaded,
+    checking: entitlementsChecking,
+    checkFailed: entitlementsCheckFailed,
+    recheck: recheckEntitlements,
     consumeCalculation,
   } = useEntitlements();
   // Доступ к расчёту через Ozon API (только отображение; решает сервер).
@@ -4751,6 +4754,8 @@ export default function AppPage() {
     hasPremium,
     calcCount,
     freeLimit: freeCalculationsLimit,
+    checking: entitlementsChecking,
+    checkFailed: entitlementsCheckFailed,
   });
 
   // Прежний документальный расчёт (реализация + УПД), восстановленный из истории.
@@ -5139,6 +5144,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 /* Нет доступа к API — пояснение над кнопкой «Оформить безлимит». */
 .api-need-unlimited .api-pro-msg{font-family:var(--sans);font-size:.88rem;line-height:1.5;
   letter-spacing:0;margin-bottom:.9rem}
+.api-recheck{display:block;margin:.7rem auto 0;min-height:44px;padding:0 .6rem;background:none;border:0;
+  color:var(--txt2);font-family:var(--sans);font-size:.85rem;text-decoration:underline;
+  text-underline-offset:3px;cursor:pointer}
+.api-recheck:hover{color:var(--txt)}
 .api-pro-actions{display:grid;grid-template-columns:1fr 1fr;gap:.8rem;margin-top:1.6rem}
 .api-pro-actions .api-pro-btn{flex:none;min-width:0;width:100%}
 .api-pro-btn.ghost{background:rgba(255,255,255,.04);color:var(--txt);
@@ -9377,7 +9386,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 {/* Главная кнопка — расчёт и сохранение. Без доступа к API (бесплатная
                     попытка израсходована, безлимита нет; разовые кредиты API не
                     открывают) — вместо неё предложение безлимита. Пока права
-                    загружаются, показываем обычную кнопку. */}
+                    загружаются — обычная кнопка; пока права перепроверяются или
+                    проверка не удалась — без предложения покупки. */}
                 {apiAccess === "needs_unlimited" ? (
                 <div className="api-field-block api-need-unlimited" role="region" aria-label="Доступ к Ozon API">
                   <p className="api-pro-msg">
@@ -9390,6 +9400,35 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     onClick={() => openTariffModal("unlimited", "api")}
                   >
                     Оформить безлимит — 449 ₽
+                  </button>
+                  <button
+                    type="button"
+                    className="api-recheck"
+                    onClick={() => void recheckEntitlements()}
+                  >
+                    Уже оплатили? Проверить доступ
+                  </button>
+                </div>
+                ) : apiAccess === "checking" ? (
+                <div className="api-field-block api-need-unlimited" role="status">
+                  <p className="api-pro-msg">Проверяем доступ к Ozon API…</p>
+                  <button type="button" className="api-pro-btn api-main-cta" disabled>
+                    <span className="spin" />
+                    Проверяем…
+                  </button>
+                </div>
+                ) : apiAccess === "check_failed" ? (
+                <div className="api-field-block api-need-unlimited" role="region" aria-label="Доступ к Ozon API">
+                  <p className="api-pro-msg">
+                    Не удалось проверить доступ к Ozon API. Это не значит, что
+                    доступа нет — проверьте ещё раз.
+                  </p>
+                  <button
+                    type="button"
+                    className="api-pro-btn api-main-cta"
+                    onClick={() => void recheckEntitlements()}
+                  >
+                    Проверить снова
                   </button>
                 </div>
                 ) : (

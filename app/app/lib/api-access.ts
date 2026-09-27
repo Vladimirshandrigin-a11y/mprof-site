@@ -6,10 +6,19 @@
 //
 //   • права ещё загружаются → "loading": обычная кнопка, без требования оплаты;
 //   • активный безлимит или бесплатная попытка не израсходована → "allowed";
+//   • иначе, пока идёт повторная проверка прав → "checking" (без предложения
+//     покупки: права могли устареть, например после оплаты в другой вкладке);
+//   • иначе, если последняя проверка не удалась → "check_failed" (не «доступа
+//     нет», а «не удалось проверить» с возможностью повторить);
 //   • иначе → "needs_unlimited": предлагаем только «Безлимит — 449 ₽».
 // ============================================================================
 
-export type ApiCalcAccess = "loading" | "allowed" | "needs_unlimited";
+export type ApiCalcAccess =
+  | "loading"
+  | "allowed"
+  | "checking"
+  | "check_failed"
+  | "needs_unlimited";
 
 export interface ApiCalcAccessInput {
   /** Права загружены (useEntitlements().loaded). */
@@ -20,10 +29,17 @@ export interface ApiCalcAccessInput {
   calcCount: number;
   /** Бесплатных попыток (FREE_CALCULATIONS_LIMIT). */
   freeLimit: number;
+  /** Идёт повторная проверка прав (useEntitlements().checking). */
+  checking?: boolean;
+  /** Последняя проверка прав не удалась (useEntitlements().checkFailed). */
+  checkFailed?: boolean;
 }
 
 export function apiCalcAccess(i: ApiCalcAccessInput): ApiCalcAccess {
   if (!i.loaded) return "loading";
   if (i.hasPremium) return "allowed";
-  return Math.max(0, i.calcCount) < i.freeLimit ? "allowed" : "needs_unlimited";
+  if (Math.max(0, i.calcCount) < i.freeLimit) return "allowed";
+  if (i.checking) return "checking";
+  if (i.checkFailed) return "check_failed";
+  return "needs_unlimited";
 }

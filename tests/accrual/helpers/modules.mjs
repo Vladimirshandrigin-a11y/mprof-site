@@ -39,6 +39,7 @@ export const salesSplit = req("./app/lib/accrual/sales-split.js");
 export const guide = req("./app/lib/accrual/download-guide.js");
 export const access = req("./app/lib/access-status.js");
 export const apiAccess = req("./app/lib/api-access.js");
+export const singleFlight = req("./app/lib/single-flight.js");
 export const XLSX = req("xlsx");
 
 // Серверные модули (автодобавление товаров в каталог, загрузчик и маршруты на моках).
