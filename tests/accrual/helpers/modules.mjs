@@ -41,6 +41,9 @@ export const guide = req("./app/lib/accrual/download-guide.js");
 export const access = req("./app/lib/access-status.js");
 export const apiAccess = req("./app/lib/api-access.js");
 export const singleFlight = req("./app/lib/single-flight.js");
+export const calcOpKeys = req("./app/lib/calc-operation-keys.js");
+export const calcOpNotes = req("./app/lib/calc-operation-notes.js");
+export const hash53 = req("./app/lib/hash53.js");
 export const XLSX = req("xlsx");
 
 // Серверные модули (автодобавление товаров в каталог, загрузчик и маршруты на моках).

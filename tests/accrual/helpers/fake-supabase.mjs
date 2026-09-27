@@ -1,6 +1,9 @@
 // Минимальная in-memory замена service-role клиента Supabase для тестов серверных
 // модулей: только те вызовы, которые реально делают catalog-import и save-calculation
-// (from().select/insert/upsert/update/delete/eq/in/order/range/single/maybeSingle).
+// (from().select/insert/upsert/update/delete/eq/in/order/range/single/maybeSingle) и
+// rpc операции API-расчёта (api_calculation_operation_status → «нет операции»;
+// save_api_calculation_operation → строки calculations/report_history, списание не
+// моделируется — это делает tests/db на настоящей БД).
 // products.upsert(onConflict "user_id,sku_key", ignoreDuplicates) эмулирует уникальный
 // индекс из миграции (ключ — нормализация расчёта); migrationApplied=false — как в БД
 // без миграции (42703). ЭТО МОК: конкурентную гарантию БД доказывает только tests/db.
@@ -174,7 +177,27 @@ export function makeFakeSupabase(seed = {}, opts = {}) {
     }
   }
 
-  const admin = { from: (t) => new Q(t) };
+  /** Вызовы admin.rpc (имя функции). */
+  const rpcCalls = [];
+  const admin = {
+    from: (t) => new Q(t),
+    async rpc(name, args) {
+      await tick();
+      rpcCalls.push(name);
+      if (name === "api_calculation_operation_status") return { data: { ok: true, status: "none" }, error: null };
+      if (name === "save_api_calculation_operation") {
+        const calc = { id: `id-${String(++idSeq).padStart(6, "0")}`, created_at: nowIso(), ...clone(args.p_calculation), user_id: args.p_user_id, mode: "api" };
+        tables.calculations.push(calc);
+        tables.report_history.push({ id: `id-${String(++idSeq).padStart(6, "0")}`, created_at: nowIso(), ...clone(args.p_history), user_id: args.p_user_id });
+        ops.push({ table: "calculations", op: "insert", count: 1 }, { table: "report_history", op: "insert", count: 1 });
+        return {
+          data: { ok: true, replay: false, status: "done", calculation_id: calc.id, created_at: calc.created_at, charged: true, used: 1, allowance: 1, unlimited: false },
+          error: null,
+        };
+      }
+      return { data: null, error: { code: "PGRST202", message: `fake: нет функции ${name}` } };
+    },
+  };
   return {
     admin,
     tables,
@@ -182,6 +205,7 @@ export function makeFakeSupabase(seed = {}, opts = {}) {
     faults,
     hooks,
     state,
+    rpcCalls,
     /** Число обращений (не сбоев) заданного вида к таблице. */
     count: (table, op) => ops.filter((o) => o.table === table && o.op === op && !o.failed).length,
     /** Число записывающих операций (insert/update/delete) по таблице. */

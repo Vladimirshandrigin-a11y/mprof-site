@@ -26,7 +26,7 @@ import {
   type ConsumeResult,
   type SavedRef,
 } from "./save-flow";
-import { createOperationStore, type OperationStore } from "./operation-store";
+import { browserOperationStorage, createOperationStore, newOperationId, type OperationStore } from "./operation-store";
 import {
   accrualSnapshotToCalculationColumns,
   type AccrualCalculationColumns,
@@ -179,21 +179,6 @@ function makeLocalId(): string {
   return "local-" + Math.random().toString(36).slice(2, 10);
 }
 
-/** UUID ключа операции (формат проверяет сервер). */
-function makeOperationId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-  const h = (n: number) => Array.from({ length: n }, () => Math.floor(Math.random() * 16).toString(16)).join("");
-  return `${h(8)}-${h(4)}-4${h(3)}-${"89ab"[Math.floor(Math.random() * 4)]}${h(3)}-${h(12)}`;
-}
-
-function browserStorage(): Storage | null {
-  try {
-    return typeof window !== "undefined" ? window.localStorage : null;
-  } catch {
-    return null;
-  }
-}
-
 export interface AccrualUploadSession {
   file: { name: string; size: number } | null;
   phase: "idle" | "reading" | "ready" | "error";
@@ -241,7 +226,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   // Ключи операций: переживают перезагрузку (localStorage), лениво в обработчике.
   const opStoreRef = useRef<OperationStore | null>(null);
   const getOpStore = (): OperationStore => {
-    if (!opStoreRef.current) opStoreRef.current = createOperationStore(browserStorage(), makeOperationId);
+    if (!opStoreRef.current) opStoreRef.current = createOperationStore(browserOperationStorage(), newOperationId);
     return opStoreRef.current;
   };
 

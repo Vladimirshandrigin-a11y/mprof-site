@@ -479,15 +479,15 @@ function setupApi({ userId = "u1", catalog = [], rows = REALIZATION, extraTables
     rows,
     operations: [{ operation_type: "OperationAgentDeliveredToCustomer", type: "orders", accruals_for_sale: 1000, sale_commission: -150, amount: 850, services: [] }],
   };
+  // Списывающий вызов — операция API-расчёта (service role); статус операции не списывает.
   const rpc = [];
+  const fakeRpc = fake.admin.rpc;
+  fake.admin.rpc = async (name, args) => {
+    if (name === "save_api_calculation_operation") rpc.push(name);
+    return fakeRpc(name, args);
+  };
   stubOzon(state);
   asUser(fake, userId);
-  patch(authLib, "getUserScopedClient", () => ({
-    rpc: async (name) => {
-      rpc.push(name);
-      return { data: { ok: true, unlimited: false, used: 1, allowance: 1 }, error: null };
-    },
-  }));
   patch(cryptoLib, "isEncryptionConfigured", () => true);
   patch(cryptoLib, "decryptOzonApiKey", () => "plain-api-key");
   const prevFlag = process.env.OZON_FINANCE_ACCRUAL_ENABLED;
@@ -561,7 +561,7 @@ describe("сценарий API: автодобавление в save-calculation
     const ok = await post();
     assert.equal(ok.status, 200, JSON.stringify(ok.json).slice(0, 300));
     assert.equal(ok.json.ok, true);
-    assert.deepEqual(rpc, ["consume_api_calculation"]);
+    assert.deepEqual(rpc, ["save_api_calculation_operation"]);
     assert.deepEqual(noCalcWrites(fake), [1, 1, 1, 1]);
     assert.notEqual(before, withCosts);
     assert.equal(JSON.stringify(fake.tables.products), withCosts, "каталог при расчёте не менялся");

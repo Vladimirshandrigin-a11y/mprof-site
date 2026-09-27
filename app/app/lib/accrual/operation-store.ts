@@ -1,7 +1,8 @@
 // ============================================================================
-// Ключи операций расчёта по XLSX (см. save-flow и /api/cloud/calculation-operations).
-// Ключ (UUID) создаётся при первом «Сохранить» для пары «пользователь + файл» и
-// живёт до подтверждения сервером — в localStorage, поэтому переживает повтор,
+// Ключи операций расчёта (см. save-flow и /api/cloud/calculation-operations; ручной
+// режим и Ozon API — calc-operation-keys). Ключ (UUID) создаётся при первом
+// сохранении для пары «пользователь + отпечаток» (файл XLSX или режим + параметры)
+// и живёт до подтверждения сервером — в localStorage, поэтому переживает повтор,
 // потерянный ответ и перезагрузку страницы. Это НЕ отметка «оплачено»: что сделано
 // на самом деле, знает только сервер (статус операции по ключу).
 // Без localStorage (приватный режим, запрет) ключи живут в памяти вкладки.
@@ -26,6 +27,8 @@ export interface OperationStore {
   getOrCreate(userId: string, attemptId: string): string;
   /** Операция подтверждена сервером (или ключ отвергнут) — ключ больше не нужен. */
   settle(userId: string, attemptId: string): void;
+  /** Незавершённые ключи пользователя (свежие), новые — первыми. */
+  pending(userId: string): Array<{ attemptId: string; id: string; at: number }>;
 }
 
 export function createOperationStore(
@@ -80,5 +83,27 @@ export function createOperationStore(
       delete byUser[attemptId];
       save({ ...st, [userId]: byUser });
     },
+    pending(userId) {
+      return Object.entries(load()[userId] ?? {})
+        .filter((kv): kv is [string, Entry] => fresh(kv[1]))
+        .map(([attemptId, e]) => ({ attemptId, id: e.id, at: e.at }))
+        .sort((a, b) => b.at - a.at);
+    },
   };
+}
+
+/** UUID ключа операции (формат проверяет сервер). */
+export function newOperationId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const h = (n: number) => Array.from({ length: n }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+  return `${h(8)}-${h(4)}-4${h(3)}-${"89ab"[Math.floor(Math.random() * 4)]}${h(3)}-${h(12)}`;
+}
+
+/** localStorage браузера или null (SSR, приватный режим, запрет). */
+export function browserOperationStorage(): StorageLike | null {
+  try {
+    return typeof window !== "undefined" ? window.localStorage : null;
+  } catch {
+    return null;
+  }
 }
