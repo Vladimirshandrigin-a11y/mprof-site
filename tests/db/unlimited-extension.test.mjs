@@ -1,14 +1,10 @@
 // Продление безлимита и однократная выдача доступа по платежу — на НАСТОЯЩЕЙ PostgreSQL
 // с НЕЗАВИСИМЫМИ соединениями. Запуск: TEST_DATABASE_URL=… npm run test:db.
 //
-// Каждая группа тестов получает отдельную временную базу: supabase/schema.sql в состоянии
-// ДО миграции (как в production сейчас) + роли и права по умолчанию как в Supabase
-// (anon / authenticated / service_role). Затем ДОСЛОВНО миграция
-// supabase/migrations/20260927_unlimited_payment_extension.sql и read-only проверки
-// supabase/checks/unlimited_payment_extension.sql.
-//
-// Роли anon / authenticated / service_role создаются в тестовом кластере, если их нет
-// (роли в PostgreSQL общие для кластера) — только для локальной тестовой БД.
+// Каждая группа тестов получает отдельную временную базу (tests/db/helpers/pay-db.mjs):
+// supabase/schema.sql в состоянии ДО миграции + роли и права по умолчанию как в Supabase,
+// затем ДОСЛОВНО миграция supabase/migrations/20260927_unlimited_payment_extension.sql и
+// read-only проверки supabase/checks/unlimited_payment_extension.sql.
 //
 // Что проверяется:
 //   • SQL-функция public.grant_unlimited_payment() напрямую, от имени service_role;
@@ -20,163 +16,20 @@
 //     «одна транзакция держит блокировку, другая ждёт».
 
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import path from "node:path";
-import { after, afterEach, before, beforeEach, describe, it } from "node:test";
-import { fileURLToPath } from "node:url";
-import pg from "pg";
+import { after, before, describe, it } from "node:test";
+import {
+  CHECK_SECTIONS,
+  MIGRATION,
+  buildRequire,
+  grant,
+  payTestEnv,
+  pidOf,
+  runScript,
+  waitForLock,
+} from "./helpers/pay-db.mjs";
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(here, "../..");
-const read = (p) => readFileSync(path.join(root, p), "utf8");
-const MIGRATION = read("supabase/migrations/20260927_unlimited_payment_extension.sql");
-const CHECKS = read("supabase/checks/unlimited_payment_extension.sql");
-const SCHEMA = read("supabase/schema.sql");
-const req = createRequire(path.join(process.env.DB_TEST_BUILD_DIR, "loader.js"));
-const WH = req("./api/payment/_lib/webhook-core.js");
-
-pg.types.setTypeParser(1184, (v) => v); // timestamptz → строка как есть (точность до микросекунд)
-
-const SECTION_MARK = "-- Продление безлимита (449 ₽) с сохранением оплаченного срока.";
-// schema.sql в состоянии ДО миграции: всё до итоговой секции продления.
-const SCHEMA_BEFORE = (() => {
-  const i = SCHEMA.indexOf(SECTION_MARK);
-  assert.ok(i > 0, "секция продления в schema.sql не найдена");
-  return SCHEMA.slice(0, SCHEMA.lastIndexOf("-- ====", i));
-})();
-
-const CHECK_SECTIONS = (() => {
-  const parts = CHECKS.split(/^(?=-- ─── РАЗДЕЛ )/m).slice(1); // строка-заголовок раздела остаётся комментарием
-  assert.equal(parts.length, 3, "в файле проверок три раздела");
-  return { before: parts[0], after: parts[1], deploy: parts[2] };
-})();
-
-// Роли и права по умолчанию как в Supabase + заглушка схемы auth.
-const SUPABASE_LIKE = `
-  do $$
-  begin
-    if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin noinherit; end if;
-    if not exists (select 1 from pg_roles where rolname = 'authenticated') then create role authenticated nologin noinherit; end if;
-    if not exists (select 1 from pg_roles where rolname = 'service_role') then create role service_role nologin noinherit bypassrls; end if;
-  end $$;
-  grant usage on schema public to anon, authenticated, service_role;
-  alter default privileges in schema public grant all on tables to anon, authenticated, service_role;
-  alter default privileges in schema public grant all on sequences to anon, authenticated, service_role;
-  alter default privileges in schema public grant all on functions to anon, authenticated, service_role;
-  create schema auth;
-  create table auth.users (id uuid primary key, email text);
-  create or replace function auth.uid() returns uuid language sql stable
-    as $$ select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
-  grant usage on schema auth to anon, authenticated, service_role;
-  grant execute on function auth.uid() to anon, authenticated, service_role;
-`;
-
-const PREFIX = `mprof_paytest_${Date.now().toString(36)}_${randomBytes(3).toString("hex")}`;
-let server;
-let adminUrl;
-let dbCount = 0;
-const databases = [];
-const opened = [];
-
-async function client(url, role) {
-  const c = new pg.Client({ connectionString: url });
-  c.on("error", () => {}); // обрыв соединения проверяется тестом явно
-  await c.connect();
-  opened.push(c);
-  if (role) await c.query(`set role ${role}`);
-  return c;
-}
-
-/** Новая временная база: схема ДО миграции (+ миграция, если migrated). */
-async function freshDb({ migrated = true, fullSchema = false } = {}) {
-  const name = `${PREFIX}_${++dbCount}`;
-  await server.query(`create database ${name} encoding 'UTF8' template template0`);
-  databases.push(name);
-  const u = new URL(adminUrl);
-  u.pathname = `/${name}`;
-  const url = u.toString();
-  const main = await client(url);
-  await main.query(SUPABASE_LIKE);
-  await main.query(fullSchema ? SCHEMA : SCHEMA_BEFORE);
-  if (migrated) await main.query(MIGRATION);
-  const db = {
-    url,
-    main,
-    /** Независимое соединение от имени service_role (как серверный webhook через PostgREST). */
-    service: () => client(url, "service_role"),
-    async serviceMany(n) {
-      const cs = await Promise.all(Array.from({ length: n }, () => client(url, "service_role")));
-      const pids = await Promise.all(cs.map(async (c) => (await c.query("select pg_backend_pid() as p")).rows[0].p));
-      assert.equal(new Set(pids).size, n, "соединения независимы (разные серверные процессы)");
-      return cs;
-    },
-    async user({ premium = null, plan } = {}) {
-      const id = randomUUID();
-      await main.query("insert into auth.users (id, email) values ($1, $2)", [id, `${id.slice(0, 8)}@example.test`]);
-      // Профиль создаёт триггер handle_new_user() из schema.sql.
-      if (premium !== null || plan) {
-        await main.query(
-          `update public.profiles set premium_until = ${premium === null ? "null" : `now() + interval '${premium}'`},
-                  plan = coalesce($2, plan) where id = $1`,
-          [id, plan ?? null]
-        );
-      }
-      return id;
-    },
-    /** Pending-подписка, как её создаёт /api/payment/create. */
-    async sub(userId, plan = "unlimited", { status = "pending", paymentId = `pay-${randomUUID()}`, createdAgo } = {}) {
-      const r = await main.query(
-        `insert into public.subscriptions (user_id, plan, status, provider, provider_payment_id, created_at)
-         values ($1, $2, $3, 'yookassa', $4, ${createdAgo ? `now() - interval '${createdAgo}'` : "now()"})
-         returning id`,
-        [userId, plan, status, paymentId]
-      );
-      return { id: r.rows[0].id, paymentId };
-    },
-    async profile(userId) {
-      return (await main.query("select plan, premium_until from public.profiles where id = $1", [userId])).rows[0];
-    },
-    async subRow(id) {
-      return (await main.query("select status, starts_at, expires_at, provider_payment_id from public.subscriptions where id = $1", [id])).rows[0];
-    },
-    async activations(userId) {
-      return (
-        await main.query(
-          "select payment_id, subscription_id, activated_at, premium_until_before, premium_until_after from public.payment_activations where ($1::uuid is null or user_id = $1) order by premium_until_after",
-          [userId ?? null]
-        )
-      ).rows;
-    },
-    /** Истинно ли SQL-выражение (сравнения времени — в БД, с точностью до микросекунд). */
-    async holds(sql, params) {
-      return (await main.query(`select (${sql}) as ok`, params)).rows[0].ok === true;
-    },
-    async snapshot() {
-      const s = await main.query("select * from public.subscriptions order by id");
-      const p = await main.query("select * from public.profiles order by id");
-      return JSON.stringify([s.rows, p.rows]);
-    },
-  };
-  return db;
-}
-
-async function grant(c, subId, paymentId) {
-  const r = await c.query("select public.grant_unlimited_payment($1, $2) as r", [subId, paymentId]);
-  return r.rows[0].r;
-}
-
-/** Ждём, пока серверный процесс pid встанет в ожидание блокировки. */
-async function waitForLock(db, pid) {
-  for (let i = 0; i < 100; i++) {
-    const r = await db.main.query("select wait_event_type from pg_stat_activity where pid = $1", [pid]);
-    if (r.rows[0]?.wait_event_type === "Lock") return;
-    await new Promise((res) => setTimeout(res, 50));
-  }
-  assert.fail(`процесс ${pid} так и не встал в ожидание блокировки`);
-}
-const pidOf = async (c) => (await c.query("select pg_backend_pid() as p")).rows[0].p;
+const WH = buildRequire("./api/payment/_lib/webhook-core.js");
+const { freshDb, client } = payTestEnv();
 
 /** Подмножество supabase-js, которое использует webhook-core, поверх одного pg-соединения. */
 function adminOver(c) {
@@ -265,34 +118,12 @@ function yk(sub, plan, over = {}) {
   };
 }
 
-let consoleErrors = [];
 const realConsoleError = console.error;
-
-before(async () => {
-  adminUrl = process.env.TEST_DATABASE_URL;
-  server = new pg.Client({ connectionString: adminUrl });
-  await server.connect();
-  console.error = (...a) => consoleErrors.push(a);
+before(() => {
+  console.error = () => {}; // сверки webhook пишут в лог ожидаемые отказы
 });
-
-// Соединения, открытые внутри теста, закрываем после него (у сервера ограничено число
-// подключений); соединения групп из before() живут до конца файла.
-let openedMark = 0;
-beforeEach(() => {
-  openedMark = opened.length;
-});
-afterEach(async () => {
-  const mine = opened.splice(openedMark);
-  await Promise.all(mine.map((c) => c.end().catch(() => {})));
-});
-
-after(async () => {
+after(() => {
   console.error = realConsoleError;
-  await Promise.all(opened.map((c) => c.end().catch(() => {})));
-  if (server) {
-    for (const d of databases) await server.query(`drop database if exists ${d} with (force)`).catch(() => {});
-    await server.end().catch(() => {});
-  }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -727,18 +558,26 @@ describe("доступ: выдать права может только серв
   });
 
   for (const role of ["anon", "authenticated"]) {
-    it(`${role} не может вызвать функцию и не видит журнал`, async () => {
+    it(`${role} не может вызвать функцию и не может читать, вставлять, менять или удалять отметки журнала`, async () => {
       const u = await db.user();
       const s = await db.sub(u);
+      const paid = await db.sub(u);
+      await grant(await db.service(), paid.id, paid.paymentId); // своя отметка в журнале уже есть
+      const ledger = JSON.stringify(await db.activations(u));
+      const profile = await db.profile(u);
       const c = await client(db.url, role);
       if (role === "authenticated") await c.query("select set_config('request.jwt.claim.sub', $1, false)", [u]);
-      await assert.rejects(grant(c, s.id, s.paymentId), (e) => e.code === "42501");
-      await assert.rejects(c.query("select count(*) from public.payment_activations"), (e) => e.code === "42501");
+      const denied = (e) => e.code === "42501";
+      await assert.rejects(grant(c, s.id, s.paymentId), denied);
+      await assert.rejects(c.query("select count(*) from public.payment_activations"), denied);
       await assert.rejects(
         c.query("insert into public.payment_activations (payment_id, subscription_id, user_id, activated_at, premium_until_after) values ('x', $1, $2, now(), now())", [s.id, u]),
-        (e) => e.code === "42501"
+        denied
       );
-      assert.deepEqual(await db.profile(u), { plan: "free", premium_until: null });
+      await assert.rejects(c.query("update public.payment_activations set premium_until_after = premium_until_after + interval '999 days'"), denied);
+      await assert.rejects(c.query("delete from public.payment_activations where user_id = $1", [u]), denied);
+      assert.equal(JSON.stringify(await db.activations(u)), ledger, "отметки не изменились");
+      assert.deepEqual(await db.profile(u), profile);
     });
   }
 
@@ -784,12 +623,13 @@ describe("миграция, read-only проверки и порядок вып�
     assert.equal(beforeRow[0].already_table, false);
     assert.equal(beforeRow[0].already_function, false);
     assert.equal(beforeCounts[0].duplicate_payment_ids, "0");
+    assert.equal(beforeCounts[0].unfinished_legacy_activations, "0");
     const snap = await db.snapshot();
     assert.equal(await db.snapshot(), snap, "раздел «ДО» ничего не изменил");
 
-    await db.main.query(MIGRATION);
+    await runScript(db.main, MIGRATION);
     assert.equal(await db.snapshot(), snap, "миграция не тронула подписки и профили");
-    await db.main.query(MIGRATION); // повторно
+    await runScript(db.main, MIGRATION); // повторно
     assert.equal(await db.snapshot(), snap);
 
     const [afterRow, afterStats] = await sectionRows(db.main, CHECK_SECTIONS.after);
@@ -806,13 +646,16 @@ describe("миграция, read-only проверки и порядок вып�
     for (const [k, v] of Object.entries(deployRow[0])) if (k.endsWith("_mismatch")) assert.equal(v, "0", k);
   });
 
-  it("итоговая секция schema.sql совпадает с миграцией (функция, таблица, права)", async () => {
+  it("итоговая секция schema.sql совпадает с миграцией (функции, таблица, права, ограждение)", async () => {
     const describeDb = async (c) => {
       const f = await c.query("select pg_get_functiondef(to_regprocedure('public.grant_unlimited_payment(uuid,text)')) as d, (select proacl::text from pg_proc where oid = to_regprocedure('public.grant_unlimited_payment(uuid,text)')) as acl");
       const t = await c.query("select column_name, data_type, is_nullable, column_default from information_schema.columns where table_schema='public' and table_name='payment_activations' order by ordinal_position");
       const a = await c.query("select relacl::text as acl, relrowsecurity from pg_class where oid = 'public.payment_activations'::regclass");
       const i = await c.query("select indexdef from pg_indexes where schemaname='public' and tablename='payment_activations' order by indexname");
-      return JSON.stringify([f.rows, t.rows, a.rows, i.rows]);
+      const g = await c.query("select pg_get_functiondef('public.guard_unlimited_writes()'::regprocedure) as d, (select proacl::text from pg_proc where oid = 'public.guard_unlimited_writes()'::regprocedure) as acl");
+      const tr = await c.query("select tgrelid::regclass::text as rel, pg_get_triggerdef(oid) as d from pg_trigger where tgname = 'guard_unlimited_writes' order by 1");
+      assert.equal(tr.rows.length, 2, "ограждение на subscriptions и profiles");
+      return JSON.stringify([f.rows, t.rows, a.rows, i.rows, g.rows, tr.rows]);
     };
     const migrated = await freshDb();
     const full = await freshDb({ migrated: false, fullSchema: true });
@@ -833,89 +676,9 @@ describe("миграция, read-only проверки и порядок вып�
     assert.equal(outSingle.http, 200);
     assert.equal((await db.subRow(single.id)).status, "active");
 
-    await db.main.query(MIGRATION);
+    await runScript(db.main, MIGRATION);
     const retry = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(s, "unlimited"));
     assert.equal(retry.body.granted, true);
     assert.ok(await db.holds("$1::timestamptz = $2::timestamptz + interval '30 days'", [(await db.profile(u)).premium_until, start]));
-  });
-
-  // Старый webhook (до этого PR) — те же запросы, что он делал через PostgREST:
-  // прочитать подписку; если не active — UPDATE подписки (срок = время Node + 30 дней);
-  // затем UPSERT профиля premium_until = срок подписки. Каждый запрос — своя транзакция.
-  const DAY = 24 * 60 * 60 * 1000;
-  async function oldRead(c, subId) {
-    return (await c.query("select id, user_id, status, expires_at from public.subscriptions where id = $1", [subId])).rows[0];
-  }
-  async function oldWrite(c, sub) {
-    let expires = sub.expires_at;
-    if (sub.status !== "active") {
-      const now = Date.now();
-      expires = new Date(now + 30 * DAY).toISOString();
-      await c.query("update public.subscriptions set status = 'active', starts_at = $2, expires_at = $3 where id = $1", [sub.id, new Date(now).toISOString(), expires]);
-    }
-    await c.query(
-      "insert into public.profiles (id, plan, premium_until) values ($1, 'unlimited', $2) on conflict (id) do update set plan = excluded.plan, premium_until = excluded.premium_until",
-      [sub.user_id, expires]
-    );
-  }
-
-  it("миграция раньше кода: старый webhook работает как прежде, новый код не выдаёт повторно его платёж", async () => {
-    const db = await freshDb();
-    const u = await db.user({ premium: "10 days", plan: "unlimited" });
-    const s = await db.sub(u);
-    const old = await db.service();
-    await oldWrite(old, await oldRead(old, s.id));
-    // Старое поведение: «сейчас + 30», остаток 10 дней потерян (дефект, который исправляет PR).
-    assert.ok(await db.holds("$1::timestamptz - now() between interval '29 days 23 hours' and interval '30 days'", [(await db.profile(u)).premium_until]));
-    const snap = await db.snapshot();
-    const out = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(s, "unlimited"));
-    assert.equal(out.body.granted, false);
-    assert.equal(await db.snapshot(), snap, "двойного начисления нет");
-  });
-
-  it("старый и новый код одновременно обрабатывают один платёж: двойного начисления нет (возможна старая потеря остатка)", async () => {
-    const db = await freshDb();
-    const u = await db.user({ premium: "10 days", plan: "unlimited" });
-    const start = (await db.profile(u)).premium_until;
-    const s = await db.sub(u);
-    const [oldC, newC] = await db.serviceMany(2);
-    const seen = await oldRead(oldC, s.id); // старый код прочитал pending
-    const r = await grant(newC, s.id, s.paymentId); // новый код выдал +30 и зафиксировал
-    assert.equal(r.granted, true);
-    await oldWrite(oldC, seen); // старый код перезаписал по-старому
-    const until = (await db.profile(u)).premium_until;
-    assert.ok(await db.holds("$1::timestamptz < $2::timestamptz + interval '30 days' + interval '1 minute'", [until, start]), "не больше одной выдачи");
-    assert.ok(await db.holds("$1::timestamptz - now() > interval '29 days 23 hours'", [until]), "доступ не потерян");
-  });
-
-  it("новый код держит блокировку, старый ждёт её и затем пишет по-старому: без взаимоблокировок и без двойного начисления", async () => {
-    const db = await freshDb();
-    const u = await db.user({ premium: "10 days", plan: "unlimited" });
-    const start = (await db.profile(u)).premium_until;
-    const s = await db.sub(u);
-    const [newC, oldC] = await db.serviceMany(2);
-    const pidOld = await pidOf(oldC);
-    const seen = await oldRead(oldC, s.id);
-    await newC.query("begin");
-    await grant(newC, s.id, s.paymentId);
-    const pOld = oldWrite(oldC, seen);
-    await waitForLock(db, pidOld);
-    await newC.query("commit");
-    await pOld;
-    assert.ok(await db.holds("$1::timestamptz < $2::timestamptz + interval '30 days' + interval '1 minute'", [(await db.profile(u)).premium_until, start]));
-  });
-
-  it("откат кода после выпуска: повтор уже выданного платежа старым кодом ставит срок этого платежа (может уменьшить)", async () => {
-    // Характеризация риска отката: не откатывать код, пока идут повторы уведомлений.
-    const db = await freshDb();
-    const u = await db.user();
-    const s1 = await db.sub(u);
-    const s2 = await db.sub(u);
-    const svc = await db.service();
-    const r1 = await grant(svc, s1.id, s1.paymentId);
-    const r2 = await grant(svc, s2.id, s2.paymentId);
-    assert.ok(await db.holds("$1::timestamptz = $2::timestamptz + interval '30 days'", [r2.premium_until, r1.premium_until]));
-    await oldWrite(svc, await oldRead(svc, s1.id));
-    assert.ok(await db.holds("$1::timestamptz = $2::timestamptz", [(await db.profile(u)).premium_until, r1.premium_until]), "старый код вернул срок первого платежа");
   });
 });

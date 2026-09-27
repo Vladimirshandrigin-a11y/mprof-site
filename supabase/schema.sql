@@ -744,7 +744,83 @@ revoke all on public.ozon_performance_connections from anon, authenticated;
 -- Здесь — итоговое состояние схемы для полноты дампа; тест tests/db сверяет, что оно
 -- совпадает с миграцией.
 -- ============================================================================
--- Журнал обработанных платежей безлимита. Строка = «этот платёж уже выдал доступ».
+-- 1. Ограждение от записей старого обработчика. CREATE TRIGGER берёт блокировку таблиц
+--    (SHARE ROW EXCLUSIVE): дожидается уже идущих записей и не пускает новые до COMMIT.
+create or replace function public.guard_unlimited_writes()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  -- Ограничиваем только серверную роль приложения; grant_unlimited_payment() на время
+  -- своих записей ставит транзакционный флаг mprof.unlimited_grant.
+  if current_user <> 'service_role'
+     or coalesce(current_setting('mprof.unlimited_grant', true), '') = 'on' then
+    return new;
+  end if;
+
+  if tg_table_name = 'subscriptions' then
+    if new.plan = 'unlimited' and (
+         (tg_op = 'INSERT' and new.status = 'active')
+      or (tg_op = 'UPDATE'
+          and (new.status = 'active' or old.status = 'active')
+          and (new.status, new.starts_at, new.expires_at)
+              is distinct from (old.status, old.starts_at, old.expires_at))
+    ) then
+      raise exception using
+        errcode = 'P0001',
+        message = 'unlimited_extension: безлимит активирует только grant_unlimited_payment()';
+    end if;
+  elsif tg_table_name = 'profiles' then
+    if (tg_op = 'INSERT' and new.premium_until is not null)
+       or (tg_op = 'UPDATE' and new.premium_until is distinct from old.premium_until) then
+      raise exception using
+        errcode = 'P0001',
+        message = 'unlimited_extension: срок безлимита меняет только grant_unlimited_payment()';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+revoke all on function public.guard_unlimited_writes() from public, anon, authenticated;
+
+drop trigger if exists guard_unlimited_writes on public.subscriptions;
+create trigger guard_unlimited_writes
+  before insert or update on public.subscriptions
+  for each row execute function public.guard_unlimited_writes();
+
+drop trigger if exists guard_unlimited_writes on public.profiles;
+create trigger guard_unlimited_writes
+  before insert or update on public.profiles
+  for each row execute function public.guard_unlimited_writes();
+
+-- 2. Незавершённая активация старым обработчиком (уже под блокировками п. 1): у каждого
+--    пользователя с действующей active-подпиской безлимита срок профиля должен совпадать
+--    со сроком самой поздней из них — старый обработчик пишет их одним значением.
+do $$
+begin
+  if exists (
+    select 1
+      from (
+        select distinct on (s.user_id) s.user_id, s.expires_at
+          from public.subscriptions s
+         where s.plan = 'unlimited' and s.status = 'active' and s.expires_at is not null
+         order by s.user_id, s.expires_at desc
+      ) latest
+      left join public.profiles p on p.id = latest.user_id
+     where latest.expires_at > now()
+       and p.premium_until is distinct from latest.expires_at
+  ) then
+    raise exception using
+      errcode = 'P0001',
+      message = 'unlimited_extension: есть незавершённая активация безлимита старым обработчиком '
+             || '(подписка active, срок профиля не совпадает). Ничего не изменено. Повторите '
+             || 'миграцию через минуту; если снова так — раздел «ДО» проверок, решение владельца.';
+  end if;
+end $$;
+
+-- 3. Журнал обработанных платежей безлимита. Строка = «этот платёж уже выдал доступ».
 create table if not exists public.payment_activations (
   payment_id            text        primary key,
   subscription_id       uuid        not null unique
@@ -764,6 +840,7 @@ alter table public.payment_activations enable row level security;
 revoke all on public.payment_activations from public, anon, authenticated;
 grant select, insert on public.payment_activations to service_role;
 
+-- 4. Выдача 30 дней по одному платежу — одна транзакция.
 create or replace function public.grant_unlimited_payment(
   p_subscription_id uuid,
   p_payment_id      text
@@ -833,7 +910,8 @@ begin
     return jsonb_build_object('ok', true, 'granted', false, 'reason', 'already_processed');
   end if;
 
-  -- 5. Срок и статус — в той же транзакции, что и отметка.
+  -- 5. Срок и статус — в той же транзакции, что и отметка (флаг пропускает ограждение).
+  perform set_config('mprof.unlimited_grant', 'on', true);
   update public.profiles
      set plan = 'unlimited', premium_until = until_after
    where id = sub.user_id;
@@ -844,6 +922,7 @@ begin
          expires_at = until_after,
          provider_payment_id = coalesce(provider_payment_id, p_payment_id)
    where id = sub.id;
+  perform set_config('mprof.unlimited_grant', '', true);
 
   return jsonb_build_object(
     'ok', true, 'granted', true,

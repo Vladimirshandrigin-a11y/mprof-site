@@ -13,10 +13,12 @@
 --   • status_check содержит 'pending' и 'active';
 --   • duplicate_payment_ids = 0 — иначе сообщить разработчику (миграцию это не
 --     блокирует: журнал всё равно не даст одному платежу выдать доступ дважды);
---   • legacy_half_processed — подписки безлимита, которые старый код отметил active,
---     но срок профиля меньше срока подписки (сбой между двумя запросами старого кода).
---     Новый код их НЕ чинит автоматически (исторические сроки не пересчитываются);
---     при значении > 0 владелец решает вручную.
+--   • unfinished_legacy_activations = 0 — то же условие, что проверяет миграция: у
+--     пользователя с действующей active-подпиской безлимита срок профиля не совпадает со
+--     сроком самой поздней из них (старый обработчик отметил подписку, но ещё не записал
+--     профиль, или срок меняли вручную). При > 0 миграция остановится; если значение не
+--     обнуляется за минуту — это не текущая запись, а данные: решение владельца.
+--     Автоматически ничего не исправляется.
 begin read only;
 
 select
@@ -55,16 +57,20 @@ select
     where plan = 'unlimited' and premium_until > now())                          as unlimited_active_now,
   (select count(*) from public.profiles
     where plan = 'unlimited' and (premium_until is null or premium_until <= now())) as unlimited_expired,
-  (select count(*) from public.subscriptions s
-     join public.profiles p on p.id = s.user_id
-    where s.plan = 'unlimited' and s.status = 'active'
-      and s.expires_at is not null
-      and (p.premium_until is null or p.premium_until < s.expires_at))          as legacy_half_processed;
+  (select count(*) from (
+     select distinct on (s.user_id) s.user_id, s.expires_at
+       from public.subscriptions s
+      where s.plan = 'unlimited' and s.status = 'active' and s.expires_at is not null
+      order by s.user_id, s.expires_at desc) latest
+     left join public.profiles p on p.id = latest.user_id
+    where latest.expires_at > now()
+      and p.premium_until is distinct from latest.expires_at)                   as unfinished_legacy_activations;
 
 rollback;
 
 -- ─── РАЗДЕЛ «ПОСЛЕ»: сразу после применения миграции ────────────────────────
--- Ожидается: все колонки *_ok = true, activations = 0. Сводка по тарифам и статусам
+-- Ожидается: все колонки *_ok = true (включая fence_ok — ограждение от старого
+-- обработчика), activations = 0. Сводка по тарифам и статусам
 -- из раздела «ДО» не изменилась (миграция существующие строки не трогает).
 begin read only;
 
@@ -92,6 +98,9 @@ select
        and a.grantee = 0 and a.privilege_type = 'EXECUTE')                      as function_closed_for_public_ok,
   has_function_privilege('service_role', 'public.grant_unlimited_payment(uuid,text)', 'execute')
                                                                                 as function_service_role_ok,
+  (select count(*) = 2 from pg_trigger
+    where tgname = 'guard_unlimited_writes' and tgenabled = 'O'
+      and tgrelid in ('public.subscriptions'::regclass, 'public.profiles'::regclass)) as fence_ok,
   (select count(*) from public.payment_activations)                             as activations;
 
 select plan, status, count(*) as subscriptions
@@ -104,10 +113,9 @@ rollback;
 -- ─── РАЗДЕЛ «ПОСЛЕ ДЕПЛОЯ»: после выпуска кода (можно повторять) ────────────
 -- Ожидается: все *_mismatch = 0.
 --   • activations — сколько платежей безлимита обработал новый код;
---   • gap_legacy_activations — безлимиты, активированные СТАРЫМ кодом после
---     применения миграции (промежуток до деплоя кода): их срок посчитан по-старому
---     («сейчас + 30», без остатка). Впишите время применения миграции вместо
---     '2000-01-01 00:00:00+00'. Автоматически ничего не исправляется.
+--   • gap_legacy_activations — безлимиты, активированные после применения миграции без
+--     отметки в журнале. Ограждение не даёт старому обработчику их создавать, поэтому
+--     ожидается 0. Впишите время применения миграции вместо '2000-01-01 00:00:00+00'.
 begin read only;
 
 with m as (select timestamptz '2000-01-01 00:00:00+00' as migration_applied_at)
