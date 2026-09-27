@@ -43,7 +43,7 @@ select
     or to_regprocedure('public.calculation_operation_status(uuid,text)') is not null
                                                                                 as already_functions;
 
--- Сводка (только числа): расчёты по режимам и строки сводки по месяцам.
+-- Сводка (только числа): сколько расчётов в каждом режиме.
 select mode, count(*) as calculations
   from public.calculations
  group by mode
