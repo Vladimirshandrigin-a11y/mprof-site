@@ -2,6 +2,12 @@
 
 import { createClient } from "@supabase/supabase-js";
 import type { User } from "@supabase/supabase-js";
+import type {
+  CalculationOperationRequest,
+  CalculationOperationResult,
+  CalculationOperationStatus,
+} from "./accrual/save-flow";
+import { asAccrualSnapshot } from "./accrual/snapshot";
 
 // ============================================================================
 // Supabase client — module-scope с placeholder fallback'ом, чтобы build
@@ -337,6 +343,106 @@ export async function readActiveSingleCredits(userId: string): Promise<number | 
     return null;
   }
 }
+
+// ============================================================================
+// Операция расчёта по XLSX: списание попытки и сохранение ОДНОЙ транзакцией БД
+// (/api/cloud/calculation-operations). Повтор с тем же operationId ничего не списывает
+// и не пишет: возвращает сохранённый снимок (или «deleted», если расчёт удалён из
+// истории). «failed» — ответа нет или он не
+// подтверждает результат: операция могла успеть сохраниться, поэтому повторять
+// нужно С ТЕМ ЖЕ operationId.
+// ============================================================================
+export async function saveCalculationOperation(
+  input: CalculationOperationRequest
+): Promise<CalculationOperationResult> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return { kind: "refused", reason: "not_authenticated" };
+    const { status, body } = await withReadTimeout(
+      (async () => {
+        const res = await fetch("/api/cloud/calculation-operations", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(input),
+          cache: "no-store",
+        });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as OperationBody };
+      })()
+    );
+    const d = body.data;
+    if (status === 200 && d) {
+      if (d.status === "deleted") return { kind: "deleted" };
+      if (d.calculationId && d.createdAt) {
+        return {
+          kind: "ok",
+          replay: d.replay === true,
+          row: { id: d.calculationId, created_at: d.createdAt },
+          snapshot: asAccrualSnapshot(d.snapshot),
+          contentMatch: d.contentMatch === true,
+        };
+      }
+      return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
+    }
+    if (status === 401 || status === 402) return { kind: "refused", reason: body.code || "limit_reached" };
+    if (status === 409) return { kind: "conflict" };
+    if (status === 503) return { kind: "unavailable", message: body.error || "Сохранение временно недоступно" };
+    return { kind: "failed", message: body.error || `Ошибка сервера (${status})` };
+  } catch (e) {
+    return { kind: "failed", message: fmtError(e).message };
+  }
+}
+
+/** Статус операции (после перезагрузки): только своя операция и только для того же файла. */
+export async function getCalculationOperationStatus(
+  operationId: string,
+  requestHash: string
+): Promise<CalculationOperationStatus> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return { kind: "failed", message: "Требуется авторизация" };
+    const q = new URLSearchParams({ operationId, requestHash });
+    const { status, body } = await withReadTimeout(
+      (async () => {
+        const res = await fetch(`/api/cloud/calculation-operations?${q}`, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as OperationBody };
+      })()
+    );
+    const d = body.data;
+    if (status !== 200 || !d) return { kind: "failed", message: body.error || `Ошибка сервера (${status})` };
+    if (d.status === "done") {
+      if (!d.calculationId || !d.createdAt) return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
+      return {
+        kind: "done",
+        row: { id: d.calculationId, created_at: d.createdAt },
+        snapshot: asAccrualSnapshot(d.snapshot),
+      };
+    }
+    if (d.status === "deleted") return { kind: "deleted" };
+    return d.status === "conflict" ? { kind: "conflict" } : { kind: "none" };
+  } catch (e) {
+    return { kind: "failed", message: fmtError(e).message };
+  }
+}
+
+type OperationBody = {
+  data?: {
+    replay?: boolean;
+    status?: string;
+    calculationId?: string | null;
+    createdAt?: string | null;
+    snapshot?: unknown;
+    contentMatch?: boolean;
+  };
+  error?: string;
+  code?: string;
+};
 
 /** Ответ RPC consume_calculation() (см. supabase/schema.sql). */
 export interface ConsumeResult {

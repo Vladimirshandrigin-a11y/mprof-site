@@ -4812,6 +4812,8 @@ export default function AppPage() {
     onPaywall: () => {
       openTariffModal(null);
     },
+    // Сервер списал попытку вместе с сохранением — обновить счётчик прав на экране.
+    onCharged: () => void recheckEntitlements(),
     onSaved: handleAccrualSaved,
     onCatalogChanged: () => setCatalogRefresh((k) => k + 1),
     isRowPresent: (id) => history.some((h) => h.id === id),

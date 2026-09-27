@@ -2,7 +2,8 @@
 // Тесты на НАСТОЯЩЕЙ PostgreSQL:  npm run test:db
 //   • уникальность артикула каталога (products-unique.test.mjs);
 //   • продление безлимита и однократная выдача по платежу (unlimited-extension.test.mjs);
-//   • webhook ЮKassa → RPC и пересечение со старым обработчиком (payment-webhook.test.mjs).
+//   • webhook ЮKassa → RPC и пересечение со старым обработчиком (payment-webhook.test.mjs);
+//   • атомарное списание и сохранение расчёта по XLSX (calculation-operations.test.mjs).
 //
 // Нужна тестовая PostgreSQL 15+ (локальная / Docker / `supabase start`) и адрес в
 // TEST_DATABASE_URL, например:
@@ -11,8 +12,8 @@
 // mprof_dbtest_<случайно>, работает только в ней и удаляет её в конце. Базу из адреса
 // тест не меняет. Адреса Supabase-облака отклоняются (защита от запуска на production).
 //
-// 1) компилирует общую функцию импорта и webhook ЮKassa (TypeScript → CommonJS) во
-//    временную папку;
+// 1) компилирует общую функцию импорта, webhook ЮKassa и маршрут операций расчёта
+//    (TypeScript → CommonJS) во временную папку;
 // 2) запускает `node --test` по tests/db/*.test.mjs.
 
 import { spawnSync } from "node:child_process";
@@ -59,6 +60,7 @@ const tsc = spawnSync(
     "app/api/cloud/_lib/catalog-import.ts",
     "app/api/payment/_lib/webhook-core.ts",
     "app/api/payment/webhook/route.ts",
+    "app/api/cloud/calculation-operations/route.ts",
   ],
   { cwd: repoRoot, stdio: "inherit" }
 );

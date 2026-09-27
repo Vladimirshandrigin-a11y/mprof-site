@@ -35,6 +35,7 @@ export const format = req("./app/lib/accrual/format.js");
 export const columns = req("./app/lib/accrual/columns.js");
 export const session = req("./app/lib/accrual/upload-session.js");
 export const saveFlow = req("./app/lib/accrual/save-flow.js");
+export const opStore = req("./app/lib/accrual/operation-store.js");
 export const salesSplit = req("./app/lib/accrual/sales-split.js");
 export const guide = req("./app/lib/accrual/download-guide.js");
 export const access = req("./app/lib/access-status.js");
