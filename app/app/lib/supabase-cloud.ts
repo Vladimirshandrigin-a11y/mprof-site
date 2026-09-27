@@ -7,6 +7,7 @@ import type {
   CalculationOperationResult,
   CalculationOperationStatus,
 } from "./accrual/save-flow";
+import { asAccrualSnapshot } from "./accrual/snapshot";
 
 // ============================================================================
 // Supabase client — module-scope с placeholder fallback'ом, чтобы build
@@ -345,8 +346,9 @@ export async function readActiveSingleCredits(userId: string): Promise<number | 
 
 // ============================================================================
 // Операция расчёта по XLSX: списание попытки и сохранение ОДНОЙ транзакцией БД
-// (/api/cloud/calculation-operations). Повтор с тем же operationId возвращает уже
-// сохранённый расчёт без нового списания. «failed» — ответа нет или он не
+// (/api/cloud/calculation-operations). Повтор с тем же operationId ничего не списывает
+// и не пишет: возвращает сохранённый снимок (или «deleted», если расчёт удалён из
+// истории). «failed» — ответа нет или он не
 // подтверждает результат: операция могла успеть сохраниться, поэтому повторять
 // нужно С ТЕМ ЖЕ operationId.
 // ============================================================================
@@ -372,12 +374,17 @@ export async function saveCalculationOperation(
     );
     const d = body.data;
     if (status === 200 && d) {
-      return {
-        kind: "ok",
-        replay: d.replay === true,
-        row: d.calculationId && d.createdAt ? { id: d.calculationId, created_at: d.createdAt } : null,
-        contentHash: d.contentHash ?? null,
-      };
+      if (d.status === "deleted") return { kind: "deleted" };
+      if (d.calculationId && d.createdAt) {
+        return {
+          kind: "ok",
+          replay: d.replay === true,
+          row: { id: d.calculationId, created_at: d.createdAt },
+          snapshot: asAccrualSnapshot(d.snapshot),
+          contentMatch: d.contentMatch === true,
+        };
+      }
+      return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
     }
     if (status === 401 || status === 402) return { kind: "refused", reason: body.code || "limit_reached" };
     if (status === 409) return { kind: "conflict" };
@@ -410,12 +417,14 @@ export async function getCalculationOperationStatus(
     const d = body.data;
     if (status !== 200 || !d) return { kind: "failed", message: body.error || `Ошибка сервера (${status})` };
     if (d.status === "done") {
+      if (!d.calculationId || !d.createdAt) return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
       return {
         kind: "done",
-        row: d.calculationId && d.createdAt ? { id: d.calculationId, created_at: d.createdAt } : null,
-        contentHash: d.contentHash ?? null,
+        row: { id: d.calculationId, created_at: d.createdAt },
+        snapshot: asAccrualSnapshot(d.snapshot),
       };
     }
+    if (d.status === "deleted") return { kind: "deleted" };
     return d.status === "conflict" ? { kind: "conflict" } : { kind: "none" };
   } catch (e) {
     return { kind: "failed", message: fmtError(e).message };
@@ -428,7 +437,8 @@ type OperationBody = {
     status?: string;
     calculationId?: string | null;
     createdAt?: string | null;
-    contentHash?: string | null;
+    snapshot?: unknown;
+    contentMatch?: boolean;
   };
   error?: string;
   code?: string;

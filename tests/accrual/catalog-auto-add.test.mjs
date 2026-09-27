@@ -366,6 +366,8 @@ describe("сценарий XLSX: файл → сопоставление → а�
     assert.deepEqual(ev.problemProducts, []);
     const cloud = makeMockCloud();
     const ctl = new SF.AccrualSaveController(cloud.deps);
+    const p = parseBuf(scenario("basic"));
+    ctl.beginAttempt(SES.reportFingerprint({ rows: p.report.rows, period: p.report.period, rowCount: p.report.summary.rowCount }));
     assert.equal((await ctl.save({ snapshot: ev.snapshot, ready: true, userId: "u1" })).status, "saved");
     assert.deepEqual([cloud.log.consume, cloud.log.inserts.length, cloud.log.histories.length], [1, 1, 1]);
     assert.equal(fake.rowsOf("products", "u1").length, 2, "каталог при расчёте не менялся");

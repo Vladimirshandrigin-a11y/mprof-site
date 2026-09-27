@@ -39,7 +39,7 @@ select
              and pg_get_constraintdef(oid) like '%mode%' and pg_get_constraintdef(oid) like '%upload%')
                                                                                 as mode_upload_ok,
   to_regclass('public.calculation_operations') is not null                      as already_table,
-  to_regprocedure('public.save_calculation_operation(uuid,text,text,text,jsonb,jsonb)') is not null
+  to_regprocedure('public.save_calculation_operation(uuid,text,text,jsonb,jsonb)') is not null
     or to_regprocedure('public.calculation_operation_status(uuid,text)') is not null
                                                                                 as already_functions;
 
@@ -58,6 +58,16 @@ begin read only;
 
 select
   to_regclass('public.calculation_operations') is not null                      as table_ok,
+  (select count(*) = 9 from information_schema.columns
+    where table_schema = 'public' and table_name = 'calculation_operations'
+      and column_name in ('id', 'user_id', 'mode', 'request_hash', 'payload_hash', 'calculation_id',
+                          'report_history_id', 'charged', 'created_at'))
+    and (select count(*) = 9 from information_schema.columns
+          where table_schema = 'public' and table_name = 'calculation_operations')
+                                                                                as columns_ok,
+  (select count(*) = 2 from pg_constraint
+    where conrelid = 'public.calculation_operations'::regclass and contype = 'f'
+      and pg_get_constraintdef(oid) like '%ON DELETE SET NULL%')                 as journal_survives_delete_ok,
   (select relrowsecurity from pg_class
     where oid = 'public.calculation_operations'::regclass)                       as rls_ok,
   (select count(*) = 0 from pg_policies
@@ -65,21 +75,21 @@ select
   not has_table_privilege('anon', 'public.calculation_operations', 'select,insert,update,delete')
     and not has_table_privilege('authenticated', 'public.calculation_operations', 'select,insert,update,delete')
                                                                                 as table_closed_for_browser_ok,
-  to_regprocedure('public.save_calculation_operation(uuid,text,text,text,jsonb,jsonb)') is not null
+  to_regprocedure('public.save_calculation_operation(uuid,text,text,jsonb,jsonb)') is not null
     and to_regprocedure('public.calculation_operation_status(uuid,text)') is not null
                                                                                 as functions_ok,
   (select bool_and(prosecdef) from pg_proc
-    where oid in (to_regprocedure('public.save_calculation_operation(uuid,text,text,text,jsonb,jsonb)'),
+    where oid in (to_regprocedure('public.save_calculation_operation(uuid,text,text,jsonb,jsonb)'),
                   to_regprocedure('public.calculation_operation_status(uuid,text)'))) as security_definer_ok,
-  not has_function_privilege('anon', 'public.save_calculation_operation(uuid,text,text,text,jsonb,jsonb)', 'execute')
+  not has_function_privilege('anon', 'public.save_calculation_operation(uuid,text,text,jsonb,jsonb)', 'execute')
     and not has_function_privilege('anon', 'public.calculation_operation_status(uuid,text)', 'execute')
                                                                                 as functions_closed_for_anon_ok,
   not exists (
     select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
-     where p.oid in (to_regprocedure('public.save_calculation_operation(uuid,text,text,text,jsonb,jsonb)'),
+     where p.oid in (to_regprocedure('public.save_calculation_operation(uuid,text,text,jsonb,jsonb)'),
                      to_regprocedure('public.calculation_operation_status(uuid,text)'))
        and a.grantee = 0 and a.privilege_type = 'EXECUTE')                      as functions_closed_for_public_ok,
-  has_function_privilege('authenticated', 'public.save_calculation_operation(uuid,text,text,text,jsonb,jsonb)', 'execute')
+  has_function_privilege('authenticated', 'public.save_calculation_operation(uuid,text,text,jsonb,jsonb)', 'execute')
     and has_function_privilege('authenticated', 'public.calculation_operation_status(uuid,text)', 'execute')
                                                                                 as functions_authenticated_ok,
   (select count(*) from public.calculation_operations)                          as operations;
@@ -90,7 +100,8 @@ rollback;
 -- Ожидается: все *_mismatch = 0.
 --   • operations — сколько расчётов по XLSX сохранено операциями;
 --   • charged / not_charged — со списанием попытки / на безлимите (справочно);
---   • deleted_by_user — строку расчёта пользователь удалил из истории (справочно);
+--   • deleted_by_user — строку расчёта пользователь удалил из истории (справочно: запись
+--     журнала остаётся, повтор операции отвечает «удалён» и ничего не создаёт);
 --   • user_mismatch — строка расчёта или сводки принадлежит другому пользователю;
 --   • mode_mismatch — строка расчёта не режима upload.
 -- Любое ненулевое *_mismatch: ничего не исправлять автоматически, сообщить разработчику.

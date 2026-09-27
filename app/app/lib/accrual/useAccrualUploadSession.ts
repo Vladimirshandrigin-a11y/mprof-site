@@ -27,16 +27,23 @@ import {
   type SavedRef,
 } from "./save-flow";
 import { createOperationStore, type OperationStore } from "./operation-store";
-import type { AccrualCalculationColumns, AccrualReportHistoryColumns } from "./columns";
 import {
+  accrualSnapshotToCalculationColumns,
+  type AccrualCalculationColumns,
+  type AccrualReportHistoryColumns,
+} from "./columns";
+import {
+  DELETED_NOTE,
   EMPTY_ACCRUAL_INPUTS,
+  RESTORED_KEY,
   evaluateAccrual,
   formatParseErrors,
   accrualMissingCatalogCandidates,
-  contentFingerprint,
+  inputsFromSnapshot,
   reportFingerprint,
   resultAccess,
   saveOutcomeUi,
+  savedEvaluation,
   savedState,
   validateAccrualFile,
   type AccrualEvaluation,
@@ -55,7 +62,6 @@ import type { AccrualParseResult } from "../report-parsers/accrual-xlsx-parser";
 export interface AccrualUploadServices {
   parseFile(file: File): Promise<AccrualParseResult>;
   loadCatalog(userId: string): Promise<{ entries: CatalogEntry[]; error: string | null }>;
-  insertCalculation(cols: AccrualCalculationColumns, userId: string): Promise<CloudResult<CloudRow>>;
   updateCalculation(id: string, cols: AccrualCalculationColumns, userId: string): Promise<CloudResult<CloudRow>>;
   insertReportHistory(cols: AccrualReportHistoryColumns, userId: string): Promise<CloudResult<unknown>>;
   /** Списание + сохранение одной транзакцией на сервере (идемпотентно по ключу операции). */
@@ -90,7 +96,11 @@ export interface AccrualUploadSessionOptions {
   onSaved: (e: AccrualSavedEvent) => void;
   /** Каталог изменился (автодобавление) — обновить открытые списки каталога. */
   onCatalogChanged?: () => void;
-  /** Строка с таким id ещё есть в истории (иначе следующая запись создаст новую). */
+  /**
+   * Строка с таким id ещё есть в истории страницы. Нет: у анонима следующая запись
+   * создаст новую локальную; у аккаунта удалён ли расчёт — проверяет сервер (удалённый
+   * заново не создаётся).
+   */
   isRowPresent: (id: string) => boolean;
   showToast?: (message: string, type: "ok" | "warn" | "err") => void;
   services?: Partial<AccrualUploadServices>;
@@ -130,11 +140,6 @@ const DEFAULT_SERVICES: AccrualUploadServices = {
       entries: (data ?? []).map((p) => ({ sku: p.sku, name: p.name, cost_price: Number(p.cost_price) })),
       error: null,
     };
-  },
-  async insertCalculation(cols, userId) {
-    const { saveCalculationToCloud } = await import("../supabase-cloud");
-    const r = await saveCalculationToCloud(cols, userId);
-    return { data: r.data ? { id: r.data.id, created_at: r.data.created_at } : null, error: r.error };
   },
   async updateCalculation(id, cols, userId) {
     const { updateCalculationInCloud } = await import("../supabase-cloud");
@@ -257,9 +262,8 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
         operationSettled: (attemptId) => getOpStore().settle(optsRef.current.userId ?? "", attemptId),
         hasPendingOperation: (attemptId) =>
           !!optsRef.current.userId && getOpStore().get(optsRef.current.userId, attemptId) !== null,
-        contentHash: contentFingerprint,
-        insertCalculation: (cols) =>
-          resolveServices(optsRef.current).insertCalculation(cols, optsRef.current.userId ?? ""),
+        operationStatus: (operationId, requestHash) =>
+          resolveServices(optsRef.current).calculationOperationStatus(operationId, requestHash),
         updateCalculation: (id, cols) =>
           resolveServices(optsRef.current).updateCalculation(id, cols, optsRef.current.userId ?? ""),
         insertReportHistory: (cols) =>
@@ -282,9 +286,9 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   const [saving, setSaving] = useState(false);
   const [saveNote, setSaveNote] = useState<SaveNote | null>(null);
   const [savedKey, setSavedKey] = useState<string | null>(null);
-  // Отпечаток содержимого расчёта, восстановленного с сервера (recoverOperationFor):
-  // ключа снимка у нас нет, сравниваем по contentFingerprint.
-  const [adoptedHash, setAdoptedHash] = useState<string | null>(null);
+  // Сохранённый снимок с сервера (восстановление): показывается как есть, без пересчёта,
+  // пока пользователь явно не поправит значения.
+  const [restored, setRestored] = useState<AccrualSnapshotV1 | null>(null);
   const [creditHeld, setCreditHeld] = useState(false);
   const [attemptPaid, setAttemptPaid] = useState(false);
   const [otherHeldCredits, setOtherHeldCredits] = useState(0);
@@ -358,9 +362,30 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
   };
 
   /**
+   * Показать расчёт, уже сохранённый операцией (восстановление или повтор после потерянного
+   * ответа): снимок сервера как есть — итог, товары и параметры (поля формы) — без пересчёта
+   * по текущему каталогу и без записи. Строка попадает в историю страницы.
+   */
+  const applyRestored = (row: SavedRef, snapshot: AccrualSnapshotV1 | null): void => {
+    setSavedKey(snapshot ? snapshotContentKey(snapshot) : RESTORED_KEY);
+    setNeedsRetry(false);
+    if (!snapshot) return;
+    setRestored(snapshot);
+    setInputs(inputsFromSnapshot(snapshot));
+    optsRef.current.onSaved({
+      row,
+      columns: accrualSnapshotToCalculationColumns(snapshot),
+      created: false,
+      local: false,
+      historyRecorded: true,
+    });
+  };
+
+  /**
    * Восстановление после перезагрузки / потерянного ответа: у этого файла есть
    * незавершённая операция → спрашиваем сервер. Уже сохранена → попытка оплачена и
-   * записана (без дубль-гарда, списания и повторной записи). Нет на сервере → ключ
+   * записана, на экране — сохранённый снимок (без дубль-гарда, списания, пересчёта и
+   * записи). Расчёт удалён из истории → не восстанавливается. Нет на сервере → ключ
    * остаётся и будет использован при сохранении. Ошибка сети → решит повтор операции.
    */
   const recoverOperationFor = async (req: number, attemptId: string): Promise<void> => {
@@ -380,19 +405,25 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
       store.settle(userId, attemptId);
       return;
     }
+    if (st.kind === "deleted") {
+      store.settle(userId, attemptId);
+      setSaveNote({ kind: "warn", text: DELETED_NOTE });
+      return;
+    }
     if (st.kind !== "done") return;
     const controller = getController();
-    if (!controller.adoptSaved(attemptId, st)) return;
+    if (!controller.adoptSaved(attemptId, { row: st.row, operationId, snapshot: st.snapshot })) return;
     store.settle(userId, attemptId);
     syncAttemptState(controller);
-    setAdoptedHash(st.row ? st.contentHash ?? "" : null);
-    setNeedsRetry(st.row === null);
-    setSaveNote({
-      kind: "ok",
-      text: st.row
-        ? "Этот файл уже рассчитан и сохранён в истории — повторного списания нет."
-        : "Попытка для этого файла уже списана; сохранённую запись удалили из истории — повторное сохранение создаст её снова без нового списания.",
-    });
+    applyRestored({ id: st.row.id, synced: true, createdAt: st.row.created_at }, st.snapshot);
+    setSaveNote(
+      st.snapshot
+        ? { kind: "ok", text: "Этот файл уже рассчитан и сохранён в истории — показан сохранённый результат, повторного списания нет." }
+        : {
+            kind: "warn",
+            text: "Этот файл уже рассчитан и сохранён в истории — повторного списания нет. Сохранённый результат не удалось прочитать: откройте его в истории.",
+          }
+    );
   };
 
   /** Подтянуть в состояние экрана то, что известно контроллеру о текущей и «чужих» попытках. */
@@ -427,7 +458,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     syncAttemptState(controller);
     setNeedsRetry(false);
     setSavedKey(null);
-    setAdoptedHash(null);
+    setRestored(null);
     setFile({ name: f.name, size: f.size });
     setParsed(null);
     setErrors([]);
@@ -490,7 +521,7 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     setCatalog({ status: "idle", entries: [], error: null });
     setCatalogImport({ status: "idle" });
     setSavedKey(null);
-    setAdoptedHash(null);
+    setRestored(null);
     setSaveNote(null);
   };
 
@@ -503,19 +534,27 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     if (entries) await autoImportFor(req, parsed, entries);
   };
 
-  const setInput = (field: InputField, value: string) => setInputs((prev) => ({ ...prev, [field]: value }));
+  // Правка значения — явное действие: сохранённый снимок уступает пересчёту по текущему
+  // каталогу и вводу; записать его можно только «Сохранить изменения».
+  const setInput = (field: InputField, value: string) => {
+    setRestored(null);
+    setInputs((prev) => ({ ...prev, [field]: value }));
+  };
 
   const evaluation = useMemo<AccrualEvaluation | null>(() => {
     if (!parsed) return null;
+    if (restored) return savedEvaluation(restored);
     if (catalog.status === "loading" || catalog.status === "error") return null;
     return evaluateAccrual({ report: parsed, catalog: catalog.entries, inputs, generatedAt: parsedAt });
-  }, [parsed, catalog, inputs, parsedAt]);
+  }, [parsed, restored, catalog, inputs, parsedAt]);
 
   const currentKey = evaluation && evaluation.status === "ok" ? snapshotContentKey(evaluation.snapshot) : null;
-  const { saved, dirty } = savedState(savedKey, adoptedHash, currentKey);
+  const { saved, dirty } = savedState(savedKey, currentKey, restored !== null);
 
   const save = async (): Promise<void> => {
     if (savingRef.current) return; // двойной клик
+    // На экране сохранённый снимок как есть — записывать нечего (правка сбрасывает его).
+    if (restored) return;
     if (!parsed || catalog.status === "loading" || catalog.status === "error") return;
     // Итог считается заново из ТЕКУЩИХ вводов и каталога — сохраняется ровно то, что на экране.
     const ev = evaluateAccrual({ report: parsed, catalog: catalog.entries, inputs, generatedAt: new Date().toISOString() });
@@ -527,13 +566,26 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
     try {
       const o = optsRef.current;
       const st = controller.state;
-      if (st.saved && !o.isRowPresent(st.saved.id)) controller.forgetSaved();
-      const out = await controller.save({ snapshot: ev.snapshot, ready: ev.readyToSave, userId: o.userId });
+      // Сохранённой строки нет в истории страницы: аноним — новая локальная запись;
+      // аккаунт — удалён ли расчёт, решает сервер (удалённый заново не создаётся).
+      const rowMissing = st.saved !== null && !o.isRowPresent(st.saved.id);
+      if (rowMissing && !o.userId) controller.forgetSaved();
+      const out = await controller.save({
+        snapshot: ev.snapshot,
+        ready: ev.readyToSave,
+        userId: o.userId,
+        savedRowMissing: rowMissing && !!o.userId,
+      });
       syncAttemptState(controller);
       // Что показать — решает чистая saveOutcomeUi (покрыта тестами); хук только применяет.
       const ui = saveOutcomeUi(out);
       if (ui.needsRetry !== null) setNeedsRetry(ui.needsRetry);
       if (ui.markSaved) setSavedKey(snapshotContentKey(ev.snapshot));
+      if (out.status === "restored") applyRestored(out.row, out.snapshot);
+      if (out.status === "deleted") {
+        setSavedKey(null);
+        setRestored(null);
+      }
       setSaveNote(ui.note);
       if (ui.openPaywall) o.onPaywall();
       if (ui.emitSaved && out.status === "saved") {

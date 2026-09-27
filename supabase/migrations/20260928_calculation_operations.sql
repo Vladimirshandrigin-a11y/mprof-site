@@ -15,15 +15,20 @@
 --
 -- Стало: public.save_calculation_operation() — ОДНА транзакция БД:
 --   • строка профиля блокируется FOR UPDATE — операции пользователя идут по очереди;
---   • операция с тем же id уже есть → повтор: возвращается сохранённый расчёт, НИЧЕГО
---     не списывается и не пишется (потерянный ответ, двойной клик, перезагрузка);
+--   • операция с тем же id уже есть → повтор: НИЧЕГО не списывается и не пишется.
+--     Возвращается сохранённый расчёт (его снимок) и признак, совпадают ли данные
+--     повтора с сохранёнными (content_match); расчёт удалён пользователем → статус
+--     «deleted», без повторного создания расчёта и сводки;
 --   • иначе — списание по действующим правилам (вызов consume_calculation(): общая
 --     бесплатная попытка, разовые кредиты, безлимит без расхода), затем строки
 --     calculations и report_history и отметка операции. Сбой на любом шаге откатывает
 --     всё: ни списания, ни частичных записей.
--- Операция привязана к пользователю и к конкретному файлу (request_hash — отпечаток
--- разобранного отчёта): тот же id с другим файлом или от другого пользователя →
--- operation_conflict, без данных чужой операции.
+-- Операция привязана к пользователю, к конкретному файлу (request_hash — отпечаток
+-- разобранного отчёта) и к сохранённым данным (payload_hash — SHA-256 расчёта, снимка
+-- без времени формирования и строки сводки; считает сервер при первом сохранении).
+-- Тот же id с другим файлом или от другого пользователя → operation_conflict, без
+-- данных чужой операции. Удаление расчёта из истории журнал не стирает: ссылка на
+-- строку обнуляется, факт завершённой операции остаётся.
 --
 -- Доступ: функции выполняются от владельца (SECURITY DEFINER), пользователь — из JWT
 -- (auth.uid()), как у consume_calculation. EXECUTE — только authenticated. Журнал
@@ -51,14 +56,16 @@ begin
   end if;
 end $$;
 
--- 1. Журнал операций расчёта: строка = «эта операция уже списала попытку и сохранила
---    расчёт». Первичный ключ — id операции от клиента (UUID).
+-- 1. Журнал операций расчёта: строка = «эта операция списала попытку и сохранила
+--    расчёт». Первичный ключ — id операции от клиента (UUID). Удаление расчёта или
+--    сводки из истории строку журнала не удаляет (ссылка обнуляется).
 create table if not exists public.calculation_operations (
   id                 uuid        primary key,
   user_id            uuid        not null references auth.users(id) on delete cascade,
   mode               text        not null check (mode in ('upload')),
   request_hash       text        not null check (char_length(request_hash) between 1 and 200),
-  content_hash       text        not null check (char_length(content_hash) between 1 and 200),
+  -- SHA-256 (hex) сохранённых данных: расчёт, снимок без generatedAt, строка сводки.
+  payload_hash       text        not null check (payload_hash ~ '^[0-9a-f]{64}$'),
   calculation_id     uuid        references public.calculations(id) on delete set null,
   report_history_id  uuid        references public.report_history(id) on delete set null,
   -- true — израсходована попытка (бесплатная или разовый кредит); false — безлимит.
@@ -78,7 +85,6 @@ create or replace function public.save_calculation_operation(
   p_operation_id  uuid,
   p_mode          text,
   p_request_hash  text,
-  p_content_hash  text,
   p_calculation   jsonb,
   p_history       jsonb
 )
@@ -90,9 +96,11 @@ as $$
 declare
   uid       uuid := auth.uid();
   op        public.calculation_operations%rowtype;
+  payload   text;
   consumed  jsonb;
   calc_id   uuid;
   calc_at   timestamptz;
+  calc_snap jsonb;
   hist_id   uuid;
   charged   boolean;
 begin
@@ -102,11 +110,19 @@ begin
   if p_operation_id is null
      or p_mode is distinct from 'upload'
      or coalesce(char_length(p_request_hash), 0) not between 1 and 200
-     or coalesce(char_length(p_content_hash), 0) not between 1 and 200
      or jsonb_typeof(p_calculation) is distinct from 'object'
+     or jsonb_typeof(p_calculation -> 'ai_insights') is distinct from 'object'
      or jsonb_typeof(p_history) is distinct from 'object' then
     return jsonb_build_object('ok', false, 'reason', 'bad_request');
   end if;
+
+  -- Отпечаток данных операции. Время формирования снимка не входит: повтор того же
+  -- расчёта собирает снимок заново.
+  payload := encode(sha256(convert_to(jsonb_build_object(
+    'calculation', p_calculation - 'ai_insights',
+    'snapshot',    (p_calculation -> 'ai_insights') - 'generatedAt',
+    'history',     p_history
+  )::text, 'UTF8')), 'hex');
 
   -- Операции пользователя — строго по очереди (та же строка, что блокирует
   -- consume_calculation): одновременный повтор той же операции дождётся первой и
@@ -119,12 +135,19 @@ begin
     if op.user_id <> uid or op.mode <> p_mode or op.request_hash <> p_request_hash then
       return jsonb_build_object('ok', false, 'reason', 'operation_conflict');
     end if;
-    select created_at into calc_at from public.calculations where id = op.calculation_id;
+    -- Повтор: ничего не списывается и не пишется, данные повтора не применяются.
+    if op.calculation_id is null then
+      -- Расчёт удалён из истории: заново не создаётся.
+      return jsonb_build_object('ok', true, 'replay', true, 'status', 'deleted', 'charged', op.charged);
+    end if;
+    select c.created_at, c.ai_insights into calc_at, calc_snap
+      from public.calculations c where c.id = op.calculation_id;
     return jsonb_build_object(
-      'ok', true, 'replay', true,
+      'ok', true, 'replay', true, 'status', 'done',
       'calculation_id', op.calculation_id,
       'created_at', calc_at,
-      'content_hash', op.content_hash,
+      'snapshot', calc_snap,
+      'content_match', op.payload_hash = payload,
       'charged', op.charged
     );
   end if;
@@ -173,15 +196,15 @@ begin
   returning id into hist_id;
 
   insert into public.calculation_operations
-    (id, user_id, mode, request_hash, content_hash, calculation_id, report_history_id, charged)
+    (id, user_id, mode, request_hash, payload_hash, calculation_id, report_history_id, charged)
   values
-    (p_operation_id, uid, p_mode, p_request_hash, p_content_hash, calc_id, hist_id, charged);
+    (p_operation_id, uid, p_mode, p_request_hash, payload, calc_id, hist_id, charged);
 
   return jsonb_build_object(
-    'ok', true, 'replay', false,
+    'ok', true, 'replay', false, 'status', 'done',
     'calculation_id', calc_id,
     'created_at', calc_at,
-    'content_hash', p_content_hash,
+    'content_match', true,
     'charged', charged,
     'used', consumed -> 'used',
     'allowance', consumed -> 'allowance',
@@ -190,13 +213,14 @@ begin
 end;
 $$;
 
-revoke all on function public.save_calculation_operation(uuid, text, text, text, jsonb, jsonb)
+revoke all on function public.save_calculation_operation(uuid, text, text, jsonb, jsonb)
   from public, anon;
-grant execute on function public.save_calculation_operation(uuid, text, text, text, jsonb, jsonb)
+grant execute on function public.save_calculation_operation(uuid, text, text, jsonb, jsonb)
   to authenticated;
 
 -- 3. Статус операции (восстановление после перезагрузки): только своя операция и
---    только для того же файла.
+--    только для того же файла. done — с сохранённым снимком (показывается как есть,
+--    без пересчёта); deleted — расчёт удалён из истории.
 create or replace function public.calculation_operation_status(
   p_operation_id  uuid,
   p_request_hash  text
@@ -208,9 +232,10 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  uid     uuid := auth.uid();
-  op      public.calculation_operations%rowtype;
-  calc_at timestamptz;
+  uid       uuid := auth.uid();
+  op        public.calculation_operations%rowtype;
+  calc_at   timestamptz;
+  calc_snap jsonb;
 begin
   if uid is null then
     return jsonb_build_object('ok', false, 'reason', 'not_authenticated');
@@ -223,12 +248,16 @@ begin
   if op.request_hash is distinct from p_request_hash then
     return jsonb_build_object('ok', true, 'status', 'conflict');
   end if;
-  select created_at into calc_at from public.calculations where id = op.calculation_id;
+  if op.calculation_id is null then
+    return jsonb_build_object('ok', true, 'status', 'deleted');
+  end if;
+  select c.created_at, c.ai_insights into calc_at, calc_snap
+    from public.calculations c where c.id = op.calculation_id;
   return jsonb_build_object(
     'ok', true, 'status', 'done',
     'calculation_id', op.calculation_id,
     'created_at', calc_at,
-    'content_hash', op.content_hash
+    'snapshot', calc_snap
   );
 end;
 $$;

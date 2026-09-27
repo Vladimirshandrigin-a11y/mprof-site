@@ -26,28 +26,33 @@ process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE_URL;
 process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "test-anon-key";
 
 const ROUTE = buildRequire("./api/cloud/calculation-operations/route.js");
-const { NextRequest } = createRequire(path.join(root, "package.json"))("next/server");
+const rootRequire = createRequire(path.join(root, "package.json"));
+const { NextRequest } = rootRequire("next/server");
+const { createClient } = rootRequire("@supabase/supabase-js");
 
 const net = installFetch();
 const { state } = net;
 const { freshDb } = payTestEnv();
 
-/** Колонки строки calculations / report_history (как accrualSnapshotTo*Columns). */
-const calcCols = (profit = 650) => ({
+/**
+ * Колонки строки calculations / report_history (как accrualSnapshotTo*Columns): налог,
+ * реклама и себестоимость — и в колонках, и в снимке ai_insights.
+ */
+const calcCols = ({ profit = 650, tax = 59.5, ads = 60, cost = 100, generatedAt = "2026-07-01T10:00:00.000Z" } = {}) => ({
   marketplace: "ozon",
   mode: "upload",
   revenue: 850,
   commission: 180,
   logistics: 67,
-  ads: 60,
+  ads,
   storage: 0,
-  tax: 59.5,
-  cost: 100,
+  tax,
+  cost,
   other_expenses: 15.55,
   total_expenses: 850 - profit,
   profit,
   margin: 76.47,
-  ai_insights: { kind: "ozon-accrual-xlsx-v1", marker: `p${profit}` },
+  ai_insights: { kind: "ozon-accrual-xlsx-v1", generatedAt, taxKopecks: tax * 100, adsKopecks: ads * 100, costKopecks: cost * 100, profitKopecks: profit * 100 },
 });
 const histCols = (profit = 650) => ({ report_month: "2026-06-01", revenue: 850, expenses: 850 - profit, profit, margin: 76.47 });
 
@@ -55,11 +60,37 @@ function body(over = {}) {
   return {
     operationId: randomUUID(),
     requestHash: "2026-06:12:fileA",
-    contentHash: "c1",
     calculation: calcCols(),
     history: histCols(),
     ...over,
   };
+}
+
+/** Штатное удаление из истории: тот же запрос supabase-js, что deleteCalculationFromCloud, с JWT пользователя. */
+async function deleteFromHistory(userId, calculationId) {
+  const sb = createClient(SUPABASE_URL, "test-anon-key", {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${userJwt(userId)}` } },
+  });
+  const { error } = await sb.from("calculations").delete().eq("id", calculationId).eq("user_id", userId);
+  return error;
+}
+
+/** Всё, что операция могла бы изменить: профили, подписки, расчёты, сводка, журнал. */
+async function dbState(db) {
+  const t = async (sql) => (await db.main.query(sql)).rows;
+  return JSON.stringify([
+    await t("select * from public.profiles order by id"),
+    await t("select * from public.subscriptions order by id"),
+    await t("select * from public.calculations order by id"),
+    await t("select * from public.report_history order by id"),
+    await t("select * from public.calculation_operations order by id"),
+  ]);
+}
+
+/** Строка журнала операции (как в БД). */
+async function opRow(db, id) {
+  return (await db.main.query("select user_id, request_hash, payload_hash, calculation_id, report_history_id, charged from public.calculation_operations where id = $1", [id])).rows[0] ?? null;
 }
 
 async function post(userId, payload) {
@@ -118,10 +149,12 @@ describe("операция расчёта через настоящий марш
     const b = body();
     const out = await post(u, b);
     assert.equal(out.status, 200);
+    const d = out.body.data;
     assert.deepEqual(
-      { replay: out.body.data.replay, charged: out.body.data.charged, contentHash: out.body.data.contentHash, used: out.body.data.used },
-      { replay: false, charged: true, contentHash: "c1", used: 1 }
+      { status: d.status, replay: d.replay, charged: d.charged, contentMatch: d.contentMatch, used: d.used, snapshot: d.snapshot },
+      { status: "done", replay: false, charged: true, contentMatch: true, used: 1, snapshot: null }
     );
+    assert.match((await opRow(db, b.operationId)).payload_hash, /^[0-9a-f]{64}$/, "отпечаток данных считает сервер");
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
     const row = (await db.main.query("select user_id, mode, profit, ai_insights from public.calculations where id = $1", [out.body.data.calculationId])).rows[0];
     assert.equal(row.user_id, u);
@@ -164,13 +197,15 @@ describe("операция расчёта через настоящий марш
     assert.equal(lost.status, 502, "маршрут не подтверждает успех без ответа БД");
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 }, "в БД всё зафиксировано");
     state.dropAfterCommit = null;
-    const retry = await post(u, b);
+    // Повтор после перезагрузки: снимок собран заново (другое время формирования) — данные те же.
+    const retry = await post(u, { ...b, calculation: calcCols({ generatedAt: "2026-07-01T10:05:00.000Z" }) });
     assert.equal(retry.status, 200);
-    assert.equal(retry.body.data.replay, true);
-    assert.equal(retry.body.data.contentHash, "c1");
+    assert.deepEqual([retry.body.data.status, retry.body.data.replay, retry.body.data.contentMatch], ["done", true, true]);
+    assert.deepEqual(retry.body.data.snapshot, b.calculation.ai_insights, "возвращён сохранённый снимок");
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
     const st = await status(u, b.operationId, b.requestHash);
     assert.deepEqual([st.body.data.status, st.body.data.calculationId], ["done", retry.body.data.calculationId]);
+    assert.deepEqual(st.body.data.snapshot, b.calculation.ai_insights, "статус тоже отдаёт сохранённый снимок");
   });
 
   it("двойной клик / две вкладки: 6 одновременных запросов одной операции → одно списание, одна строка; остальные — повтор", async () => {
@@ -195,19 +230,42 @@ describe("операция расчёта через настоящий марш
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
   });
 
-  it("повтор ключа с другим файлом → 409; с тем же файлом, но другими данными → возвращается сохранённое, данные не подменяются", async () => {
+  it("повтор ключа с другим файлом → 409 без данных", async () => {
     const u = await db.user({ plan: "unlimited", premium: "10 days" });
     const b = body();
+    assert.equal((await post(u, b)).status, 200);
+    const other = await post(u, { ...b, requestHash: "2026-05:9:fileB" });
+    assert.deepEqual([other.status, other.body.code, other.body.data], [409, "operation_conflict", undefined]);
+    assert.deepEqual(await facts(db, u), { used: 0, calcs: 1, history: 1, ops: 1 });
+  });
+
+  it("тот же ключ и файл, но другие данные (налог, реклама, себестоимость, снимок): ничего не перезаписано и не создано — возвращён сохранённый снимок, contentMatch=false", async () => {
+    const u = await db.user();
+    await db.main.query("insert into public.subscriptions (user_id, plan, status) values ($1, 'single', 'active')", [u]);
+    const b = body({ calculation: calcCols({ tax: 42.5, ads: 250.75 }) });
     const first = await post(u, b);
     assert.equal(first.status, 200);
-    const other = await post(u, { ...b, requestHash: "2026-05:9:fileB" });
-    assert.deepEqual([other.status, other.body.code], [409, "operation_conflict"]);
-    const tampered = await post(u, { ...b, contentHash: "c2", calculation: calcCols(9999), history: histCols(9999) });
-    assert.equal(tampered.status, 200);
-    assert.deepEqual([tampered.body.data.replay, tampered.body.data.contentHash], [true, "c1"]);
-    const rows = (await db.main.query("select profit from public.calculations where user_id = $1", [u])).rows;
-    assert.deepEqual(rows.map((r) => Number(r.profit)), [650], "строка не подменена");
-    assert.deepEqual(await facts(db, u), { used: 0, calcs: 1, history: 1, ops: 1 });
+    const snapBefore = await dbState(db);
+    const opBefore = await opRow(db, b.operationId);
+    for (const changed of [
+      calcCols({ tax: 99, ads: 250.75 }),
+      calcCols({ tax: 42.5, ads: 10 }),
+      calcCols({ tax: 42.5, ads: 250.75, cost: 555 }),
+      { ...calcCols({ tax: 42.5, ads: 250.75 }), ai_insights: { ...calcCols({ tax: 42.5, ads: 250.75 }).ai_insights, profitKopecks: 1 } },
+    ]) {
+      const r = await post(u, { ...b, calculation: changed });
+      assert.equal(r.status, 200);
+      assert.deepEqual(
+        [r.body.data.status, r.body.data.replay, r.body.data.contentMatch, r.body.data.calculationId, r.body.data.charged],
+        ["done", true, false, first.body.data.calculationId, true]
+      );
+      assert.deepEqual(r.body.data.snapshot, b.calculation.ai_insights, "показан сохранённый снимок, а не присланный");
+    }
+    const changedHistory = await post(u, { ...b, history: histCols(1) });
+    assert.equal(changedHistory.body.data.contentMatch, false);
+    assert.equal(await dbState(db), snapBefore, "ни одной записи: calculations, report_history, profiles, журнал");
+    assert.deepEqual(await opRow(db, b.operationId), opBefore, "операция по-прежнему связана с первыми данными");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
   });
 
   it("изоляция пользователей: чужой ключ → 409 без данных; статус чужой операции — none; свои счётчики не тронуты", async () => {
@@ -246,12 +304,80 @@ describe("операция расчёта через настоящий марш
 
   it("некорректный запрос → 400 без обращения к БД", async () => {
     const u = await db.user();
-    for (const bad of [body({ operationId: "не-uuid" }), body({ history: null }), body({ requestHash: "" }), body({ calculation: [1] })]) {
+    for (const bad of [
+      body({ operationId: "не-uuid" }),
+      body({ history: null }),
+      body({ requestHash: "" }),
+      body({ calculation: [1] }),
+      body({ calculation: { ...calcCols(), ai_insights: null } }),
+    ]) {
       const r = await post(u, bad);
       assert.equal(r.status, 400);
     }
     assert.equal(net.rpcCalls().length, 0);
     assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+describe("удалённый расчёт: журнал остаётся, повтор операции его не восстанавливает", () => {
+  let db;
+  before(async () => {
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION] });
+  });
+  beforeEach(() => {
+    state.pool = db.pool(6);
+  });
+
+  it("сохранение → удаление штатным запросом (supabase-js, JWT пользователя) → повтор прежней операции: «deleted», без списания и без новых calculations/report_history", async () => {
+    const u = await db.user();
+    await db.main.query("insert into public.subscriptions (user_id, plan, status) values ($1, 'single', 'active')", [u]);
+    const b = body();
+    const saved = await post(u, b);
+    assert.equal(saved.status, 200);
+    const calcId = saved.body.data.calculationId;
+
+    assert.equal(await deleteFromHistory(u, calcId), null, "пользователь удаляет свой расчёт как раньше");
+    const del = net.dbRequests().find((r) => r.method === "DELETE");
+    assert.ok(del && del.path === "/rest/v1/calculations", "запрос удаления шёл через PostgREST от пользователя");
+    const op = await opRow(db, b.operationId);
+    assert.ok(op, "журнал операции не исчез вместе с расчётом");
+    assert.deepEqual([op.calculation_id, op.charged, op.user_id], [null, true, u]);
+    assert.ok(op.report_history_id, "сводка операции на месте");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 0, history: 1, ops: 1 });
+
+    const snap = await dbState(db);
+    const replay = await post(u, b);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(
+      [replay.body.data.status, replay.body.data.replay, replay.body.data.calculationId, replay.body.data.snapshot, replay.body.data.charged],
+      ["deleted", true, null, null, true]
+    );
+    const twice = await post(u, { ...b, calculation: calcCols({ tax: 1 }) });
+    assert.equal(twice.body.data.status, "deleted", "и с другими данными — тоже не создаётся");
+    assert.equal(await dbState(db), snap, "повтор ничего не записал и не списал");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 0, history: 1, ops: 1 });
+
+    const st = await status(u, b.operationId, b.requestHash);
+    assert.deepEqual([st.status, st.body.data.status, st.body.data.calculationId], [200, "deleted", null]);
+
+    // Новый расчёт того же файла — новая операция: списывает по правилам (здесь — разовый кредит).
+    const fresh = await post(u, body({ requestHash: b.requestHash }));
+    assert.deepEqual([fresh.status, fresh.body.data.replay, fresh.body.data.used], [200, false, 2]);
+    assert.deepEqual(await facts(db, u), { used: 2, calcs: 1, history: 2, ops: 2 });
+  });
+
+  it("удаление сводки и «Очистить историю» (все расчёты пользователя) тоже проходят; журнал остаётся со ссылками null", async () => {
+    const u = await db.user({ plan: "unlimited", premium: "10 days" });
+    const a = await post(u, body());
+    const b2 = await post(u, body({ requestHash: "2026-05:9:fileB" }));
+    assert.deepEqual([a.status, b2.status], [200, 200]);
+    const c = await db.client("authenticated");
+    await c.query("select set_config('request.jwt.claim.sub', $1, false)", [u]);
+    await c.query("delete from public.report_history where user_id = $1", [u]);
+    await c.query("delete from public.calculations where user_id = $1", [u]);
+    const ops = (await db.main.query("select calculation_id, report_history_id from public.calculation_operations where user_id = $1", [u])).rows;
+    assert.deepEqual(ops, [{ calculation_id: null, report_history_id: null }, { calculation_id: null, report_history_id: null }]);
   });
 });
 
@@ -267,11 +393,11 @@ describe("доступ, миграция и совместимость", () => {
     await c.query("select set_config('request.jwt.claim.sub', $1, false)", [u]);
     const denied = (e) => e.code === "42501";
     await assert.rejects(c.query("select * from public.calculation_operations"), denied);
-    await assert.rejects(c.query("insert into public.calculation_operations (id, user_id, mode, request_hash, content_hash, charged) values ($1, $2, 'upload', 'x', 'y', true)", [randomUUID(), u]), denied);
+    await assert.rejects(c.query("insert into public.calculation_operations (id, user_id, mode, request_hash, payload_hash, charged) values ($1, $2, 'upload', 'x', repeat('a', 64), true)", [randomUUID(), u]), denied);
     await assert.rejects(c.query("update public.calculation_operations set charged = false"), denied);
     await assert.rejects(c.query("delete from public.calculation_operations"), denied);
     const anon = await db.client("anon");
-    await assert.rejects(anon.query("select public.save_calculation_operation($1, 'upload', 'x', 'y', '{}'::jsonb, '{}'::jsonb)", [randomUUID()]), denied);
+    await assert.rejects(anon.query("select public.save_calculation_operation($1, 'upload', 'x', '{}'::jsonb, '{}'::jsonb)", [randomUUID()]), denied);
     await assert.rejects(anon.query("select public.calculation_operation_status($1, 'x')", [randomUUID()]), denied);
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
   });

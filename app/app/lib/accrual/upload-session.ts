@@ -154,7 +154,8 @@ export type AccrualEvaluation =
   | { status: "calc_error"; code: string; message: string }
   | {
       status: "ok";
-      calc: AccrualProfitCalc;
+      /** Результат ядра; null — показан сохранённый расчёт (снимок с сервера, без пересчёта). */
+      calc: AccrualProfitCalc | null;
       snapshot: AccrualSnapshotV1;
       /** Товары, без себестоимости которых итог нельзя считать готовым. */
       problemProducts: ProblemProduct[];
@@ -239,6 +240,41 @@ export function evaluateAccrual(args: EvaluateArgs): AccrualEvaluation {
   };
 }
 
+/**
+ * Сохранённый расчёт как есть (восстановление после перезагрузки или потерянного
+ * ответа): итог, параметры и товарные строки — из снимка сервера. Текущий каталог и
+ * ввод НЕ участвуют — пересчёт только после явной правки значений.
+ */
+export function savedEvaluation(s: AccrualSnapshotV1): AccrualEvaluation {
+  const notes: string[] = [];
+  if (s.tax.ratePercent === 0) notes.push("Налог не указан (0 %) — итоговая прибыль может быть завышена.");
+  if (!s.period.periodComplete) notes.push("Отчёт охватывает не весь календарный месяц — итоги неполные.");
+  return {
+    status: "ok",
+    calc: null,
+    snapshot: s,
+    problemProducts: [],
+    blockers: [],
+    notes,
+    readyToSave: !s.preliminary,
+  };
+}
+
+/** Поля формы из сохранённого снимка (ставка и ручные расходы) — те, с которыми он сохранён. */
+export function inputsFromSnapshot(s: AccrualSnapshotV1): AccrualUploadInputs {
+  const num = (n: number): string => (n === 0 ? "" : String(n).replace(".", ","));
+  const rub = (kopecks: number): string => num(kopecks / 100);
+  const m = s.manualExpenses;
+  return {
+    taxPercent: num(s.tax.ratePercent),
+    packaging: rub(m.packagingKopecks),
+    deliveryToWarehouse: rub(m.deliveryToWarehouseKopecks),
+    salary: rub(m.salaryKopecks),
+    other: rub(m.otherKopecks),
+    adsOutsideOzon: rub(m.adsOutsideOzonKopecks),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Автодобавление отсутствующих товаров в каталог (единая серверная точка импорта)
 // ---------------------------------------------------------------------------
@@ -285,33 +321,28 @@ function hash53(str: string, seed = 0): number {
 }
 
 /**
+ * Кнопка сохранения: сохранён ли расчёт и изменён ли он после сохранения. savedKey —
+ * ключ содержимого сохранённого расчёта (для восстановленного с сервера — ключ его снимка;
+ * RESTORED_KEY — снимок не прочитан, любой пересчёт считается изменением); restored —
+ * на экране сохранённый снимок как есть.
+ */
+export const RESTORED_KEY = "restored-from-server";
+
+export function savedState(
+  savedKey: string | null,
+  currentKey: string | null,
+  restored: boolean
+): { saved: boolean; dirty: boolean } {
+  if (restored) return { saved: true, dirty: false };
+  const saved = savedKey !== null;
+  return { saved, dirty: saved && currentKey !== null && currentKey !== savedKey };
+}
+
+/**
  * Отпечаток разобранного отчёта — идентичность «попытки расчёта». Тот же файл
  * (то же содержимое строк и период) даёт тот же отпечаток; другой файл — другой.
  * Ручные вводы и каталог в отпечаток НЕ входят: их правка остаётся в рамках попытки.
  */
-/** Хеш содержимого снимка (snapshotContentKey) для сверки с сохранённой операцией. */
-export function contentFingerprint(contentKey: string): string {
-  return `${contentKey.length}:${hash53(contentKey).toString(36)}:${hash53(contentKey, 7).toString(36)}`;
-}
-
-/**
- * Кнопка сохранения: сохранён ли расчёт и изменён ли он после сохранения. savedKey —
- * ключ содержимого, сохранённого в этой вкладке; adoptedHash — отпечаток расчёта,
- * восстановленного с сервера после перезагрузки (ключа снимка тогда нет).
- */
-export function savedState(
-  savedKey: string | null,
-  adoptedHash: string | null,
-  currentKey: string | null
-): { saved: boolean; dirty: boolean } {
-  const saved = savedKey !== null || adoptedHash !== null;
-  const dirty =
-    saved &&
-    currentKey !== null &&
-    (savedKey !== null ? currentKey !== savedKey : contentFingerprint(currentKey) !== adoptedHash);
-  return { saved, dirty };
-}
-
 export function reportFingerprint(report: Pick<AccrualParsedReport, "rows" | "period" | "rowCount">): string {
   const body = JSON.stringify([report.period, report.rows]);
   return `${report.period.month}:${report.rowCount}:${hash53(body).toString(36)}:${hash53(body, 7).toString(36)}`;
@@ -334,6 +365,10 @@ export interface SaveOutcomeUi {
   openPaywall: boolean;
   toast: { text: string; type: "ok" | "warn" | "err" } | null;
 }
+
+/** Расчёт операции удалён из истории: не восстанавливается и не списывается. */
+export const DELETED_NOTE =
+  "Расчёт по этому файлу был сохранён и затем удалён из истории. Заново он не создаётся, попытка повторно не списывается. Новый расчёт этого файла — отдельная попытка.";
 
 const UI_NONE: SaveOutcomeUi = {
   note: null,
@@ -389,6 +424,25 @@ export function saveOutcomeUi(out: SaveOutcome): SaveOutcomeUi {
         markSaved: true,
         note: { kind: "ok", text: "Расчёт уже сохранён, изменений нет — повторная запись не создана и попытка не списывалась." },
       };
+    case "restored":
+      return {
+        ...UI_NONE,
+        needsRetry: false,
+        note: !out.snapshot
+          ? {
+              kind: "warn",
+              text: "Расчёт по этому файлу уже сохранён — повторной записи и списания нет. Сохранённый результат не удалось прочитать: откройте его в истории.",
+            }
+          : out.contentMatch
+          ? { kind: "ok", text: "Расчёт уже был сохранён — показан сохранённый результат. Повторной записи и списания нет." }
+          : {
+              kind: "warn",
+              text: "По этому файлу уже сохранён расчёт с другими значениями — показан сохранённый вариант, текущие значения не применены. Повторной записи и списания нет. Чтобы изменить расчёт, поправьте значения и нажмите «Сохранить изменения».",
+            },
+        toast: { text: "Расчёт уже сохранён", type: "ok" },
+      };
+    case "deleted":
+      return { ...UI_NONE, needsRetry: false, note: { kind: "warn", text: DELETED_NOTE } };
     case "saved": {
       const historyFailed = out.historyWrite === "failed";
       const text = out.local
@@ -399,8 +453,6 @@ export function saveOutcomeUi(out: SaveOutcome): SaveOutcomeUi {
         ? "Расчёт сохранён в историю."
         : out.calculationWrite === "update"
         ? "Изменения сохранены. Попытка не списывалась повторно."
-        : out.replay
-        ? "Расчёт уже был сохранён — повторной записи и списания нет."
         : "Сводка по месяцам дописана. Расчёт уже был сохранён — повторной записи и списания нет.";
       return {
         note: { kind: out.local || historyFailed ? "warn" : "ok", text },

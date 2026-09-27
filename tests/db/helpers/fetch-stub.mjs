@@ -5,7 +5,7 @@
 //     PostgreSQL: каждый HTTP-запрос — своё соединение из пула и своя транзакция от имени
 //     service_role (service-ключ) или authenticated с auth.uid() из JWT пользователя
 //     (user-scoped клиент). Покрыто ровно то, что вызывают обработчики через supabase-js:
-//     GET/PATCH таблицы с фильтрами eq, upsert
+//     GET/PATCH/DELETE таблицы с фильтрами eq, upsert
 //     (POST … on_conflict, Prefer: resolution=merge-duplicates) и POST /rpc/<функция>;
 //   • любой другой адрес — ошибка (сеть в тестах запрещена).
 // Журнал всех запросов (метод, адрес, заголовки, тело) доступен тесту.
@@ -134,6 +134,10 @@ export function installFetch() {
             : "";
           await c.query(`insert into public.${table} (${cols.join(", ")}) values ${values.join(", ")}${conflict}`, params);
           response = () => json(201);
+        } else if (req.method === "DELETE") {
+          if (!where.length) throw new Error("DELETE без фильтра не поддержан");
+          await c.query(`delete from public.${table} where ${where.join(" and ")}`, params);
+          response = () => json(204);
         } else {
           throw new Error(`метод ${req.method} не поддержан`);
         }

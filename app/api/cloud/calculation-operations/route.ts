@@ -5,10 +5,11 @@ import { getUserScopedClient } from "../_lib/auth";
 // /api/cloud/calculation-operations — операции расчёта по XLSX «Отчёт по
 // начислениям»: списание попытки и сохранение расчёта ОДНОЙ транзакцией БД.
 //   POST — выполнить операцию (RPC save_calculation_operation). Повтор с тем же
-//          operationId (потерянный ответ, двойной клик, перезагрузка) возвращает
-//          уже сохранённый расчёт без нового списания;
+//          operationId (потерянный ответ, двойной клик, перезагрузка) ничего не
+//          списывает и не пишет: возвращает сохранённый снимок и признак совпадения
+//          данных (contentMatch) или status "deleted", если расчёт удалён из истории;
 //   GET  — статус операции (RPC calculation_operation_status): для восстановления
-//          после перезагрузки страницы.
+//          после перезагрузки страницы (done — с сохранённым снимком; deleted; none).
 //
 // Как /api/cloud/consume: USER-SCOPED клиент (anon-ключ + JWT пользователя) —
 // функции берут пользователя из auth.uid(); user_id из тела не принимаем.
@@ -31,6 +32,11 @@ function bearer(req: NextRequest): string {
 
 function isHash(v: unknown): v is string {
   return typeof v === "string" && v.length >= 1 && v.length <= 200;
+}
+
+/** Снимок из ai_insights — как есть (JSON-объект) или null. */
+function snapshotOf(v: unknown): Record<string, unknown> | null {
+  return isObject(v) ? v : null;
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -64,13 +70,13 @@ export async function POST(req: NextRequest) {
   } catch {
     return json({ error: "Некорректный JSON в теле запроса", code: "bad_request" }, 400);
   }
-  const { operationId, requestHash, contentHash, calculation, history } = body;
+  const { operationId, requestHash, calculation, history } = body;
   if (
     typeof operationId !== "string" ||
     !UUID_RE.test(operationId) ||
     !isHash(requestHash) ||
-    !isHash(contentHash) ||
     !isObject(calculation) ||
+    !isObject(calculation.ai_insights) ||
     !isObject(history)
   ) {
     return json({ error: "Некорректный запрос", code: "bad_request" }, 400);
@@ -80,7 +86,6 @@ export async function POST(req: NextRequest) {
     p_operation_id: operationId,
     p_mode: "upload",
     p_request_hash: requestHash,
-    p_content_hash: contentHash,
     p_calculation: calculation,
     p_history: history,
   });
@@ -100,10 +105,12 @@ export async function POST(req: NextRequest) {
 
   return json({
     data: {
+      status: r.status === "deleted" ? "deleted" : "done",
       replay: r.replay === true,
       calculationId: typeof r.calculation_id === "string" ? r.calculation_id : null,
       createdAt: typeof r.created_at === "string" ? r.created_at : null,
-      contentHash: typeof r.content_hash === "string" ? r.content_hash : null,
+      snapshot: snapshotOf(r.snapshot),
+      contentMatch: r.content_match === true,
       charged: r.charged === true,
       used: typeof r.used === "number" ? r.used : null,
       unlimited: r.unlimited === true,
@@ -133,13 +140,13 @@ export async function GET(req: NextRequest) {
 
   const r = (data ?? {}) as Record<string, unknown>;
   if (r.ok !== true) return json({ error: "Сессия недействительна", code: "not_authenticated" }, 401);
-  const status = r.status === "done" || r.status === "conflict" ? r.status : "none";
+  const status = r.status === "done" || r.status === "deleted" || r.status === "conflict" ? r.status : "none";
   return json({
     data: {
       status,
       calculationId: typeof r.calculation_id === "string" ? r.calculation_id : null,
       createdAt: typeof r.created_at === "string" ? r.created_at : null,
-      contentHash: typeof r.content_hash === "string" ? r.content_hash : null,
+      snapshot: snapshotOf(r.snapshot),
     },
   });
 }

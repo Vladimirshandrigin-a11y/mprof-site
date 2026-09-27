@@ -11,7 +11,7 @@ import { CAT } from "./helpers/expected.mjs";
 
 const INPUTS = { taxPercent: "7", packaging: "10", deliveryToWarehouse: "", salary: "", other: "3,33", adsOutsideOzon: "" };
 
-function evaluate(buf, inputs = INPUTS) {
+function evaluate(buf, inputs = INPUTS, catalog = CAT) {
   const parsed = parseBuf(buf);
   assert.equal(parsed.ok, true);
   const report = {
@@ -21,7 +21,7 @@ function evaluate(buf, inputs = INPUTS) {
     sheet: parsed.report.sheetName,
     rowCount: parsed.report.summary.rowCount,
   };
-  const ev = SES.evaluateAccrual({ report, catalog: CAT, inputs, generatedAt: "2026-07-01T10:00:00.000Z" });
+  const ev = SES.evaluateAccrual({ report, catalog, inputs, generatedAt: "2026-07-01T10:00:00.000Z" });
   return { fp: SES.reportFingerprint(report), ev, req: { snapshot: ev.snapshot, ready: ev.readyToSave, userId: "u1" } };
 }
 const A = (inputs) => evaluate(scenario("basic"), inputs);
@@ -31,6 +31,33 @@ function openFile(ctl, x) {
   assert.equal(ctl.beginAttempt(null), true);
   assert.equal(ctl.beginAttempt(x.fp), true);
 }
+
+describe("операция привязана к файлу: без начатой попытки сохранение не начинается", () => {
+  it("аккаунт без отпечатка файла (beginAttempt не вызван): понятная ошибка ДО запроса — ни ключа, ни операции, ни дубль-гарда, ни списания", async () => {
+    const cloud = makeMockCloud();
+    const ctl = new SF.AccrualSaveController(cloud.deps);
+    const a = A();
+    const out = await ctl.save(a.req);
+    assert.deepEqual([out.status, out.charge], ["save_failed", "none"]);
+    assert.match(out.error, /файл отчёта не определён/);
+    assert.match(SES.saveOutcomeUi(out).note.text, /загрузите отчёт заново.*Попытка расчёта не списана/);
+    assert.deepEqual([cloud.log.opTry, cloud.log.opIds.length, cloud.log.dup, cloud.log.canCalc, cloud.log.consume], [0, 0, 0, 0, 0]);
+    assert.equal(cloud.pendingKeys.size, 0, "идентичность файла не придумана");
+    // «Убрать файл» → тоже нет отпечатка.
+    openFile(ctl, a);
+    ctl.beginAttempt(null);
+    assert.equal((await ctl.save(a.req)).status, "save_failed");
+    assert.equal(cloud.log.opTry, 0);
+  });
+
+  it("аноним без начатой попытки — как раньше: локальная запись со списанием локального счётчика", async () => {
+    const cloud = makeMockCloud();
+    const ctl = new SF.AccrualSaveController(cloud.deps);
+    const out = await ctl.save({ ...A().req, userId: null });
+    assert.deepEqual([out.status, out.local], ["saved", true]);
+    assert.deepEqual([cloud.log.consume, cloud.log.opTry], [1, 0]);
+  });
+});
 
 describe("операция расчёта: отказы до записи ничего не списывают", () => {
   it("сервер без миграции (unavailable): save_failed «не списано», списаний и строк нет, ключ сохраняется для повтора", async () => {
@@ -54,7 +81,7 @@ describe("операция расчёта: отказы до записи нич
     const b = B();
     // Ключ A уже использован для другого файла (например, подменённое хранилище).
     const key = cloud.deps.operationIdFor(a.fp);
-    cloud.ops.set(key, { requestHash: b.fp, contentHash: "x", rowId: null });
+    cloud.ops.set(key, { requestHash: b.fp, payload: "x", rowId: null });
     openFile(ctl, a);
     const out = await ctl.save(a.req);
     assert.deepEqual([out.status, out.charge], ["save_failed", "none"]);
@@ -79,7 +106,7 @@ describe("операция расчёта: отказы до записи нич
 });
 
 describe("операция расчёта: восстановление после перезагрузки и потерянного ответа", () => {
-  it("незавершённая операция обходит устаревший клиентский paywall: сервер возвращает уже сохранённый расчёт без списания", async () => {
+  it("незавершённая операция обходит устаревший клиентский paywall: сервер возвращает уже сохранённый снимок без списания", async () => {
     const ent = makeEntitlements({ used: 0 });
     const cloud = makeMockCloud({ entitlement: ent, dropResponse: true });
     const tab1 = new SF.AccrualSaveController(cloud.deps);
@@ -92,7 +119,7 @@ describe("операция расчёта: восстановление посл
     const tab2 = new SF.AccrualSaveController({ ...cloud.deps, canCalculate: () => ent.canCalculate() });
     openFile(tab2, a);
     const out = await tab2.save(a.req);
-    assert.deepEqual([out.status, out.replay], ["saved", true]);
+    assert.deepEqual([out.status, out.contentMatch], ["restored", true]);
     assert.deepEqual([ent.st.used, cloud.rows.size, cloud.log.histories.length], [1, 1, 1]);
   });
 
@@ -107,40 +134,98 @@ describe("операция расчёта: восстановление посл
     assert.deepEqual([ent.st.used, cloud.rows.size], [1, 0]);
   });
 
-  it("восстановленный расчёт с другим содержимым (правка ставки после перезагрузки): обновление той же строки без списания", async () => {
+  it("потерянный ответ → смена себестоимости в каталоге → перезагрузка → тот же файл: показан СОХРАНЁННЫЙ снимок (налог, реклама, итог), без пересчёта, PATCH и списания", async () => {
+    const SAVED_INPUTS = { taxPercent: "6,5", packaging: "10", deliveryToWarehouse: "", salary: "", other: "", adsOutsideOzon: "250,75" };
     const cloud = makeMockCloud({ dropResponse: true });
     const tab1 = new SF.AccrualSaveController(cloud.deps);
-    const a = A();
+    const a = A(SAVED_INPUTS);
+    assert.ok(a.ev.snapshot.tax.kopecks > 0 && a.ev.snapshot.manualExpenses.adsOutsideOzonKopecks === 25075);
     openFile(tab1, a);
-    await tab1.save(a.req);
-    cloud.cfg.dropResponse = false;
+    assert.equal((await tab1.save(a.req)).status, "save_failed"); // COMMIT прошёл, ответ потерян
     const key = cloud.pendingKeys.get(a.fp);
-    const tab2 = new SF.AccrualSaveController(cloud.deps);
-    openFile(tab2, a);
-    assert.equal(tab2.adoptSaved(a.fp, cloud.status(key, a.fp)), true);
-    const edited = A({ ...INPUTS, taxPercent: "10" });
-    const out = await tab2.save(edited.req);
-    assert.deepEqual([out.status, out.calculationWrite], ["saved", "update"]);
-    assert.deepEqual([cloud.log.consume, cloud.rows.size, cloud.log.updates.length], [1, 1, 1]);
-  });
+    cloud.cfg.dropResponse = false;
+    const before = cloud.counts();
 
-  it("восстановленная операция, строку которой удалили из истории: «Сохранить» создаёт строку заново без списания", async () => {
-    const cloud = makeMockCloud({ dropResponse: true });
-    const tab1 = new SF.AccrualSaveController(cloud.deps);
-    const a = A();
-    openFile(tab1, a);
-    await tab1.save(a.req);
-    const key = cloud.pendingKeys.get(a.fp);
-    cloud.rows.clear(); // пользователь удалил расчёт; ссылка операции обнулилась
-    cloud.cfg.dropResponse = false;
+    // Владелец поменял себестоимость; после перезагрузки поля формы пустые.
+    const newCatalog = CAT.map((c) => (c.sku === "ART-A" ? { ...c, cost_price: c.cost_price + 40 } : c));
+    const recomputed = evaluate(scenario("basic"), { ...SAVED_INPUTS, taxPercent: "", adsOutsideOzon: "" }, newCatalog);
+    assert.notEqual(recomputed.ev.snapshot.netProfitKopecks, a.ev.snapshot.netProfitKopecks, "пересчёт дал бы другой итог");
+
+    // Перезагрузка: новый контроллер, тот же файл → статус операции.
     const tab2 = new SF.AccrualSaveController(cloud.deps);
     openFile(tab2, a);
     const st = cloud.status(key, a.fp);
-    assert.deepEqual([st.kind, st.row], ["done", null]);
-    assert.equal(tab2.adoptSaved(a.fp, st), true);
-    const out = await tab2.save(a.req);
-    assert.deepEqual([out.status, out.calculationWrite], ["saved", "insert"]);
-    assert.equal(cloud.log.consume, 1, "без нового списания");
+    assert.equal(st.kind, "done");
+    assert.equal(tab2.adoptSaved(a.fp, { row: st.row, operationId: key, snapshot: st.snapshot }), true);
+    cloud.deps.operationSettled(a.fp);
+
+    // Экран: сохранённый снимок как есть — итог, налог, реклама и поля формы.
+    const shown = SES.savedEvaluation(st.snapshot);
+    assert.equal(shown.status, "ok");
+    assert.equal(shown.calc, null, "ядро не пересчитывало");
+    assert.equal(SF.snapshotContentKey(shown.snapshot), SF.snapshotContentKey(a.ev.snapshot));
+    assert.deepEqual(
+      [shown.snapshot.netProfitKopecks, shown.snapshot.tax.ratePercent, shown.snapshot.tax.kopecks, shown.snapshot.manualExpenses.adsOutsideOzonKopecks, shown.snapshot.productionCostKopecks],
+      [a.ev.snapshot.netProfitKopecks, 6.5, a.ev.snapshot.tax.kopecks, 25075, a.ev.snapshot.productionCostKopecks]
+    );
+    assert.deepEqual(SES.inputsFromSnapshot(st.snapshot), SAVED_INPUTS);
+    assert.deepEqual(SES.savedState(SF.snapshotContentKey(st.snapshot), SF.snapshotContentKey(shown.snapshot), true), { saved: true, dirty: false });
+    assert.deepEqual(SES.resultAccess(tab2.state.paid, shown), { unlocked: true, showResult: true, pdfAllowed: true });
+    assert.deepEqual(cloud.counts(), before, "ни записи, ни списания");
+    assert.equal(cloud.log.updateTry, 0, "PATCH не было");
+
+    // Явная правка → пересчёт по новому каталогу → «Сохранить изменения» = PATCH той же строки без списания.
+    const edited = evaluate(scenario("basic"), SAVED_INPUTS, newCatalog);
+    const out = await tab2.save(edited.req);
+    assert.deepEqual([out.status, out.calculationWrite, out.row.id], ["saved", "update", st.row.id]);
+    assert.equal(cloud.log.consume, 1);
+  });
+
+  it("то же содержимое после восстановления (правка и возврат значений): «Сохранить» ничего не пишет", async () => {
+    const cloud = makeMockCloud({ dropResponse: true });
+    const tab1 = new SF.AccrualSaveController(cloud.deps);
+    const a = A();
+    openFile(tab1, a);
+    await tab1.save(a.req);
+    cloud.cfg.dropResponse = false;
+    const key = cloud.pendingKeys.get(a.fp);
+    const tab2 = new SF.AccrualSaveController(cloud.deps);
+    openFile(tab2, a);
+    const st = cloud.status(key, a.fp);
+    tab2.adoptSaved(a.fp, { row: st.row, operationId: key, snapshot: st.snapshot });
+    const before = cloud.counts();
+    assert.equal((await tab2.save(A().req)).status, "unchanged");
+    assert.deepEqual(cloud.counts(), before);
+  });
+
+  it("расчёт операции удалён из истории: повтор прежней операции → «удалён», без списания и без повторного создания расчёта и сводки; журнал остаётся; новый расчёт — новая операция", async () => {
+    const cloud = makeMockCloud({ dropResponse: true });
+    const tab1 = new SF.AccrualSaveController(cloud.deps);
+    const a = A();
+    openFile(tab1, a);
+    await tab1.save(a.req); // зафиксировано, ответ потерян — ключ остался
+    const key = cloud.pendingKeys.get(a.fp);
+    cloud.cfg.dropResponse = false;
+    const [rowId] = cloud.rows.keys();
+    cloud.deleteRow(rowId); // штатное удаление из истории
+    assert.deepEqual(cloud.status(key, a.fp), { kind: "deleted" });
+
+    const tab2 = new SF.AccrualSaveController(cloud.deps);
+    openFile(tab2, a);
+    const before = cloud.counts();
+    const out = await tab2.save(a.req); // повтор прежней операции (тот же ключ)
+    assert.equal(out.status, "deleted");
+    assert.equal(cloud.log.lastOp.operationId, key);
+    assert.deepEqual(cloud.counts(), { ...before, dup: before.dup + 1 }, "ни списания, ни calculations, ни сводки");
+    assert.equal(cloud.ops.size, 1, "журнал операции не исчез");
+    assert.equal(cloud.pendingKeys.has(a.fp), false, "ключ закрыт");
+    assert.deepEqual([tab2.state.paid, tab2.state.saved], [false, null]);
+    assert.match(SES.saveOutcomeUi(out).note.text, /удалён из истории.*не создаётся.*не списывается/);
+
+    const fresh = await tab2.save(a.req); // новый расчёт этого файла — отдельная попытка
+    assert.deepEqual([fresh.status, fresh.created], ["saved", true]);
+    assert.notEqual(cloud.log.lastOp.operationId, key);
+    assert.equal(cloud.log.consume, 2);
   });
 
   it("adoptSaved — только для текущей неоплаченной попытки и не во время сохранения", async () => {
@@ -148,12 +233,13 @@ describe("операция расчёта: восстановление посл
     const ctl = new SF.AccrualSaveController(cloud.deps);
     const a = A();
     const b = B();
+    const done = { row: { id: "c", created_at: "" }, operationId: "k", snapshot: null };
     openFile(ctl, a);
-    assert.equal(ctl.adoptSaved(b.fp, { row: null, contentHash: null }), false, "чужой файл");
+    assert.equal(ctl.adoptSaved(b.fp, done), false, "чужой файл");
     const pending = ctl.save(a.req);
-    assert.equal(ctl.adoptSaved(a.fp, { row: null, contentHash: null }), false, "идёт сохранение");
+    assert.equal(ctl.adoptSaved(a.fp, done), false, "идёт сохранение");
     await pending;
-    assert.equal(ctl.adoptSaved(a.fp, { row: null, contentHash: null }), false, "уже оплачено");
+    assert.equal(ctl.adoptSaved(a.fp, done), false, "уже оплачено");
   });
 });
 
@@ -174,7 +260,6 @@ describe("операция расчёта: одна оставшаяся поп�
 });
 
 describe("saveOutcomeUi: исходы операции", () => {
-  const cols = {};
   it("save_failed: none / unknown / kept — разные тексты; повтор доступен", () => {
     const none = SES.saveOutcomeUi({ status: "save_failed", error: "x", charge: "none" });
     const unknown = SES.saveOutcomeUi({ status: "save_failed", error: "x", charge: "unknown" });
@@ -184,20 +269,44 @@ describe("saveOutcomeUi: исходы операции", () => {
     assert.match(kept.note.text, /уже списана за этот файл/);
     for (const u of [none, unknown, kept]) assert.equal(u.needsRetry, true);
   });
-  it("saved replay — «уже был сохранён», без записи", () => {
-    const ui = SES.saveOutcomeUi({
-      status: "saved",
-      row: { id: "c", synced: true, createdAt: "" },
-      created: false,
-      local: false,
-      calculationWrite: "none",
-      historyWrite: "written",
-      historyWarning: null,
-      columns: cols,
-      replay: true,
+  it("restored: совпало — «уже был сохранён»; другие значения — предупреждение «текущие не применены»; снимок не прочитан — «откройте в истории»; ничего не пишется", () => {
+    const row = { id: "c", synced: true, createdAt: "" };
+    const snap = A().ev.snapshot;
+    const same = SES.saveOutcomeUi({ status: "restored", row, snapshot: snap, contentMatch: true });
+    const diff = SES.saveOutcomeUi({ status: "restored", row, snapshot: snap, contentMatch: false });
+    const none = SES.saveOutcomeUi({ status: "restored", row, snapshot: null, contentMatch: true });
+    assert.match(same.note.text, /уже был сохранён — показан сохранённый результат/);
+    assert.equal(diff.note.kind, "warn");
+    assert.match(diff.note.text, /другими значениями.*текущие значения не применены/);
+    assert.match(none.note.text, /откройте его в истории/);
+    for (const u of [same, diff, none]) {
+      assert.deepEqual([u.markSaved, u.emitSaved, u.needsRetry, u.openPaywall], [false, false, false, false]);
+    }
+  });
+  it("deleted — «удалён из истории», без повтора и paywall", () => {
+    const ui = SES.saveOutcomeUi({ status: "deleted" });
+    assert.equal(ui.note.text, SES.DELETED_NOTE);
+    assert.deepEqual([ui.markSaved, ui.emitSaved, ui.needsRetry, ui.openPaywall], [false, false, false, false]);
+  });
+});
+
+describe("сохранённый снимок на экране: без пересчёта, поля формы — как при сохранении", () => {
+  it("inputsFromSnapshot → evaluateAccrual с тем же каталогом даёт тот же снимок (налог, реклама вне Ozon, расходы)", () => {
+    const FULL = { taxPercent: "7", packaging: "10", deliveryToWarehouse: "20", salary: "30,5", other: "3,33", adsOutsideOzon: "100" };
+    const a = A(FULL);
+    const back = SES.inputsFromSnapshot(a.ev.snapshot);
+    assert.deepEqual(back, FULL);
+    assert.equal(SF.snapshotContentKey(A(back).ev.snapshot), SF.snapshotContentKey(a.ev.snapshot));
+    assert.deepEqual(SES.inputsFromSnapshot(A({ ...FULL, taxPercent: "", packaging: "", deliveryToWarehouse: "", salary: "", other: "", adsOutsideOzon: "" }).ev.snapshot), {
+      taxPercent: "", packaging: "", deliveryToWarehouse: "", salary: "", other: "", adsOutsideOzon: "",
     });
-    assert.match(ui.note.text, /уже был сохранён/);
-    assert.equal(ui.markSaved, true);
+  });
+  it("savedEvaluation: снимок как есть, calc = null, готов к показу; замечания из снимка", () => {
+    const b = B();
+    const ev = SES.savedEvaluation(b.ev.snapshot);
+    assert.deepEqual([ev.status, ev.calc, ev.readyToSave, ev.blockers, ev.problemProducts], ["ok", null, true, [], []]);
+    assert.equal(ev.snapshot, b.ev.snapshot);
+    assert.ok(ev.notes.some((n) => /не весь календарный месяц/.test(n)));
   });
 });
 
@@ -205,19 +314,18 @@ describe("savedState: кнопка после сохранения и после
   const key = SF.snapshotContentKey(A().ev.snapshot);
   const other = SF.snapshotContentKey(A({ ...INPUTS, taxPercent: "6" }).ev.snapshot);
   it("не сохранено → «Рассчитать и сохранить»", () => {
-    assert.deepEqual(SES.savedState(null, null, key), { saved: false, dirty: false });
+    assert.deepEqual(SES.savedState(null, key, false), { saved: false, dirty: false });
   });
-  it("сохранено в этой вкладке: то же содержимое — «сохранён», правка — «Сохранить изменения»", () => {
-    assert.deepEqual(SES.savedState(key, null, key), { saved: true, dirty: false });
-    assert.deepEqual(SES.savedState(key, null, other), { saved: true, dirty: true });
+  it("сохранено: то же содержимое — «сохранён», правка — «Сохранить изменения»", () => {
+    assert.deepEqual(SES.savedState(key, key, false), { saved: true, dirty: false });
+    assert.deepEqual(SES.savedState(key, other, false), { saved: true, dirty: true });
   });
-  it("восстановлено с сервера (перезагрузка): совпадение по отпечатку — «сохранён», правка — изменения", () => {
-    const h = SES.contentFingerprint(key);
-    assert.deepEqual(SES.savedState(null, h, key), { saved: true, dirty: false });
-    assert.deepEqual(SES.savedState(null, h, other), { saved: true, dirty: true });
+  it("на экране сохранённый снимок с сервера — «сохранён», записывать нечего", () => {
+    assert.deepEqual(SES.savedState(key, other, true), { saved: true, dirty: false });
   });
-  it("расчёт ещё не готов (каталог грузится) — не «изменён»", () => {
-    assert.deepEqual(SES.savedState(null, SES.contentFingerprint(key), null), { saved: true, dirty: false });
+  it("снимок не прочитан (RESTORED_KEY): любой пересчёт — изменение; расчёт ещё не готов — не «изменён»", () => {
+    assert.deepEqual(SES.savedState(SES.RESTORED_KEY, key, false), { saved: true, dirty: true });
+    assert.deepEqual(SES.savedState(key, null, false), { saved: true, dirty: false });
   });
 });
 

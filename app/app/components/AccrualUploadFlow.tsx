@@ -118,10 +118,10 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
               <span className="calc-check-label">
                 {ok.blockers.length === 0
                   ? "Себестоимость заполнена"
-                  : `У ${ok.calc.costCoverage.missingCost} ${pluralRu(ok.calc.costCoverage.missingCost, "товара", "товаров", "товаров")} нет себестоимости`}
+                  : `У ${ok.snapshot.costCoverage.missingCost} ${pluralRu(ok.snapshot.costCoverage.missingCost, "товара", "товаров", "товаров")} нет себестоимости`}
               </span>
               <span className="calc-check-val">
-                {ok.calc.costCoverage.withCost} / {ok.calc.costCoverage.requiredProducts}
+                {ok.snapshot.costCoverage.withCost} / {ok.snapshot.costCoverage.requiredProducts}
               </span>
             </div>
             {ok.blockers.length > 0 && (
@@ -133,18 +133,18 @@ export function AccrualUploadFlow({ session: s, onOpenCatalog, signedIn }: Props
             )}
           </div>
         </div>
-        <div className={"calc-check-row " + (ok.calc.taxRatePercent === 0 ? "warn" : "ok")}>
-          <span className="calc-check-ico">{ok.calc.taxRatePercent === 0 ? "⚠" : "✓"}</span>
+        <div className={"calc-check-row " + (ok.snapshot.tax.ratePercent === 0 ? "warn" : "ok")}>
+          <span className="calc-check-ico">{ok.snapshot.tax.ratePercent === 0 ? "⚠" : "✓"}</span>
           <div className="calc-check-body">
             <div className="calc-check-line">
-              <span className="calc-check-label">{ok.calc.taxRatePercent === 0 ? "Налог не указан" : "Налог указан"}</span>
-              {ok.calc.taxRatePercent !== 0 && (
+              <span className="calc-check-label">{ok.snapshot.tax.ratePercent === 0 ? "Налог не указан" : "Налог указан"}</span>
+              {ok.snapshot.tax.ratePercent !== 0 && (
                 <span className="calc-check-val">
-                  {ok.calc.taxRatePercent.toLocaleString("ru-RU", { maximumFractionDigits: 2 })}%
+                  {ok.snapshot.tax.ratePercent.toLocaleString("ru-RU", { maximumFractionDigits: 2 })}%
                 </span>
               )}
             </div>
-            {ok.calc.taxRatePercent === 0 && <div className="calc-check-hint">итоговая прибыль может быть завышена</div>}
+            {ok.snapshot.tax.ratePercent === 0 && <div className="calc-check-hint">итоговая прибыль может быть завышена</div>}
           </div>
         </div>
       </div>
