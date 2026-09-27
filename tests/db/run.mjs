@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// Тесты уникальности артикула каталога на НАСТОЯЩЕЙ PostgreSQL:  npm run test:db
+// Тесты на НАСТОЯЩЕЙ PostgreSQL:  npm run test:db
+//   • уникальность артикула каталога (products-unique.test.mjs);
+//   • продление безлимита и однократная выдача по платежу (unlimited-extension.test.mjs).
 //
 // Нужна тестовая PostgreSQL 15+ (локальная / Docker / `supabase start`) и адрес в
 // TEST_DATABASE_URL, например:
@@ -8,7 +10,8 @@
 // mprof_dbtest_<случайно>, работает только в ней и удаляет её в конце. Базу из адреса
 // тест не меняет. Адреса Supabase-облака отклоняются (защита от запуска на production).
 //
-// 1) компилирует общую функцию импорта (TypeScript → CommonJS) во временную папку;
+// 1) компилирует общую функцию импорта и обработку платежа webhook (TypeScript →
+//    CommonJS) во временную папку;
 // 2) запускает `node --test` по tests/db/*.test.mjs.
 
 import { spawnSync } from "node:child_process";
@@ -53,6 +56,7 @@ const tsc = spawnSync(
     "--skipLibCheck",
     "--strict",
     "app/api/cloud/_lib/catalog-import.ts",
+    "app/api/payment/_lib/webhook-core.ts",
   ],
   { cwd: repoRoot, stdio: "inherit" }
 );
