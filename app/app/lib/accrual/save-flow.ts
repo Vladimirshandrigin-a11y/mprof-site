@@ -191,10 +191,12 @@ export type SaveOutcome =
       error: string;
       /**
        * Что с попыткой: none — точно не списана; unknown — нет подтверждения (могла
-       * сохраниться, повтор с тем же ключом не спишет дважды); kept — списана раньше,
-       * не удалось сохранить изменения.
+       * сохраниться, повтор с тем же ключом не спишет дважды); unconfirmed — сохранение
+       * сейчас недоступно (этот запрос ничего не записал), но запрос с тем же ключом,
+       * отправленный раньше, мог завершиться — «не списана» не обещаем; kept — списана
+       * раньше, не удалось сохранить изменения.
        */
-      charge: "none" | "unknown" | "kept";
+      charge: "none" | "unknown" | "unconfirmed" | "kept";
     };
 
 export interface SaveRequest {
@@ -421,7 +423,8 @@ export class AccrualSaveController {
               charge: "none",
             };
           case "unavailable":
-            return { status: "save_failed", error: op.message, charge: "none" };
+            // Ключ остаётся (как и раньше); ранее отправленный запрос с ним мог завершиться.
+            return { status: "save_failed", error: op.message, charge: "unconfirmed" };
           case "failed":
             return { status: "save_failed", error: op.message, charge: "unknown" };
           case "deleted":
