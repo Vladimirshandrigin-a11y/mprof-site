@@ -25,8 +25,10 @@ const TIER_DATA: Record<
     perks: string[];
   }
 > = {
-  // Условия сверены с кодом: цены — PLAN_PRICING; 449 ₽ — premium_until = +30 дней
-  // от активации (webhook), разовый платёж без сохранения карты (автосписаний нет);
+  // Условия сверены с кодом: цены — PLAN_PRICING; 449 ₽ — premium_until =
+  // max(текущее окончание, момент активации) + 30 дней (grant_unlimited_payment, PR #105):
+  // при действующем «Безлимите» — +30 дней к окончанию, иначе 30 дней от активации;
+  // разовый платёж без сохранения карты (автосписаний нет);
   // 149 ₽ — +1 расчёт, Ozon API не открывает (consume_api_calculation). PDF и
   // товарная аналитика есть только у расчёта по XLSX «Отчёт по начислениям».
   single: {
@@ -45,9 +47,10 @@ const TIER_DATA: Record<
     name: "Безлимит",
     priceNumber: 449,
     isSub: true,
-    period: "30 дней с момента активации · без автопродления",
+    period: "30 дней · без автопродления",
     perks: [
       "Неограниченное число расчётов в течение 30 дней",
+      "Срок — 30 дней с активации; если «Безлимит» уже действует, 30 дней добавятся к дате его окончания",
       "Все способы: XLSX «Отчёт по начислениям», вручную и Ozon API",
       "По XLSX — товарная аналитика и PDF‑отчёт; расчёты сохраняются в историю",
       "Для Ozon API — подключение Ozon в «Личном кабинете» и себестоимость товаров в каталоге",
@@ -201,7 +204,10 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
           pointer-events:none;z-index:0;
           filter:blur(20px)
         }
-        .tm-card > *{position:relative;z-index:1}
+        /* Крестик исключён: styled-jsx добавляет класс области к обоим селекторам, и это
+           правило (0,3,0) перебивало .tm-close{position:absolute} (0,2,0) — кнопка
+           вставала в поток слева сверху поверх значка PRO. */
+        .tm-card > *:not(.tm-close){position:relative;z-index:1}
 
         /* === Close button — floating glass island above ALL decorative layers === */
         .tm-close{

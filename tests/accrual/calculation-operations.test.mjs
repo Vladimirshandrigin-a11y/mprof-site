@@ -60,15 +60,19 @@ describe("операция привязана к файлу: без начато
 });
 
 describe("операция расчёта: отказы до записи ничего не списывают", () => {
-  it("сервер без миграции (unavailable): save_failed «не списано», списаний и строк нет, ключ сохраняется для повтора", async () => {
+  it("сервер ответил «сохранение недоступно» (503): save_failed без обещания «не списано» — ранее отправленный запрос с тем же ключом мог завершиться; списаний и строк нет, ключ сохраняется для повтора", async () => {
     const cloud = makeMockCloud({ opUnavailable: true });
     const ctl = new SF.AccrualSaveController(cloud.deps);
     const a = A();
     openFile(ctl, a);
     const out = await ctl.save(a.req);
-    assert.deepEqual([out.status, out.charge], ["save_failed", "none"]);
+    assert.deepEqual([out.status, out.charge], ["save_failed", "unconfirmed"]);
     assert.deepEqual([cloud.log.consume, cloud.rows.size, cloud.log.histories.length, ctl.state.paid], [0, 0, 0, false]);
-    assert.match(SES.saveOutcomeUi(out).note.text, /Попытка расчёта не списана/);
+    assert.equal(cloud.pendingKeys.has(a.fp), true, "ключ для повтора сохранён");
+    const ui = SES.saveOutcomeUi(out);
+    assert.doesNotMatch(ui.note.text, /не списан/);
+    assert.match(ui.note.text, /^Сохранение не подтверждено: .*отправлялся раньше, тот запрос мог успеть его сохранить — нажмите «Повторить сохранение»/);
+    assert.equal(ui.needsRetry, true, "существующее действие повтора доступно");
     cloud.cfg.opUnavailable = false;
     assert.equal((await ctl.save(a.req)).status, "saved");
     assert.deepEqual([cloud.log.consume, cloud.log.opIds.length], [1, 1]);
@@ -260,14 +264,20 @@ describe("операция расчёта: одна оставшаяся поп�
 });
 
 describe("saveOutcomeUi: исходы операции", () => {
-  it("save_failed: none / unknown / kept — разные тексты; повтор доступен", () => {
+  it("save_failed: none / unknown / unconfirmed / kept — разные тексты; «не списана» только у none; повтор доступен", () => {
     const none = SES.saveOutcomeUi({ status: "save_failed", error: "x", charge: "none" });
     const unknown = SES.saveOutcomeUi({ status: "save_failed", error: "x", charge: "unknown" });
+    const unconfirmed = SES.saveOutcomeUi({ status: "save_failed", error: "Сохранение расчёта временно недоступно", charge: "unconfirmed" });
     const kept = SES.saveOutcomeUi({ status: "save_failed", error: "x", charge: "kept" });
     assert.match(none.note.text, /Попытка расчёта не списана/);
     assert.match(unknown.note.text, /повтор вернёт его без повторного списания/);
+    assert.equal(
+      unconfirmed.note.text,
+      "Сохранение не подтверждено: Сохранение расчёта временно недоступно. Если этот расчёт уже отправлялся раньше, тот запрос мог успеть его сохранить — нажмите «Повторить сохранение»: уже сохранённый расчёт вернётся без повторного списания."
+    );
     assert.match(kept.note.text, /уже списана за этот файл/);
-    for (const u of [none, unknown, kept]) assert.equal(u.needsRetry, true);
+    for (const u of [unknown, unconfirmed, kept]) assert.doesNotMatch(u.note.text, /не списан/);
+    for (const u of [none, unknown, unconfirmed, kept]) assert.equal(u.needsRetry, true);
   });
   it("restored: совпало — «уже был сохранён»; другие значения — предупреждение «текущие не применены»; снимок не прочитан — «откройте в истории»; ничего не пишется", () => {
     const row = { id: "c", synced: true, createdAt: "" };

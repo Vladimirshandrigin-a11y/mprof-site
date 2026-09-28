@@ -488,7 +488,9 @@ export async function downloadAccrualPdf(
   const ph = doc.internal.pageSize.getHeight();
   canvases.forEach((canvas, i) => {
     if (i > 0) doc.addPage();
-    doc.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, pw, ph);
+    // Сжатие без потерь (Flate): без него jsPDF кладёт пиксели страницы несжатыми —
+    // ≈10 МБ на страницу. Картинка та же (PNG, те же пиксели), меньше только файл.
+    doc.addImage(canvas.toDataURL("image/png"), "PNG", 0, 0, pw, ph, undefined, "FAST");
   });
   doc.save(model.fileName);
   return { pages: canvases.length, fileName: model.fileName };
