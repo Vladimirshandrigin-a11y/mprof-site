@@ -3,7 +3,8 @@
 //   • уникальность артикула каталога (products-unique.test.mjs);
 //   • продление безлимита и однократная выдача по платежу (unlimited-extension.test.mjs);
 //   • webhook ЮKassa → RPC и пересечение со старым обработчиком (payment-webhook.test.mjs);
-//   • атомарное списание и сохранение расчёта по XLSX (calculation-operations.test.mjs).
+//   • атомарное списание и сохранение расчёта по XLSX (calculation-operations.test.mjs);
+//   • то же для ручного расчёта и Ozon API (calculation-operations-manual-api.test.mjs).
 //
 // Нужна тестовая PostgreSQL 15+ (локальная / Docker / `supabase start`) и адрес в
 // TEST_DATABASE_URL, например:
@@ -61,6 +62,11 @@ const tsc = spawnSync(
     "app/api/payment/_lib/webhook-core.ts",
     "app/api/payment/webhook/route.ts",
     "app/api/cloud/calculation-operations/route.ts",
+    "app/api/cloud/calculations/route.ts",
+    "app/api/ozon/save-calculation/route.ts",
+    // Клиентские правила ключа операции (без React/сети) — для сценариев «страница + сервер».
+    "app/app/lib/accrual/operation-store.ts",
+    "app/app/lib/calc-operation-notes.ts",
   ],
   { cwd: repoRoot, stdio: "inherit" }
 );

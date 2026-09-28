@@ -13,6 +13,11 @@ import { authenticateRequest } from "../_lib/auth";
 //
 // Авторизация: Authorization: Bearer <access_token>. user_id берём ТОЛЬКО из
 // токена (не из тела) и фильтруем/пишем по нему — чужие данные не трогаем.
+//
+// Расчёты Ozon API (mode 'api') пишет ТОЛЬКО сервер (/api/ozon/save-calculation):
+// здесь такую строку нельзя ни создать, ни изменить — иначе клиент мог бы выдать
+// свои числа за проверенный сервером API-расчёт. Та же граница — в RLS (миграция
+// 20260929).
 // ============================================================================
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -26,6 +31,13 @@ function parseLimit(raw: string | null): number {
   const n = raw ? parseInt(raw, 10) : DEFAULT_LIMIT;
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_LIMIT;
   return Math.min(n, MAX_LIMIT);
+}
+
+function apiModeRejected() {
+  return NextResponse.json(
+    { error: "Расчёт через Ozon API сохраняет только сервер", code: "api_mode_forbidden" },
+    { status: 400, headers: NO_STORE }
+  );
 }
 
 /** Поля, которые клиент НЕ вправе задавать сам (ставит/фильтрует сервер). */
@@ -82,6 +94,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  if (body.mode === "api") return apiModeRejected();
   // user_id всегда из токена — клиентское значение игнорируем.
   const payload = { ...stripServerFields(body), user_id: userId };
 
@@ -130,12 +143,14 @@ export async function PATCH(req: NextRequest) {
     body.fields && typeof body.fields === "object"
       ? stripServerFields(body.fields as Record<string, unknown>)
       : {};
+  if (fields.mode === "api") return apiModeRejected();
 
   const { data, error } = await admin
     .from("calculations")
     .update(fields)
     .eq("id", id)
     .eq("user_id", userId) // правим только свою строку
+    .neq("mode", "api") // API-расчёт не редактируется клиентом
     .select()
     .single();
 

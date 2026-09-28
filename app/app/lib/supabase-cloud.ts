@@ -8,6 +8,7 @@ import type {
   CalculationOperationStatus,
 } from "./accrual/save-flow";
 import { asAccrualSnapshot } from "./accrual/snapshot";
+import type { ManualCalcInputs } from "./calc-operation-keys";
 
 // ============================================================================
 // Supabase client — module-scope с placeholder fallback'ом, чтобы build
@@ -435,14 +436,145 @@ type OperationBody = {
   data?: {
     replay?: boolean;
     status?: string;
+    mode?: string | null;
     calculationId?: string | null;
     createdAt?: string | null;
     snapshot?: unknown;
+    calculation?: unknown;
     contentMatch?: boolean;
   };
   error?: string;
   code?: string;
 };
+
+// ============================================================================
+// Операции ручного расчёта (/api/cloud/calculation-operations, mode "manual") и
+// статус с сохранённой строкой — для восстановления ручного и API-расчёта без
+// пересчёта. Сервер сам считает итог и отпечаток параметров; «failed» — исход
+// неизвестен (ответа нет), повторять нужно С ТЕМ ЖЕ operationId.
+// ============================================================================
+
+/** Сохранённая строка расчёта из ответа операции (или null, если форма неожиданная). */
+function savedCalculationOf(v: unknown): CloudCalculation | null {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+  const c = v as Record<string, unknown>;
+  if (typeof c.id !== "string" || typeof c.created_at !== "string") return null;
+  const num = (x: unknown): number => (typeof x === "number" ? x : Number(x ?? 0) || 0);
+  return {
+    id: c.id,
+    user_id: typeof c.user_id === "string" ? c.user_id : "",
+    marketplace: (c.marketplace === "wb" ? "wb" : "ozon") as Marketplace,
+    mode: (c.mode === "api" || c.mode === "upload" ? c.mode : "manual") as CalcMode,
+    revenue: num(c.revenue),
+    commission: num(c.commission),
+    logistics: num(c.logistics),
+    ads: num(c.ads),
+    storage: num(c.storage),
+    tax: num(c.tax),
+    cost: num(c.cost),
+    other_expenses: num(c.other_expenses),
+    total_expenses: num(c.total_expenses),
+    profit: num(c.profit),
+    margin: num(c.margin),
+    ai_score: typeof c.ai_score === "number" ? c.ai_score : null,
+    ai_insights: c.ai_insights ?? null,
+    created_at: c.created_at,
+  };
+}
+
+export type SavedOperationResult =
+  /** Сохранено (replay — операция выполнена раньше: без списания и записи). */
+  | { kind: "ok"; replay: boolean; calculation: CloudCalculation; contentMatch: boolean }
+  /** Операция выполнена раньше, но расчёт удалён из истории: заново не создаётся. */
+  | { kind: "deleted" }
+  /** Отказ в списании (нет попытки / сессии): ничего не записано. */
+  | { kind: "refused"; reason: string }
+  /** Ключ относится к другим параметрам: ничего не записано. */
+  | { kind: "conflict" }
+  /** Сохранение недоступно (не применена миграция): ничего не записано. */
+  | { kind: "unavailable"; message: string }
+  /** Нет подтверждения: исход неизвестен — повторять с тем же ключом. */
+  | { kind: "failed"; message: string };
+
+export type SavedOperationStatus =
+  | { kind: "done"; mode: string | null; calculation: CloudCalculation }
+  | { kind: "deleted" }
+  | { kind: "none" }
+  | { kind: "conflict" }
+  | { kind: "failed"; message: string };
+
+/** Ручной расчёт: списание и сохранение одной операцией (итог считает сервер). */
+export async function saveManualCalculationOperation(input: {
+  operationId: string;
+  inputs: ManualCalcInputs;
+}): Promise<SavedOperationResult> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return { kind: "refused", reason: "not_authenticated" };
+    const { status, body } = await withReadTimeout(
+      (async () => {
+        const res = await fetch("/api/cloud/calculation-operations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ mode: "manual", operationId: input.operationId, inputs: input.inputs }),
+          cache: "no-store",
+        });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as OperationBody };
+      })()
+    );
+    const d = body.data;
+    if (status === 200 && d) {
+      if (d.status === "deleted") return { kind: "deleted" };
+      const calculation = savedCalculationOf(d.calculation);
+      if (!calculation) return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
+      return { kind: "ok", replay: d.replay === true, calculation, contentMatch: d.contentMatch === true };
+    }
+    if (status === 401 || status === 402) return { kind: "refused", reason: body.code || "limit_reached" };
+    if (status === 409) return { kind: "conflict" };
+    if (status === 503) return { kind: "unavailable", message: body.error || "Сохранение временно недоступно" };
+    return { kind: "failed", message: body.error || `Ошибка сервера (${status})` };
+  } catch (e) {
+    return { kind: "failed", message: fmtError(e).message };
+  }
+}
+
+/** Статус операции с сохранённой строкой (ручной и API-расчёт): восстановление без пересчёта. */
+export async function getSavedOperationStatus(
+  operationId: string,
+  requestHash: string
+): Promise<SavedOperationStatus> {
+  try {
+    const token = await getAccessToken();
+    if (!token) return { kind: "failed", message: "Требуется авторизация" };
+    const q = new URLSearchParams({ operationId, requestHash });
+    const { status, body } = await withReadTimeout(
+      (async () => {
+        const res = await fetch(`/api/cloud/calculation-operations?${q}`, {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+          cache: "no-store",
+        });
+        return { status: res.status, body: (await res.json().catch(() => ({}))) as OperationBody };
+      })()
+    );
+    const d = body.data;
+    if (status !== 200 || !d) return { kind: "failed", message: body.error || `Ошибка сервера (${status})` };
+    if (d.status === "done") {
+      const calculation = savedCalculationOf(d.calculation);
+      if (!calculation) return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
+      return { kind: "done", mode: d.mode ?? null, calculation };
+    }
+    if (d.status === "deleted") return { kind: "deleted" };
+    return d.status === "conflict" ? { kind: "conflict" } : { kind: "none" };
+  } catch (e) {
+    return { kind: "failed", message: fmtError(e).message };
+  }
+}
+
+/** Сохранённая строка из ответа /api/ozon/save-calculation (повтор завершённой операции). */
+export function savedCalculationFromResponse(v: unknown): CloudCalculation | null {
+  return savedCalculationOf(v);
+}
 
 /** Ответ RPC consume_calculation() (см. supabase/schema.sql). */
 export interface ConsumeResult {

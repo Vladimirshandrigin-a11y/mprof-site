@@ -452,7 +452,7 @@ describe("доступ, миграция и совместимость", () => {
     for (const [k, v] of Object.entries(cons)) if (k.endsWith("_mismatch")) assert.equal(v, "0", k);
   });
 
-  it("итоговая секция schema.sql совпадает с миграцией (таблица, функции, права)", async () => {
+  it("итоговые секции schema.sql совпадают с миграциями 20260928 + 20260929 (таблица, функции, права)", async () => {
     const describeDb = async (c) => {
       const f = await c.query(`select p.proname, pg_get_functiondef(p.oid) as d, p.proacl::text as acl
         from pg_proc p join pg_namespace n on n.oid = p.pronamespace
@@ -462,7 +462,8 @@ describe("доступ, миграция и совместимость", () => {
       const k = await c.query("select conname, pg_get_constraintdef(oid) as d from pg_constraint where conrelid = 'public.calculation_operations'::regclass order by 1");
       return JSON.stringify([f.rows, t.rows, a.rows, k.rows]);
     };
-    const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION] });
+    // schema.sql — итоговое состояние: #107 и следующая миграция (ручной расчёт и API).
+    const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, read("supabase/migrations/20260929_calculation_operations_manual_api.sql")] });
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_calculation_operation"));
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));

@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateRequest, getUserScopedClient } from "../../cloud/_lib/auth";
+import { authenticateRequest } from "../../cloud/_lib/auth";
+import { apiRequestHash } from "../../../app/lib/calc-operation-keys";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
 import {
@@ -17,7 +19,7 @@ import { syncMissingRealizationProducts } from "../_lib/realization-catalog-sync
 // POST /api/ozon/save-calculation — ФИНАЛЬНОЕ сохранение API-расчёта Ozon в
 // историю + списание попытки (PR #19).
 //
-//   Вход: { month: "YYYY-MM", manualExpenses? }.
+//   Вход: { month: "YYYY-MM", manualExpenses?, operationId? (UUID) }.
 //
 // Целевая формула API-расчёта:
 //   Чистая прибыль = Итого Ozon − Себестоимость из отчёта реализации Ozon
@@ -47,21 +49,22 @@ import { syncMissingRealizationProducts } from "../_lib/realization-catalog-sync
 //      нет в каталоге, автоматически добавляются в каталог пользователя (единая
 //      функция cloud/_lib/catalog-import, cost_price = 0 = «не указана») — так что
 //      пользователю остаётся только заполнить стоимость и запустить расчёт снова;
-//   4. списываем РОВНО один API-расчёт СТРОГИМ RPC consume_api_calculation
-//      (PR #21): доступ ТОЛЬКО при активном безлимите 449₽ ИЛИ первом бесплатном
-//      пробном расчёте; 149₽ single-кредит API НЕ открывает. Списание — ПЕРЕД
-//      сохранением. Нет доступа → 402, без сохранения (RPC при лимите ничего не
-//      инкрементит);
-//   5. пишем строку в calculations (mode='api', снимок в ai_insights) и снимок
-//      за месяц в report_history (для помесячных графиков).
+//   4. ОДНА транзакция БД (RPC save_api_calculation_operation, только service_role):
+//      окончательная проверка прав и списание по правилам API (активный безлимит
+//      449₽ ИЛИ общая первая бесплатная попытка; 149₽ single-кредит API НЕ открывает),
+//      строка calculations (mode='api', снимок в ai_insights), снимок за месяц в
+//      report_history и отметка операции. Нет доступа → 402, ничего не записано;
+//      сбой записи откатывает и списание.
 //
-// Списание идёт ПЕРЕД insert (как в рабочем ручном/файловом сохранении: оно тоже
-// зовёт свой RPC до сохранения; ручной/файловый — consume_calculation, API —
-// consume_api_calculation). Атомарной транзакции «списал+сохранил»
-// в текущей архитектуре нет (RPC идёт user-scoped клиентом, insert — service-role
-// клиентом), поэтому повторяем существующий порядок. Остаточный риск (списание
-// прошло, а insert упал → расчёт «потрачен» без строки) такой же, как в текущем
-// рабочем флоу, и описан в отчёте PR #19.
+// Операция расчёта (миграция 20260929): operationId от страницы привязан к
+// пользователю (из токена), режиму api и параметрам (месяц + ручные расходы —
+// отпечаток считает сервер). Завершённая операция возвращает сохранённый расчёт
+// ДО новых обращений к Ozon (потерянный ответ, двойной клик, перезагрузка) — без
+// списания и записи; удалённый из истории — status "deleted", заново не создаётся;
+// тот же operationId с другими параметрами → 409. Запросы к Ozon — ВНЕ транзакции:
+// их ошибка попытку не расходует. Нет функций в БД (миграция не применена) → 503
+// ДО Ozon, раздельного списания нет. Старая страница без operationId получает новый
+// ключ на сервере — атомарность сохраняется, повтор между запросами — нет.
 //
 // Безопасность: raw-ключ Ozon не логируем и не возвращаем; api_key_encrypted,
 // client_id и расшифрованный ключ наружу НЕ уходят.
@@ -72,31 +75,71 @@ export const dynamic = "force-dynamic";
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
-type ConsumeResult = {
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Ответ RPC операции / статуса (миграция 20260929). */
+type OperationResult = {
   ok?: boolean;
   reason?: string;
+  status?: string;
+  replay?: boolean;
+  calculation_id?: string;
+  created_at?: string;
+  calculation?: Record<string, unknown> | null;
   used?: number;
   allowance?: number;
   unlimited?: boolean;
 };
 
+/** Ошибка RPC операции: нет функции (миграция не применена) → 503, иначе исход неизвестен. */
+function operationRpcFailure(error: { code?: string; message?: string }, where: string): NextResponse {
+  if (error.code === "PGRST202" || error.code === "42883") {
+    return NextResponse.json(
+      { error: "Сохранение расчёта временно недоступно. Попытка не списана.", code: "migration_missing" },
+      { status: 503, headers: NO_STORE }
+    );
+  }
+  console.error(`[api/ozon/save-calculation] operation ${where} rpc error`, error);
+  return NextResponse.json(
+    {
+      error: "Сервер не подтвердил сохранение расчёта. Повторите: если расчёт уже сохранён, повтор вернёт его без повторного списания.",
+      code: "operation_failed",
+    },
+    { status: 502, headers: NO_STORE }
+  );
+}
+
+function operationConflict(): NextResponse {
+  return NextResponse.json(
+    { error: "Операция относится к расчёту с другими параметрами. Попытка не списана.", code: "operation_conflict" },
+    { status: 409, headers: NO_STORE }
+  );
+}
+
+/** Завершённая операция: сохранённый расчёт (без Ozon, списания и записи) или «удалён». */
+function savedOperationResponse(r: OperationResult): NextResponse {
+  if (r.status === "deleted") {
+    return NextResponse.json({ ok: true, replay: true, status: "deleted" }, { headers: NO_STORE });
+  }
+  return NextResponse.json(
+    {
+      ok: true,
+      replay: true,
+      status: "done",
+      calculationId: r.calculation_id ?? null,
+      createdAt: r.created_at ?? null,
+      calculation: r.calculation ?? null,
+    },
+    { headers: NO_STORE }
+  );
+}
+
 export async function POST(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
+  // userId — ТОЛЬКО из проверенного токена; операция (service_role) получает его
+  // параметром и списывает по правилам API.
   const { admin, userId } = auth;
-
-  // Bearer-токен для USER-SCOPED клиента (consume_api_calculation опирается на
-  // auth.uid()). authenticateRequest уже подтвердил, что токен валиден.
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.toLowerCase().startsWith("bearer ")
-    ? authHeader.slice(7).trim()
-    : "";
-  if (!token) {
-    return NextResponse.json(
-      { error: "Требуется авторизация" },
-      { status: 401, headers: NO_STORE }
-    );
-  }
 
   if (!isEncryptionConfigured()) {
     return NextResponse.json(
@@ -109,9 +152,9 @@ export async function POST(req: NextRequest) {
   }
 
   // ---- input ----
-  let body: { month?: unknown; manualExpenses?: unknown };
+  let body: { month?: unknown; manualExpenses?: unknown; operationId?: unknown };
   try {
-    body = (await req.json()) as { month?: unknown; manualExpenses?: unknown };
+    body = (await req.json()) as { month?: unknown; manualExpenses?: unknown; operationId?: unknown };
   } catch {
     return NextResponse.json(
       { error: "Некорректный JSON в теле запроса" },
@@ -149,6 +192,27 @@ export async function POST(req: NextRequest) {
     );
   }
   const manualExpenses = meParsed.value;
+
+  // ---- операция: ключ страницы (или новый) + отпечаток параметров (считает сервер) ----
+  if (body.operationId !== undefined && (typeof body.operationId !== "string" || !UUID_RE.test(body.operationId))) {
+    return NextResponse.json(
+      { error: "Некорректный ключ операции", code: "bad_request" },
+      { status: 400, headers: NO_STORE }
+    );
+  }
+  const operationId = typeof body.operationId === "string" ? body.operationId : randomUUID();
+  const requestHash = apiRequestHash(month, manualExpenses);
+
+  // ---- 0) завершённая операция → сохранённый расчёт ДО обращений к Ozon ----
+  const { data: stData, error: stErr } = await admin.rpc("api_calculation_operation_status", {
+    p_user_id: userId,
+    p_operation_id: operationId,
+    p_request_hash: requestHash,
+  });
+  if (stErr) return operationRpcFailure(stErr, "status");
+  const st = (stData ?? {}) as OperationResult;
+  if (st.status === "conflict") return operationConflict();
+  if (st.status === "done" || st.status === "deleted") return savedOperationResponse(st);
 
   // ---- подключение Ozon текущего пользователя (ключ ТОЛЬКО отсюда) ----
   const { data: conn, error: connErr } = await admin
@@ -266,56 +330,7 @@ export async function POST(req: NextRequest) {
   const t = loaded.draft.totals;
   const c = loaded.computed;
 
-  // ---- 3) списываем РОВНО один API-расчёт (server-authoritative, ПЕРЕД сохранением) ----
-  // USER-SCOPED клиент: consume_api_calculation опирается на auth.uid(); service-role
-  // обошёл бы auth и вернул not_authenticated. СТРОГИЙ API-RPC (PR #21): доступ
-  // только при активном безлимите 449₽ ИЛИ первом бесплатном пробном расчёте;
-  // 149₽ single-кредит API НЕ открывает. Цены не хардкодим — решает RPC.
-  const userClient = getUserScopedClient(token);
-  if (!userClient) {
-    return NextResponse.json(
-      {
-        error:
-          "Supabase не настроен (NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)",
-        code: "supabase_env_missing",
-      },
-      { status: 503, headers: NO_STORE }
-    );
-  }
-
-  const { data: consumeData, error: consumeErr } =
-    await userClient.rpc("consume_api_calculation");
-  if (consumeErr) {
-    // eslint-disable-next-line no-console
-    console.error("[api/ozon/save-calculation] consume rpc error", consumeErr);
-    return NextResponse.json(
-      { error: consumeErr.message || "Ошибка списания расчёта", code: "consume_failed" },
-      { status: 502, headers: NO_STORE }
-    );
-  }
-  const consume = (consumeData ?? {}) as ConsumeResult;
-  if (consume.ok !== true) {
-    // Нет доступа → НЕ сохраняем. При limit_reached RPC ничего не инкрементит,
-    // так что попытка НЕ потрачена. Фронт откроет окно тарифа.
-    const notAuth = consume.reason === "not_authenticated";
-    return NextResponse.json(
-      {
-        error: notAuth
-          ? "Сессия недействительна"
-          : "API-расчёт доступен на тарифе «Безлимит» (449 ₽/мес) или как первый бесплатный пробный расчёт. Оформите тариф, чтобы продолжить.",
-        code: notAuth ? "not_authenticated" : "limit_reached",
-        consume: {
-          ok: false,
-          reason: consume.reason,
-          used: consume.used,
-          allowance: consume.allowance,
-        },
-      },
-      { status: notAuth ? 401 : 402, headers: NO_STORE }
-    );
-  }
-
-  // ---- 4) строка calculations: положительные величины расходов; reconcile с profit.
+  // ---- 3) строка calculations: положительные величины расходов; reconcile с profit.
   // other_expenses — балансирующая статья (Ozon-услуги/прочее + ручные расходы
   // кроме налога), так что revenue − total_expenses === profit. Полный снимок —
   // в ai_insights (тот же приём, что у файлового net-profit расчёта).
@@ -416,8 +431,8 @@ export async function POST(req: NextRequest) {
     savedAt: new Date().toISOString(),
   };
 
+  // Пользователь — ТОЛЬКО из токена (параметр p_user_id операции), не из тела.
   const calcRow = {
-    user_id: userId, // ТОЛЬКО из токена
     marketplace: "ozon",
     mode: "api",
     revenue,
@@ -434,40 +449,46 @@ export async function POST(req: NextRequest) {
     ai_insights: snapshot,
   };
 
-  const { data: savedCalc, error: calcErr } = await admin
-    .from("calculations")
-    .insert([calcRow])
-    .select("id, created_at")
-    .single();
-
-  if (calcErr) {
-    // eslint-disable-next-line no-console
-    console.error("[api/ozon/save-calculation] calculations insert error", calcErr);
-    // Расчёт уже списан (см. остаточный риск в шапке). Сообщаем об ошибке сейва.
-    return NextResponse.json(
-      { error: calcErr.message || "Не удалось сохранить расчёт", code: "save_failed" },
-      { status: 502, headers: NO_STORE }
-    );
-  }
-
-  // ---- 5) снимок за месяц для помесячных графиков (best-effort: не валит сейв) ----
-  let reportHistorySaved = false;
-  const { error: histErr } = await admin.from("report_history").insert([
-    {
-      user_id: userId,
+  // ---- 4) ОДНА транзакция: права + списание + calculations + report_history + журнал ----
+  const { data: opData, error: opErr } = await admin.rpc("save_api_calculation_operation", {
+    p_user_id: userId,
+    p_operation_id: operationId,
+    p_request_hash: requestHash,
+    p_calculation: calcRow,
+    p_history: {
       report_month: `${month}-01`, // первое число месяца отчёта (date)
       revenue,
       expenses: totalExpensesCol,
       profit: c.netProfit,
       margin: c.margin,
     },
-  ]);
-  if (histErr) {
-    // eslint-disable-next-line no-console
-    console.error("[api/ozon/save-calculation] report_history insert error", histErr);
-  } else {
-    reportHistorySaved = true;
+  });
+  if (opErr) return operationRpcFailure(opErr, "save");
+  const op = (opData ?? {}) as OperationResult;
+  if (op.ok !== true) {
+    if (op.reason === "operation_conflict") return operationConflict();
+    if (op.reason === "bad_request") {
+      console.error("[api/ozon/save-calculation] operation bad_request");
+      return NextResponse.json(
+        { error: "Не удалось сохранить расчёт", code: "save_failed" },
+        { status: 500, headers: NO_STORE }
+      );
+    }
+    // Нет доступа → ничего не записано и не списано. Фронт откроет окно тарифа.
+    const notAuth = op.reason === "not_authenticated";
+    return NextResponse.json(
+      {
+        error: notAuth
+          ? "Сессия недействительна"
+          : "API-расчёт доступен на тарифе «Безлимит» (449 ₽/мес) или как первый бесплатный пробный расчёт. Оформите тариф, чтобы продолжить.",
+        code: notAuth ? "not_authenticated" : "limit_reached",
+        consume: { ok: false, reason: op.reason, used: op.used, allowance: op.allowance },
+      },
+      { status: notAuth ? 401 : 402, headers: NO_STORE }
+    );
   }
+  // Параллельный запрос той же операции успел раньше — его сохранённый расчёт.
+  if (op.replay === true || op.status === "deleted") return savedOperationResponse(op);
 
   // ---- 5.1) диагностика отчёта о реализации Ozon: ТА ЖЕ, что дала боевую
   //          себестоимость выше (loaded.realization) — повторно НЕ запрашиваем.
@@ -498,14 +519,16 @@ export async function POST(req: NextRequest) {
   return NextResponse.json(
     {
       ok: true,
-      calculationId: savedCalc.id,
-      createdAt: savedCalc.created_at,
-      reportHistorySaved,
+      replay: false,
+      operationId,
+      calculationId: op.calculation_id,
+      createdAt: op.created_at,
+      reportHistorySaved: true,
       consume: {
         ok: true,
-        unlimited: consume.unlimited === true,
-        used: typeof consume.used === "number" ? consume.used : undefined,
-        allowance: typeof consume.allowance === "number" ? consume.allowance : undefined,
+        unlimited: op.unlimited === true,
+        used: typeof op.used === "number" ? op.used : undefined,
+        allowance: typeof op.allowance === "number" ? op.allowance : undefined,
       },
       // Краткая сводка (обратная совместимость) + полный расчёт для отрисовки.
       result: {

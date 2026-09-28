@@ -1,6 +1,8 @@
 // Подмена сети для тестов серверных обработчиков: globalThis.fetch.
 //
 //   • https://api.yookassa.ru/…      → ответ, заданный тестом (настоящей ЮKassa нет);
+//   • https://api-seller.ozon.ru/…   → ответ, заданный тестом (state.ozon; настоящего Ozon нет);
+//   • http://supabase.test/auth/v1/user → пользователь из тестового JWT (как GoTrue getUser);
 //   • http://supabase.test/rest/v1/… → минимальная эмуляция PostgREST поверх НАСТОЯЩЕЙ
 //     PostgreSQL: каждый HTTP-запрос — своё соединение из пула и своя транзакция от имени
 //     service_role (service-ключ) или authenticated с auth.uid() из JWT пользователя
@@ -13,6 +15,7 @@
 export const SUPABASE_URL = "http://supabase.test";
 export const SERVICE_KEY = "test-service-role-key";
 const YOOKASSA = "https://api.yookassa.ru/";
+const OZON = "https://api-seller.ozon.ru/";
 
 /** Полезная нагрузка JWT без проверки подписи (тестовые токены). */
 function jwtClaims(token) {
@@ -29,6 +32,18 @@ function jwtClaims(token) {
 export function userJwt(userId) {
   const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   return `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ sub: userId, role: "authenticated", aud: "authenticated" })}.test`;
+}
+
+/** numeric (OID 1700) → JSON-число, как отдаёт PostgREST (драйвер pg возвращает строку). */
+const NUMERIC_OID = 1700;
+function asPostgrestRows(res) {
+  const numeric = (res.fields ?? []).filter((f) => f.dataTypeID === NUMERIC_OID).map((f) => f.name);
+  if (numeric.length === 0) return res.rows ?? [];
+  return (res.rows ?? []).map((row) => {
+    const out = { ...row };
+    for (const k of numeric) if (out[k] !== null && out[k] !== undefined) out[k] = Number(out[k]);
+    return out;
+  });
 }
 
 const ident = (s) => {
@@ -62,6 +77,8 @@ export function installFetch() {
     log: [],
     /** Ответ ЮKassa: (paymentId) => Response. */
     yookassa: null,
+    /** Ответ Ozon Seller API: (req) => Response; null — обращение к Ozon в тесте запрещено. */
+    ozon: null,
     /** pg.Pool текущей тестовой базы. */
     pool: null,
     /** Задержки: [{ match(req), wait: Promise }] — запрос ждёт перед выполнением SQL. */
@@ -108,21 +125,33 @@ export function installFetch() {
         const where = [];
         for (const [k, v] of u.searchParams) {
           if (k === "select" || k === "on_conflict" || k === "columns") continue;
-          if (!v.startsWith("eq.")) throw new Error(`фильтр ${k}=${v} не поддержан`);
-          params.push(v.slice(3));
-          where.push(`${ident(k)} = $${params.length}`);
+          const m = /^(eq|neq)\.(.*)$/.exec(v);
+          if (!m) throw new Error(`фильтр ${k}=${v} не поддержан`);
+          params.push(m[2]);
+          where.push(`${ident(k)} ${m[1] === "eq" ? "=" : "<>"} $${params.length}`);
         }
+        // Prefer: return=representation → строки в ответе; Accept object+json → ровно одна.
+        const wantRows = (req.headers.prefer ?? "").includes("return=representation");
+        const wantOne = (req.headers.accept ?? "").includes("vnd.pgrst.object+json");
+        const represent = (rows, created) => {
+          if (!wantRows) return () => json(created ? 201 : 204);
+          if (!wantOne) return () => json(created ? 201 : 200, rows);
+          if (rows.length !== 1) {
+            return () => json(406, { code: "PGRST116", details: `The result contains ${rows.length} rows`, hint: null, message: "JSON object requested, multiple (or no) rows returned" });
+          }
+          return () => json(created ? 201 : 200, rows[0]);
+        };
         if (req.method === "GET") {
           const cols = (u.searchParams.get("select") ?? "*").split(",").map((x) => (x === "*" ? x : ident(x))).join(", ");
           const r = await c.query(`select ${cols} from public.${table}${where.length ? ` where ${where.join(" and ")}` : ""}`, params);
-          response = () => json(200, r.rows);
+          response = () => json(200, asPostgrestRows(r));
         } else if (req.method === "PATCH") {
           const sets = Object.entries(req.body).map(([k, v]) => {
             params.push(v);
             return `${ident(k)} = $${params.length}`;
           });
-          await c.query(`update public.${table} set ${sets.join(", ")} where ${where.join(" and ")}`, params);
-          response = () => json(204);
+          const r = await c.query(`update public.${table} set ${sets.join(", ")} where ${where.join(" and ")}${wantRows ? " returning *" : ""}`, params);
+          response = represent(asPostgrestRows(r), false);
         } else if (req.method === "POST") {
           const rows = Array.isArray(req.body) ? req.body : [req.body];
           const cols = Object.keys(rows[0]).map(ident);
@@ -132,8 +161,8 @@ export function installFetch() {
           const conflict = onConflict
             ? ` on conflict (${onConflict.split(",").map(ident).join(", ")}) ${merge ? `do update set ${cols.map((col) => `${col} = excluded.${col}`).join(", ")}` : "do nothing"}`
             : "";
-          await c.query(`insert into public.${table} (${cols.join(", ")}) values ${values.join(", ")}${conflict}`, params);
-          response = () => json(201);
+          const r = await c.query(`insert into public.${table} (${cols.join(", ")}) values ${values.join(", ")}${conflict}${wantRows ? " returning *" : ""}`, params);
+          response = represent(asPostgrestRows(r), true);
         } else if (req.method === "DELETE") {
           if (!where.length) throw new Error("DELETE без фильтра не поддержан");
           await c.query(`delete from public.${table} where ${where.join(" and ")}`, params);
@@ -165,6 +194,16 @@ export function installFetch() {
       return state.yookassa(id, req);
     }
     if (url.startsWith(`${SUPABASE_URL}/rest/v1/`)) return postgrest(req);
+    if (url.startsWith(`${SUPABASE_URL}/auth/v1/user`)) {
+      // admin.auth.getUser(jwt): пользователь из тестового JWT (подпись не проверяется).
+      const claims = jwtClaims((req.headers.authorization ?? "").replace(/^Bearer\s+/i, ""));
+      if (!claims?.sub) return json(401, { code: 401, msg: "invalid JWT" });
+      return json(200, { id: claims.sub, aud: "authenticated", role: "authenticated", email: `${claims.sub.slice(0, 8)}@example.test`, app_metadata: {}, user_metadata: {}, created_at: "2026-01-01T00:00:00Z" });
+    }
+    if (url.startsWith(OZON)) {
+      if (!state.ozon) throw new Error(`обращение к Ozon в этом тесте не ожидалось: ${url}`);
+      return state.ozon(req);
+    }
     throw new Error(`сеть в тестах запрещена: ${url}`);
   };
 
@@ -176,11 +215,14 @@ export function installFetch() {
     /** Запросы к БД (без ЮKassa). */
     dbRequests: () => state.log.filter((r) => r.url.startsWith(SUPABASE_URL)),
     rpcCalls: () => state.log.filter((r) => r.path.startsWith("/rest/v1/rpc/")),
+    /** Обращения к Ozon Seller API. */
+    ozonCalls: () => state.log.filter((r) => r.url.startsWith(OZON)),
     reset() {
       state.log.length = 0;
       state.gates.length = 0;
       state.dropAfterCommit = null;
       state.override = null;
+      state.ozon = null;
     },
   };
 }

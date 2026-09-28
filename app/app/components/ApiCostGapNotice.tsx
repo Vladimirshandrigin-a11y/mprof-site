@@ -6,15 +6,26 @@
 // — глобальные, в page.tsx), чтобы его можно было отрисовать в изолированном стенде
 // с мок-ответом. Расчёт не сделан, попытка не списана; итог автодобавления товаров в
 // каталог показывается честно: число добавленных, неоднозначные, строки без артикула
-// или ошибка (при ошибке «успех» не показывается).
+// или ошибка (при ошибке «успех» не показывается). earlierRequest — ответ на повтор
+// операции, запрос которой уже отправлялся раньше: тот мог сохранить расчёт, поэтому
+// «попытка не списана» не обещаем.
 // ============================================================================
 
 import { pluralRu } from "../lib/accrual/format";
 import type { ApiCostGap } from "../lib/api-cost-gap";
+import { OP_TEXT } from "../lib/calc-operation-notes";
 
 const fmt = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
 
-export function ApiCostGapNotice({ gap, onOpenCatalog }: { gap: ApiCostGap; onOpenCatalog: () => void }) {
+export function ApiCostGapNotice({
+  gap,
+  onOpenCatalog,
+  earlierRequest = false,
+}: {
+  gap: ApiCostGap;
+  onOpenCatalog: () => void;
+  earlierRequest?: boolean;
+}) {
   return (
     <div className="api-costgap" role="alert">
       <div className="api-costgap-title">
@@ -27,8 +38,10 @@ export function ApiCostGapNotice({ gap, onOpenCatalog }: { gap: ApiCostGap; onOp
       </div>
       <p className="api-costgap-sub">
         Чтобы рассчитать чистую прибыль, заполните себестоимость всех
-        товаров в каталоге. Сейчас расчёт не сделан и попытка не
-        списана.
+        товаров в каталоге.{" "}
+        {earlierRequest
+          ? `Этот повтор не выполнен. ${OP_TEXT.earlierMaySave}`
+          : "Сейчас расчёт не сделан и попытка не списана."}
       </p>
       <div className="api-costgap-stats">
         {gap.unmatchedItems > 0 && (
