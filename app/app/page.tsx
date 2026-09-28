@@ -74,7 +74,9 @@ import {
 import {
   OP_TEXT,
   RECHECK_RECENT_MS,
+  apiBeforeUi,
   apiSaveOutcome,
+  keepKeyAfter,
   opOutcomeUi,
   opRecoveryUi,
   recheckAfterReload,
@@ -1466,6 +1468,9 @@ export default function AppPage() {
   // понятный блок с действиями (перейти в каталог / добавить несопоставленные),
   // а не сухой текст. null — блок скрыт.
   const [apiCostGap, setApiCostGap] = useState<ApiCostGap | null>(null);
+  // Блок пришёл на повтор операции, запрос которой уже отправлялся раньше: тот мог
+  // сохранить расчёт — блок не обещает «попытка не списана».
+  const [apiCostGapEarlier, setApiCostGapEarlier] = useState(false);
   // Счётчик обновления каталога: растёт, когда товары добавлены автоматически (XLSX или
   // API-расчёт), — открытый список каталога перечитывается без перезагрузки страницы.
   const [catalogRefresh, setCatalogRefresh] = useState(0);
@@ -4391,6 +4396,9 @@ export default function AppPage() {
     setApiCostGap(null);
     setRealizationDiag(null);
     const operationId = store.getOrCreate(uid, ident, { month, manualExpenses });
+    // Этим ключом запрос уже отправлялся (исход неизвестен)? Тогда «ничего не записано»
+    // в ответ на ЭТОТ запрос не закрывает операцию: отправленный раньше может завершиться.
+    const earlier = store.markSent(uid, ident);
     type SaveResponse = {
       ok?: boolean;
       replay?: boolean;
@@ -4455,24 +4463,30 @@ export default function AppPage() {
           // Вместо сухого текста показываем структурированный блок «Не хватает
           // себестоимости у товаров» с понятными действиями (перейти в каталог).
           // Отсутствующие товары сервер уже добавил в каталог сам (catalogImport).
+          if (!keepKeyAfter("request_no_write", earlier)) store.settle(uid, ident);
           const gap = parseApiCostGap(data ?? {});
           setApiCostGap(gap);
+          setApiCostGapEarlier(earlier);
           // Товары уже добавлены сервером в каталог — обновляем открытые списки.
           if (gap.catalogImport.attempted && gap.catalogImport.created > 0) {
             setCatalogRefresh((k) => k + 1);
           }
           return;
         }
-        case "before":
-          // Ошибка ДО операции (Ozon, ввод): ничего не списано и не записано.
-          setProfitError(out.message);
-          showToast(out.message, "err");
+        case "before": {
+          // Ошибка ДО операции (Ozon, ввод): этот запрос ничего не списал и не записал.
+          const ui = apiBeforeUi(out.message, earlier);
+          if (!ui.keepKey) store.settle(uid, ident);
+          if (ui.error) setProfitError(ui.error);
+          if (ui.note) setOpNote({ ...ui.note, mode: "api" });
+          showToast(ui.error ?? "Повтор не выполнен", "err");
           return;
+        }
         default: {
-          const ui = opOutcomeUi(out, "api");
+          const ui = opOutcomeUi(out, "api", earlier);
           if (!ui.keepKey) store.settle(uid, ident);
           // Нет доступа к API (бесплатная попытка израсходована, безлимита нет;
-          // 149 ₽ API не открывает) → окно только с безлимитом. Ничего не списано.
+          // 149 ₽ API не открывает) → окно только с безлимитом. Этот запрос ничего не списал.
           if (ui.paywall) openTariffModal("unlimited", "api");
           if (ui.note) setOpNote({ ...ui.note, mode: "api" });
         }
@@ -4849,12 +4863,16 @@ export default function AppPage() {
     setLoadedApiView(null);
     try {
       const operationId = store.getOrCreate(uid, ident, inputs);
+      // Этим ключом запрос уже отправлялся (исход неизвестен)? Тогда отказ или
+      // «недоступно» в ответ на ЭТОТ запрос не закрывают операцию.
+      const earlier = store.markSent(uid, ident);
       // 5 стадий × 700мс — минимальная задержка для AI processing overlay.
       const minDelay = new Promise<void>((r) => setTimeout(r, 3600));
       const [res] = await Promise.all([saveManualCalculationOperation({ operationId, inputs }), minDelay]);
-      const ui = opOutcomeUi(res, "manual");
+      const ui = opOutcomeUi(res, "manual", earlier);
       if (!ui.keepKey) store.settle(uid, ident);
       if (ui.paywall) {
+        if (ui.note) setOpNote({ ...ui.note, mode: "manual" });
         openTariffModal(null);
         return;
       }
@@ -4877,7 +4895,9 @@ export default function AppPage() {
         return;
       }
       if (ui.note) setOpNote({ ...ui.note, mode: "manual" });
-      if (res.kind !== "deleted") showToast("Не удалось сохранить расчёт", "err");
+      if (res.kind !== "deleted") {
+        showToast(earlier && ui.keepKey && res.kind !== "failed" ? "Повтор не выполнен" : "Не удалось сохранить расчёт", "err");
+      }
     } finally {
       setIsCalculating(false);
       refreshPendingOps(uid);
@@ -9664,6 +9684,9 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 </button>
               </div>
             )}
+            {/* Незавершённые операции видны и без подключения Ozon (после перезагрузки
+                открывается эта вкладка, а операция может быть ручной). */}
+            {user && !ozonConn?.connected && pendingOpsNotice}
 
             {/* Форма расчёта — доступна только после подключения Ozon */}
             {ozonConn?.connected && (
@@ -9830,8 +9853,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 {pendingOpsNotice}
 
                 {/* Не хватает себестоимости — структурированный блок с действиями.
-                    Расчёт не сделан, попытка не списана. */}
-                {apiCostGap && <ApiCostGapNotice gap={apiCostGap} onOpenCatalog={goToCatalog} />}
+                    Этот запрос расчёт не сделал и попытку не списал (на повторе операции,
+                    запрос которой отправлялся раньше, блок этого не обещает). */}
+                {apiCostGap && (
+                  <ApiCostGapNotice gap={apiCostGap} onOpenCatalog={goToCatalog} earlierRequest={apiCostGapEarlier} />
+                )}
 
                 {/* Успех — чистый результат. Показываем только после сохранения. */}
                 {profitResult && apiSaved && (

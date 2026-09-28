@@ -2,12 +2,15 @@
 // Операции ручного расчёта и Ozon API: исход операции → что показать и что делать
 // с ключом незавершённой операции. Чистые функции без React/сети (покрыты тестами).
 //
-// Правило ключа: ключ убирается, когда исход известен — сохранено, удалено, конфликт,
-// отказ в списании или сохранение недоступно (в двух последних ничего не записано).
+// Правило ключа: ключ убирается, когда известен исход ОПЕРАЦИИ — сохранено, удалено,
+// конфликт. Ответ «этот запрос ничего не записал» (отказ в списании, сохранение
+// недоступно, ошибка до операции) — исход только этого запроса: ключ убирается, лишь
+// если раньше этим ключом ничего не отправлялось; иначе отправленный раньше запрос
+// может завершиться позже, и повтор должен найти его, а не стать новой операцией.
 // Неизвестный исход (нет ответа) и статус «нет операции» ключ СОХРАНЯЮТ — в том числе
 // после окончания окна перепроверки: «нет» не доказывает, что исходный запрос уже не
-// завершится. Повтор с тем же ключом безопасен (сервер не спишет дважды). При
-// потерянном ответе НЕ утверждаем «ничего не списано»: исход неизвестен.
+// завершится. Повтор с тем же ключом безопасен (сервер не спишет дважды). Пока исход
+// операции неизвестен, НЕ утверждаем «ничего не списано».
 // ============================================================================
 
 export type OpMode = "manual" | "api";
@@ -16,6 +19,9 @@ export interface OpNote {
   kind: "ok" | "warn" | "err";
   text: string;
 }
+
+const EARLIER_MAY_SAVE =
+  "Запрос этого расчёта, отправленный раньше, мог успеть его сохранить — ключ операции сохранён. Проверьте позже: сохранённый расчёт откроется без повторного списания, а если сервер его не получил, сохранение завершится той же операцией.";
 
 export const OP_TEXT = {
   restoredManual:
@@ -39,7 +45,32 @@ export const OP_TEXT = {
   unavailable: (msg: string) => `Не удалось сохранить расчёт: ${msg.replace(/\.\s*$/, "")}. Попытка расчёта не списана.`,
   unknown: (msg: string) =>
     `Сервер не подтвердил сохранение (${msg.replace(/\.\s*$/, "")}). Расчёт мог успеть сохраниться — повторите: если он уже сохранён, повтор вернёт его без повторного списания.`,
+  earlierMaySave: EARLIER_MAY_SAVE,
+  retryNotDone: (msg: string) => `Повтор не выполнен. ${withoutChargeClaim(msg)}. ${EARLIER_MAY_SAVE}`,
 } as const;
+
+/**
+ * Текст ошибки сервера без обещаний «попытка не списана» / «расчёт не сделан»: они про
+ * ЭТОТ запрос, а не про операцию, которую мог завершить отправленный раньше запрос.
+ */
+export function withoutChargeClaim(msg: string): string {
+  const t = msg
+    .replace(/[,.]?\s*(?:Расчёт не сделан,\s*)?(?:[Пп]опытка(?: расчёта)?|[Нн]ичего) не списан[аоы]?\.?/g, "")
+    .trim()
+    .replace(/[.\s]+$/, "");
+  return t && !/не списан|не сделан/i.test(t) ? t : "Запрос не выполнен";
+}
+
+/**
+ * Ключ после ответа ОДНОГО запроса. operation — сервер сообщил исход операции
+ * (сохранено, удалено, конфликт): ключ убирается. request_no_write — этот запрос ничего
+ * не записал (отказ, недоступно, ошибка до операции): ключ убирается, только если
+ * раньше этим ключом запросы не отправлялись (earlierRequest = false). unknown — нет
+ * ответа: ключ остаётся.
+ */
+export function keepKeyAfter(result: "operation" | "request_no_write" | "unknown", earlierRequest: boolean): boolean {
+  return result === "unknown" || (result === "request_no_write" && earlierRequest);
+}
 
 /** Исход операции (ручной: saveManualCalculationOperation; API: apiSaveOutcome). */
 export type OpOutcome =
@@ -59,7 +90,21 @@ export interface OpOutcomeUi {
   paywall: boolean;
 }
 
-export function opOutcomeUi(out: OpOutcome, mode: OpMode): OpOutcomeUi {
+/**
+ * earlierRequest — этим ключом запрос уже отправлялся раньше и его исход неизвестен
+ * (OperationStore.markSent): тогда отказ и «недоступно» — исход только ЭТОГО запроса.
+ */
+export function opOutcomeUi(out: OpOutcome, mode: OpMode, earlierRequest = false): OpOutcomeUi {
+  if ((out.kind === "refused" || out.kind === "unavailable") && earlierRequest) {
+    return {
+      note: {
+        kind: "warn",
+        text: OP_TEXT.retryNotDone(out.kind === "refused" ? "Нет доступной попытки расчёта" : out.message),
+      },
+      keepKey: keepKeyAfter("request_no_write", true),
+      paywall: out.kind === "refused",
+    };
+  }
   switch (out.kind) {
     case "ok":
       return {
@@ -72,13 +117,17 @@ export function opOutcomeUi(out: OpOutcome, mode: OpMode): OpOutcomeUi {
     case "deleted":
       return { note: { kind: "warn", text: OP_TEXT.deleted }, keepKey: false, paywall: false };
     case "refused":
-      // Операции по ключу нет и списание отклонено — ничего не записано.
-      return { note: null, keepKey: false, paywall: true };
+      // Первый запрос ключа: операции нет и списание отклонено — ничего не записано.
+      return { note: null, keepKey: keepKeyAfter("request_no_write", false), paywall: true };
     case "conflict":
       return { note: { kind: "err", text: OP_TEXT.conflict }, keepKey: false, paywall: false };
     case "unavailable":
-      // Функции операции на сервере нет (миграция не применена) — ничего не выполнено.
-      return { note: { kind: "err", text: OP_TEXT.unavailable(out.message) }, keepKey: false, paywall: false };
+      // Первый запрос ключа: функции операции нет (миграция не применена) — ничего не выполнено.
+      return {
+        note: { kind: "err", text: OP_TEXT.unavailable(out.message) },
+        keepKey: keepKeyAfter("request_no_write", false),
+        paywall: false,
+      };
     case "failed":
       return { note: { kind: "err", text: OP_TEXT.unknown(out.message) }, keepKey: true, paywall: false };
   }
@@ -157,6 +206,23 @@ export function apiSaveOutcome(
   // 5xx без ответа маршрута (сбой мог случиться и после записи) — исход неизвестен.
   if (status >= 500 && !data.error) return { kind: "failed", message: `ошибка сервера ${status}` };
   return { kind: "before", message: data.error || "Не удалось рассчитать и сохранить расчёт" };
+}
+
+/**
+ * API: ошибка ДО операции (Ozon, ввод) — исход только этого запроса. Первый запрос
+ * ключа: ключ убирается, показывается текст сервера. Ключом уже отправлялся запрос с
+ * неизвестным исходом: ключ остаётся, текст — без обещания «попытка не списана».
+ */
+export function apiBeforeUi(
+  message: string,
+  earlierRequest: boolean
+): { keepKey: boolean; error: string | null; note: OpNote | null } {
+  if (!earlierRequest) return { keepKey: keepKeyAfter("request_no_write", false), error: message, note: null };
+  return {
+    keepKey: keepKeyAfter("request_no_write", true),
+    error: null,
+    note: { kind: "warn", text: OP_TEXT.retryNotDone(message) },
+  };
 }
 
 // ---------------------------------------------------------------------------

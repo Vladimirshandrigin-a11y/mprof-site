@@ -4,6 +4,7 @@
 // настоящей PostgreSQL проверяет tests/db/calculation-operations-manual-api.test.mjs.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { calcOpKeys as K, calcOpNotes as N, hash53 as H, opStore as OS } from "./helpers/modules.mjs";
 
@@ -67,7 +68,7 @@ describe("исход операции → сообщение и ключ", () =>
     assert.match(N.opOutcomeUi({ kind: "ok", replay: true }, "api").note.text, /Повторного обращения к Ozon и списания нет/);
   });
 
-  it("потерянный ответ: НЕ утверждаем «не списано», ключ остаётся; недоступность (нет функции на сервере) — «не списана», ключ снимается", () => {
+  it("потерянный ответ: НЕ утверждаем «не списано», ключ остаётся; недоступность на ПЕРВЫЙ запрос ключа (нет функции на сервере) — «не списана», ключ снимается", () => {
     const failed = N.opOutcomeUi({ kind: "failed", message: "нет ответа сервера" }, "manual");
     assert.equal(failed.keepKey, true);
     assert.doesNotMatch(failed.note.text, /не списан/);
@@ -77,7 +78,7 @@ describe("исход операции → сообщение и ключ", () =>
     assert.match(unavailable.note.text, /временно недоступно\. Попытка расчёта не списана\./);
   });
 
-  it("отказ — окно тарифов, ключ снимается (операции нет, ничего не записано); конфликт и «удалён» — ключ снимается, сообщение понятное", () => {
+  it("отказ на первый запрос ключа — окно тарифов, ключ снимается (операции нет, ничего не записано); конфликт и «удалён» — ключ снимается, сообщение понятное", () => {
     assert.deepEqual(N.opOutcomeUi({ kind: "refused" }, "api"), { note: null, keepKey: false, paywall: true });
     const conflict = N.opOutcomeUi({ kind: "conflict" }, "manual");
     assert.deepEqual([conflict.keepKey, conflict.note.kind], [false, "err"]);
@@ -112,6 +113,107 @@ describe("исход операции → сообщение и ключ", () =>
     assert.equal(o(500, {}), "failed", "5xx без ответа маршрута — исход неизвестен");
     assert.deepEqual(N.apiSaveOutcome(502, { error: "Ozon временно недоступен", code: "unavailable" }, null), { kind: "before", message: "Ozon временно недоступен" });
     assert.equal(o(400, { error: "Выберите месяц" }), "before");
+  });
+});
+
+describe("исход отдельного запроса ≠ исход операции", () => {
+  const memStorage = () => {
+    let v = null;
+    return { getItem: () => v, setItem: (_, x) => (v = x) };
+  };
+  let n = 0;
+  const newId = () => `s-${++n}`;
+  const read = (rel) => readFileSync(new URL(`../../${rel}`, import.meta.url), "utf8");
+
+  it("markSent: первый запрос ключа — false, дальше — true, в том числе после перезагрузки; ключ без записи — false; settle снимает", () => {
+    const storage = memStorage();
+    const m = K.manualRequestHash(MANUAL);
+    const s = OS.createOperationStore(storage, newId);
+    assert.equal(s.markSent("u1", m), false, "ключа нет — отмечать нечего");
+    const key = s.getOrCreate("u1", m, MANUAL);
+    assert.equal(s.markSent("u1", m), false);
+    assert.equal(s.markSent("u1", m), true);
+    const reloaded = OS.createOperationStore(storage, newId);
+    assert.equal(reloaded.getOrCreate("u1", m, MANUAL), key);
+    assert.equal(reloaded.markSent("u1", m), true, "отметка переживает перезагрузку");
+    assert.deepEqual(reloaded.pending("u1").map((e) => [e.id, e.payload]), [[key, MANUAL]]);
+    reloaded.settle("u1", m);
+    reloaded.getOrCreate("u1", m, MANUAL);
+    assert.equal(reloaded.markSent("u1", m), false, "новый ключ — снова первый запрос");
+  });
+
+  it("судьба ключа: исход операции закрывает; «этот запрос ничего не записал» — только если раньше ничего не отправлялось; нет ответа — ключ остаётся", () => {
+    assert.deepEqual(
+      [[false, false], [false, true], [true, false], [true, true]].map(([op, earlier]) =>
+        N.keepKeyAfter(op ? "operation" : "request_no_write", earlier)
+      ),
+      [false, true, false, false]
+    );
+    assert.deepEqual([N.keepKeyAfter("unknown", false), N.keepKeyAfter("unknown", true)], [true, true]);
+    for (const out of [{ kind: "ok", replay: false }, { kind: "ok", replay: true }, { kind: "deleted" }, { kind: "conflict" }]) {
+      assert.equal(N.opOutcomeUi(out, "manual", true).keepKey, false, out.kind);
+    }
+    assert.equal(N.opOutcomeUi({ kind: "failed", message: "нет ответа" }, "api", true).keepKey, true);
+  });
+
+  it("повтор получил 503 или отказ, а ключом уже отправлялся запрос: ключ остаётся, «не списано» не обещаем, отказ всё равно открывает окно тарифов", () => {
+    const unavailable = N.opOutcomeUi({ kind: "unavailable", message: "Сохранение расчёта временно недоступно" }, "manual", true);
+    assert.deepEqual([unavailable.keepKey, unavailable.paywall, unavailable.note.kind], [true, false, "warn"]);
+    assert.match(unavailable.note.text, /^Повтор не выполнен\. Сохранение расчёта временно недоступно\. Запрос этого расчёта, отправленный раньше, мог успеть его сохранить/);
+    assert.match(unavailable.note.text, /без повторного списания.*той же операцией/);
+    const refused = N.opOutcomeUi({ kind: "refused" }, "api", true);
+    assert.deepEqual([refused.keepKey, refused.paywall], [true, true]);
+    for (const ui of [unavailable, refused]) assert.doesNotMatch(ui.note.text, /не списан|ничего не записано/i);
+    // Первый запрос ключа — как раньше.
+    assert.equal(N.opOutcomeUi({ kind: "unavailable", message: "x" }, "manual", false).keepKey, false);
+    assert.deepEqual(N.opOutcomeUi({ kind: "refused" }, "manual"), { note: null, keepKey: false, paywall: true });
+  });
+
+  it("API: ошибка до операции — на первый запрос ключ снимается и показывается текст сервера; на повтор ключ остаётся, текст без «попытка не списана»", () => {
+    const msg = "Отчёт о реализации Ozon за выбранный месяц пуст — себестоимость определить нельзя. Расчёт не сделан, попытка не списана.";
+    assert.deepEqual(N.apiBeforeUi(msg, false), { keepKey: false, error: msg, note: null });
+    const again = N.apiBeforeUi(msg, true);
+    assert.deepEqual([again.keepKey, again.error, again.note.kind], [true, null, "warn"]);
+    assert.equal(
+      again.note.text,
+      `Повтор не выполнен. Отчёт о реализации Ozon за выбранный месяц пуст — себестоимость определить нельзя. ${N.OP_TEXT.earlierMaySave}`
+    );
+  });
+
+  it("тексты сервера: из каждого обещания «попытка не списана» маршрутов остаётся только причина", () => {
+    const claims = [];
+    for (const rel of ["app/api/ozon/save-calculation/route.ts", "app/api/cloud/calculation-operations/route.ts"]) {
+      for (const m of read(rel).matchAll(/"([^"\n]*не списан[^"\n]*)"/g)) claims.push(m[1]);
+    }
+    assert.ok(claims.length >= 8, `найдено ${claims.length}`);
+    for (const c of claims) {
+      const t = N.withoutChargeClaim(c);
+      assert.doesNotMatch(t, /списан|не сделан/i, c);
+      assert.ok(t.length >= 10 && c.startsWith(t.slice(0, 10)), `${c} → ${t}`);
+    }
+    assert.equal(N.withoutChargeClaim("Ozon временно недоступен"), "Ozon временно недоступен");
+    assert.equal(N.withoutChargeClaim("Попытка не списана."), "Запрос не выполнен");
+  });
+
+  it("сценарий страницы: A отправлен → перезагрузка, статус «нет» → повтор B: 503 → ключ K и параметры на месте → поздний COMMIT A находится повтором", () => {
+    const storage = memStorage();
+    const a = K.apiRequestHash("2026-06", EXP);
+    const params = { month: "2026-06", manualExpenses: EXP };
+    let page = OS.createOperationStore(storage, newId);
+    const key = page.getOrCreate("u1", a, params);
+    page.markSent("u1", a); // запрос A ушёл
+    page = OS.createOperationStore(storage, newId); // перезагрузка
+    const rec = N.opRecoveryUi("none", "reload");
+    if (!rec.keepKey) page.settle("u1", a);
+    const earlier = page.markSent("u1", a); // «Проверить и завершить» — запрос B
+    const out = N.apiSaveOutcome(503, { error: "Сохранение расчёта временно недоступно. Попытка не списана.", code: "migration_missing" }, null);
+    const ui = N.opOutcomeUi(out, "api", earlier);
+    if (!ui.keepKey) page.settle("u1", a);
+    assert.deepEqual(page.pending("u1").map((e) => [e.id, e.payload]), [[key, params]]);
+    assert.equal(page.getOrCreate("u1", a, params), key, "повтор пользователя — тот же ключ, не новая операция");
+    const done = N.opRecoveryUi("done", "pending"); // A сделал COMMIT
+    if (!done.keepKey) page.settle("u1", a);
+    assert.deepEqual([done.restore, page.pending("u1").length], [true, 0]);
   });
 });
 

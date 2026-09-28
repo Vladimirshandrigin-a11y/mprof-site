@@ -6,6 +6,8 @@
 // формы / месяцем и расходами API, чтобы после перезагрузки повторить ТУ ЖЕ операцию) — в localStorage, поэтому переживает повтор,
 // потерянный ответ и перезагрузку страницы. Это НЕ отметка «оплачено»: что сделано
 // на самом деле, знает только сервер (статус операции по ключу).
+// Отметка sent — «этим ключом уже отправлялся запрос» (ручной и API): ответ другого
+// запроса «ничего не записано» не доказывает, что отправленный раньше не завершится.
 // Без localStorage (приватный режим, запрет) ключи живут в памяти вкладки.
 // ============================================================================
 
@@ -13,7 +15,7 @@ const STORAGE_KEY = "mprof_calc_operations_v1";
 /** Незавершённые ключи старше этого срока не восстанавливаются. */
 const TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
-type Entry = { id: string; at: number; payload?: unknown };
+type Entry = { id: string; at: number; payload?: unknown; sent?: boolean };
 type Store = Record<string, Record<string, Entry>>; // userId → отпечаток файла → ключ
 
 export interface StorageLike {
@@ -26,6 +28,12 @@ export interface OperationStore {
   get(userId: string, attemptId: string): string | null;
   /** Ключ операции: существующий незавершённый или новый (payload — параметры операции). */
   getOrCreate(userId: string, attemptId: string, payload?: unknown): string;
+  /**
+   * Перед отправкой запроса операции: отметить ключ «запрос отправлен». true — этим
+   * ключом запрос уже отправлялся раньше (в том числе до перезагрузки) и его исход не
+   * известен: он может завершиться позже.
+   */
+  markSent(userId: string, attemptId: string): boolean;
   /** Операция подтверждена сервером (или ключ отвергнут) — ключ больше не нужен. */
   settle(userId: string, attemptId: string): void;
   /** Незавершённые ключи пользователя (свежие), новые — первыми. */
@@ -81,6 +89,14 @@ export function createOperationStore(
       byUser[attemptId] = payload === undefined ? { id, at: now() } : { id, at: now(), payload };
       save({ ...st, [userId]: byUser });
       return id;
+    },
+    markSent(userId, attemptId) {
+      const st = load();
+      const e = st[userId]?.[attemptId];
+      if (!fresh(e)) return false;
+      if (e.sent === true) return true;
+      save({ ...st, [userId]: { ...st[userId], [attemptId]: { ...e, sent: true } } });
+      return false;
     },
     settle(userId, attemptId) {
       const st = load();

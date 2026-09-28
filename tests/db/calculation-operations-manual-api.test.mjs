@@ -31,6 +31,9 @@ const SAVE_API = buildRequire("./api/ozon/save-calculation/route.js");
 const CALCS_ROUTE = buildRequire("./api/cloud/calculations/route.js");
 const CRYPTO = buildRequire("./api/ozon/_lib/crypto.js");
 const KEYS = buildRequire("./app/lib/calc-operation-keys.js");
+// Правила ключа на странице (localStorage, исход запроса → судьба ключа) — те же модули.
+const STORE = buildRequire("./app/lib/accrual/operation-store.js");
+const NOTES = buildRequire("./app/lib/calc-operation-notes.js");
 const rootRequire = createRequire(path.join(root, "package.json"));
 const { NextRequest } = rootRequire("next/server");
 const { createClient } = rootRequire("@supabase/supabase-js");
@@ -558,6 +561,166 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     const out = await postApi(u);
     const st = await opStatus(u, out.operationId, KEYS.apiRequestHash("2026-06", EXPENSES));
     assert.deepEqual([st.body.data.status, st.body.data.mode, st.body.data.calculation.id], ["done", "api", out.body.calculationId]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Исход отдельного запроса ≠ исход операции. Страница моделируется теми же модулями,
+// что в браузере: localStorage (перезагрузка — новое хранилище над теми же данными),
+// отметка отправки ключа и судьба ключа по ответу запроса.
+describe("503 на повтор, пока исходный запрос операции ещё может завершиться", () => {
+  let db;
+  before(async () => {
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+  });
+  beforeEach(() => {
+    state.pool = db.pool(12);
+  });
+  const memStorage = () => {
+    let v = null;
+    return { getItem: () => v, setItem: (_, x) => (v = x) };
+  };
+  /** Ответ PostgREST «функции нет в схеме» (как при неприменённой миграции / сбросе кэша схемы). */
+  const missingFunction = (fn) =>
+    new Response(
+      JSON.stringify({ code: "PGRST202", details: null, hint: null, message: `Could not find the function public.${fn} in the schema cache` }),
+      { status: 404, headers: { "content-type": "application/json" } }
+    );
+
+  it("ручной: A в полёте → перезагрузка, статус «нет» → повтор B получает 503 → A делает COMMIT → повтор находит A; ключ K и ввод сохранены; одна запись и одно списание из двух кредитов", async () => {
+    const u = await db.user();
+    // Бесплатная попытка израсходована, два разовых кредита: ошибочное второе списание
+    // прошло бы, а не спряталось за отказом по лимиту.
+    await db.main.query("update public.profiles set calculations_used = 1 where id = $1", [u]);
+    for (let i = 0; i < 2; i++) {
+      await db.main.query("insert into public.subscriptions (user_id, plan, status) values ($1, 'single', 'active')", [u]);
+    }
+    const storage = memStorage();
+    const ident = KEYS.manualRequestHash(MANUAL);
+
+    // A: страница создаёт ключ K, отмечает отправку, запрос уходит — SQL удерживается.
+    let page = STORE.createOperationStore(storage, randomUUID);
+    const K = page.getOrCreate(u, ident, MANUAL);
+    assert.equal(page.markSent(u, ident), false, "первый запрос ключа");
+    let seen = 0;
+    const g = gate((r) => r.path === "/rest/v1/rpc/save_manual_calculation_operation" && seen++ === 0);
+    state.gates.push(g);
+    const A = postManual(u, { operationId: K });
+    await g.reached;
+
+    // Перезагрузка: новая страница над тем же localStorage; сервер пока отвечает «нет».
+    page = STORE.createOperationStore(storage, randomUUID);
+    assert.equal((await opStatus(u, K, ident)).body.data.status, "none");
+    assert.equal(NOTES.opRecoveryUi("none", "reload").keepKey, true);
+
+    // B: «Проверить и завершить сохранение» — тот же ключ и ввод; ответ 503.
+    const entry = page.pending(u).find((e) => e.attemptId === ident);
+    assert.deepEqual([entry.id, entry.payload], [K, MANUAL]);
+    const earlier = page.markSent(u, ident);
+    assert.equal(earlier, true, "ключом уже отправлялся запрос A");
+    state.override = (r) =>
+      r.path === "/rest/v1/rpc/save_manual_calculation_operation" ? missingFunction("save_manual_calculation_operation") : undefined;
+    const B = await postManual(u, { operationId: K, inputs: entry.payload });
+    state.override = null;
+    assert.deepEqual([B.status, B.body.code], [503, "migration_missing"]);
+    // Исход ЭТОГО запроса (saveManualCalculationOperation: 503 → unavailable) → судьба ключа.
+    const ui = NOTES.opOutcomeUi({ kind: "unavailable", message: B.body.error }, "manual", earlier);
+    if (!ui.keepKey) page.settle(u, ident);
+    assert.equal(ui.keepKey, true, "503 другого запроса не закрывает операцию");
+    assert.doesNotMatch(ui.note.text, /не списан/);
+    assert.deepEqual(page.pending(u).map((e) => [e.id, e.payload]), [[K, MANUAL]], "ключ K и ввод сохранены");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 0, history: 0, ops: 0 });
+
+    // A делает COMMIT позже.
+    g.open();
+    const a = await A;
+    assert.deepEqual([a.status, a.body.data.replay], [200, false]);
+
+    // Пользователь повторяет: статус ключа K → сохранённое; повтор операции K → тоже оно.
+    const st = await opStatus(u, K, ident);
+    assert.deepEqual([st.body.data.status, st.body.data.calculation.id], ["done", a.body.data.calculationId]);
+    const retry = await postManual(u, { operationId: K });
+    assert.deepEqual([retry.status, retry.body.data.replay, retry.body.data.calculationId], [200, true, a.body.data.calculationId]);
+    if (!NOTES.opRecoveryUi("done", "pending").keepKey) page.settle(u, ident);
+    assert.equal(page.pending(u).length, 0);
+    assert.deepEqual(await facts(db, u), { used: 2, calcs: 1, history: 0, ops: 1 }, "одна запись, одно списание");
+
+    // Контроль: лимит дубль не скрывает — новый ключ был бы новой операцией со вторым кредитом.
+    const fresh = await postManual(u);
+    assert.deepEqual([fresh.status, fresh.body.data.replay, fresh.body.data.used], [200, false, 3]);
+  });
+
+  it("API (безлимит): A в полёте → перезагрузка, статус «нет» → повтор B получает 503 до Ozon → A делает COMMIT → повтор находит A без новых запросов к Ozon; без дубля", async () => {
+    const u = await apiUser(db, { unlimited: true });
+    state.ozon = ozonOk;
+    const storage = memStorage();
+    const params = { month: "2026-06", manualExpenses: EXPENSES };
+    const ident = KEYS.apiRequestHash(params.month, params.manualExpenses);
+
+    let page = STORE.createOperationStore(storage, randomUUID);
+    const K = page.getOrCreate(u, ident, params);
+    assert.equal(page.markSent(u, ident), false);
+    let seen = 0;
+    const g = gate((r) => r.path === "/rest/v1/rpc/save_api_calculation_operation" && seen++ === 0);
+    state.gates.push(g);
+    const A = postApi(u, { operationId: K });
+    await g.reached; // Ozon опрошен, транзакция ещё не выполнена
+    const ozonAfterA = net.ozonCalls().length;
+    assert.ok(ozonAfterA > 0);
+
+    page = STORE.createOperationStore(storage, randomUUID); // перезагрузка
+    assert.equal((await opStatus(u, K, ident)).body.data.status, "none");
+    const entry = page.pending(u).find((e) => e.attemptId === ident);
+    assert.deepEqual([entry.id, entry.payload], [K, params]);
+    const earlier = page.markSent(u, ident);
+    assert.equal(earlier, true);
+    state.override = (r) =>
+      r.path === "/rest/v1/rpc/api_calculation_operation_status" ? missingFunction("api_calculation_operation_status") : undefined;
+    const B = await postApi(u, { operationId: K, ...entry.payload });
+    state.override = null;
+    assert.deepEqual([B.status, B.body.code], [503, "migration_missing"]);
+    assert.equal(net.ozonCalls().length, ozonAfterA, "повтор B до Ozon не дошёл");
+    const out = NOTES.apiSaveOutcome(B.status, B.body, null);
+    const ui = NOTES.opOutcomeUi(out, "api", earlier);
+    if (!ui.keepKey) page.settle(u, ident);
+    assert.deepEqual([out.kind, ui.keepKey], ["unavailable", true]);
+    assert.doesNotMatch(ui.note.text, /не списан/);
+    assert.deepEqual(page.pending(u).map((e) => [e.id, e.payload]), [[K, params]], "ключ K и параметры сохранены");
+
+    g.open();
+    const a = await A;
+    assert.deepEqual([a.status, a.body.ok, a.body.replay], [200, true, false]);
+
+    const ozonBefore = net.ozonCalls().length;
+    const st = await opStatus(u, K, ident);
+    assert.deepEqual([st.body.data.status, st.body.data.calculation.id], ["done", a.body.calculationId]);
+    const retry = await postApi(u, { operationId: K });
+    assert.deepEqual([retry.status, retry.body.replay, retry.body.status, retry.body.calculationId], [200, true, "done", a.body.calculationId]);
+    assert.equal(NOTES.apiSaveOutcome(retry.status, retry.body, null).kind, "replay");
+    assert.equal(net.ozonCalls().length, ozonBefore, "завершённая операция — без новых запросов к Ozon");
+    if (!NOTES.opRecoveryUi("done", "pending").keepKey) page.settle(u, ident);
+    assert.equal(page.pending(u).length, 0);
+    assert.deepEqual(await facts(db, u), { used: 0, calcs: 1, history: 1, ops: 1 }, "одна запись и одна сводка — без дубля");
+    assert.equal((await opRow(db, K)).charged, false, "безлимит — без расхода");
+  });
+
+  it("первый запрос ключа получил 503: операция точно не выполнялась — ключ снимается, как раньше", async () => {
+    const u = await db.user();
+    const storage = memStorage();
+    const ident = KEYS.manualRequestHash(MANUAL);
+    const page = STORE.createOperationStore(storage, randomUUID);
+    const K = page.getOrCreate(u, ident, MANUAL);
+    const earlier = page.markSent(u, ident);
+    state.override = (r) =>
+      r.path === "/rest/v1/rpc/save_manual_calculation_operation" ? missingFunction("save_manual_calculation_operation") : undefined;
+    const B = await postManual(u, { operationId: K });
+    state.override = null;
+    assert.deepEqual([earlier, B.status], [false, 503]);
+    const ui = NOTES.opOutcomeUi({ kind: "unavailable", message: B.body.error }, "manual", earlier);
+    if (!ui.keepKey) page.settle(u, ident);
+    assert.deepEqual([ui.keepKey, page.pending(u).length], [false, 0]);
+    assert.match(ui.note.text, /Попытка расчёта не списана/);
+    assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
   });
 });
 
