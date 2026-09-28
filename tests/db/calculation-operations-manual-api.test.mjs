@@ -565,6 +565,165 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Себестоимость API = (продано − возвращено) × цена. Заглушка отчёта реализации:
+// ART-A продано 10, возвращено 2 (100 ₽); ART-B 5 (50 ₽); ART-C 1 (20 ₽) →
+// нетто 8×100 + 5×50 + 1×20 = 1070 ₽ (прежнее правило «только продано» — 1270 ₽).
+describe("себестоимость API по нетто-количеству: сохранение, восстановление, старые снимки", () => {
+  let db;
+  before(async () => {
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+  });
+  beforeEach(() => {
+    state.pool = db.pool(12);
+    state.ozon = ozonOk;
+  });
+
+  it("новый расчёт: себестоимость 1070 ₽ в ответе, строке calculations и снимке (с меткой правила); налог и начисления — по прежним правилам; восстановление и повтор отдают те же 1070 ₽ без Ozon", async () => {
+    const u = await apiUser(db, { unlimited: true });
+    const out = await postApi(u);
+    assert.equal(out.status, 200, JSON.stringify(out.body).slice(0, 300));
+    const p = out.body.profit;
+    assert.deepEqual([p.costDraft.matchedCostTotal, p.preliminary.matchedCostTotal, p.costQuantityBasis], [1070, 1070, "sold_minus_returned"]);
+    // База налога — выручка реализации за вычетом возвратов: (1500 + 900 + 100) − 300.
+    assert.deepEqual([p.preliminary.taxRevenueBase, p.manualExpenses.tax], [2200, 154]);
+    assert.equal(p.netProfitPreview.value, Math.round((p.preliminary.ozonOperationsTotal - 1070 - p.manualExpenses.total) * 100) / 100);
+
+    const row = (await db.main.query("select cost, tax, profit, ai_insights from public.calculations where id = $1", [out.body.calculationId])).rows[0];
+    assert.deepEqual([Number(row.cost), Number(row.tax), Number(row.profit)], [1070, 154, p.netProfitPreview.value]);
+    assert.deepEqual(row.ai_insights.cost, { matchedCostTotal: 1070, matchedNoCostCount: row.ai_insights.cost.matchedNoCostCount, quantityBasis: "sold_minus_returned" });
+    assert.equal(row.ai_insights.preliminary.matchedCostTotal, 1070);
+
+    const st = await opStatus(u, out.operationId, KEYS.apiRequestHash("2026-06", EXPENSES));
+    assert.deepEqual([st.body.data.status, st.body.data.calculation.cost, st.body.data.calculation.ai_insights.cost.quantityBasis], ["done", 1070, "sold_minus_returned"]);
+
+    net.reset();
+    state.pool = db.pool(4);
+    state.ozon = ozonOk;
+    const again = await postApi(u, { operationId: out.operationId });
+    assert.deepEqual([again.status, again.body.replay, again.body.calculation.cost], [200, true, 1070]);
+    assert.equal(net.ozonCalls().length, 0);
+  });
+
+  // Заглушка Ozon с заданными строками реализации и операциями начислений.
+  const ozonWith = (rows, operations) => (req) => {
+    const u = req.url;
+    if (u.includes("/v3/finance/transaction/list")) return jsonRes({ result: { operations, page_count: 1, row_count: operations.length } });
+    if (u.includes("/v2/finance/realization")) return jsonRes({ result: { header: {}, rows } });
+    if (u.includes("/v2/posting/fbo/list")) return jsonRes({ result: [] });
+    if (u.includes("/v3/posting/fbs/list")) return jsonRes({ result: { postings: [], has_next: false } });
+    return jsonRes({}, 404);
+  };
+  const opAmount = (amount) => ({ operation_type: "OperationItemReturn", type: "returns", accruals_for_sale: 0, sale_commission: 0, amount, services: [] });
+  const NO_EXPENSES = { tax: 0, packaging: 0, warehouseDelivery: 0, salary: 0, other: 0 };
+  async function userWithCatalog(prices) {
+    const u = await db.user();
+    await db.main.query(
+      "insert into public.ozon_connections (user_id, client_id, api_key_encrypted, status) values ($1, 'c1', $2, 'connected')",
+      [u, CRYPTO.encryptOzonApiKey("plain-api-key")]
+    );
+    for (const [sku, cost] of Object.entries(prices)) {
+      await db.main.query("insert into public.products (user_id, sku, name, cost_price) values ($1, $2, $3, $4)", [u, sku, `имя ${sku}`, cost]);
+    }
+    return u;
+  }
+
+  it("месяц только с возвратами (продано 0, возвращено 1 по 1600 ₽): проверка себестоимости его не блокирует; расчёт останавливает база налога ≤ 0 — как в XLSX; ничего не списано", async () => {
+    const u = await userWithCatalog({ "ART-R": 1600 });
+    state.ozon = ozonWith([rzRow("ART-R", 555, "Возвратный", 0, 0, 1, 2000)], [opAmount(-2000)]);
+    const out = await postApi(u, { manualExpenses: NO_EXPENSES });
+    assert.deepEqual([out.status, out.body.code, out.body.reason], [422, "realization_unavailable", "no_tax_revenue"], JSON.stringify(out.body));
+    assert.match(out.body.error, /за вычетом возвратов/);
+    assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+  });
+
+  it("отрицательная себестоимость −1600 ₽ (возврат без продажи в месяце с положительной базой налога): начисления −2000, налог и расходы 0 → прибыль −400; ответ, calculations, снимок, восстановление; повтор — без списания и без Ozon", async () => {
+    const u = await userWithCatalog({ "ART-S": 700, "ART-R": 1600 });
+    // ART-S: продано 1 (3000 ₽) и возвращено 1 (500 ₽) — нетто 0; ART-R: только возврат 1 (2000 ₽).
+    state.ozon = ozonWith(
+      [rzRow("ART-S", 444, "Продаваемый", 1, 3000, 1, 500), rzRow("ART-R", 555, "Возвратный", 0, 0, 1, 2000)],
+      [opAmount(-2000)]
+    );
+    const out = await postApi(u, { manualExpenses: NO_EXPENSES });
+    assert.equal(out.status, 200, JSON.stringify(out.body).slice(0, 400));
+    const p = out.body.profit;
+    assert.deepEqual(
+      [p.preliminary.ozonOperationsTotal, p.costDraft.matchedCostTotal, p.preliminary.taxRevenueBase, p.manualExpenses.tax, p.manualExpenses.total, p.netProfitPreview.value, p.status],
+      [-2000, -1600, 500, 0, 0, -400, "complete_cost"]
+    );
+    assert.deepEqual([out.body.consume.used, out.body.consume.unlimited], [1, false]);
+    const row = (await db.main.query("select cost, tax, profit, ai_insights from public.calculations where id = $1", [out.body.calculationId])).rows[0];
+    assert.deepEqual([Number(row.cost), Number(row.tax), Number(row.profit)], [-1600, 0, -400]);
+    assert.deepEqual([row.ai_insights.cost.matchedCostTotal, row.ai_insights.cost.quantityBasis, row.ai_insights.netProfit], [-1600, "sold_minus_returned", -400]);
+    const rh = KEYS.apiRequestHash("2026-06", NO_EXPENSES);
+    const st = await opStatus(u, out.operationId, rh);
+    assert.deepEqual([st.body.data.status, st.body.data.calculation.cost, st.body.data.calculation.profit], ["done", -1600, -400]);
+
+    net.reset();
+    state.pool = db.pool(4);
+    state.ozon = ozonWith([], []);
+    const again = await postApi(u, { manualExpenses: NO_EXPENSES, operationId: out.operationId });
+    assert.deepEqual([again.status, again.body.replay, again.body.calculation.cost, again.body.calculation.profit], [200, true, -1600, -400]);
+    assert.equal(net.ozonCalls().length, 0);
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 }, "одно списание, одна строка");
+  });
+
+  it("продано = возвращено: полное покрытие ценами → себестоимость 0 ₽ и расчёт сохраняется; цена 0 или товар не в каталоге → 400 incomplete_cost, ничего не списано", async () => {
+    // ART-E: продано 1 (1500 ₽), возвращён 1 (1200 ₽, продажа прошлого месяца по другой цене) — нетто 0.
+    const rows = [rzRow("ART-E", 666, "Равный", 1, 1500, 1, 1200)];
+    const ok = await userWithCatalog({ "ART-E": 1600 });
+    state.ozon = ozonWith(rows, [opAmount(1000)]);
+    const out = await postApi(ok, { manualExpenses: NO_EXPENSES });
+    assert.equal(out.status, 200, JSON.stringify(out.body).slice(0, 400));
+    assert.deepEqual(
+      [out.body.profit.costDraft.matchedCostTotal, out.body.profit.preliminary.taxRevenueBase, out.body.profit.netProfitPreview.value, out.body.profit.status],
+      [0, 300, 1000, "complete_cost"]
+    );
+    const row = (await db.main.query("select cost, profit from public.calculations where id = $1", [out.body.calculationId])).rows[0];
+    assert.deepEqual([Number(row.cost), Number(row.profit)], [0, 1000]);
+
+    for (const [label, prices] of [["цена 0", { "ART-E": 0 }], ["не в каталоге", { "ART-OTHER": 1600 }]]) {
+      const u = await userWithCatalog(prices);
+      state.ozon = ozonWith(rows, [opAmount(1000)]);
+      const r = await postApi(u, { manualExpenses: NO_EXPENSES });
+      assert.deepEqual([r.status, r.body.code], [400, "incomplete_cost"], label);
+      assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 }, label);
+    }
+  });
+
+  it("старый сохранённый расчёт (прежнее правило, снимок без метки) открывается и повторяется со своими суммами — не пересчитывается", async () => {
+    const u = await apiUser(db, { unlimited: true });
+    const operationId = randomUUID();
+    const rh = KEYS.apiRequestHash("2026-06", EXPENSES);
+    // Так сохранял прежний код: себестоимость «только продано» = 1270 ₽, cost без quantityBasis.
+    const oldSnapshot = {
+      kind: "ozon-api-v1", source: "ozon_api", period: { month: "2026-06", dateFrom: "2026-06-01", dateTo: "2026-06-30" },
+      cost: { matchedCostTotal: 1270, matchedNoCostCount: 0 },
+      manualExpenses: { tax: 154, packaging: 100, warehouseDelivery: 0, salary: 0, other: 0, total: 254 },
+      preliminary: { ozonOperationsTotal: 850, matchedCostTotal: 1270, profitBeforeManualExpenses: -420, taxRevenueBase: 2200 },
+      netProfit: -674, margin: -30.64, savedAt: "2026-09-27T10:00:00.000Z",
+    };
+    const svc = await db.client("service_role");
+    const [{ r }] = (await svc.query(
+      "select public.save_api_calculation_operation($1, $2, $3, $4::jsonb, $5::jsonb) as r",
+      [u, operationId, rh,
+        JSON.stringify({ marketplace: "ozon", revenue: 1000, commission: 150, logistics: 0, ads: 0, storage: 0, tax: 154, cost: 1270, other_expenses: 100, total_expenses: 1674, profit: -674, margin: -30.64, ai_insights: oldSnapshot }),
+        JSON.stringify({ report_month: "2026-06-01", revenue: 1000, expenses: 1674, profit: -674, margin: -30.64 })]
+    )).rows;
+    assert.equal(r.ok, true);
+
+    net.reset();
+    state.pool = db.pool(4);
+    state.ozon = ozonOk;
+    const replay = await postApi(u, { operationId });
+    assert.deepEqual([replay.status, replay.body.replay, replay.body.calculation.cost, replay.body.calculation.profit], [200, true, 1270, -674]);
+    assert.equal(replay.body.calculation.ai_insights.cost.quantityBasis, undefined, "старому снимку новое правило не приписывается");
+    assert.equal(net.ozonCalls().length, 0, "без обращения к Ozon и пересчёта");
+    const st = await opStatus(u, operationId, rh);
+    assert.deepEqual([st.body.data.calculation.cost, st.body.data.calculation.profit], [1270, -674]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Исход отдельного запроса ≠ исход операции. Страница моделируется теми же модулями,
 // что в браузере: localStorage (перезагрузка — новое хранилище над теми же данными),
 // отметка отправки ключа и судьба ключа по ответу запроса.
