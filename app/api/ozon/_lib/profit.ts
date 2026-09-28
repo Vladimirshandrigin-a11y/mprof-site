@@ -50,8 +50,10 @@ const LEGACY_FINANCE_SOURCE: FinanceSourceMeta = {
 // поэтому повторно его НЕ прибавляем):
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
 //   productionCost      = себестоимость из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
-//                         (/v2/finance/realization → candidateCogs.bySaleQty:
-//                         Σ количество продаж × cost_price каталога по offer_id).
+//                         (/v2/finance/realization → candidateCogs.byNetQty:
+//                         Σ по товарам round((продано − возвращено) × cost_price)
+//                         по offer_id — то же правило, что в XLSX «Отчёте по
+//                         начислениям»; возврат без продажи уменьшает себестоимость).
 //   profitBeforeManualExpenses = ozonOperationsTotal − productionCost
 //   realizationRevenueForTax = выручка ОТЧЁТА О РЕАЛИЗАЦИИ за вычетом возвратов
 //                         (/v2/finance/realization → sums.taxRevenueBase =
@@ -69,17 +71,26 @@ const LEGACY_FINANCE_SOURCE: FinanceSourceMeta = {
 //                         исправлено после живой сверки: 24.72% по старой
 //                         формуле vs верные 22.75% на реальных июньских числах)
 //
-// ИСТОЧНИК СЕБЕСТОИМОСТИ (боевой): отчёт о реализации Ozon (тот же источник, что и
-// документальный расчёт), а НЕ отправления (postings delivered-only). Себестоимость
-// по отправлениям остаётся только СПРАВОЧНОЙ (postingsReferenceCost) и НЕ участвует
-// в прибыли. byNetQty (продажи−возвраты) остаётся ТОЛЬКО в диагностике. Если из
-// отчёта реализации нельзя надёжно получить себестоимость (нет offer_id, есть
-// несопоставленные/без себестоимости строки, отчёт пуст/не получен) —
-// loadAndComputeApiProfit возвращает ошибку, боевой расчёт НЕ показывается.
+// ИСТОЧНИК СЕБЕСТОИМОСТИ (боевой): отчёт о реализации Ozon, а НЕ отправления
+// (postings delivered-only). Себестоимость по отправлениям остаётся только
+// СПРАВОЧНОЙ (postingsReferenceCost) и НЕ участвует в прибыли. Количество —
+// продано − возвращено (API_COST_QUANTITY_BASIS); до 2026-09 API брал только
+// проданное (bySaleQty, теперь справочно) — сохранённые тогда расчёты не
+// пересчитываются, их снимки метки правила не имеют. Если из отчёта реализации
+// нельзя надёжно получить себестоимость (нет offer_id, есть несопоставленные/без
+// себестоимости строки, отчёт пуст/не получен) — loadAndComputeApiProfit
+// возвращает ошибку, боевой расчёт НЕ показывается.
 // ============================================================================
 
 export const round2 = (n: number): number =>
   Math.round((n + Number.EPSILON) * 100) / 100;
+
+/**
+ * Правило количества себестоимости API-расчёта: продано − возвращено (как в XLSX
+ * «Отчёте по начислениям»). Пишется в ответ расчёта и снимок новых расчётов; снимки
+ * без этой метки посчитаны прежним правилом (только проданное).
+ */
+export const API_COST_QUANTITY_BASIS = "sold_minus_returned" as const;
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
@@ -252,10 +263,12 @@ export type ApiProfitComputed = {
  * ручные расходы в итоговые числа. ЧИСТАЯ функция — никаких сетей и БД.
  *
  * productionCost — боевая себестоимость из отчёта о реализации Ozon
- * (candidateCogs.bySaleQty), уже провалидированная вызывающим (полное покрытие).
- * Полнота проверяется ДО вызова (resolveRealizationProductionCost →
+ * (candidateCogs.byNetQty: продано − возвращено), уже провалидированная вызывающим
+ * (полное покрытие). Полнота проверяется ДО вызова (resolveRealizationProductionCost →
  * loadAndComputeApiProfit): сюда productionCost приходит только когда всё
- * сопоставлено и себестоимость > 0, поэтому status здесь = complete_cost.
+ * сопоставлено и у товаров есть себестоимость, поэтому status здесь = complete_cost.
+ * Итог может быть 0 или < 0 (возвраты прошлых периодов дороже продаж месяца) — как
+ * в XLSX, он не обрезается.
  *
  * realizationRevenueForTax — БАЗА НАЛОГА: выручка отчёта реализации за вычетом
  * возвратов (sums.taxRevenueBase = deliveryAmount − returnAmount), тоже уже
@@ -283,12 +296,9 @@ export function computeApiProfit(
       totals.adjustments +
       totals.other
   );
-  // Боевая себестоимость = из отчёта о реализации Ozon (bySaleQty), НЕ из
-  // отправлений. Отрицательную/нечисловую себестоимость не пропускаем.
-  const matchedCostTotal =
-    Number.isFinite(productionCost) && productionCost > 0
-      ? round2(productionCost)
-      : 0;
+  // Боевая себестоимость = из отчёта о реализации Ozon (byNetQty), НЕ из
+  // отправлений. Нечисловую не пропускаем; отрицательную — сохраняем как есть.
+  const matchedCostTotal = Number.isFinite(productionCost) ? round2(productionCost) + 0 : 0;
   const profitBeforeManualExpenses = round2(ozonOperationsTotal - matchedCostTotal);
 
   // База налога = выручка отчёта реализации за вычетом возвратов (НЕ Итого Ozon).
@@ -320,10 +330,10 @@ export function computeApiProfit(
   const margin =
     taxRevenueBase > 0 ? round2((netProfit / taxRevenueBase) * 100) : 0;
 
-  // Себестоимость из реализации приходит уже полной (валидатор отсёк неполноту),
-  // поэтому complete_cost при cost>0. Защитный no_cost — если по какой-то причине
-  // себестоимость всё же 0 (боевой расчёт в этом случае не должен сохраняться).
-  const status: CostStatus = matchedCostTotal > 0 ? "complete_cost" : "no_cost";
+  // Себестоимость из реализации приходит уже полной (валидатор отсёк неполноту) —
+  // complete_cost при любом числовом итоге (нетто может быть 0 или < 0). Защитный
+  // no_cost — только для нечисловой себестоимости.
+  const status: CostStatus = Number.isFinite(productionCost) ? "complete_cost" : "no_cost";
 
   return {
     ozonOperationsTotal,
@@ -348,7 +358,7 @@ export function computeApiProfit(
 // Боевая себестоимость из отчёта о реализации Ozon: валидация + резолюция.
 //
 // Себестоимость для API-прибыли берётся из /v2/finance/realization
-// (candidateCogs.bySaleQty). Прежде чем использовать её как боевую, проверяем
+// (candidateCogs.byNetQty — продано − возвращено). Прежде чем использовать её как боевую, проверяем
 // НАДЁЖНОСТЬ. Любая из проблем → боевой расчёт останавливается понятной ошибкой
 // (мы НЕ показываем неверную прибыль и НЕ используем postings как тихий фолбэк):
 //   • not_connected — отчёт реализации не получен (сеть/ключ);
@@ -356,7 +366,9 @@ export function computeApiProfit(
 //   • no_offer_id   — в строках нет offer_id → сопоставить с каталогом нельзя;
 //   • unmatched     — есть строки, не сопоставленные с каталогом;
 //   • no_cost       — есть сопоставленные строки без cost_price (0 ₽);
-//   • zero_cost     — bySaleQty ≤ 0 (нечего использовать как себестоимость);
+//   • zero_cost     — bySaleQty ≤ 0: в отчёте нет проданных единиц с себестоимостью
+//                      (нет продаж или нет количеств) — оценивать нечего. Нетто
+//                      (byNetQty) при этом может быть ≤ 0 и НЕ блокирует расчёт;
 //   • no_tax_revenue — sums.taxRevenueBase ≤ 0 (выручку реализации для БАЗЫ НАЛОГА
 //                      получить нельзя: нет delivery/return amount) → налог считать
 //                      не от чего, боевой расчёт останавливается.
@@ -392,9 +404,9 @@ export type RealizationCostResolution =
 
 /**
  * Провалидировать диагностику отчёта реализации и вернуть боевую себестоимость
- * (bySaleQty) + БАЗУ НАЛОГА (taxRevenueBase = выручка за вычетом возвратов) ЛИБО
- * причину, по которой их нельзя использовать. ЧИСТАЯ функция.
- * byNetQty здесь НЕ используется (остаётся только в диагностике).
+ * (byNetQty: продано − возвращено, как в XLSX) + БАЗУ НАЛОГА (taxRevenueBase =
+ * выручка за вычетом возвратов) ЛИБО причину, по которой их нельзя использовать.
+ * ЧИСТАЯ функция. bySaleQty — только признак «есть что оценивать» (zero_cost).
  */
 export function resolveRealizationProductionCost(
   rz: RealizationDiagnostic
@@ -422,10 +434,10 @@ export function resolveRealizationProductionCost(
   if (noCostRows > 0) {
     return { ok: false, code: "no_cost", unmatchedRows, noCostRows };
   }
-  const productionCost = round2(rz.candidateCogs.bySaleQty);
-  if (!(productionCost > 0)) {
+  if (!(rz.candidateCogs.bySaleQty > 0)) {
     return { ok: false, code: "zero_cost", unmatchedRows: 0, noCostRows: 0 };
   }
+  const productionCost = rz.candidateCogs.byNetQty;
   // База налога: выручка реализации за вычетом возвратов. Если её нельзя получить
   // (нет delivery/return amount → ≤ 0) — налог считать не от чего, останавливаемся.
   const realizationRevenueForTax = round2(rz.sums.taxRevenueBase);
@@ -451,6 +463,8 @@ export type ApiProfitResponseBody = {
   status: CostStatus;
   /** Источник боевой себестоимости: "realization" (отчёт о реализации Ozon). */
   costSource: "realization";
+  /** Правило количества себестоимости: продано − возвращено. */
+  costQuantityBasis: typeof API_COST_QUANTITY_BASIS;
   /** СПРАВОЧНАЯ себестоимость по отправлениям (postings delivered-only): показываем
    *  как справку, в чистую прибыль НЕ входит. 0 — если отправления недоступны. */
   postingsReferenceCost: number;
@@ -513,6 +527,7 @@ export function buildApiProfitResponseBody(params: {
     source,
     status: computed.status,
     costSource: "realization",
+    costQuantityBasis: API_COST_QUANTITY_BASIS,
     postingsReferenceCost: round2(postingsReferenceCost),
     apiTotals: {
       ozonAccruals: t.revenue,
@@ -591,7 +606,7 @@ export type ApiProfitLoaded =
       cost: ProfitCostDraft;
       /** Диагностика отчёта о реализации Ozon (источник боевой себестоимости). */
       realization: RealizationDiagnostic;
-      /** Боевая себестоимость (bySaleQty) — уже провалидированная. */
+      /** Боевая себестоимость (byNetQty: продано − возвращено) — уже провалидированная. */
       productionCost: number;
       /** База налога: выручка реализации за вычетом возвратов — уже > 0. */
       realizationRevenueForTax: number;
@@ -621,7 +636,7 @@ export type ApiProfitLoaded =
  * прибыль. Бэкенд НЕ доверяет числам с фронтенда — единственный источник истины.
  *
  * Боевая СЕБЕСТОИМОСТЬ берётся из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon (/v2/finance/realization,
- * candidateCogs.bySaleQty) — тот же источник, что и документальный расчёт. Отчёт
+ * candidateCogs.byNetQty: продано − возвращено, как в XLSX «Отчёте по начислениям»). Отчёт
  * реализации получаем и валидируем ДО расчёта: если себестоимость нельзя надёжно
  * получить (нет offer_id / несопоставленные / без себестоимости / пусто / не
  * получен) — возвращаем kind:"realization_cost" и НЕ считаем прибыль (боевой расчёт

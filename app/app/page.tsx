@@ -1094,6 +1094,8 @@ type OzonProfitDraftResponse = {
   status: "complete_cost" | "partial_cost" | "no_cost";
   // Источник боевой себестоимости: "realization" (отчёт о реализации Ozon).
   costSource?: "realization";
+  // Правило количества: продано − возвращено (нет поля — ответ прежнего сервера).
+  costQuantityBasis?: "sold_minus_returned";
   // СПРАВОЧНАЯ себестоимость по отправлениям (postings delivered-only): показываем
   // как справку, в чистую прибыль НЕ входит. 0/undefined — отправления недоступны.
   postingsReferenceCost?: number;
@@ -9899,15 +9901,19 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                       </div>
                       <div className="api-result-row">
                         <span className="rl">Себестоимость товаров</span>
-                        <span className="rv neg">
-                          − {fmt(profitResult.costDraft.matchedCostTotal)} ₽
+                        {/* Нетто-себестоимость может быть < 0 (возвраты прошлых периодов). */}
+                        <span className={"rv" + (profitResult.costDraft.matchedCostTotal >= 0 ? " neg" : "")}>
+                          {profitResult.costDraft.matchedCostTotal >= 0 ? "− " : "+ "}
+                          {fmt(Math.abs(profitResult.costDraft.matchedCostTotal))} ₽
                         </span>
                       </div>
                       <p
                         className="api-step-hint"
                         style={{ margin: "-.15rem 0 .1rem" }}
                       >
-                        Себестоимость получена из отчёта реализации Ozon
+                        {profitResult.costQuantityBasis === "sold_minus_returned"
+                          ? "Себестоимость — из отчёта реализации Ozon: проданные единицы за вычетом возвращённых"
+                          : "Себестоимость получена из отчёта реализации Ozon"}
                       </p>
                       {typeof profitResult.postingsReferenceCost === "number" &&
                         profitResult.postingsReferenceCost > 0 && (
@@ -10018,7 +10024,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         <div className="rz-cand">
                           <div className="rz-cand-row">
                             <span className="rz-cand-lbl">
-                              Кандидатная себестоимость (по количеству продаж)
+                              По количеству продаж (справочно)
                             </span>
                             <span className="rz-cand-val">
                               {fmt(realizationDiag.candidateCogs.bySaleQty)} ₽
@@ -10026,15 +10032,16 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                           </div>
                           <div className="rz-cand-row sub">
                             <span className="rz-cand-lbl">
-                              С вычетом возвратов (продажи − возвраты)
+                              С вычетом возвратов (продажи − возвраты) — в расчёте
                             </span>
                             <span className="rz-cand-val">
                               {fmt(realizationDiag.candidateCogs.byNetQty)} ₽
                             </span>
                           </div>
                           <p className="rz-cand-hint">
-                            Сравните с себестоимостью в «Расчёте по документам Ozon» за
-                            тот же месяц. Величина справочная — в прибыль не входит.
+                            В себестоимость API-расчёта входит вариант с вычетом возвратов —
+                            как в расчёте по «Отчёту по начислениям». Вариант по количеству
+                            продаж — справочный.
                           </p>
                         </div>
 

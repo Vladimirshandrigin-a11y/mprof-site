@@ -3,22 +3,16 @@
 //
 // Тонкая обёртка над Ozon Seller API  POST /v2/finance/realization:
 //   • строит запрос из { month: 1..12, year } (месяц отчёта реализации);
-//   • читает result.rows[] и агрегирует СПРАВОЧНЫЕ суммы (кол-во, выручка,
-//     возвраты, баллы, программы партнёров) + «кандидатную себестоимость»
-//     (candidate COGS) = Σ количество × cost_price из каталога, сопоставленного
-//     по тому же артикулу (offer_id ↔ products.sku), что и документальный расчёт.
+//   • читает result.rows[] и агрегирует суммы (кол-во, выручка, возвраты, баллы,
+//     программы партнёров) + себестоимость (candidate COGS) по каталогу,
+//     сопоставленному по артикулу (offer_id ↔ products.sku):
+//       – byNetQty  = Σ по товарам round((продано − возвращено) × cost_price) —
+//         БОЕВАЯ себестоимость API-расчёта (profit.ts resolveRealizationProductionCost),
+//         то же правило и то же округление, что в XLSX «Отчёте по начислениям»;
+//       – bySaleQty = Σ продано × cost_price — справочно (прежнее правило API).
 //
-// ЗАЧЕМ ЭТОТ МОДУЛЬ (диагностика, а НЕ смена формулы):
-//   Боевой API-расчёт берёт себестоимость из ОТПРАВЛЕНИЙ (postings, delivered) —
-//   период по дате создания/обработки отправления, возвраты у delivered не
-//   вычитаются. Документальный расчёт берёт количество из ОТЧЁТА О РЕАЛИЗАЦИИ.
-//   Из-за разных источников за один месяц себестоимости расходятся. Этот модуль
-//   ПРОВЕРЯЕТ, можно ли из отчёта реализации получить надёжные количество+артикул,
-//   чтобы посчитать себестоимость из ТОГО ЖЕ источника, что и документы.
-//
-//   ВАЖНО: модуль НИЧЕГО не меняет в прибыли/налоге/COGS. Он только СЧИТАЕТ
-//   справочные числа и «кандидатную» себестоимость и отдаёт их для показа.
-//   candidate COGS НЕ идёт ни в netProfit, ни в matchedCostTotal, ни в историю.
+// Сам модуль прибыль/налог не считает и ничего не сохраняет: он отдаёт числа
+// вызывающему (profit.ts), который проверяет их полноту.
 //
 // Api-Key приходит сюда уже расшифрованным (из route) и НИКОГДА не логируется и
 // не возвращается. Форма ответа v2 (сверена с офиц. схемой Ozon Seller API,
@@ -177,9 +171,13 @@ export type RealizationDiagnostic = {
     sellerPriceValue: number;
   };
   candidateCogs: {
-    /** Σ saleQty × cost по сопоставленным (offer_id↔products.sku) с cost>0. */
+    /** Σ saleQty × cost по сопоставленным (offer_id↔products.sku) с cost>0 — справочно. */
     bySaleQty: number;
-    /** Σ (saleQty − returnQty) × cost по тем же сопоставленным. */
+    /**
+     * Σ по товарам Math.round((saleQty − |returnQty|) × cost × 100) / 100 — как
+     * себестоимость XLSX «Отчёта по начислениям». Возврат без продажи — отрицательный
+     * вклад; отрицательное нетто не обрезается.
+     */
     byNetQty: number;
     matchedRows: number;
     unmatchedRows: number;
@@ -398,8 +396,8 @@ function buildRealizationDebug(rows: RealizationRow[]): RealizationDebug {
 
 /**
  * Собрать диагностику по строкам отчёта реализации + каталогу себестоимости.
- * ЧИСТАЯ функция. candidate COGS — СПРАВОЧНАЯ величина, она НЕ участвует в
- * netProfit/matchedCostTotal/налоге и никуда не сохраняется.
+ * ЧИСТАЯ функция. candidateCogs.byNetQty — себестоимость, которую API-расчёт
+ * использует после проверки полноты (profit.ts); bySaleQty — справочно.
  *
  * Матч с каталогом — как в документальном/боевом расчёте: по нормализованному
  * offer_id ↔ products.sku (точное совпадение, без fuzzy).
@@ -500,7 +498,9 @@ export function buildRealizationDiagnostic(
   let sellerPriceValue = 0;
 
   let candBySaleQty = 0;
-  let candByNetQty = 0;
+  // Нетто-количество по товару (нормализованный артикул): округление — по товару,
+  // как в XLSX (aggregateAccrualProducts), а не по строкам отчёта.
+  const netByProduct = new Map<string, { quantity: number; cost: number }>();
   let matchedRows = 0;
   let unmatchedRows = 0;
   let matchedNoCostRows = 0;
@@ -559,7 +559,10 @@ export function buildRealizationDiagnostic(
         matched = true;
         costPerUnit = round2(hit.cost);
         candBySaleQty += sQty * hit.cost;
-        candByNetQty += (sQty - rQty) * hit.cost;
+        // Возврат вычитается ровно один раз, независимо от знака в ответе Ozon.
+        const net = netByProduct.get(offer);
+        if (net) net.quantity += sQty - Math.abs(rQty);
+        else netByProduct.set(offer, { quantity: sQty - Math.abs(rQty), cost: hit.cost });
       } else {
         matchedNoCostRows += 1;
       }
@@ -582,12 +585,16 @@ export function buildRealizationDiagnostic(
 
   const netQuantity = saleQuantity - returnQuantity;
 
+  // Себестоимость по нетто-количеству в целых копейках — то же выражение, что в XLSX.
+  let netCostKopecks = 0;
+  for (const p of netByProduct.values()) netCostKopecks += Math.round(p.quantity * p.cost * 100) + 0;
+
   // ---- пояснения / предупреждения ----
   if (rows.length === 0) {
     notes.push("Отчёт о реализации Ozon за выбранный месяц пуст (нет строк).");
   } else {
     notes.push(
-      "Диагностика справочная: candidate COGS считается из количества отчёта реализации и себестоимости каталога, НЕ участвует в чистой прибыли и никуда не сохраняется."
+      "Себестоимость считается по количеству отчёта реализации и себестоимости каталога: в API-расчёт входит вариант «продано − возвращено», вариант «по количеству продаж» — справочно."
     );
   }
   if (rows.length > 0 && debug.hasNestedItem) {
@@ -641,7 +648,7 @@ export function buildRealizationDiagnostic(
     },
     candidateCogs: {
       bySaleQty: round2(candBySaleQty),
-      byNetQty: round2(candByNetQty),
+      byNetQty: netCostKopecks / 100,
       matchedRows,
       unmatchedRows,
       matchedNoCostRows,

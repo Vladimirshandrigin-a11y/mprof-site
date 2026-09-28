@@ -5,6 +5,7 @@ import { apiRequestHash } from "../../../app/lib/calc-operation-keys";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
 import {
+  API_COST_QUANTITY_BASIS,
   accrualErrorResponse,
   buildApiProfitResponseBody,
   errorResponse,
@@ -26,7 +27,8 @@ import { syncMissingRealizationProducts } from "../_lib/realization-catalog-sync
 //                    − Налог от выручки реализации − Внешние расходы вручную.
 //   • Итого Ozon (ozonOperationsTotal) — из финопераций Ozon API;
 //   • Себестоимость (productionCost) — из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
-//     (/v2/finance/realization → candidateCogs.bySaleQty), сопоставленного с
+//     (/v2/finance/realization → candidateCogs.byNetQty: продано − возвращено,
+//     как в XLSX «Отчёте по начислениям»), сопоставленного с
 //     каталогом по item.offer_id; postings delivered-only COGS БОЛЬШЕ НЕ боевая
 //     (остаётся только справочной строкой postingsReferenceCost);
 //   • Налог = round2(realizationRevenueForTax × tax% / 100) — ПРОЦЕНТ от выручки
@@ -41,7 +43,8 @@ import { syncMissingRealizationProducts } from "../_lib/realization-catalog-sync
 //   3. финальное сохранение разрешено ТОЛЬКО когда боевая себестоимость надёжно
 //      получена ИЗ ОТЧЁТА РЕАЛИЗАЦИИ: realization подключился, есть строки и
 //      item.offer_id, все строки сопоставлены с каталогом (unmatchedRows === 0) и
-//      у всех есть cost_price (noCostRows === 0), bySaleQty > 0. Иначе:
+//      у всех есть cost_price (noCostRows === 0), есть проданные единицы (bySaleQty > 0;
+//      нетто-себестоимость может быть ≤ 0). Иначе:
 //        • unmatched/no-cost → 400 incomplete_cost (пользователь заполняет каталог);
 //        • not_connected/no_rows/no_offer_id/zero_cost → 422 realization_unavailable;
 //      в обоих случаях БЕЗ сохранения и БЕЗ списания — некорректная прибыль НЕ
@@ -418,6 +421,9 @@ export async function POST(req: NextRequest) {
     cost: {
       matchedCostTotal: c.matchedCostTotal,
       matchedNoCostCount: loaded.cost.matchedNoCostCount,
+      // Правило количества (продано − возвращено). Снимки без этого поля посчитаны
+      // прежним правилом (только проданное) — их суммы не пересчитываются.
+      quantityBasis: API_COST_QUANTITY_BASIS,
     },
     manualExpenses: c.manualExpenses,
     preliminary: {
@@ -493,7 +499,7 @@ export async function POST(req: NextRequest) {
   // ---- 5.1) диагностика отчёта о реализации Ozon: ТА ЖЕ, что дала боевую
   //          себестоимость выше (loaded.realization) — повторно НЕ запрашиваем.
   //          Показываем ровно те количества/сопоставления, из которых посчитана
-  //          боевая COGS (bySaleQty). byNetQty остаётся справочным (не в прибыли).
+  //          боевая COGS (byNetQty). bySaleQty (только продано) — справочно.
   const realizationDiagnostic: RealizationDiagnostic = loaded.realization;
 
   // ---- 6) полный расчёт для UI (PR #20): та же форма, что и preview-ответ, но
@@ -509,7 +515,7 @@ export async function POST(req: NextRequest) {
     computed: c,
     postingsReferenceCost: loaded.cost.matchedCostTotal,
     extraNotes: [
-      "Себестоимость взята из отчёта о реализации Ozon (тот же источник, что и документальный расчёт); себестоимость по отправлениям показана справочно и в прибыль не входит.",
+      "Себестоимость взята из отчёта о реализации Ozon: проданные единицы за вычетом возвращённых (как в расчёте по «Отчёту по начислениям»); себестоимость по отправлениям показана справочно и в прибыль не входит.",
       "Налог рассчитан как процент от выручки из отчёта о реализации Ozon (за вычетом возвратов).",
       "Возвраты (returns) показаны справочно: они уже учтены внутри «Начислений Ozon» (signed accruals_for_sale) и повторно в сумму не добавляются.",
       "Расчёт сохранён в историю; одна попытка списана (для активного безлимита — без списания).",
