@@ -2,7 +2,8 @@
 // Ключи операций расчёта (см. save-flow и /api/cloud/calculation-operations; ручной
 // режим и Ozon API — calc-operation-keys). Ключ (UUID) создаётся при первом
 // сохранении для пары «пользователь + отпечаток» (файл XLSX или режим + параметры)
-// и живёт до подтверждения сервером — в localStorage, поэтому переживает повтор,
+// и живёт до подтверждения сервером (вместе с параметрами операции — вводом ручной
+// формы / месяцем и расходами API, чтобы после перезагрузки повторить ТУ ЖЕ операцию) — в localStorage, поэтому переживает повтор,
 // потерянный ответ и перезагрузку страницы. Это НЕ отметка «оплачено»: что сделано
 // на самом деле, знает только сервер (статус операции по ключу).
 // Без localStorage (приватный режим, запрет) ключи живут в памяти вкладки.
@@ -12,7 +13,7 @@ const STORAGE_KEY = "mprof_calc_operations_v1";
 /** Незавершённые ключи старше этого срока не восстанавливаются. */
 const TTL_MS = 14 * 24 * 60 * 60 * 1000;
 
-type Entry = { id: string; at: number };
+type Entry = { id: string; at: number; payload?: unknown };
 type Store = Record<string, Record<string, Entry>>; // userId → отпечаток файла → ключ
 
 export interface StorageLike {
@@ -23,12 +24,12 @@ export interface StorageLike {
 export interface OperationStore {
   /** Незавершённый ключ операции файла (или null). */
   get(userId: string, attemptId: string): string | null;
-  /** Ключ операции файла: существующий незавершённый или новый. */
-  getOrCreate(userId: string, attemptId: string): string;
+  /** Ключ операции: существующий незавершённый или новый (payload — параметры операции). */
+  getOrCreate(userId: string, attemptId: string, payload?: unknown): string;
   /** Операция подтверждена сервером (или ключ отвергнут) — ключ больше не нужен. */
   settle(userId: string, attemptId: string): void;
   /** Незавершённые ключи пользователя (свежие), новые — первыми. */
-  pending(userId: string): Array<{ attemptId: string; id: string; at: number }>;
+  pending(userId: string): Array<{ attemptId: string; id: string; at: number; payload?: unknown }>;
 }
 
 export function createOperationStore(
@@ -65,14 +66,19 @@ export function createOperationStore(
       const e = load()[userId]?.[attemptId];
       return fresh(e) ? e.id : null;
     },
-    getOrCreate(userId, attemptId) {
+    getOrCreate(userId, attemptId, payload) {
       const st = load();
       const e = st[userId]?.[attemptId];
-      if (fresh(e)) return e.id;
+      if (fresh(e)) {
+        if (payload !== undefined && e.payload === undefined) {
+          save({ ...st, [userId]: { ...st[userId], [attemptId]: { ...e, payload } } });
+        }
+        return e.id;
+      }
       const byUser: Record<string, Entry> = {};
       for (const [k, v] of Object.entries(st[userId] ?? {})) if (fresh(v)) byUser[k] = v;
       const id = newId();
-      byUser[attemptId] = { id, at: now() };
+      byUser[attemptId] = payload === undefined ? { id, at: now() } : { id, at: now(), payload };
       save({ ...st, [userId]: byUser });
       return id;
     },
@@ -86,7 +92,7 @@ export function createOperationStore(
     pending(userId) {
       return Object.entries(load()[userId] ?? {})
         .filter((kv): kv is [string, Entry] => fresh(kv[1]))
-        .map(([attemptId, e]) => ({ attemptId, id: e.id, at: e.at }))
+        .map(([attemptId, e]) => ({ attemptId, id: e.id, at: e.at, ...(e.payload !== undefined ? { payload: e.payload } : {}) }))
         .sort((a, b) => b.at - a.at);
     },
   };

@@ -101,6 +101,53 @@ export function computeManualColumns(i: ManualCalcInputs): ManualCalcColumns {
   };
 }
 
+/**
+ * Поле ручной формы → число (как форма читала всегда: запятая = точка, нечисло → 0).
+ * Отрицательные значения форма допускает.
+ */
+export function parseManualAmount(v: string): number {
+  const n = parseFloat(String(v).replace(",", "."));
+  return isNaN(n) ? 0 : n;
+}
+
+/**
+ * Число → поле ручной формы БЕЗ округления: parseManualAmount(manualFormValue(x)) === x.
+ * Восстановленный расчёт не теряет копеек — правка одного поля не меняет остальные.
+ */
+export function manualFormValue(n: number): string {
+  return Number.isFinite(n) ? String(n) : "0";
+}
+
+/** Поля ручной формы из сохранённой строки расчёта (колонки calculations = ввод формы). */
+export function manualFormFromSaved(c: Record<ManualInputField, number>): Record<ManualInputField, string> {
+  const out = {} as Record<ManualInputField, string>;
+  for (const f of MANUAL_INPUT_FIELDS) out[f] = manualFormValue(c[f]);
+  return out;
+}
+
+/** Параметры незавершённой ручной операции из хранилища страницы (проверка формы). */
+export function isManualCalcInputs(v: unknown): v is ManualCalcInputs {
+  return parseManualInputs(v).ok;
+}
+
+/** Параметры незавершённой API-операции: месяц и ручные расходы. */
+export interface ApiOperationParams {
+  month: string;
+  manualExpenses: ApiManualExpenses;
+}
+
+export function isApiOperationParams(v: unknown): v is ApiOperationParams {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  if (typeof o.month !== "string" || !/^\d{4}-\d{2}$/.test(o.month)) return false;
+  const e = o.manualExpenses;
+  if (typeof e !== "object" || e === null) return false;
+  const r = e as Record<string, unknown>;
+  return (["tax", "packaging", "warehouseDelivery", "salary", "other"] as const).every(
+    (k) => typeof r[k] === "number" && Number.isFinite(r[k]) && (r[k] as number) >= 0
+  );
+}
+
 /** Отпечаток ручного расчёта: маркетплейс и все поля формы. */
 export function manualRequestHash(i: ManualCalcInputs): string {
   return MANUAL_REQUEST_PREFIX + fingerprint(JSON.stringify([i.marketplace, ...MANUAL_INPUT_FIELDS.map((f) => i[f])]));

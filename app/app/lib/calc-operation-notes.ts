@@ -2,10 +2,12 @@
 // Операции ручного расчёта и Ozon API: исход операции → что показать и что делать
 // с ключом незавершённой операции. Чистые функции без React/сети (покрыты тестами).
 //
-// Правило ключа: ключ убирается только когда исход известен (сохранено, удалено,
-// конфликт). Отказ в списании, недоступность и неизвестный исход ключ СОХРАНЯЮТ —
-// повтор с тем же ключом безопасен (сервер не спишет дважды). При потерянном ответе
-// НЕ утверждаем «ничего не списано»: исход неизвестен.
+// Правило ключа: ключ убирается, когда исход известен — сохранено, удалено, конфликт,
+// отказ в списании или сохранение недоступно (в двух последних ничего не записано).
+// Неизвестный исход (нет ответа) и статус «нет операции» ключ СОХРАНЯЮТ — в том числе
+// после окончания окна перепроверки: «нет» не доказывает, что исходный запрос уже не
+// завершится. Повтор с тем же ключом безопасен (сервер не спишет дважды). При
+// потерянном ответе НЕ утверждаем «ничего не списано»: исход неизвестен.
 // ============================================================================
 
 export type OpMode = "manual" | "api";
@@ -24,6 +26,12 @@ export const OP_TEXT = {
     "Расчёт, начатый до перезагрузки страницы, успел сохраниться — показан сохранённый результат. Повторного списания нет.",
   restoredOther:
     "Незавершённый расчёт с другими значениями уже сохранён — показан он. Повторного списания нет. Чтобы рассчитать с новыми значениями, нажмите кнопку ещё раз.",
+  restoredPending:
+    "Расчёт, сохранение которого не было подтверждено, сохранён — показан сохранённый результат. Повторного списания нет.",
+  pending:
+    "Сохранение расчёта не подтверждено сервером — расчёт мог успеть сохраниться. Проверьте: сохранённый откроется без повторного списания, а если сервер его не получил, сохранение завершится той же операцией.",
+  stillUnknown: (msg: string) =>
+    `Не удалось проверить сохранение (${msg.replace(/\.\s*$/, "")}). Ключ операции сохранён — повторите проверку позже; повторного списания не будет.`,
   deleted:
     "Расчёт по этой операции был сохранён и затем удалён из истории. Заново он не создаётся, попытка повторно не списывается. Новый расчёт — отдельная попытка.",
   conflict:
@@ -64,11 +72,13 @@ export function opOutcomeUi(out: OpOutcome, mode: OpMode): OpOutcomeUi {
     case "deleted":
       return { note: { kind: "warn", text: OP_TEXT.deleted }, keepKey: false, paywall: false };
     case "refused":
-      return { note: null, keepKey: true, paywall: true };
+      // Операции по ключу нет и списание отклонено — ничего не записано.
+      return { note: null, keepKey: false, paywall: true };
     case "conflict":
       return { note: { kind: "err", text: OP_TEXT.conflict }, keepKey: false, paywall: false };
     case "unavailable":
-      return { note: { kind: "err", text: OP_TEXT.unavailable(out.message) }, keepKey: true, paywall: false };
+      // Функции операции на сервере нет (миграция не применена) — ничего не выполнено.
+      return { note: { kind: "err", text: OP_TEXT.unavailable(out.message) }, keepKey: false, paywall: false };
     case "failed":
       return { note: { kind: "err", text: OP_TEXT.unknown(out.message) }, keepKey: true, paywall: false };
   }
@@ -79,7 +89,7 @@ export type OpRecoveryStatus = "done" | "deleted" | "conflict" | "none" | "faile
 
 export function opRecoveryUi(
   status: OpRecoveryStatus,
-  context: "same" | "other" | "reload"
+  context: "same" | "other" | "reload" | "pending"
 ): { note: OpNote | null; keepKey: boolean; restore: boolean } {
   switch (status) {
     case "done":
@@ -91,6 +101,8 @@ export function opRecoveryUi(
               ? OP_TEXT.restoredAfterReload
               : context === "other"
               ? OP_TEXT.restoredOther
+              : context === "pending"
+              ? OP_TEXT.restoredPending
               : OP_TEXT.restoredManual,
         },
         keepKey: false,
@@ -145,4 +157,36 @@ export function apiSaveOutcome(
   // 5xx без ответа маршрута (сбой мог случиться и после записи) — исход неизвестен.
   if (status >= 500 && !data.error) return { kind: "failed", message: `ошибка сервера ${status}` };
   return { kind: "before", message: data.error || "Не удалось рассчитать и сохранить расчёт" };
+}
+
+// ---------------------------------------------------------------------------
+// Перепроверка после перезагрузки
+// ---------------------------------------------------------------------------
+
+/** «Молодой» ключ: сервер мог ещё сохранять, когда страницу перезагрузили. */
+export const RECHECK_RECENT_MS = 120_000;
+export const RECHECK_ATTEMPTS = 6;
+export const RECHECK_DELAY_MS = 4_000;
+
+/**
+ * Ограниченное окно перепроверки после перезагрузки (без постоянного опроса):
+ * check() — один проход по незавершённым операциям (true — показан сохранённый
+ * расчёт); пока остаются «молодые» ключи, проход повторяется RECHECK_ATTEMPTS раз с
+ * паузой. Окно закончилось — ключи НЕ удаляются: страница показывает действие
+ * «проверить и завершить сохранение» (повтор той же операции тем же ключом).
+ */
+export async function recheckAfterReload(o: {
+  check: () => Promise<boolean>;
+  hasRecent: () => boolean;
+  sleep: (ms: number) => Promise<void>;
+  attempts?: number;
+  delayMs?: number;
+}): Promise<boolean> {
+  const attempts = o.attempts ?? RECHECK_ATTEMPTS;
+  for (let i = 0; i < attempts; i++) {
+    if (await o.check()) return true;
+    if (i === attempts - 1 || !o.hasRecent()) return false;
+    await o.sleep(o.delayMs ?? RECHECK_DELAY_MS);
+  }
+  return false;
 }

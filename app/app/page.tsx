@@ -62,15 +62,22 @@ import {
 } from "./lib/supabase-cloud"
 import {
   apiRequestHash,
+  isApiOperationParams,
+  isManualCalcInputs,
+  manualFormFromSaved,
   manualRequestHash,
   operationModeOf,
+  parseManualAmount,
+  type ApiManualExpenses,
   type ManualCalcInputs,
 } from "./lib/calc-operation-keys"
 import {
   OP_TEXT,
+  RECHECK_RECENT_MS,
   apiSaveOutcome,
   opOutcomeUi,
   opRecoveryUi,
+  recheckAfterReload,
   type OpNote,
 } from "./lib/calc-operation-notes"
 import {
@@ -1479,6 +1486,10 @@ export default function AppPage() {
   // Операции ручного / API-расчёта: сообщение об исходе (восстановленный расчёт,
   // «удалён», сбой без подтверждения). mode — в каком блоке показать.
   const [opNote, setOpNote] = useState<(OpNote & { mode: "manual" | "api" }) | null>(null);
+  // Незавершённые операции (исход неизвестен) по режимам — для действия «проверить и
+  // завершить сохранение»; и идёт ли сейчас такая проверка.
+  const [pendingOps, setPendingOps] = useState<{ manual: number; api: number }>({ manual: 0, api: 0 });
+  const [opResuming, setOpResuming] = useState(false);
   // Ключи незавершённых операций (localStorage) — создаются лениво в обработчиках.
   const calcOpStoreRef = useRef<OperationStore | null>(null);
   // Восстановление после перезагрузки: зовётся из загрузки данных пользователя.
@@ -2702,21 +2713,12 @@ export default function AppPage() {
       restoreUploadCalc(item);
     } else {
       // Ручной расчёт (или старый API с неотрицательным other): восстанавливаем
-      // форму и итог, режим — обычный редактируемый (view-only снимаем).
-      const s = (n: number) => String(Math.round(n));
+      // форму и итог, режим — обычный редактируемый (view-only снимаем). Значения —
+      // ТОЧНО как сохранены (без округления): правка одного поля не меняет остальные.
       setLoadedApiView(null);
       setCalcMode("manual");
       setMarketplace(item.marketplace);
-      setForm({
-        revenue: s(item.revenue),
-        commission: s(item.commission),
-        logistics: s(item.logistics),
-        storage: s(item.storage),
-        ads: s(item.ads),
-        cost: s(item.cost),
-        tax: s(item.tax),
-        other: s(item.other),
-      });
+      setForm(manualFormFromSaved(item));
       setResult(item);
       setShowProfitForm(false);
       setSelectedId(item.id);
@@ -4300,6 +4302,14 @@ export default function AppPage() {
   // единственная точка списания, двойного списания нет. Числам с фронта не верим:
   // шлём только месяц и ручные расходы. Защита от двойного клика — profitLoading.
   const calculateAndSaveApi = async () => {
+    try {
+      await calculateAndSaveApiChecked();
+    } finally {
+      refreshPendingOps(user?.id ?? null);
+    }
+  };
+
+  const calculateAndSaveApiChecked = async () => {
     if (profitLoading) return; // защита от двойного клика
     if (!user?.id) {
       setProfitError("Войдите в аккаунт, чтобы рассчитать прибыль");
@@ -4360,12 +4370,27 @@ export default function AppPage() {
       // попытка НЕ списывается (для API это критично — списание на сервере в save).
       if (!(await confirmNoMonthDuplicate(profitMonth, "ozon"))) return;
     }
+    await runApiOperation(uid, ident, profitMonth, manualExpenses);
+  };
+
+  /**
+   * Отправка операции API-расчёта тем ключом, что хранится у страницы для этих
+   * параметров (новый — если ключа нет). Повтор ключа: сервер вернёт сохранённый
+   * расчёт без Ozon и без списания. Ключ и параметры остаются, пока исход неизвестен.
+   */
+  const runApiOperation = async (
+    uid: string,
+    ident: string,
+    month: string,
+    manualExpenses: ApiManualExpenses
+  ) => {
+    const store = calcOpStore();
     setProfitLoading(true);
     setProfitResult(null);
     setApiSaved(false);
     setApiCostGap(null);
     setRealizationDiag(null);
-    const operationId = store.getOrCreate(uid, ident);
+    const operationId = store.getOrCreate(uid, ident, { month, manualExpenses });
     type SaveResponse = {
       ok?: boolean;
       replay?: boolean;
@@ -4387,7 +4412,7 @@ export default function AppPage() {
       const res = await fetch("/api/ozon/save-calculation", {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
-        body: JSON.stringify({ month: profitMonth, manualExpenses, operationId }),
+        body: JSON.stringify({ month, manualExpenses, operationId }),
         cache: "no-store",
       });
       status = res.status;
@@ -4454,6 +4479,7 @@ export default function AppPage() {
       }
     } finally {
       setProfitLoading(false);
+      refreshPendingOps(uid);
     }
   };
 
@@ -4624,10 +4650,7 @@ export default function AppPage() {
     setUploadedReports(enriched);
   };
 
-  const num = (v: string) => {
-    const n = parseFloat(String(v).replace(",", "."));
-    return isNaN(n) ? 0 : n;
-  };
+  const num = parseManualAmount;
 
   const fmt = (n: number) =>
     n.toLocaleString("ru-RU", { maximumFractionDigits: 0 });
@@ -4663,6 +4686,18 @@ export default function AppPage() {
       calcOpStoreRef.current = createOperationStore(browserOperationStorage(), newOperationId);
     }
     return calcOpStoreRef.current;
+  };
+
+  /** Сколько незавершённых операций (исход неизвестен) по режимам — для уведомления. */
+  const refreshPendingOps = (uid: string | null) => {
+    const counts = { manual: 0, api: 0 };
+    if (uid) {
+      for (const e of calcOpStore().pending(uid)) {
+        const m = operationModeOf(e.attemptId);
+        if (m === "manual" || m === "api") counts[m]++;
+      }
+    }
+    setPendingOps(counts);
   };
 
   /** Сохранённый расчёт — в историю страницы (без дубля, если строка уже есть). */
@@ -4726,15 +4761,17 @@ export default function AppPage() {
       recoveredForRef.current = uid;
       void (async () => {
         // Перезагрузка могла случиться, пока сервер ещё сохранял: «молодые» ключи
-        // (до 2 минут) проверяем ещё несколько раз, пока операция не завершится.
-        for (let attempt = 0; attempt < 6; attempt++) {
-          if (await recoverPendingOperations(uid, null, null, "reload")) return;
-          const young = calcOpStore()
-            .pending(uid)
-            .some((e) => operationModeOf(e.attemptId) !== "upload" && Date.now() - e.at < 120_000);
-          if (!young) return;
-          await new Promise((r) => setTimeout(r, 4000));
-        }
+        // (до 2 минут) проверяем ещё несколько раз. Окно закончилось — ключи остаются,
+        // страница предлагает «проверить и завершить сохранение».
+        await recheckAfterReload({
+          check: () => recoverPendingOperations(uid, null, null, "reload"),
+          hasRecent: () =>
+            calcOpStore()
+              .pending(uid)
+              .some((e) => operationModeOf(e.attemptId) !== "upload" && Date.now() - e.at < RECHECK_RECENT_MS),
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+        });
+        refreshPendingOps(uid);
       })();
     };
   });
@@ -4795,14 +4832,23 @@ export default function AppPage() {
       // выходим ДО операции: попытка НЕ списывается.
       if (!(await confirmNoMonthDuplicate(currentMonthKey(), marketplace))) return;
     }
+    await runManualOperation(uid, ident, inputs);
+  };
 
+  /**
+   * Отправка ручной операции тем ключом, что хранится у страницы для этих значений
+   * (новый — если ключа нет); значения хранятся вместе с ключом, пока исход неизвестен,
+   * — чтобы после перезагрузки повторить ТУ ЖЕ операцию.
+   */
+  const runManualOperation = async (uid: string, ident: string, inputs: ManualCalcInputs) => {
+    const store = calcOpStore();
     setIsCalculating(true);
     // Прежний результат не показываем рядом с новыми значениями: новый появится только
     // после подтверждения сохранения сервером.
     setResult(null);
     setLoadedApiView(null);
     try {
-      const operationId = store.getOrCreate(uid, ident);
+      const operationId = store.getOrCreate(uid, ident, inputs);
       // 5 стадий × 700мс — минимальная задержка для AI processing overlay.
       const minDelay = new Promise<void>((r) => setTimeout(r, 3600));
       const [res] = await Promise.all([saveManualCalculationOperation({ operationId, inputs }), minDelay]);
@@ -4834,14 +4880,116 @@ export default function AppPage() {
       if (res.kind !== "deleted") showToast("Не удалось сохранить расчёт", "err");
     } finally {
       setIsCalculating(false);
+      refreshPendingOps(uid);
     }
   };
+
+  /**
+   * «Проверить и завершить сохранение»: незавершённая операция режима (исход неизвестен,
+   * в том числе после окончания окна перепроверки). Сохранена → показываем сохранённое;
+   * удалена → сообщаем; нет или не удалось узнать → повторяем ТУ ЖЕ операцию тем же
+   * ключом и с теми же параметрами: сервер не спишет дважды, завершённую API-операцию
+   * вернёт без Ozon. Права страницы не проверяем (могут показывать исчерпанную
+   * попытку, хотя операция уже оплачена) — решает сервер.
+   */
+  const resumePendingOperation = async (mode: "manual" | "api") => {
+    const uid = user?.id;
+    if (!uid || opResuming || isCalculating || profitLoading) return;
+    const store = calcOpStore();
+    const entry = store.pending(uid).find((e) => operationModeOf(e.attemptId) === mode);
+    if (!entry) {
+      refreshPendingOps(uid);
+      return;
+    }
+    setOpResuming(true);
+    setOpNote(null);
+    try {
+      const st = await getSavedOperationStatus(entry.id, entry.attemptId);
+      const ui = opRecoveryUi(st.kind, "pending");
+      if (!ui.keepKey) store.settle(uid, entry.attemptId);
+      if (st.kind === "done") {
+        showSavedCalculation(st.calculation, ui.note);
+        return;
+      }
+      if (st.kind === "deleted" || st.kind === "conflict") {
+        setCalcMode(mode);
+        if (ui.note) setOpNote({ ...ui.note, mode });
+        return;
+      }
+      // Нет операции на сервере или не удалось узнать: исход не доказан — повтор той же
+      // операции тем же ключом безопасен. Результат показываем во вкладке режима.
+      if (mode === "manual" && isManualCalcInputs(entry.payload)) {
+        setCalcMode("manual");
+        setMarketplace(entry.payload.marketplace);
+        setForm(manualFormFromSaved(entry.payload));
+        await runManualOperation(uid, entry.attemptId, entry.payload);
+        return;
+      }
+      if (mode === "api" && isApiOperationParams(entry.payload)) {
+        const p = entry.payload;
+        const str = (n: number) => (n > 0 ? String(n) : "");
+        setCalcMode("api");
+        setProfitMonth(p.month);
+        setApiExpenses({
+          tax: str(p.manualExpenses.tax),
+          packaging: str(p.manualExpenses.packaging),
+          warehouseDelivery: str(p.manualExpenses.warehouseDelivery),
+          salary: str(p.manualExpenses.salary),
+          other: str(p.manualExpenses.other),
+        });
+        await runApiOperation(uid, entry.attemptId, p.month, p.manualExpenses);
+        return;
+      }
+      setOpNote({
+        kind: "warn",
+        text: OP_TEXT.stillUnknown(st.kind === "failed" ? st.message : "сервер ещё не подтвердил операцию"),
+        mode,
+      });
+    } finally {
+      setOpResuming(false);
+      refreshPendingOps(uid);
+    }
+  };
+
+  // Незавершённые операции — в блоке ручного расчёта и в блоке API (после перезагрузки
+  // открывается вкладка API): действие доступно независимо от кнопки расчёта и прав
+  // страницы (исчерпанная попытка не мешает забрать уже оплаченный расчёт).
+  const pendingOpsNotice =
+    user && (pendingOps.manual > 0 || pendingOps.api > 0) && !isCalculating && !profitLoading ? (
+      <div className="calc-op-pending" role="status">
+        <span>{OP_TEXT.pending}</span>
+        {pendingOps.manual > 0 && (
+          <button
+            type="button"
+            className="btn-ghost calc-op-pending-btn"
+            onClick={() => void resumePendingOperation("manual")}
+            disabled={opResuming}
+          >
+            {opResuming ? "Проверяем…" : pendingOps.api > 0 ? "Проверить ручной расчёт" : "Проверить и завершить сохранение"}
+          </button>
+        )}
+        {pendingOps.api > 0 && (
+          <button
+            type="button"
+            className="btn-ghost calc-op-pending-btn"
+            onClick={() => void resumePendingOperation("api")}
+            disabled={opResuming}
+          >
+            {opResuming ? "Проверяем…" : pendingOps.manual > 0 ? "Проверить API-расчёт" : "Проверить и завершить сохранение"}
+          </button>
+        )}
+      </div>
+    ) : null;
 
   const calculate = async () => {
     if (isCalculating) return;
     // Аккаунт: списание и сохранение — одна операция на сервере (повтор безопасен).
     if (user?.id) {
-      await calculateManualSaved(user.id);
+      try {
+        await calculateManualSaved(user.id);
+      } finally {
+        refreshPendingOps(user.id);
+      }
       return;
     }
     // Аноним — как раньше: локальный счётчик попыток и локальный результат.
@@ -5343,6 +5491,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .calc-op-note.ok{color:var(--green);border-color:rgba(46,204,113,.28)}
 .calc-op-note.warn{color:#f0b429;border-color:rgba(240,180,41,.3)}
 .calc-op-note.err{color:var(--red);border-color:rgba(255,99,99,.3)}
+.calc-op-pending{margin:.9rem 0 0;display:flex;flex-wrap:wrap;align-items:center;gap:.6rem .9rem;
+  padding:.75rem .9rem;border-radius:10px;border:1px solid rgba(240,180,41,.3);background:rgba(240,180,41,.05);
+  font-family:var(--sans);font-size:.86rem;line-height:1.5;color:var(--txt2)}
+.calc-op-pending span{flex:1 1 260px}
+.calc-op-pending-btn{flex:0 0 auto}
 /* Нет доступа к API — пояснение над кнопкой «Оформить безлимит». */
 .api-need-unlimited .api-pro-msg{font-family:var(--sans);font-size:.88rem;line-height:1.5;
   letter-spacing:0;margin-bottom:.9rem}
@@ -9255,6 +9408,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   {opNote.text}
                 </p>
               )}
+              {pendingOpsNotice}
             </div>
 
             {isCalculating && (
@@ -9673,6 +9827,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     {opNote.text}
                   </p>
                 )}
+                {pendingOpsNotice}
 
                 {/* Не хватает себестоимости — структурированный блок с действиями.
                     Расчёт не сделан, попытка не списана. */}

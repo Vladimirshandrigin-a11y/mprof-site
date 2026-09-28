@@ -98,9 +98,15 @@ select
     and not has_function_privilege('anon', 'public.save_api_calculation_operation(uuid,uuid,text,jsonb,jsonb)', 'execute')
     and not has_function_privilege('anon', 'public.api_calculation_operation_status(uuid,uuid,text)', 'execute')
                                                                                 as api_fn_server_only_ok,
+  -- PUBLIC не получил EXECUTE ни на одну новую функцию (включая внутренние с явным user_id).
   not exists (
     select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
-     where p.oid in (to_regprocedure('public.save_manual_calculation_operation(uuid,text,jsonb)'),
+     where p.oid in (to_regprocedure('public.consume_calculation_for(uuid)'),
+                     to_regprocedure('public.consume_api_calculation_for(uuid)'),
+                     to_regprocedure('public.calculation_operation_saved(uuid)'),
+                     to_regprocedure('public.calculation_operation_execute(uuid,uuid,text,text,jsonb,jsonb)'),
+                     to_regprocedure('public.calculation_operation_lookup(uuid,uuid,text,text)'),
+                     to_regprocedure('public.save_manual_calculation_operation(uuid,text,jsonb)'),
                      to_regprocedure('public.save_api_calculation_operation(uuid,uuid,text,jsonb,jsonb)'),
                      to_regprocedure('public.api_calculation_operation_status(uuid,uuid,text)'))
        and a.grantee = 0 and a.privilege_type = 'EXECUTE')                      as functions_closed_for_public_ok,

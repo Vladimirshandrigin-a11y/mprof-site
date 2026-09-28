@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { SERVICE_KEY, SUPABASE_URL, installFetch, userJwt } from "./helpers/fetch-stub.mjs";
+import { SERVICE_KEY, SUPABASE_URL, gate, installFetch, userJwt } from "./helpers/fetch-stub.mjs";
 import { SCHEMA, buildRequire, payTestEnv, read, root, runScript } from "./helpers/pay-db.mjs";
 
 const OPS_MIGRATION = read("supabase/migrations/20260928_calculation_operations.sql");
@@ -320,6 +320,65 @@ describe("ручной расчёт: списание и запись — одн
     assert.deepEqual([fresh.status, fresh.body.data.replay, fresh.body.data.used], [200, false, 2], "новый расчёт — новая операция по правилам");
   });
 
+  it("точность: копейки и дробные суммы сохраняются и отдаются статусом точно; итог — ровно computeManualColumns; восстановленная форма даёт ту же операцию", async () => {
+    const u = await db.user();
+    const KOP = { marketplace: "ozon", revenue: 123456.78, commission: 18518.52, logistics: 7654.31, storage: 0.07, ads: 3210.99, cost: 45678.9, tax: 7407.41, other: 12.345 };
+    const out = await postManual(u, { inputs: KOP });
+    assert.equal(out.status, 200);
+    const st = await opStatus(u, out.operationId, KEYS.manualRequestHash(KOP));
+    const c = st.body.data.calculation;
+    assert.deepEqual(
+      [c.revenue, c.commission, c.logistics, c.storage, c.ads, c.cost, c.tax, c.other_expenses],
+      [KOP.revenue, KOP.commission, KOP.logistics, KOP.storage, KOP.ads, KOP.cost, KOP.tax, KOP.other]
+    );
+    const exp = KEYS.computeManualColumns(KOP);
+    assert.deepEqual([c.total_expenses, c.profit, c.margin], [exp.total_expenses, exp.profit, exp.margin]);
+    const [txt] = (await db.main.query("select revenue::text as r, storage::text as s, other_expenses::text as o from public.calculations where id = $1", [c.id])).rows;
+    assert.deepEqual([txt.r, txt.s, txt.o], ["123456.78", "0.07", "12.345"], "numeric хранит ввод без округления");
+    const form = KEYS.manualFormFromSaved({ revenue: c.revenue, commission: c.commission, logistics: c.logistics, storage: c.storage, ads: c.ads, cost: c.cost, tax: c.tax, other: c.other_expenses });
+    const back = { marketplace: c.marketplace };
+    for (const f of KEYS.MANUAL_INPUT_FIELDS) back[f] = KEYS.parseManualAmount(form[f]);
+    assert.deepEqual(back, KOP);
+    const replay = await postManual(u, { inputs: back, operationId: out.operationId });
+    assert.deepEqual([replay.status, replay.body.data.replay, replay.body.data.contentMatch], [200, true, true], "та же операция — без списания");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 0, ops: 1 });
+  });
+
+  it("поздний COMMIT: пока исходный запрос в полёте, статус «нет» (не доказательство отказа); после COMMIT статус done, повтор тем же ключом — сохранённая строка без списания", async () => {
+    const u = await db.user();
+    const operationId = randomUUID();
+    const rh = KEYS.manualRequestHash(MANUAL);
+    let seen = 0;
+    const g = gate((r) => r.path === "/rest/v1/rpc/save_manual_calculation_operation" && seen++ === 0);
+    state.gates.push(g);
+    const original = postManual(u, { operationId });
+    await g.reached; // запрос дошёл до сервера, SQL ещё не выполнен
+    for (let i = 0; i < 3; i++) assert.equal((await opStatus(u, operationId, rh)).body.data.status, "none");
+    assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+    g.open(); // поздний COMMIT — уже после «окна перепроверки»
+    assert.deepEqual([(await original).status], [200]);
+    assert.equal((await opStatus(u, operationId, rh)).body.data.status, "done");
+    const retry = await postManual(u, { operationId });
+    assert.deepEqual([retry.status, retry.body.data.replay], [200, true]);
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 0, ops: 1 });
+  });
+
+  it("повтор тем же ключом, пока исходный запрос ещё в полёте: выполняется один раз — исходный потом получает сохранённое; попытка последняя, списание одно", async () => {
+    const u = await db.user(); // одна (бесплатная) попытка
+    const operationId = randomUUID();
+    let seen = 0;
+    const g = gate((r) => r.path === "/rest/v1/rpc/save_manual_calculation_operation" && seen++ === 0);
+    state.gates.push(g);
+    const original = postManual(u, { operationId });
+    await g.reached;
+    const resend = await postManual(u, { operationId }); // «проверить и завершить сохранение»
+    assert.deepEqual([resend.status, resend.body.data.replay], [200, false]);
+    g.open();
+    const late = await original;
+    assert.deepEqual([late.status, late.body.data.replay, late.body.data.calculationId], [200, true, resend.body.data.calculationId]);
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 0, ops: 1 });
+  });
+
   it("некорректный ввод → 400 без обращения к БД", async () => {
     const u = await db.user();
     for (const inputs of [null, {}, { ...MANUAL, revenue: "100" }, { ...MANUAL, marketplace: "ya" }, { ...MANUAL, tax: Number.NaN }]) {
@@ -470,6 +529,30 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     assert.equal((await opRow(db, out.operationId)).calculation_id, null);
   });
 
+  it("поздний COMMIT API: пока запись в полёте — статус «нет»; после COMMIT повтор тем же ключом — сохранённый расчёт без Ozon и без списания, хотя права уже исчерпаны", async () => {
+    const u = await apiUser(db); // единственная бесплатная попытка
+    const operationId = randomUUID();
+    const rh = KEYS.apiRequestHash("2026-06", EXPENSES);
+    let seen = 0;
+    const g = gate((r) => r.path === "/rest/v1/rpc/save_api_calculation_operation" && seen++ === 0);
+    state.gates.push(g);
+    const original = postApi(u, { operationId });
+    await g.reached; // Ozon уже опрошен, запись ждёт
+    for (let i = 0; i < 3; i++) assert.equal((await opStatus(u, operationId, rh)).body.data.status, "none");
+    assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+    g.open();
+    assert.equal((await original).status, 200);
+    const ozonBefore = net.ozonCalls().length;
+    const fresh = await postApi(u); // новая операция — прав уже нет
+    assert.deepEqual([fresh.status, fresh.body.code], [402, "limit_reached"]);
+    const ozonMid = net.ozonCalls().length;
+    const retry = await postApi(u, { operationId });
+    assert.deepEqual([retry.status, retry.body.replay, retry.body.status], [200, true, "done"]);
+    assert.equal(net.ozonCalls().length, ozonMid, "повтор завершённой операции не обращается к Ozon");
+    assert.ok(ozonMid > ozonBefore, "новая операция к Ozon обращалась (до отказа)");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
+  });
+
   it("восстановление через статус пользователя: API-операция отдаёт сохранённую строку", async () => {
     const u = await apiUser(db);
     const out = await postApi(u);
@@ -488,25 +571,73 @@ describe("граница доверия: клиент не пишет API-рас
     state.pool = db.pool(6);
   });
 
-  it("функции API — только service_role: authenticated и anon не вызывают; внутренние функции закрыты для всех ролей", async () => {
-    const u = await db.user();
+  it("права: внутренние функции (явный user_id) не вызывает никто — PUBLIC, anon, authenticated, service_role; серверные API-функции — только service_role; отказ ничего не меняет", async () => {
+    const victim = await db.user();
+    const attacker = await db.user();
+    const victimOp = await postManual(victim);
+    assert.equal(victimOp.status, 200);
     const denied = (e) => e.code === "42501";
     const calc = JSON.stringify({ marketplace: "ozon", revenue: 1, commission: 0, logistics: 0, ads: 0, storage: 0, tax: 0, cost: 0, other_expenses: 0, total_expenses: 0, profit: 1, margin: 100, ai_insights: { kind: "ozon-api-v1" } });
     const hist = JSON.stringify({ report_month: "2026-06-01", revenue: 1, expenses: 0, profit: 1, margin: 100 });
-    await assert.rejects(asUser(db, u, "select public.save_api_calculation_operation($1, $2, 'x', $3::jsonb, $4::jsonb)", [u, randomUUID(), calc, hist]), denied);
-    await assert.rejects(asUser(db, u, "select public.api_calculation_operation_status($1, $2, 'x')", [u, randomUUID()]), denied);
-    for (const fn of [
-      "public.consume_calculation_for($1)",
-      "public.consume_api_calculation_for($1)",
-    ]) {
-      await assert.rejects(asUser(db, u, `select ${fn}`, [u]), denied, fn);
+    // Функции с явным пользователем — через них можно было бы списать или прочитать чужое.
+    const INTERNAL = [
+      ["public.consume_calculation_for($1)", [victim]],
+      ["public.consume_api_calculation_for($1)", [victim]],
+      ["public.calculation_operation_saved($1)", [victimOp.body.data.calculationId]],
+      ["public.calculation_operation_execute($1, $2, 'api', 'x', $3::jsonb, $4::jsonb)", [victim, randomUUID(), calc, hist]],
+      ["public.calculation_operation_lookup($1, $2, $3, null)", [victim, victimOp.operationId, KEYS.manualRequestHash(MANUAL)]],
+    ];
+    const SERVER = [
+      ["public.save_api_calculation_operation($1, $2, 'x', $3::jsonb, $4::jsonb)", [victim, randomUUID(), calc, hist]],
+      ["public.api_calculation_operation_status($1, $2, 'x')", [victim, victimOp.operationId]],
+    ];
+    const before = await dbState(db);
+
+    // PUBLIC: роль без собственных прав получает только выданное PUBLIC.
+    await db.main.query("do $$ begin if not exists (select 1 from pg_roles where rolname = 'mprof_public_probe') then create role mprof_public_probe nologin; end if; end $$");
+    const probe = await db.client("mprof_public_probe");
+    for (const [sql, args] of [...INTERNAL, ...SERVER, ["public.save_manual_calculation_operation($1, 'x', '{}'::jsonb)", [randomUUID()]]]) {
+      await assert.rejects(probe.query(`select ${sql}`, args), denied, `PUBLIC: ${sql}`);
     }
-    await assert.rejects(asUser(db, u, "select public.calculation_operation_execute($1, $2, 'api', 'x', $3::jsonb, $4::jsonb)", [u, randomUUID(), calc, hist]), denied);
+    const publicAcl = (await db.main.query(`
+      select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace,
+             aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+       where n.nspname = 'public' and a.grantee = 0 and a.privilege_type = 'EXECUTE'
+         and p.proname in ('consume_calculation_for', 'consume_api_calculation_for', 'calculation_operation_saved',
+                           'calculation_operation_execute', 'calculation_operation_lookup', 'save_manual_calculation_operation',
+                           'save_api_calculation_operation', 'api_calculation_operation_status')`)).rows;
+    assert.deepEqual(publicAcl, [], "EXECUTE для PUBLIC не выдан ни одной новой функции");
+
+    // anon и authenticated (атакующий пытается действовать за жертву).
     const anon = await db.client("anon");
-    await assert.rejects(anon.query("select public.save_manual_calculation_operation($1, 'x', '{}'::jsonb)", [randomUUID()]), denied);
+    for (const [sql, args] of [...INTERNAL, ...SERVER]) {
+      await assert.rejects(anon.query(`select ${sql}`, args), denied, `anon: ${sql}`);
+      await assert.rejects(asUser(db, attacker, `select ${sql}`, args), denied, `authenticated: ${sql}`);
+    }
+    // service_role: внутренние — нет (сервер не списывает мимо операции), серверные — да.
     const svc = await db.client("service_role");
-    await assert.rejects(svc.query("select public.consume_calculation_for($1)", [u]), denied, "и сервер не списывает мимо операции");
-    assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+    for (const [sql, args] of INTERNAL) await assert.rejects(svc.query(`select ${sql}`, args), denied, `service_role: ${sql}`);
+    const [{ r: svcStatus }] = (await svc.query("select public.api_calculation_operation_status($1, $2, 'x') as r", [victim, randomUUID()])).rows;
+    assert.equal(svcStatus.status, "none");
+    assert.equal(await dbState(db), before, "ни один отказ ничего не изменил");
+
+    // Пользовательские функции — без параметра пользователя: только auth.uid().
+    const params = (await db.main.query(`
+      select p.proname, coalesce(p.proargnames, '{}') as names from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'public' and p.proname in ('consume_calculation', 'consume_api_calculation', 'save_calculation_operation',
+             'save_manual_calculation_operation', 'calculation_operation_status') order by 1`)).rows;
+    assert.equal(params.length, 5);
+    for (const r of params) assert.ok(!r.names.includes("p_user_id"), r.proname);
+    const [{ r: own }] = await asUser(db, attacker, "select public.consume_calculation() as r");
+    assert.deepEqual([own.ok, own.used], [true, 1], "списано у вызывающего");
+    const [{ r: peek }] = await asUser(db, attacker, "select public.calculation_operation_status($1, $2) as r", [victimOp.operationId, KEYS.manualRequestHash(MANUAL)]);
+    assert.equal(peek.status, "none", "чужая операция не видна");
+    const [{ r: hijack }] = await asUser(db, attacker, "select public.save_manual_calculation_operation($1, $2, $3::jsonb) as r", [victimOp.operationId, KEYS.manualRequestHash(MANUAL), JSON.stringify(KEYS.computeManualColumns(MANUAL))]);
+    assert.equal(hijack.reason, "operation_conflict");
+    const [{ r: anonWrapper }] = (await anon.query("select public.consume_calculation() as r")).rows;
+    assert.equal(anonWrapper.reason, "not_authenticated");
+    assert.deepEqual(await facts(db, victim), { used: 1, calcs: 1, history: 0, ops: 1 }, "данные жертвы не изменились");
+    assert.deepEqual((await facts(db, attacker)).used, 1);
   });
 
   it("ручная операция не создаёт строку api: режим фиксирован, снимок не принимается", async () => {
