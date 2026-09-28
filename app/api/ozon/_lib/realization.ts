@@ -179,6 +179,8 @@ export type RealizationDiagnostic = {
      * вклад; отрицательное нетто не обрезается.
      */
     byNetQty: number;
+    /** Σ (saleQty + |returnQty|) по сопоставленным строкам с cost>0 — есть ли что оценивать. */
+    pricedQuantity: number;
     matchedRows: number;
     unmatchedRows: number;
     matchedNoCostRows: number;
@@ -450,6 +452,7 @@ export function buildRealizationDiagnostic(
       candidateCogs: {
         bySaleQty: 0,
         byNetQty: 0,
+        pricedQuantity: 0,
         matchedRows: 0,
         unmatchedRows: 0,
         matchedNoCostRows: 0,
@@ -501,6 +504,7 @@ export function buildRealizationDiagnostic(
   // Нетто-количество по товару (нормализованный артикул): округление — по товару,
   // как в XLSX (aggregateAccrualProducts), а не по строкам отчёта.
   const netByProduct = new Map<string, { quantity: number; cost: number }>();
+  let pricedQuantity = 0;
   let matchedRows = 0;
   let unmatchedRows = 0;
   let matchedNoCostRows = 0;
@@ -559,6 +563,7 @@ export function buildRealizationDiagnostic(
         matched = true;
         costPerUnit = round2(hit.cost);
         candBySaleQty += sQty * hit.cost;
+        pricedQuantity += sQty + Math.abs(rQty);
         // Возврат вычитается ровно один раз, независимо от знака в ответе Ozon.
         const net = netByProduct.get(offer);
         if (net) net.quantity += sQty - Math.abs(rQty);
@@ -649,6 +654,7 @@ export function buildRealizationDiagnostic(
     candidateCogs: {
       bySaleQty: round2(candBySaleQty),
       byNetQty: netCostKopecks / 100,
+      pricedQuantity: round2(pricedQuantity),
       matchedRows,
       unmatchedRows,
       matchedNoCostRows,

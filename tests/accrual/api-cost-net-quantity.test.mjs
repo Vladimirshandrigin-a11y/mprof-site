@@ -155,14 +155,18 @@ describe("себестоимость API = продано − возвращен
     assert.deepEqual([zeroPrice.api.ok, zeroPrice.api.code], [false, "no_cost"]);
     assert.equal(zeroPrice.xlsx.calc.readyToSave, false);
 
-    const onlyReturns = bothPaths([{ offer: "ART-A", sku: 111, returned: 2, returnedRub: 300 }], CATALOG);
-    assert.equal(onlyReturns.api.ok, false, "без продаж API-расчёт не выполняется");
-
     const noQty = RZ.buildRealizationDiagnostic(
       { ok: true, rows: [{ item: { offer_id: "ART-A", sku: 111 }, delivery_commission: { amount: 1500 }, return_commission: { amount: 0 } }], rawRowCount: 1 },
       CATALOG, 8, 2026
     );
     assert.deepEqual([PROFIT.resolveRealizationProductionCost(noQty).ok, PROFIT.resolveRealizationProductionCost(noQty).code], [false, "zero_cost"]);
+  });
+
+  it("месяц только с возвратами оценённого товара: себестоимость −цена × возвращено, проверка себестоимости его не блокирует; останавливает база налога ≤ 0 — в API и в XLSX одинаково", () => {
+    const { diag, api, xlsx } = bothPaths([{ offer: "ART-R", sku: 555, returned: 1, returnedRub: 2000 }], [{ sku: "ART-R", name: "r", cost_price: 1600 }]);
+    assert.deepEqual([diag.candidateCogs.byNetQty, diag.candidateCogs.bySaleQty, diag.candidateCogs.pricedQuantity], [-1600, 0, 1]);
+    assert.deepEqual([api.ok, api.code], [false, "no_tax_revenue"], "не zero_cost: себестоимость известна");
+    assert.deepEqual([xlsx.ok, xlsx.error.code], [false, "no_tax_revenue"]);
   });
 
   it("ответ расчёта и снимок помечают правило: costQuantityBasis — только у новых расчётов", () => {

@@ -366,12 +366,13 @@ export function computeApiProfit(
 //   • no_offer_id   — в строках нет offer_id → сопоставить с каталогом нельзя;
 //   • unmatched     — есть строки, не сопоставленные с каталогом;
 //   • no_cost       — есть сопоставленные строки без cost_price (0 ₽);
-//   • zero_cost     — bySaleQty ≤ 0: в отчёте нет проданных единиц с себестоимостью
-//                      (нет продаж или нет количеств) — оценивать нечего. Нетто
-//                      (byNetQty) при этом может быть ≤ 0 и НЕ блокирует расчёт;
-//   • no_tax_revenue — sums.taxRevenueBase ≤ 0 (выручку реализации для БАЗЫ НАЛОГА
-//                      получить нельзя: нет delivery/return amount) → налог считать
-//                      не от чего, боевой расчёт останавливается.
+//   • zero_cost     — pricedQuantity ≤ 0: в отчёте нет ни проданных, ни возвращённых
+//                      единиц (нет количеств) — оценивать нечего. Нетто-себестоимость
+//                      (byNetQty) может быть ≤ 0 и расчёт НЕ блокирует;
+//   • no_tax_revenue — sums.taxRevenueBase ≤ 0: выручка реализации за вычетом
+//                      возвратов не положительна (например, в месяце только возвраты)
+//                      или не определена → налог считать не от чего, боевой расчёт
+//                      останавливается (то же правило, что no_tax_revenue в XLSX).
 // unmatched/no_cost решаются пользователем в каталоге (заполнить себестоимость).
 // ---------------------------------------------------------------------------
 
@@ -406,7 +407,7 @@ export type RealizationCostResolution =
  * Провалидировать диагностику отчёта реализации и вернуть боевую себестоимость
  * (byNetQty: продано − возвращено, как в XLSX) + БАЗУ НАЛОГА (taxRevenueBase =
  * выручка за вычетом возвратов) ЛИБО причину, по которой их нельзя использовать.
- * ЧИСТАЯ функция. bySaleQty — только признак «есть что оценивать» (zero_cost).
+ * ЧИСТАЯ функция. pricedQuantity — признак «есть что оценивать» (zero_cost).
  */
 export function resolveRealizationProductionCost(
   rz: RealizationDiagnostic
@@ -434,7 +435,10 @@ export function resolveRealizationProductionCost(
   if (noCostRows > 0) {
     return { ok: false, code: "no_cost", unmatchedRows, noCostRows };
   }
-  if (!(rz.candidateCogs.bySaleQty > 0)) {
+  // Оценивать нечего: в отчёте нет ни проданных, ни возвращённых единиц (к этому
+  // месту все строки сопоставлены и с ценой). Месяц только с возвратами оцененных
+  // товаров НЕ блокируется здесь — его себестоимость отрицательная.
+  if (!(rz.candidateCogs.pricedQuantity > 0)) {
     return { ok: false, code: "zero_cost", unmatchedRows: 0, noCostRows: 0 };
   }
   const productionCost = rz.candidateCogs.byNetQty;
