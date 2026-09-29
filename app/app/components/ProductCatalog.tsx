@@ -63,9 +63,19 @@ interface Draft {
   sku: string;
   name: string;
   cost: string;
+  /** Сохранённая цена товара — ровно 0 (поле показано пустым; null сюда не относится). */
+  savedZeroCost: boolean;
+  /** Поле цены меняли вводом/стиранием; фокус и уход из поля правкой не считаются. */
+  costEdited: boolean;
 }
 
-const EMPTY_DRAFT: Draft = { sku: "", name: "", cost: "" };
+const EMPTY_DRAFT: Draft = {
+  sku: "",
+  name: "",
+  cost: "",
+  savedZeroCost: false,
+  costEdited: false,
+};
 
 /** Итог массового импорта — показывается отдельной панелью после загрузки файла. */
 interface ImportResult {
@@ -193,6 +203,8 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
       sku: p.sku ?? "",
       name: p.name ?? "",
       cost: costFieldText(p.cost_price),
+      savedZeroCost: p.cost_price === 0,
+      costEdited: false,
     });
     setDeletingId(null);
     setFormOpen(true);
@@ -208,7 +220,11 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
     e.preventDefault();
     const name = draft.name.trim();
     const sku = draft.sku.trim();
-    const cost = parseCost(draft.cost);
+    // Сохранённый 0 показан пустым полем: если цену не правили — остаётся исходный 0.
+    const cost =
+      editingId && draft.savedZeroCost && !draft.costEdited
+        ? 0
+        : parseCost(draft.cost);
     if (!name) {
       showToast("Введите название товара", "warn");
       return;
@@ -963,7 +979,7 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
                 value={draft.cost}
                 inputMode="decimal"
                 onChange={(e) =>
-                  setDraft((d) => ({ ...d, cost: e.target.value }))
+                  setDraft((d) => ({ ...d, cost: e.target.value, costEdited: true }))
                 }
                 placeholder={editingId ? "Цена" : "0"}
                 autoComplete="off"
