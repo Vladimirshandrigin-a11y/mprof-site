@@ -29,6 +29,7 @@ import {
   type ChangeEvent,
   type FormEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import type { User } from "@supabase/supabase-js";
 import {
   loadProductsFromCloud,
@@ -51,6 +52,11 @@ interface Props {
 /** Текущее правило валидности себестоимости: конечное число > 0 (0 = «не указана»). */
 export function hasValidCost(costPrice: number | null | undefined): boolean {
   return typeof costPrice === "number" && Number.isFinite(costPrice) && costPrice > 0;
+}
+
+/** Текст поля себестоимости в строке до правки: неуказанная (0/null) — пустое поле с placeholder. */
+function costFieldText(costPrice: number | null | undefined): string {
+  return hasValidCost(costPrice) ? String(costPrice) : "";
 }
 
 interface Draft {
@@ -109,9 +115,14 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
   const [saving, setSaving] = useState(false);
 
-  // Подтверждение удаления — прямо в строке.
+  // Подтверждение удаления — модальное окно для выбранного товара.
+  // deleteTriggerRef — кнопка, открывшая окно: после закрытия фокус
+  // возвращается на неё, если строка ещё на странице.
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const deleteTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement | null>(null);
+  const deleteConfirmRef = useRef<HTMLButtonElement | null>(null);
 
   // Массовый импорт из Excel.
   const [importing, setImporting] = useState(false);
@@ -236,7 +247,19 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
     reload();
   }
 
+  function openDeleteDialog(id: string, trigger: HTMLButtonElement) {
+    deleteTriggerRef.current = trigger;
+    setDeletingId(id);
+  }
+
+  // Отмена / Escape / клик по фону. Пока запрос удаления идёт — не закрываем.
+  const closeDeleteDialog = useCallback(() => {
+    if (busyId) return;
+    setDeletingId(null);
+  }, [busyId]);
+
   async function confirmDelete(id: string) {
+    if (busyId) return; // повторное нажатие во время запроса
     setBusyId(id);
     const { error } = await deleteProductFromCloud(id, user.id);
     setBusyId(null);
@@ -248,6 +271,43 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
     showToast("Товар удалён", "ok");
     setProducts((prev) => prev.filter((p) => p.id !== id));
   }
+
+  // Окно открыто → фокус на «Отмена»; закрыто → фокус обратно на кнопку
+  // удаления, если её строка ещё существует (после удаления её уже нет).
+  useEffect(() => {
+    if (deletingId) {
+      deleteCancelRef.current?.focus();
+      return;
+    }
+    const trigger = deleteTriggerRef.current;
+    deleteTriggerRef.current = null;
+    if (trigger?.isConnected) trigger.focus();
+  }, [deletingId]);
+
+  // Escape закрывает окно как «Отмена»; Tab не выводит фокус за пределы окна.
+  useEffect(() => {
+    if (!deletingId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeDeleteDialog();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      e.preventDefault();
+      const items = [deleteCancelRef.current, deleteConfirmRef.current].filter(
+        (el): el is HTMLButtonElement => !!el && !el.disabled
+      );
+      if (items.length === 0) return;
+      const i = items.indexOf(document.activeElement as HTMLButtonElement);
+      const next = e.shiftKey
+        ? items[(i <= 0 ? items.length : i) - 1]
+        : items[(i + 1) % items.length];
+      next.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [deletingId, closeDeleteDialog]);
 
   // --- Inline-редактирование себестоимости в строке -----------------------
   // Меняем черновик строки и сбрасываем её ошибку (если была).
@@ -267,7 +327,7 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
   // точечно, без reload; сортировка не меняется (cost не входит в ключ).
   async function saveCost(p: Product) {
     if (costSavingId === p.id) return; // защита от двойного клика
-    const raw = costDraft[p.id] ?? String(p.cost_price ?? "");
+    const raw = costDraft[p.id] ?? costFieldText(p.cost_price);
     const parsed = parseCost(raw); // запятая → точка внутри parseCost
     // Требование: принимать только число строго больше 0.
     if (parsed === null || parsed <= 0) {
@@ -782,6 +842,11 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
     }
   }
 
+  // Товар, для которого открыто окно удаления (исчез из списка — окна нет).
+  const deleteTarget = deletingId
+    ? products.find((p) => p.id === deletingId) ?? null
+    : null;
+
   return (
     <section className="pc">
       <div className="pc-head">
@@ -1219,10 +1284,10 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
                           className={`pc-cost-input${
                             costErr[p.id] ? " has-err" : ""
                           }`}
-                          value={costDraft[p.id] ?? String(p.cost_price ?? "")}
+                          value={costDraft[p.id] ?? costFieldText(p.cost_price)}
                           inputMode="decimal"
                           aria-label="Себестоимость за 1 шт."
-                          placeholder="Например, 120"
+                          placeholder="Цена"
                           disabled={costSavingId === p.id}
                           onChange={(e) =>
                             onCostDraftChange(p.id, e.target.value)
@@ -1256,56 +1321,33 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
                     )}
                   </span>
                   <span className="pc-cell pc-c-act" role="cell">
-                    {deletingId === p.id ? (
-                      <span className="pc-confirm">
-                        <span className="pc-confirm-q">Удалить?</span>
-                        <button
-                          type="button"
-                          className="pc-mini pc-mini-yes"
-                          disabled={busyId === p.id}
-                          onClick={() => confirmDelete(p.id)}
-                        >
-                          {busyId === p.id ? "…" : "Да"}
-                        </button>
-                        <button
-                          type="button"
-                          className="pc-mini"
-                          disabled={busyId === p.id}
-                          onClick={() => setDeletingId(null)}
-                        >
-                          Нет
-                        </button>
-                      </span>
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          className="pc-icon"
-                          title="Редактировать"
-                          aria-label="Редактировать"
-                          onClick={() => openEdit(p)}
-                        >
-                          <svg viewBox="0 0 24 24" aria-hidden="true">
-                            <path d="M12 20h9" />
-                            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
-                          </svg>
-                        </button>
-                        <button
-                          type="button"
-                          className="pc-icon pc-icon-del"
-                          title="Удалить"
-                          aria-label="Удалить"
-                          onClick={() => setDeletingId(p.id)}
-                        >
-                          <svg viewBox="0 0 24 24" aria-hidden="true">
-                            <path d="M3 6h18" />
-                            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                            <path d="M10 11v6M14 11v6" />
-                          </svg>
-                        </button>
-                      </>
-                    )}
+                    <button
+                      type="button"
+                      className="pc-icon"
+                      title="Редактировать"
+                      aria-label="Редактировать"
+                      onClick={() => openEdit(p)}
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 20h9" />
+                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      className="pc-icon pc-icon-del"
+                      title="Удалить"
+                      aria-label="Удалить"
+                      aria-haspopup="dialog"
+                      onClick={(e) => openDeleteDialog(p.id, e.currentTarget)}
+                    >
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M3 6h18" />
+                        <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                        <path d="M10 11v6M14 11v6" />
+                      </svg>
+                    </button>
                   </span>
                 </div>
                 );
@@ -1315,6 +1357,55 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
           )}
         </>
       )}
+
+      {/* Подтверждение удаления. Портал в body: у .pc есть backdrop-filter,
+          внутри него position:fixed считался бы от карточки, а не от экрана. */}
+      {deleteTarget &&
+        createPortal(
+          <div className="pc-dlg-overlay" onClick={closeDeleteDialog}>
+            <div
+              className="pc-dlg"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="pc-dlg-title"
+              aria-describedby="pc-dlg-item"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 id="pc-dlg-title" className="pc-dlg-title">
+                Удалить товар?
+              </h3>
+              <div id="pc-dlg-item" className="pc-dlg-item">
+                {deleteTarget.name && (
+                  <span className="pc-dlg-name">{deleteTarget.name}</span>
+                )}
+                {deleteTarget.sku && (
+                  <span className="pc-dlg-sku">Артикул: {deleteTarget.sku}</span>
+                )}
+              </div>
+              <div className="pc-dlg-actions">
+                <button
+                  ref={deleteCancelRef}
+                  type="button"
+                  className="pc-dlg-btn pc-dlg-cancel"
+                  disabled={busyId !== null}
+                  onClick={closeDeleteDialog}
+                >
+                  Отмена
+                </button>
+                <button
+                  ref={deleteConfirmRef}
+                  type="button"
+                  className="pc-dlg-btn pc-dlg-del"
+                  disabled={busyId !== null}
+                  onClick={() => confirmDelete(deleteTarget.id)}
+                >
+                  {busyId === deleteTarget.id ? "Удаление…" : "Удалить"}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
 
       <style jsx>{`
         .pc {
@@ -1908,41 +1999,150 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
           background: rgba(224, 85, 102, 0.1);
         }
 
-        .pc-confirm {
-          display: inline-flex;
+        /* Окно подтверждения удаления — в стиле окна «За этот месяц уже есть расчёт». */
+        .pc-dlg-overlay {
+          position: fixed;
+          inset: 0;
+          z-index: 1100;
+          background: rgba(4, 6, 14, 0.78);
+          backdrop-filter: blur(12px);
+          -webkit-backdrop-filter: blur(12px);
+          display: flex;
           align-items: center;
-          gap: 7px;
+          justify-content: center;
+          padding: 1.5rem;
+          overflow-y: auto;
+          overscroll-behavior: contain;
+          animation: pcDlgFade 0.24s ease both;
+          font-family: "Outfit", sans-serif;
+          color: #e8eef8;
         }
-        .pc-confirm-q {
-          font-size: 0.8rem;
-          color: var(--txt2);
+        @keyframes pcDlgFade {
+          from {
+            opacity: 0;
+          }
+          to {
+            opacity: 1;
+          }
         }
-        .pc-mini {
-          min-height: 32px;
-          padding: 0 12px;
-          border-radius: 8px;
-          border: 1px solid var(--edge2);
-          background: rgba(255, 255, 255, 0.03);
-          color: var(--txt2);
-          font-size: 0.8rem;
+        .pc-dlg {
+          position: relative;
+          width: 100%;
+          max-width: 420px;
+          margin: auto;
+          background: linear-gradient(
+            160deg,
+            rgba(201, 168, 76, 0.1) 0%,
+            rgba(13, 16, 32, 0.96) 70%
+          );
+          border: 1px solid rgba(201, 168, 76, 0.32);
+          border-radius: 20px;
+          padding: 1.9rem 1.8rem 1.6rem;
+          box-shadow: 0 32px 90px rgba(0, 0, 0, 0.6),
+            0 0 90px rgba(201, 168, 76, 0.14);
+          animation: pcDlgSlide 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+        @keyframes pcDlgSlide {
+          from {
+            opacity: 0;
+            transform: translateY(12px) scale(0.97);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0) scale(1);
+          }
+        }
+        .pc-dlg-title {
+          font-family: "Playfair Display", Georgia, serif;
+          font-size: 1.35rem;
           font-weight: 700;
+          color: #e8eef8;
+          line-height: 1.22;
+          margin: 0 0 1rem;
+        }
+        .pc-dlg-item {
+          display: flex;
+          flex-direction: column;
+          gap: 0.3rem;
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          border-radius: 13px;
+          background: rgba(255, 255, 255, 0.03);
+          padding: 0.8rem 1rem;
+          margin-bottom: 1.4rem;
+        }
+        .pc-dlg-name {
+          font-size: 0.95rem;
+          font-weight: 500;
+          color: #e8eef8;
+          line-height: 1.4;
+          overflow-wrap: anywhere;
+        }
+        .pc-dlg-sku {
+          font-size: 0.82rem;
+          color: #8a9fbb;
+          overflow-wrap: anywhere;
+        }
+        .pc-dlg-actions {
+          display: flex;
+          gap: 0.7rem;
+        }
+        .pc-dlg-btn {
+          flex: 1;
+          min-width: 0;
+          min-height: 44px;
+          padding: 0 16px;
+          border-radius: 11px;
+          font-family: inherit;
+          font-size: 0.9rem;
+          font-weight: 600;
+          white-space: nowrap;
           cursor: pointer;
-          transition: all 0.16s ease;
+          transition: background 0.16s ease, color 0.16s ease,
+            border-color 0.16s ease;
         }
-        .pc-mini:hover:not(:disabled) {
-          color: var(--txt);
+        .pc-dlg-cancel {
+          background: rgba(255, 255, 255, 0.04);
+          color: #e8eef8;
+          border: 1px solid rgba(255, 255, 255, 0.14);
         }
-        .pc-mini-yes {
+        .pc-dlg-cancel:hover:not(:disabled) {
+          border-color: var(--gold);
+          color: var(--gold2);
+          background: rgba(201, 168, 76, 0.08);
+        }
+        .pc-dlg-del {
           color: #fff;
-          border-color: rgba(224, 85, 102, 0.5);
+          border: 1px solid rgba(224, 85, 102, 0.5);
           background: rgba(224, 85, 102, 0.85);
         }
-        .pc-mini-yes:hover:not(:disabled) {
+        .pc-dlg-del:hover:not(:disabled) {
           background: var(--red);
         }
-        .pc-mini:disabled {
+        .pc-dlg-btn:disabled {
           opacity: 0.6;
           cursor: default;
+        }
+        .pc-dlg-btn:focus-visible {
+          outline: 2px solid var(--gold2);
+          outline-offset: 2px;
+        }
+        @media (max-width: 640px) {
+          .pc-dlg-overlay {
+            padding: 16px;
+          }
+          .pc-dlg {
+            padding: 1.5rem 1.2rem 1.2rem;
+            border-radius: 16px;
+          }
+          .pc-dlg-title {
+            font-size: 1.2rem;
+          }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .pc-dlg-overlay,
+          .pc-dlg {
+            animation: none;
+          }
         }
 
         .pc-state {
@@ -2332,7 +2532,6 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
             width: 44px;
             height: 44px;
           }
-          .pc-mini,
           .pc-cost-save {
             min-height: 44px;
           }
