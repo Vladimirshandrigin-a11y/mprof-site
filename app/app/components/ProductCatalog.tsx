@@ -54,7 +54,7 @@ export function hasValidCost(costPrice: number | null | undefined): boolean {
   return typeof costPrice === "number" && Number.isFinite(costPrice) && costPrice > 0;
 }
 
-/** Текст поля себестоимости в строке до правки: неуказанная (0/null) — пустое поле с placeholder. */
+/** Начальный текст поля себестоимости (строка каталога, форма «Редактировать»): неуказанная (0/null) — пустое поле с placeholder. */
 function costFieldText(costPrice: number | null | undefined): string {
   return hasValidCost(costPrice) ? String(costPrice) : "";
 }
@@ -192,7 +192,7 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
     setDraft({
       sku: p.sku ?? "",
       name: p.name ?? "",
-      cost: p.cost_price != null ? String(p.cost_price) : "",
+      cost: costFieldText(p.cost_price),
     });
     setDeletingId(null);
     setFormOpen(true);
@@ -965,7 +965,7 @@ export function ProductCatalog({ user, showToast, refreshKey = 0 }: Props) {
                 onChange={(e) =>
                   setDraft((d) => ({ ...d, cost: e.target.value }))
                 }
-                placeholder="0"
+                placeholder={editingId ? "Цена" : "0"}
                 autoComplete="off"
               />
             </label>
