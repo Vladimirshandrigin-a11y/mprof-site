@@ -50,6 +50,7 @@ const SOURCES = [
   "app/app/lib/api-access.ts",
   "app/app/lib/single-flight.ts",
   "app/components/payment-create-result.ts",
+  "app/app/lib/payment-return.ts",
   "app/app/lib/calc-operation-keys.ts",
   "app/app/lib/calc-operation-notes.ts",
   "app/app/lib/api-cost-gap.ts",

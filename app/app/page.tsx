@@ -24,6 +24,8 @@ import {
 } from "./components/OzonProductBreakdown"
 import { TariffModal, type TariffContext, type TariffTier } from "../components/TariffModal"
 import { useEntitlements } from "./lib/entitlements"
+import { usePaymentReturn } from "./lib/usePaymentReturn"
+import { PaymentReturnNotice } from "./components/PaymentReturnNotice"
 import { accessStatus } from "./lib/access-status"
 import { apiCalcAccess } from "./lib/api-access"
 import {
@@ -5121,6 +5123,22 @@ export default function AppPage() {
     checking: entitlementsChecking,
     checkFailed: entitlementsCheckFailed,
   });
+  // Возврат из ЮKassa (/app?payment=return): перечитываем права тем же recheck и
+  // сообщаем об оплате только по подтверждённому росту доступа.
+  const paymentReturn = usePaymentReturn({
+    userId: user?.id ?? null,
+    authResolved: !authLoading,
+    tariffModalOpen,
+    entitlements: {
+      loaded: entitlementsLoaded,
+      checking: entitlementsChecking,
+      checkFailed: entitlementsCheckFailed,
+      hasPremium,
+      premiumUntil,
+      singleCredits,
+      recheck: recheckEntitlements,
+    },
+  });
 
   // Прежний документальный расчёт (реализация + УПД), восстановленный из истории.
   const legacyDocView = combinedStatus === "success" && !!combinedResult;
@@ -5518,6 +5536,22 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
   font-family:var(--sans);font-size:.86rem;line-height:1.5;color:var(--txt2)}
 .calc-op-pending span{flex:1 1 260px}
 .calc-op-pending-btn{flex:0 0 auto}
+/* Статус оплаты после возврата из ЮKassa (PaymentReturnNotice). */
+.pay-return{margin:0 0 1rem;display:flex;flex-wrap:wrap;align-items:center;gap:.6rem .9rem;
+  padding:.75rem .9rem;border-radius:10px;border:1px solid var(--edge2);background:rgba(255,255,255,.03);
+  font-family:var(--sans);font-size:.88rem;line-height:1.5;color:var(--txt2)}
+.pay-return-ok{border-color:rgba(46,204,138,.32);background:rgba(46,204,138,.06);color:var(--txt)}
+.pay-return-warn{border-color:rgba(240,180,41,.3);background:rgba(240,180,41,.05)}
+.pay-return-text{flex:1 1 240px}
+.pay-return-detail{display:block;margin-top:.15rem;color:var(--txt2)}
+.pay-return-btn{flex:0 0 auto;min-height:40px}
+.pay-return-close{flex:0 0 auto;width:40px;height:40px;border:0;background:none;color:var(--txt2);
+  font-size:1.3rem;line-height:1;cursor:pointer;border-radius:8px}
+.pay-return-close:hover{color:var(--txt)}
+.pay-return-spin{flex:0 0 auto;width:16px;height:16px;border-radius:50%;border:2px solid var(--edge2);
+  border-top-color:var(--gold);animation:payReturnSpin .8s linear infinite}
+@keyframes payReturnSpin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion: reduce){.pay-return-spin{animation:none}}
 /* Нет доступа к API — пояснение над кнопкой «Оформить безлимит». */
 .api-need-unlimited .api-pro-msg{font-family:var(--sans);font-size:.88rem;line-height:1.5;
   letter-spacing:0;margin-bottom:.9rem}
@@ -8530,6 +8564,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             <span>Проверяем сессию…</span>
           </div>
         )}
+        <PaymentReturnNotice
+          status={paymentReturn.status}
+          growth={paymentReturn.growth}
+          premiumUntilText={hasPremium ? formatRuDate(premiumUntil) : ""}
+          onRetry={paymentReturn.retry}
+          onDismiss={paymentReturn.dismiss}
+        />
         {!authLoading && !user && (
           <div className="card auth-card">
             <h3 className="auth-title">Вход в аккаунт</h3>
