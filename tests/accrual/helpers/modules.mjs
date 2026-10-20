@@ -81,3 +81,8 @@ export async function quietly(fn) {
     console.error = err;
   }
 }
+
+// Базовое SEO (rootDir app → build/seo.js и т. д.).
+export const seo = req("./seo.js");
+export const seoRobots = req("./robots.js");
+export const seoSitemap = req("./sitemap.js");

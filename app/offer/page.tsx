@@ -1,11 +1,13 @@
 import type { Metadata } from "next";
 import { LegalPage } from "../components/LegalPage";
+import { pageMetadata } from "../seo";
 
-export const metadata: Metadata = {
+export const metadata: Metadata = pageMetadata({
+  path: "/offer",
   title: "Публичная оферта — M-Prof",
   description:
     "Публичная оферта на оказание услуг сервиса M-Prof: тарифы, порядок оплаты и предоставления доступа.",
-};
+});
 
 export default function OfferPage() {
   return (
