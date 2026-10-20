@@ -53,6 +53,7 @@ export const profitLib = req("./api/ozon/_lib/profit.js");
 export const authLib = req("./api/cloud/_lib/auth.js");
 export const cryptoLib = req("./api/ozon/_lib/crypto.js");
 export const importRoute = req("./api/cloud/products/import-missing/route.js");
+export const ozonReportRoute = req("./api/ozon/report/route.js");
 export const saveCalcRoute = req("./api/ozon/save-calculation/route.js");
 export const realizationLib = req("./api/ozon/_lib/realization.js");
 export const product = req("./app/lib/product-breakdown-calc.js");

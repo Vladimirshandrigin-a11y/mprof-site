@@ -55,6 +55,7 @@ const SOURCES = [
   "app/app/lib/supabase-cloud.ts",
   // Серверные модули (автодобавление товаров в каталог; загрузчик и маршруты — на моках).
   "app/api/cloud/_lib/catalog-import.ts",
+  "app/api/ozon/report/route.ts",
   "app/api/cloud/products/import-missing/route.ts",
   "app/api/ozon/_lib/realization-catalog-sync.ts",
   "app/api/ozon/_lib/profit.ts",
