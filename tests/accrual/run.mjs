@@ -59,6 +59,10 @@ const SOURCES = [
   "app/api/ozon/_lib/realization-catalog-sync.ts",
   "app/api/ozon/_lib/profit.ts",
   "app/api/ozon/save-calculation/route.ts",
+  // Базовое SEO: robots.txt, sitemap.xml и metadata страниц.
+  "app/seo.ts",
+  "app/robots.ts",
+  "app/sitemap.ts",
 ];
 
 rmSync(buildDir, { recursive: true, force: true });

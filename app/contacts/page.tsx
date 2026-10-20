@@ -1,11 +1,13 @@
 import type { Metadata } from "next";
 import { LegalPage } from "../components/LegalPage";
+import { pageMetadata } from "../seo";
 
-export const metadata: Metadata = {
+export const metadata: Metadata = pageMetadata({
+  path: "/contacts",
   title: "Контакты — M-Prof",
   description:
     "Контактные данные сервиса M-Prof: реквизиты, email и телефон для связи.",
-};
+});
 
 export default function ContactsPage() {
   return (
