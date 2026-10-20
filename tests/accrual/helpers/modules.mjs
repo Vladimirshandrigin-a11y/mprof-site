@@ -30,6 +30,7 @@ export const money = req("./app/lib/accrual/money.js");
 export const buckets = req("./app/lib/accrual/buckets.js");
 export const analytics = req("./app/lib/accrual/product-analytics.js");
 export const snapshot = req("./app/lib/accrual/snapshot.js");
+export const legacyUpd = req("./app/lib/legacy-upd-display.js");
 export const pdfModel = req("./app/lib/accrual/pdf-model.js");
 export const format = req("./app/lib/accrual/format.js");
 export const columns = req("./app/lib/accrual/columns.js");

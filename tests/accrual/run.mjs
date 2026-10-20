@@ -39,6 +39,7 @@ const SOURCES = [
   "app/app/lib/accrual/money.ts",
   "app/app/lib/accrual/format.ts",
   "app/app/lib/accrual/snapshot.ts",
+  "app/app/lib/legacy-upd-display.ts",
   "app/app/lib/accrual/pdf-model.ts",
   "app/app/lib/accrual/columns.ts",
   "app/app/lib/accrual/upload-session.ts",
