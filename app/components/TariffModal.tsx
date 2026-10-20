@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase } from "../app/lib/supabase-cloud";
+import { PAY_MSG, paymentCreateOutcome } from "./payment-create-result";
 
 export type TariffTier = "single" | "unlimited";
 /** Откуда открыто окно. "api" — расчёт через Ozon API: предлагаем только безлимит. */
@@ -62,11 +63,26 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
   // Реальная оплата через POST /api/payment/create → redirect в ЮKassa.
   const [loadingPlan, setLoadingPlan] = useState<TariffTier | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Запрос создания платежа уже идёт (или идёт переход в ЮKassa): второй не
+  // отправляем — ни повторным кликом, ни после закрытия и открытия окна.
+  const payInFlight = useRef(false);
 
-  // Сбрасываем платёжное состояние при каждом открытии модалки
+  // «Назад» со страницы ЮKassa может вернуть страницу из bfcache в состоянии
+  // перехода — снимаем его, чтобы оплату можно было начать снова.
+  useEffect(() => {
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!e.persisted) return;
+      payInFlight.current = false;
+      setLoadingPlan(null);
+    };
+    window.addEventListener("pageshow", onPageShow);
+    return () => window.removeEventListener("pageshow", onPageShow);
+  }, []);
+
+  // Сбрасываем платёжное состояние при каждом открытии модалки (кроме идущего запроса)
   useEffect(() => {
     if (open) {
-      setLoadingPlan(null);
+      if (!payInFlight.current) setLoadingPlan(null);
       setError(null);
     }
   }, [open, tier, context]);
@@ -113,20 +129,34 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
   // на сервере (PLAN_PRICING); сюда приходит только confirmationUrl. Какой
   // тариф оплачивать — приходит из нажатой кнопки (payPlan).
   const handlePay = async (payPlan: TariffTier) => {
+    if (payInFlight.current) return;
+    payInFlight.current = true;
     setError(null);
     setLoadingPlan(payPlan);
+    const fail = (message: string) => {
+      payInFlight.current = false;
+      setError(message);
+      setLoadingPlan(null);
+    };
+
+    let token: string | undefined;
     try {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const token = session?.access_token;
-      if (!token) {
-        setError("Войдите в аккаунт, чтобы оформить тариф.");
-        setLoadingPlan(null);
-        return;
-      }
+      token = session?.access_token;
+    } catch {
+      fail(PAY_MSG.failed);
+      return;
+    }
+    if (!token) {
+      fail(PAY_MSG.noSession);
+      return;
+    }
 
-      const res = await fetch("/api/payment/create", {
+    let res: Response;
+    try {
+      res = await fetch("/api/payment/create", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -134,25 +164,19 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
         },
         body: JSON.stringify({ plan: payPlan }),
       });
-      const result = (await res.json().catch(() => null)) as {
-        ok?: boolean;
-        confirmationUrl?: string;
-        error?: string;
-      } | null;
-
-      if (result?.ok && result.confirmationUrl) {
-        // Уходим на страницу оплаты ЮKassa — loadingPlan не снимаем.
-        window.location.href = result.confirmationUrl;
-        return;
-      }
-
-      // ЮKassa не настроена / любая иная ошибка — честное сообщение в модалке.
-      setError("Оплата пока не настроена. Попробуйте позже.");
-      setLoadingPlan(null);
     } catch {
-      setError("Оплата пока не настроена. Попробуйте позже.");
-      setLoadingPlan(null);
+      // Запрос не дошёл до сервера (нет сети, обрыв соединения).
+      fail(PAY_MSG.network);
+      return;
     }
+    const body: unknown = await res.json().catch(() => null);
+    const outcome = paymentCreateOutcome(res.status, body);
+    if ("redirect" in outcome) {
+      // Уходим на страницу оплаты ЮKassa — loadingPlan и защиту от повтора не снимаем.
+      window.location.href = outcome.redirect;
+      return;
+    }
+    fail(outcome.message);
   };
 
   return (
