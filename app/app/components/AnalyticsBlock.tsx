@@ -2581,6 +2581,46 @@ function buildBookPagesFromAiDoc(
   }));
 }
 
+/** Saved expense columns, before preparing the AI request. */
+interface AiExpenseRecord {
+  commission: number;
+  logistics: number;
+  aiInsights?: unknown;
+}
+
+interface AiExpenseCategories {
+  commission: number;
+  logistics: number;
+  updServices: number;
+  updAgentFee: number;
+}
+
+/**
+ * Legacy document calculations store UPD services in commission and the agent
+ * fee in logistics. Classify those amounts for AI only, across the full selected
+ * history. Never infer a split inside UPD services or recalculate profit.
+ */
+function aggregateAiExpenseCategories(history: readonly AiExpenseRecord[]) {
+  return history.reduce<AiExpenseCategories>(
+    (totals, row) => {
+      const commission = Number(row.commission) || 0;
+      const logistics = Number(row.logistics) || 0;
+      const insights = row.aiInsights;
+      const legacyUpd = !!insights && typeof insights === "object" &&
+        (insights as Record<string, unknown>).kind === "net-profit-3file";
+      if (legacyUpd) {
+        totals.updServices += commission;
+        totals.updAgentFee += logistics;
+      } else {
+        totals.commission += commission;
+        totals.logistics += logistics;
+      }
+      return totals;
+    },
+    { commission: 0, logistics: 0, updServices: 0, updAgentFee: 0 }
+  );
+}
+
 export function AnalyticsBlock({
   realHistory,
   chartHistory,
@@ -2625,6 +2665,7 @@ export function AnalyticsBlock({
 
   const aiPayloadSig = (() => {
     if (history.length === 0) return "";
+    const aiExpenses = aggregateAiExpenseCategories(history);
     const sum = (sel: (h: AnalyticsCalc) => number) =>
       history.reduce((a, h) => a + (Number(sel(h)) || 0), 0);
     const revenue = sum((h) => h.revenue);
@@ -2725,8 +2766,12 @@ export function AnalyticsBlock({
       revenue: Math.round(revenue),
       profit: Math.round(profit),
       margin: Number(margin.toFixed(2)),
+      // Preserve the existing aggregate input contract. The AI route separates
+      // the explicit UPD portions once, before naming categories for the model.
       commission: Math.round(sum((h) => h.commission)),
       logistics: Math.round(sum((h) => h.logistics)),
+      ...(aiExpenses.updServices !== 0 ? { updServices: Math.round(aiExpenses.updServices) } : {}),
+      ...(aiExpenses.updAgentFee !== 0 ? { updAgentFee: Math.round(aiExpenses.updAgentFee) } : {}),
       ads: Math.round(sum((h) => h.ads)),
       storage: Math.round(sum((h) => h.storage)),
       cost: Math.round(sum((h) => h.cost)),

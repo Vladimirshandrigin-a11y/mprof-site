@@ -81,6 +81,9 @@ type AnalyzeInput = {
   margin?: number;
   commission?: number;
   logistics?: number;
+  /** Optional AI categories for historical realization + UPD calculations. */
+  updServices?: number;
+  updAgentFee?: number;
   ads?: number;
   storage?: number;
   cost?: number;
@@ -100,6 +103,8 @@ type SanitizedData = {
   margin: number;
   commission: number;
   logistics: number;
+  updServices: number;
+  updAgentFee: number;
   ads: number;
   storage: number;
   cost: number;
@@ -166,6 +171,11 @@ function stripCodeFences(s: string): string {
 
 /** Принимаем ТОЛЬКО нужные бизнес-метрики; ничего лишнего в модель не уходит. */
 function sanitize(input: AnalyzeInput): SanitizedData {
+  // Optional portions of the original saved-column aggregates, not additional
+  // expenses. Partition after the existing whole-ruble rounding so the model's
+  // category total stays identical, including fractional and signed amounts.
+  const updServices = Math.round(num(input.updServices));
+  const updAgentFee = Math.round(num(input.updAgentFee));
   const products: ProductRow[] = Array.isArray(input.products)
     ? input.products
         .slice(0, 12)
@@ -193,8 +203,10 @@ function sanitize(input: AnalyzeInput): SanitizedData {
     revenue: Math.round(num(input.revenue)),
     profit: Math.round(num(input.profit)),
     margin: Math.round(num(input.margin) * 10) / 10,
-    commission: Math.round(num(input.commission)),
-    logistics: Math.round(num(input.logistics)),
+    commission: Math.round(num(input.commission)) - updServices,
+    logistics: Math.round(num(input.logistics)) - updAgentFee,
+    updServices,
+    updAgentFee,
     ads: Math.round(num(input.ads)),
     storage: Math.round(num(input.storage)),
     cost: Math.round(num(input.cost)),
@@ -213,6 +225,7 @@ function sanitize(input: AnalyzeInput): SanitizedData {
 function buildPrompt(d: SanitizedData): { system: string; user: string } {
   const r = d.revenue;
   const pct = (v: number) => (r > 0 ? Math.round((v / r) * 1000) / 10 : 0);
+  const hasUpd = d.updServices !== 0 || d.updAgentFee !== 0;
 
   const system = [
     "Ты — помощник по прибыли для обычного продавца на Ozon и Wildberries.",
@@ -245,6 +258,11 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
     "- mixed: используются несколько схем сразу. Прямо напиши, что схема смешанная, и что советы по логистике надо проверять отдельно по каждой схеме.",
     "- unknown: схема не выбрана. НЕ предполагай схему. Если речь заходит о доставке — напиши «схема доставки не указана» и дай нейтральные советы без привязки к конкретной схеме.",
     "- Схема доставки — это пользовательский контекст. НЕ меняй расчётные показатели (выручку, прибыль, маржу и т.п.) — они уже посчитаны.",
+    ...(hasUpd ? [
+      "- Расходы Ozon по УПД и агентское вознаграждение по УПД — отдельные статьи исторических расчётов, а не обычная комиссия и не логистика.",
+      "- Расходы Ozon по УПД могут включать разные услуги, в том числе логистику, но их состав неизвестен. Не выдумывай детализацию и не называй агентское вознаграждение логистикой.",
+      "- В данных для анализа УПД-суммы уже исключены из обычных комиссии и логистики. Не учитывай их повторно и не пересчитывай готовые прибыль и маржу.",
+    ] : []),
     "",
     "Верни СТРОГО валидный JSON по схеме (без markdown, без текста вне JSON):",
     "{",
@@ -272,6 +290,10 @@ function buildPrompt(d: SanitizedData): { system: string; user: string } {
       себестоимость: { сумма: d.cost, процентОтВыручки: pct(d.cost) },
       комиссииМаркетплейса: { сумма: d.commission, процентОтВыручки: pct(d.commission) },
       логистика: { сумма: d.logistics, процентОтВыручки: pct(d.logistics) },
+      ...(hasUpd ? {
+        расходыOzonПоУПД: { сумма: d.updServices, процентОтВыручки: pct(d.updServices) },
+        агентскоеВознаграждениеПоУПД: { сумма: d.updAgentFee, процентОтВыручки: pct(d.updAgentFee) },
+      } : {}),
       реклама: { сумма: d.ads, процентОтВыручки: pct(d.ads) },
       хранение: { сумма: d.storage, процентОтВыручки: pct(d.storage) },
       налог: { сумма: d.tax, процентОтВыручки: pct(d.tax) },
