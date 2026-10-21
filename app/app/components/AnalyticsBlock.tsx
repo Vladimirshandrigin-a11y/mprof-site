@@ -14,6 +14,7 @@ import {
   readAccrualSnapshot,
 } from "../lib/accrual/snapshot";
 import { kopecksToRub } from "../lib/accrual/money";
+import { UPD_AGENT_FEE_LABEL, UPD_SERVICES_LABEL, withUpdCategories } from "../lib/legacy-upd-display";
 
 interface AnalyticsCalc {
   id: string;
@@ -29,6 +30,9 @@ interface AnalyticsCalc {
   cost: number;
   tax: number;
   other: number;
+  /** Старый расчёт по УПД: его суммы под своими названиями (lib/legacy-upd-display). */
+  updServices?: number;
+  updAgentFee?: number;
   date: string;
   /** ai_insights расчёта (net-profit-3file breakdown) — нужно лишь чтобы выбрать
    *  подпись прибыли: «Чистая прибыль» vs «Прибыль до себестоимости». Снимок
@@ -278,9 +282,11 @@ function computeExpenseBreakdown(history: AnalyticsCalc[]): ExpenseSegment[] {
       acc.tax        += h.tax;
       acc.storage    += h.storage;
       acc.other      += h.other;
+      acc.updServices += h.updServices ?? 0;
+      acc.updAgentFee += h.updAgentFee ?? 0;
       return acc;
     },
-    { cost: 0, commission: 0, ads: 0, logistics: 0, tax: 0, storage: 0, other: 0 }
+    { cost: 0, commission: 0, ads: 0, logistics: 0, tax: 0, storage: 0, other: 0, updServices: 0, updAgentFee: 0 }
   );
 
   return [
@@ -288,6 +294,8 @@ function computeExpenseBreakdown(history: AnalyticsCalc[]): ExpenseSegment[] {
     { label: "Комиссия",      value: totals.commission, color: "#C9A84C" },
     { label: "Реклама",       value: totals.ads,        color: "#cb11ab" },
     { label: "Логистика",     value: totals.logistics,  color: "#5b7fff" },
+    { label: UPD_SERVICES_LABEL, value: totals.updServices, color: "#8E7CC3" },
+    { label: UPD_AGENT_FEE_LABEL, value: totals.updAgentFee, color: "#B9975B" },
     { label: "Налог",         value: totals.tax,        color: "#E05566" },
     { label: "Хранение",      value: totals.storage,    color: "#5BC7C9" },
     { label: "Прочее",        value: totals.other,      color: "#7C8DB5" },
@@ -605,6 +613,9 @@ interface AiFinancials {
   ads: number;
   tax: number;
   other: number;
+  /** Старые расчёты по УПД: расходы по УПД и агентское вознаграждение (не комиссия и не логистика). */
+  updServices: number;
+  updAgentFee: number;
   expenses: number;
   marginPct: number;
   hasCost: boolean;
@@ -625,6 +636,7 @@ function buildFinancials(history: AnalyticsCalc[]): AiFinancials {
     return {
       isDemo: true, count: 0, lossCount: 0, noCostCount: 0,
       revenue, profit, cost, commission, logistics, storage, ads, tax, other,
+      updServices: 0, updAgentFee: 0,
       expenses, marginPct: (profit / revenue) * 100, hasCost: true,
       discrepancy: 0,
     };
@@ -647,6 +659,8 @@ function buildFinancials(history: AnalyticsCalc[]): AiFinancials {
     ads: sum((h) => h.ads),
     tax: sum((h) => h.tax),
     other: sum((h) => h.other),
+    updServices: sum((h) => h.updServices ?? 0),
+    updAgentFee: sum((h) => h.updAgentFee ?? 0),
     // маржа по агрегату (profit/revenue) — точнее простого среднего по расчётам
     marginPct: revenue > 0
       ? (profit / revenue) * 100
@@ -681,7 +695,9 @@ function topFactors(f: AiFinancials): FactorRow[] {
   return [
     { name: "себестоимость", amount: f.cost },
     { name: "комиссия маркетплейса", amount: f.commission },
-    { name: "логистика и УПД", amount: f.logistics },
+    { name: "логистика", amount: f.logistics },
+    { name: "расходы Ozon по УПД", amount: f.updServices },
+    { name: "агентское вознаграждение по УПД", amount: f.updAgentFee },
     { name: "реклама", amount: f.ads },
     { name: "налог", amount: f.tax },
     { name: "хранение", amount: f.storage },
@@ -896,8 +912,14 @@ function buildFirstActions(f: AiFinancials): string[] {
   if (s.logisticsElevated)
     out.push(`Разберите логистику (${s.logisticsPct.toFixed(1)}% выручки): проверьте габариты карточек, схему FBO/FBS и упаковку — на объёме это даёт быструю экономию.`);
 
-  // 4) сверка УПД — гарантированное действие
-  out.push(`Сверьте отчёт Ozon с актом УПД (услуги ${shareStr(f.logistics, f.revenue)} выручки): расхождения по услугам и агентскому вознаграждению часто незаметно съедают прибыль.`);
+  // 4) сверка с документами Ozon — гарантированное действие; доля УПД — только
+  //    если в расчётах есть УПД (у остальных режимов логистика — не услуги УПД)
+  const updTotal = f.updServices + f.updAgentFee;
+  out.push(
+    updTotal > 0
+      ? `Сверьте отчёт Ozon с актом УПД (расходы по УПД ${shareStr(updTotal, f.revenue)} выручки): расхождения по услугам и агентскому вознаграждению часто незаметно съедают прибыль.`
+      : "Сверьте начисления Ozon за период по документам: расхождения по услугам и вознаграждению Ozon часто незаметно съедают прибыль."
+  );
 
   // 5) возвраты — частая скрытая утечка
   out.push("Сверьте возвраты и компенсации по товарам: один SKU с высоким невыкупом способен съесть прибыль нескольких прибыльных.");
@@ -1044,7 +1066,7 @@ function buildLeaks(f: AiFinancials): string[] {
     );
   if (s.logisticsElevated)
     out.push(
-      `Логистика и УПД ${s.logisticsPct.toFixed(1)}% (${fmt(f.logistics)} ₽). Почему опасно: крупные габариты и возвраты превращают прибыльные позиции в убыточные. Что проверить: габариты карточек, схему FBO/FBS и процент возвратов.`
+      `Логистика ${s.logisticsPct.toFixed(1)}% (${fmt(f.logistics)} ₽). Почему опасно: крупные габариты и возвраты превращают прибыльные позиции в убыточные. Что проверить: габариты карточек, схему FBO/FBS и процент возвратов.`
     );
   if (s.adsPct > 8)
     out.push(
@@ -1735,7 +1757,7 @@ function mainProblemText(f: AiFinancials, s: AiScore): string {
   if (s.commissionHigh)
     return `высокая комиссия маркетплейса (${s.commissionPct.toFixed(1)}%)`;
   if (s.logisticsHigh)
-    return `высокая логистика и УПД (${s.logisticsPct.toFixed(1)}%)`;
+    return `высокая логистика (${s.logisticsPct.toFixed(1)}%)`;
   if (s.marginCritical || s.marginWeak)
     return `тонкая маржа ${f.marginPct.toFixed(1)}% — мало запаса прочности`;
   if (s.costElevated)
@@ -1809,7 +1831,10 @@ function buildExpenseReportItems(f: AiFinancials): AiItem[] {
   const defs: { label: string; amount: number }[] = [
     { label: "Себестоимость", amount: f.cost },
     { label: "Комиссия маркетплейса", amount: f.commission },
-    { label: "Логистика и УПД", amount: f.logistics },
+    { label: "Логистика", amount: f.logistics },
+    // Старые расчёты по УПД — отдельными барами, только если такие суммы есть.
+    ...(f.updServices > 0 ? [{ label: UPD_SERVICES_LABEL, amount: f.updServices }] : []),
+    ...(f.updAgentFee > 0 ? [{ label: UPD_AGENT_FEE_LABEL, amount: f.updAgentFee }] : []),
     { label: "Налог", amount: f.tax },
     { label: "Остальное (реклама, хранение, прочее)", amount: rest },
   ];
@@ -1869,7 +1894,7 @@ function buildLeakCards(f: AiFinancials): AiItem[] {
     );
   if (s.logisticsElevated)
     push(
-      `Логистика и УПД ${s.logisticsPct.toFixed(1)}% (${fmt(f.logistics)} ₽)`,
+      `Логистика ${s.logisticsPct.toFixed(1)}% (${fmt(f.logistics)} ₽)`,
       "Крупные габариты и возвраты превращают прибыльные позиции в убыточные.",
       "Проверьте габариты карточек, схему FBO/FBS и процент возвратов.",
       s.logisticsHigh ? "bad" : "warn"
@@ -2750,8 +2775,13 @@ export function AnalyticsBlock({
     ? sumProf / profitSeries.length
     : 0;
 
+  // Старые расчёты по УПД: агентское вознаграждение и расходы по УПД показываем под
+  // своими названиями, а не как логистику и комиссию. Суммы те же (lib/legacy-upd-display);
+  // индекс здоровья и данные для AI-разбора считаются по исходным записям, как раньше.
+  const displayHistory = history.map(withUpdCategories);
+
   /* expense breakdown */
-  const computedExpenses = computeExpenseBreakdown(history);
+  const computedExpenses = computeExpenseBreakdown(displayHistory);
   // Демо-разбивку показываем ТОЛЬКО в полном demo-режиме (0 расчётов). Если у
   // пользователя есть расчёты, но в них нет разбивки расходов, — рисуем реальную
   // (возможно пустую) структуру, а НЕ подмешиваем пример поверх реальных данных.
@@ -2760,12 +2790,12 @@ export function AnalyticsBlock({
   const totalExp = expenses.reduce((s, e) => s + e.value, 0);
 
   /* AI cockpit data — rule-based база (fallback), поверх неё AI-override */
-  const insights = computeInsights(history);
+  const insights = computeInsights(displayHistory);
   const insightsAreDemo = history.length === 0;
   const aiConfidence = getConfidence(history.length);
   const aiConfidencePct = getConfidencePct(history.length);
   const aiTrend = getTrend(history);
-  const aiIndicators = computeIndicators(history);
+  const aiIndicators = computeIndicators(displayHistory);
   const aiHealth = buildHealth(history, aiIndicators);
 
   // --- rule-based значения: используются, когда AI недоступен/ошибка ---
@@ -2823,7 +2853,7 @@ export function AnalyticsBlock({
 
   // Числа расчёта для rule-based книжки («Базовая аналитика», когда настоящий
   // AI-разбор недоступен). Саму математику расчёта не трогаем — только агрегаты.
-  const aiFin = buildFinancials(history);
+  const aiFin = buildFinancials(displayHistory);
   const aiSkuCtx = extractSkuContext(history);
 
   // Настоящая AI-аналитика = успешный ответ модели (source=timeweb_gateway) с готовыми
