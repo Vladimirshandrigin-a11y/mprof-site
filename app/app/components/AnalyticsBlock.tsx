@@ -6,6 +6,7 @@ import {
   type ProfitRecommendationsProps,
 } from "./ProfitRecommendations";
 import { AiAnalyticsV1 } from "./AiAnalyticsV1";
+import { aggregateAiExpenseCategories } from "../lib/ai-expense-categories";
 import {
   accrualAiProducts,
   accrualChargeCategories,
@@ -2600,6 +2601,7 @@ export function AnalyticsBlock({
 
   const aiPayloadSig = (() => {
     if (history.length === 0) return "";
+    const aiExpenses = aggregateAiExpenseCategories(history);
     const sum = (sel: (h: AnalyticsCalc) => number) =>
       history.reduce((a, h) => a + (Number(sel(h)) || 0), 0);
     const revenue = sum((h) => h.revenue);
@@ -2700,8 +2702,12 @@ export function AnalyticsBlock({
       revenue: Math.round(revenue),
       profit: Math.round(profit),
       margin: Number(margin.toFixed(2)),
+      // Preserve the existing aggregate input contract. The AI route separates
+      // the explicit UPD portions once, before naming categories for the model.
       commission: Math.round(sum((h) => h.commission)),
       logistics: Math.round(sum((h) => h.logistics)),
+      ...(aiExpenses.updServices !== 0 ? { updServices: Math.round(aiExpenses.updServices) } : {}),
+      ...(aiExpenses.updAgentFee !== 0 ? { updAgentFee: Math.round(aiExpenses.updAgentFee) } : {}),
       ads: Math.round(sum((h) => h.ads)),
       storage: Math.round(sum((h) => h.storage)),
       cost: Math.round(sum((h) => h.cost)),

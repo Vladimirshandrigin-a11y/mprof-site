@@ -48,6 +48,7 @@ const SOURCES = [
   "app/app/lib/product-breakdown-calc.ts",
   "app/app/lib/access-status.ts",
   "app/app/lib/api-access.ts",
+  "app/app/lib/ai-expense-categories.ts",
   "app/app/lib/single-flight.ts",
   "app/components/payment-create-result.ts",
   "app/app/lib/payment-return.ts",
@@ -58,6 +59,7 @@ const SOURCES = [
   // Серверные модули (автодобавление товаров в каталог; загрузчик и маршруты — на моках).
   "app/api/cloud/_lib/catalog-import.ts",
   "app/api/ozon/report/route.ts",
+  "app/api/ai/profit-advice/route.ts",
   "app/api/cloud/products/import-missing/route.ts",
   "app/api/ozon/_lib/realization-catalog-sync.ts",
   "app/api/ozon/_lib/profit.ts",
