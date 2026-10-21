@@ -1,15 +1,48 @@
 // Семантика расходов AI: старые колонки УПД не должны называться комиссией
-// и логистикой. Настоящие helper и POST компилирует общий test:accrual runner.
+// и логистикой. Helper загружается из настоящего компонента, POST компилирует общий runner.
 // Supabase/auth и Gateway здесь подменены; живые сеть, БД и платежи не нужны.
 
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { readFileSync } from "node:fs";
+import vm from "node:vm";
 import path from "node:path";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
-import { BUILD_DIR, authLib, nextServer } from "./helpers/modules.mjs";
+import { BUILD_DIR, REPO_ROOT, authLib, nextServer } from "./helpers/modules.mjs";
 
 const req = createRequire(path.join(BUILD_DIR, "loader.js"));
-const { aggregateAiExpenseCategories: aggregate } = req("./app/lib/ai-expense-categories.js");
+// Load the actual private helper from the component, just as the legacy UPD
+// tests load its analytics functions. No copy of its classification logic.
+function loadExpenseCategories() {
+  const repoRequire = createRequire(path.join(REPO_ROOT, "package.json"));
+  const ts = repoRequire("typescript");
+  const file = path.join(REPO_ROOT, "app/app/components/AnalyticsBlock.tsx");
+  const code = ts.transpileModule(readFileSync(file, "utf8"), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2019,
+      jsx: ts.JsxEmit.ReactJSX,
+      esModuleInterop: true,
+    },
+  }).outputText;
+  const libraries = {
+    "../lib/accrual/snapshot": "./app/lib/accrual/snapshot.js",
+    "../lib/accrual/money": "./app/lib/accrual/money.js",
+    "../lib/legacy-upd-display": "./app/lib/legacy-upd-display.js",
+  };
+  const requireActual = (id) => {
+    if (id === "./ProfitRecommendations" || id === "./AiAnalyticsV1") return {};
+    if (libraries[id]) return req(libraries[id]);
+    return repoRequire(id);
+  };
+  const mod = { exports: {} };
+  vm.runInThisContext(
+    `(function(exports, require, module) {${code}\nmodule.exports.expenses = aggregateAiExpenseCategories;\n})`,
+    { filename: file }
+  )(mod.exports, requireActual, mod);
+  return mod.exports.expenses;
+}
+const aggregate = loadExpenseCategories();
 const route = req("./api/ai/profit-advice/route.js");
 
 const legacy = (extra = {}) => ({ kind: "net-profit-3file", ...extra });

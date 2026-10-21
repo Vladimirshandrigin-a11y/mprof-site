@@ -48,7 +48,6 @@ const SOURCES = [
   "app/app/lib/product-breakdown-calc.ts",
   "app/app/lib/access-status.ts",
   "app/app/lib/api-access.ts",
-  "app/app/lib/ai-expense-categories.ts",
   "app/app/lib/single-flight.ts",
   "app/components/payment-create-result.ts",
   "app/app/lib/payment-return.ts",
