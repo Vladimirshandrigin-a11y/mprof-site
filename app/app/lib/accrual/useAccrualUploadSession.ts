@@ -16,6 +16,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AccrualSaveController,
+  type CalculationEditRequest,
   snapshotContentKey,
   type AccrualSaveDeps,
   type CalculationOperationRequest,
@@ -30,7 +31,6 @@ import { browserOperationStorage, createOperationStore, newOperationId, type Ope
 import {
   accrualSnapshotToCalculationColumns,
   type AccrualCalculationColumns,
-  type AccrualReportHistoryColumns,
 } from "./columns";
 import {
   DELETED_NOTE,
@@ -62,8 +62,7 @@ import type { AccrualParseResult } from "../report-parsers/accrual-xlsx-parser";
 export interface AccrualUploadServices {
   parseFile(file: File): Promise<AccrualParseResult>;
   loadCatalog(userId: string): Promise<{ entries: CatalogEntry[]; error: string | null }>;
-  updateCalculation(id: string, cols: AccrualCalculationColumns, userId: string): Promise<CloudResult<CloudRow>>;
-  insertReportHistory(cols: AccrualReportHistoryColumns, userId: string): Promise<CloudResult<unknown>>;
+  updateCalculation(id: string, cols: AccrualCalculationColumns, userId: string, edit: CalculationEditRequest): Promise<CloudResult<CloudRow>>;
   /** Списание + сохранение одной транзакцией на сервере (идемпотентно по ключу операции). */
   saveCalculationOperation(req: CalculationOperationRequest): Promise<CalculationOperationResult>;
   /** Статус операции по ключу (восстановление после перезагрузки). */
@@ -141,14 +140,10 @@ const DEFAULT_SERVICES: AccrualUploadServices = {
       error: null,
     };
   },
-  async updateCalculation(id, cols, userId) {
+  async updateCalculation(id, cols, userId, edit) {
     const { updateCalculationInCloud } = await import("../supabase-cloud");
-    const r = await updateCalculationInCloud(id, cols, userId);
-    return { data: r.data ? { id: r.data.id, created_at: r.data.created_at } : null, error: r.error };
-  },
-  async insertReportHistory(cols, userId) {
-    const { saveReportHistoryToCloud } = await import("../supabase-cloud");
-    return saveReportHistoryToCloud(cols, userId);
+    const r = await updateCalculationInCloud(id, cols, userId, edit);
+    return { data: r.data ? { id: r.data.id, created_at: r.data.created_at, edit_version: r.data.edit_version } : null, error: r.error };
   },
   async saveCalculationOperation(req) {
     const { saveCalculationOperation } = await import("../supabase-cloud");
@@ -249,10 +244,9 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
           !!optsRef.current.userId && getOpStore().get(optsRef.current.userId, attemptId) !== null,
         operationStatus: (operationId, requestHash) =>
           resolveServices(optsRef.current).calculationOperationStatus(operationId, requestHash),
-        updateCalculation: (id, cols) =>
-          resolveServices(optsRef.current).updateCalculation(id, cols, optsRef.current.userId ?? ""),
-        insertReportHistory: (cols) =>
-          resolveServices(optsRef.current).insertReportHistory(cols, optsRef.current.userId ?? ""),
+        newEditOperationId: () => crypto.randomUUID(),
+        updateCalculation: (id, cols, edit) =>
+          resolveServices(optsRef.current).updateCalculation(id, cols, optsRef.current.userId ?? "", edit),
         newLocalId: makeLocalId,
         nowIso: () => new Date().toISOString(),
       } satisfies AccrualSaveDeps);

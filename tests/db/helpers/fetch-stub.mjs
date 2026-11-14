@@ -124,7 +124,7 @@ export function installFetch() {
         const params = [];
         const where = [];
         for (const [k, v] of u.searchParams) {
-          if (k === "select" || k === "on_conflict" || k === "columns") continue;
+          if (k === "select" || k === "on_conflict" || k === "columns" || k === "order" || k === "limit") continue;
           const m = /^(eq|neq)\.(.*)$/.exec(v);
           if (!m) throw new Error(`фильтр ${k}=${v} не поддержан`);
           params.push(m[2]);
@@ -143,7 +143,15 @@ export function installFetch() {
         };
         if (req.method === "GET") {
           const cols = (u.searchParams.get("select") ?? "*").split(",").map((x) => (x === "*" ? x : ident(x))).join(", ");
-          const r = await c.query(`select ${cols} from public.${table}${where.length ? ` where ${where.join(" and ")}` : ""}`, params);
+          const order = (u.searchParams.get("order") ?? "").split(",").filter(Boolean).map((entry) => {
+            const m = /^([a-z_]+)\.(asc|desc)$/.exec(entry);
+            if (!m) throw new Error(`order ${entry} не поддержан`);
+            return `${ident(m[1])} ${m[2]}`;
+          });
+          const limit = u.searchParams.get("limit");
+          if (limit !== null && !/^\d+$/.test(limit)) throw new Error("invalid limit");
+          if (limit !== null) params.push(Number(limit));
+          const r = await c.query(`select ${cols} from public.${table}${where.length ? ` where ${where.join(" and ")}` : ""}${order.length ? ` order by ${order.join(", ")}` : ""}${limit !== null ? ` limit $${params.length}` : ""}`, params);
           response = () => json(200, asPostgrestRows(r));
         } else if (req.method === "PATCH") {
           const sets = Object.entries(req.body).map(([k, v]) => {

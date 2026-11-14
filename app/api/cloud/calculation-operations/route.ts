@@ -79,6 +79,7 @@ export async function POST(req: NextRequest) {
   } catch {
     return json({ error: "Некорректный JSON в теле запроса", code: "bad_request" }, 400);
   }
+  if (!isObject(body)) return json({ error: "Некорректный запрос", code: "bad_request" }, 400);
   if (body.mode === "manual") return saveManual(client, body);
   const { operationId, requestHash, calculation, history } = body;
   if (

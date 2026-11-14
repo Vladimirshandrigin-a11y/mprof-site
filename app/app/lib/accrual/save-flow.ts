@@ -34,9 +34,9 @@
 //      данные повтора не применяются, даже если отличаются. Расчёт этой операции
 //      удалён из истории → deleted: заново не создаётся, попытка закрыта;
 //   6. после сохранения — явная правка (ставка/расходы): обновление той же строки
-//      calculations без списания; то же содержимое — ничего не пишется;
-//   7. report_history при обновлении — best-effort: сбой даёт предупреждение и НЕ
-//      отменяет сохранённый расчёт; повтор дописывает ТОЛЬКО недостающую запись.
+//      calculations и связанной report_history одной транзакцией без списания.
+//      Подтверждённое то же содержимое — ничего не пишется; при ошибке ответа
+//      состояние сервера неизвестно, следующая правка повторяет транзакцию.
 // Аноним: списание через consume (localStorage у страницы), запись только локальная.
 //
 // Чтение файла, ошибка формата и отмена дубля происходят ДО операции — они её не
@@ -60,7 +60,13 @@ export interface ConsumeResult {
   reason?: string;
 }
 
+export interface CalculationEditRequest {
+  editOperationId: string;
+  expectedVersion: number;
+}
+
 export interface CloudRow {
+  edit_version?: number;
   id: string;
   created_at: string;
 }
@@ -123,8 +129,8 @@ export interface AccrualSaveDeps {
   hasPendingOperation(attemptId: string): boolean;
   /** Статус выполненной операции (удалён ли её расчёт из истории — решает сервер). */
   operationStatus(operationId: string, requestHash: string): Promise<CalculationOperationStatus>;
-  updateCalculation(id: string, cols: AccrualCalculationColumns): Promise<CloudResult<CloudRow>>;
-  insertReportHistory(cols: AccrualReportHistoryColumns): Promise<CloudResult<unknown>>;
+  newEditOperationId(): string;
+  updateCalculation(id: string, cols: AccrualCalculationColumns, edit: CalculationEditRequest): Promise<CloudResult<CloudRow>>;
   /** id для записи, не попавшей в облако (аноним). */
   newLocalId(): string;
   nowIso(): string;
@@ -223,6 +229,8 @@ interface Attempt {
   historyKey: string | null;
   /** Ключ выполненной операции (после подтверждения сервером). */
   operationId: string | null;
+  version: number | null;
+  pendingEdit: { key: string; columns: AccrualCalculationColumns; edit: CalculationEditRequest } | null;
 }
 
 const freshAttempt = (id: string | null): Attempt => ({
@@ -233,6 +241,8 @@ const freshAttempt = (id: string | null): Attempt => ({
   calcKey: null,
   historyKey: null,
   operationId: null,
+  version: null,
+  pendingEdit: null,
 });
 
 export class AccrualSaveController {
@@ -302,6 +312,7 @@ export class AccrualSaveController {
     // Записано то, что в снимке сервера (и в calculations, и в сводке операции).
     a.calcKey = a.historyKey = done.snapshot ? snapshotContentKey(done.snapshot) : null;
     a.operationId = done.operationId;
+    a.version = done.row.edit_version ?? null;
     return true;
   }
 
@@ -435,6 +446,7 @@ export class AccrualSaveController {
         }
         at.paid = true;
         at.operationId = operationId;
+        at.version = op.row.edit_version ?? null;
         this.deps.operationSettled(attemptId);
         at.saved = { id: op.row.id, synced: true, createdAt: op.row.created_at };
         if (op.replay) {
@@ -461,44 +473,42 @@ export class AccrualSaveController {
         // У оплаченной попытки аккаунта строка есть всегда; удалённая заново не создаётся.
         return { status: "save_failed", error: "сохранённый расчёт не найден", charge: "kept" };
       }
-      let row: SavedRef;
-      let calculationWrite: CalculationWrite;
-      if (at.calcKey === key) {
-        // calculations уже содержит именно этот результат (сбой был на сводке) — не пишем второй раз.
-        row = at.saved;
-        calculationWrite = "none";
-      } else {
-        const up = await this.deps.updateCalculation(at.saved.id, columns);
-        if (up.error || !up.data) {
-          return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт", charge: "kept" };
-        }
-        row = { id: up.data.id, synced: true, createdAt: up.data.created_at };
-        calculationWrite = "update";
+      if (at.version === null) return {
+        status: "save_failed", error: "Обновите страницу, чтобы загрузить версию сохранённого расчёта", charge: "kept",
+      };
+      // Resolve any uncertain COMMIT with its ORIGINAL key, version and payload.
+      // Never attach a fresh version to an old edit or silently overwrite a conflict.
+      at.calcKey = at.historyKey = null;
+      if (at.pendingEdit && at.pendingEdit.key !== key) {
+        const pending = at.pendingEdit;
+        const settled = await this.deps.updateCalculation(at.saved.id, pending.columns, pending.edit);
+        if (settled.error || settled.data?.edit_version === undefined) return {
+          status: "save_failed", error: settled.error?.message ?? "Не удалось подтвердить предыдущую правку", charge: "kept",
+        };
+        at.version = settled.data.edit_version;
+        at.pendingEdit = null;
       }
+      at.pendingEdit ??= {
+        key, columns,
+        edit: { expectedVersion: at.version, editOperationId: this.deps.newEditOperationId() },
+      };
+      const up = await this.deps.updateCalculation(at.saved.id, at.pendingEdit.columns, at.pendingEdit.edit);
+      if (up.error || !up.data || up.data.edit_version === undefined) {
+        return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт", charge: "kept" };
+      }
+      at.version = up.data.edit_version;
+      at.pendingEdit = null;
+      const row = { id: up.data.id, synced: true, createdAt: up.data.created_at };
       at.saved = row;
-      at.calcKey = key;
-
-      // report_history — best-effort: не отменяет уже сохранённый расчёт. Повтор
-      // дописывает только недостающую запись (historyKey ≠ key).
-      let historyWrite: HistoryWrite = "written";
-      let historyWarning: string | null = null;
-      if (at.historyKey !== key) {
-        const hist = await this.deps.insertReportHistory(accrualSnapshotToReportHistoryColumns(snapshot));
-        if (hist.error) {
-          historyWrite = "failed";
-          historyWarning = `Расчёт сохранён, но сводка по месяцам не обновилась: ${hist.error.message}`;
-        } else {
-          at.historyKey = key;
-        }
-      }
+      at.calcKey = at.historyKey = key;
       return {
         status: "saved",
         row,
         created: false,
         local: false,
-        calculationWrite,
-        historyWrite,
-        historyWarning,
+        calculationWrite: "update",
+        historyWrite: "written",
+        historyWarning: null,
         columns,
       };
     } finally {

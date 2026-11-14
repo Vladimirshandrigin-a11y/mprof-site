@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 // Мок «облака» для проверки границы списания и сохранения: считает ВСЕ побочные
 // эффекты (consume, дубль-гард, insert/update calculations, report_history).
 // Никакого Supabase/сети — только счётчики и память.
@@ -9,7 +10,7 @@
 // report_history фиксируются вместе, сбой записи откатывает списание; dropResponse —
 // COMMIT прошёл, а ответ «потерян» (kind: failed).
 
-import { snapshot as S } from "./modules.mjs";
+import { snapshot as S, columns as COL } from "./modules.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -84,12 +85,14 @@ export function makeMockCloud(over = {}) {
     opNetworkError: null,
     /** COMMIT прошёл, но ответ потерян (kind: failed). */
     dropResponse: false,
+    dropEditResponse: false,
     /** Сервер без миграции (kind: unavailable). */
     opUnavailable: false,
     ...over,
   };
   let seq = 0;
   let opSeq = 0;
+  const edits = new Map();
   const rows = new Map(); // «таблица calculations»
   const ops = new Map(); // «таблица calculation_operations»: ключ → { requestHash, payload, rowId }
   const pendingKeys = new Map(); // «localStorage» страницы: попытка → ключ операции
@@ -126,7 +129,7 @@ export function makeMockCloud(over = {}) {
         return {
           kind: "ok",
           replay: true,
-          row: { id: prev.rowId, created_at: r.created_at },
+          row: { id: prev.rowId, created_at: r.created_at, edit_version: r.edit_version },
           snapshot: S.asAccrualSnapshot(clone(r.ai_insights)),
           contentMatch: prev.payload === payloadOf(req),
         };
@@ -144,11 +147,11 @@ export function makeMockCloud(over = {}) {
         log.rolledBack++;
         return { kind: "failed", message: cfg.insertError ?? cfg.historyError };
       }
-      const row = { id: `calc-${++seq}`, created_at: "2026-07-01T10:00:00.000Z" };
+      const row = { id: `calc-${++seq}`, created_at: "2026-07-01T10:00:00.000Z", edit_version: 0 };
       rows.set(row.id, { ...row, ...clone(req.calculation) });
       log.inserts.push(row.id);
       log.histories.push(clone(req.history));
-      ops.set(req.operationId, { requestHash: req.requestHash, payload: payloadOf(req), rowId: row.id });
+      ops.set(req.operationId, { requestHash: req.requestHash, payload: payloadOf(req), rowId: row.id, historyIndex: log.histories.length - 1 });
       if (cfg.dropResponse) return { kind: "failed", message: "ответ потерян" };
       return { kind: "ok", replay: false, row, snapshot: null, contentMatch: true };
     },
@@ -169,21 +172,31 @@ export function makeMockCloud(over = {}) {
       if (cfg.statusError) return { kind: "failed", message: cfg.statusError };
       return status(operationId, requestHash);
     },
-    updateCalculation: async (id, cols) => {
+    newEditOperationId: () => randomUUID(),
+    updateCalculation: async (id, cols, edit) => {
       log.updateTry++;
       if (cfg.delayMs) await sleep(cfg.delayMs);
       if (cfg.updateError) return { data: null, error: { message: cfg.updateError } };
       const prev = rows.get(id);
       if (!prev) return { data: null, error: { message: "row not found" } };
-      rows.set(id, { ...prev, ...clone(cols) });
-      log.updates.push(id);
-      return { data: { id, created_at: prev.created_at }, error: null };
-    },
-    insertReportHistory: async (cols) => {
+      const hash = JSON.stringify({ id, cols, expectedVersion: edit.expectedVersion });
+      const receipt = edits.get(edit.editOperationId);
+      if (receipt && receipt.hash !== hash) return { data: null, error: { message: "edit_operation_conflict" } };
+      if (receipt) return prev.edit_version === receipt.version
+        ? { data: { id, created_at: prev.created_at, edit_version: prev.edit_version }, error: null }
+        : { data: null, error: { message: "version_conflict" } };
+      if (prev.edit_version !== edit.expectedVersion) return { data: null, error: { message: "version_conflict" } };
       log.historyTry++;
       if (cfg.historyError) return { data: null, error: { message: cfg.historyError } };
-      log.histories.push(clone(cols));
-      return { data: {}, error: null };
+      const op = [...ops.values()].find((o) => o.rowId === id);
+      const history = COL.accrualSnapshotToReportHistoryColumns(S.asAccrualSnapshot(cols.ai_insights));
+      rows.set(id, { ...prev, ...clone(cols), edit_version: prev.edit_version + 1 });
+      edits.set(edit.editOperationId, { hash, version: prev.edit_version + 1 });
+      log.histories[op.historyIndex] = clone(history);
+      op.payload = payloadOf({ calculation: cols, history });
+      log.updates.push(id);
+      if (cfg.dropEditResponse) return { data: null, error: { message: "ответ правки потерян после COMMIT" } };
+      return { data: { id, created_at: prev.created_at, edit_version: prev.edit_version + 1 }, error: null };
     },
     newLocalId: () => `local-${++seq}`,
     nowIso: () => "2026-07-01T10:00:00.000Z",
@@ -210,7 +223,7 @@ export function makeMockCloud(over = {}) {
     if (op.requestHash !== requestHash) return { kind: "conflict" };
     const r = rows.get(op.rowId);
     if (!r) return { kind: "deleted" };
-    return { kind: "done", row: { id: op.rowId, created_at: r.created_at }, snapshot: S.asAccrualSnapshot(clone(r.ai_insights)) };
+    return { kind: "done", row: { id: op.rowId, created_at: r.created_at, edit_version: r.edit_version }, snapshot: S.asAccrualSnapshot(clone(r.ai_insights)) };
   }
   /** Штатное удаление расчёта из истории: строка calculations удаляется, журнал операций — нет. */
   const deleteRow = (id) => rows.delete(id);

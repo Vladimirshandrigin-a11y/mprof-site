@@ -63,6 +63,9 @@ const tsc = spawnSync(
     "app/api/payment/webhook/route.ts",
     "app/api/cloud/calculation-operations/route.ts",
     "app/api/cloud/calculations/route.ts",
+    "app/api/cloud/report-history/route.ts",
+    "app/app/lib/accrual/upload-session.ts",
+    "app/app/lib/report-parsers/accrual-xlsx-parser.ts",
     "app/api/ozon/save-calculation/route.ts",
     // Клиентские правила ключа операции (без React/сети) — для сценариев «страница + сервер».
     "app/app/lib/accrual/operation-store.ts",

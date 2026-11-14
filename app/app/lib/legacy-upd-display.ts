@@ -1,3 +1,5 @@
+import type { ProductBreakdownRow } from "./product-breakdown-calc";
+
 // ============================================================================
 // Старые расчёты по документам (отчёт о реализации + УПД) — только отображение.
 //
@@ -47,4 +49,33 @@ export type WithUpdCategories<T> = T & {
 export function withUpdCategories<T extends ExpenseColumnsLike>(h: T): WithUpdCategories<T> {
   if (!isLegacyUpdRecord(h.aiInsights)) return { ...h, updServices: 0, updAgentFee: 0 };
   return { ...h, commission: 0, logistics: 0, updServices: h.commission, updAgentFee: h.logistics };
+}
+
+export const LEGACY_DETAIL_UNAVAILABLE = "Историческая детализация по товарам недоступна: себестоимость товаров не была сохранена. Общий финансовый итог сохранён.";
+
+/** Read persisted financial rows only. Raw Ozon rows are not historical costs. */
+export function readLegacyUpdProductDetail(
+  snapshot: unknown, totals: { cost: number; profit: number; revenue: number }
+): ProductBreakdownRow[] | null {
+  if (!isLegacyUpdRecord(snapshot)) return null;
+  const s = snapshot as Record<string, unknown>;
+  const rows = s.productBreakdownRows ?? s.products;
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const out: ProductBreakdownRow[] = [];
+  for (const value of rows) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const r = value as Record<string, unknown>;
+    if (typeof r.article !== "string" || typeof r.name !== "string" ||
+        typeof r.matched !== "boolean" || r.hasCost !== true) return null;
+    for (const key of ["revenue", "returnsAmount", "loyaltyPayout", "quantity", "unitCost", "cogs", "profit", "margin"]) {
+      if (typeof r[key] !== "number" || !Number.isFinite(r[key])) return null;
+    }
+    out.push({ ...r } as unknown as ProductBreakdownRow);
+  }
+  // Do not mix saved rows from a different revision with this financial result.
+  const cents = (n: number) => Math.round(n * 100);
+  for (const [key, total] of [["cogs", totals.cost], ["profit", totals.profit], ["revenue", totals.revenue]] as const) {
+    if (!Number.isFinite(total) || Math.abs(cents(out.reduce((sum, r) => sum + (r[key] ?? 0), 0)) - cents(total)) > 1) return null;
+  }
+  return out;
 }
