@@ -34,9 +34,9 @@
 //      данные повтора не применяются, даже если отличаются. Расчёт этой операции
 //      удалён из истории → deleted: заново не создаётся, попытка закрыта;
 //   6. после сохранения — явная правка (ставка/расходы): обновление той же строки
-//      calculations без списания; то же содержимое — ничего не пишется;
-//   7. report_history при обновлении — best-effort: сбой даёт предупреждение и НЕ
-//      отменяет сохранённый расчёт; повтор дописывает ТОЛЬКО недостающую запись.
+//      calculations и связанной report_history одной транзакцией без списания.
+//      Подтверждённое то же содержимое — ничего не пишется; при ошибке ответа
+//      состояние сервера неизвестно, следующая правка повторяет транзакцию.
 // Аноним: списание через consume (localStorage у страницы), запись только локальная.
 //
 // Чтение файла, ошибка формата и отмена дубля происходят ДО операции — они её не
@@ -460,9 +460,13 @@ export class AccrualSaveController {
         // У оплаченной попытки аккаунта строка есть всегда; удалённая заново не создаётся.
         return { status: "save_failed", error: "сохранённый расчёт не найден", charge: "kept" };
       }
+      // The request can commit even if its response is lost. Invalidate both
+      // content keys before sending, so reverting inputs cannot return a false
+      // "unchanged" based on the previously acknowledged snapshot.
+      at.calcKey = at.historyKey = null;
       const up = await this.deps.updateCalculation(at.saved.id, columns);
       if (up.error || !up.data) {
-        // Both rows rolled back; retry the complete edit, never fall back to INSERT.
+        // Retry the complete edit; the response does not prove whether COMMIT happened.
         return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт", charge: "kept" };
       }
       const row = { id: up.data.id, synced: true, createdAt: up.data.created_at };

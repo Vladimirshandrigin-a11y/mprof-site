@@ -84,6 +84,7 @@ export function makeMockCloud(over = {}) {
     opNetworkError: null,
     /** COMMIT прошёл, но ответ потерян (kind: failed). */
     dropResponse: false,
+    dropEditResponse: false,
     /** Сервер без миграции (kind: unavailable). */
     opUnavailable: false,
     ...over,
@@ -183,6 +184,7 @@ export function makeMockCloud(over = {}) {
       log.histories[op.historyIndex] = clone(history);
       op.payload = payloadOf({ calculation: cols, history });
       log.updates.push(id);
+      if (cfg.dropEditResponse) return { data: null, error: { message: "ответ правки потерян после COMMIT" } };
       return { data: { id, created_at: prev.created_at }, error: null };
     },
     newLocalId: () => `local-${++seq}`,

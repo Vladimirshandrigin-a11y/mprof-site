@@ -626,7 +626,25 @@ describe("жизненный цикл: первое сохранение и пр
     assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 2, updates: 1, historyTry: 3, histories: 1, calcRows: 1 });
   });
 
-  it("возврат к исходным значениям после отката правки не требует новой записи", async () => {
+  it("потеря ответа правки после COMMIT: возврат к исходным значениям действительно сохраняется", async () => {
+    const cloud = makeMockCloud();
+    const ctl = startedCtl(cloud);
+    const a = A();
+    const edited = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, taxPercent: "10" } });
+    const first = await ctl.save(req(a));
+    cloud.cfg.dropEditResponse = true;
+    assert.equal((await ctl.save(req(edited))).status, "save_failed");
+    assert.equal(cloud.rows.get(first.row.id).tax, 120, "COMMIT уже изменил обе строки");
+    assert.equal(cloud.log.histories[0].profit, 554.13);
+    cloud.cfg.dropEditResponse = false;
+    const back = await ctl.save(req(a));
+    assert.equal(back.status, "saved", "нельзя вернуть unchanged по устаревшему локальному ключу");
+    assert.equal(cloud.rows.get(first.row.id).tax, 84);
+    assert.equal(cloud.log.histories[0].profit, 590.13);
+    assert.deepEqual([cloud.log.consume, cloud.rows.size, cloud.log.histories.length], [1, 1, 1]);
+  });
+
+  it("возврат к исходным значениям после ошибки правки подтверждает обе строки без дубликатов", async () => {
     const cloud = makeMockCloud();
     const ctl = startedCtl(cloud);
     const a = A();
@@ -636,9 +654,9 @@ describe("жизненный цикл: первое сохранение и пр
     assert.equal((await ctl.save(req(edited))).status, "save_failed"); // обе строки остались K1
     cloud.cfg.historyError = null;
     const back = await ctl.save(req(a)); // снова K1
-    assert.equal(back.status, "unchanged");
+    assert.equal(back.status, "saved");
     assert.equal(cloud.log.histories.length, 1, "в сводке по-прежнему одна запись K1");
-    assert.equal(cloud.log.historyTry, 2, "лишнего обращения к сводке нет");
+    assert.equal(cloud.log.historyTry, 3, "клиент не может отличить откат от потери ответа после COMMIT");
     assert.equal(cloud.rows.get(back.row.id).tax, 84);
     assert.equal((await ctl.save(req(a))).status, "unchanged");
   });
@@ -805,7 +823,7 @@ describe("жизненный цикл: отметка «списано» при�
     assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 0, updates: 0, historyTry: 1, histories: 1, calcRows: 0 });
     const again = await ctl.save(req(a));
     assert.deepEqual([again.status, again.created], ["saved", true]);
-    assert.deepEqual(cloud.counts(), { consume: 2, dup: 2, insertTry: 2, inserts: 2, updateTry: 0, updates: 0, historyTry: 2, histories: 1, calcRows: 1 });
+    assert.deepEqual(cloud.counts(), { consume: 2, dup: 2, insertTry: 2, inserts: 2, updateTry: 0, updates: 0, historyTry: 2, histories: 2, calcRows: 1 });
     assert.equal(cloud.log.opIds.length, 2, "новая операция — новый ключ");
   });
 });

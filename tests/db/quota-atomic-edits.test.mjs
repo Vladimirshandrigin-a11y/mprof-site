@@ -47,7 +47,8 @@ async function create(u, s = snapshot()) {
   const body = uploadBody(s);
   const result = await call(OPS, 'POST', u, body);
   assert.equal(result.status, 200, JSON.stringify(result));
-  return { ...result.body, request: body };
+  assert.equal(typeof result.body.data?.calculationId, 'string');
+  return { ...result.body.data, request: body };
 }
 const edit = (u, id, s = snapshot({ taxPercent: '10', cost: 120 })) => call(CALCS, 'PATCH', u, { id, snapshot: s });
 async function asRole(db, role, u, sql, args = []) {
@@ -96,8 +97,13 @@ describe('P1 quota and immutable history boundaries', () => {
     assert.equal((await asRole(db, 'authenticated', u, 'delete from public.calculations where id=$1 returning id', [id])).rowCount, 1);
     assert.equal((await edit(u, id)).status, 404);
     const replay = await call(OPS, 'POST', u, saved.request);
-    assert.equal(replay.body.status, 'deleted');
+    assert.equal(replay.body.data.status, 'deleted');
     assert.equal((await state(db, u)).used, 1);
+    assert.equal((await state(db, u)).report_history.length, 1, 'deleting calculation preserves its monthly history');
+    await db.sub(u, 'single', { status: 'active' });
+    await create(u);
+    const afterNew = await state(db, u);
+    assert.deepEqual([afterNew.used, afterNew.calculations.length, afterNew.report_history.length], [2, 1, 2]);
   });
   it('edits keep IDs, source and chronology; update existing history; no quota even when exhausted', async () => {
     const u = await db.user(); const saved = await create(u); const before = await state(db, u);
@@ -114,7 +120,7 @@ describe('P1 quota and immutable history boundaries', () => {
     assert.equal(Number(now.report_history[0].profit), 514.13);
     assert.deepEqual(now.calculations[0].ai_insights, s);
     const replay = await call(OPS, 'POST', u, saved.request);
-    assert.equal(replay.body.replay, true); assert.equal(replay.body.contentMatch, false);
+    assert.equal(replay.body.data.replay, true); assert.equal(replay.body.data.contentMatch, false);
     assert.deepEqual(await state(db, u), now);
     assert.equal((await call(OPS, 'POST', u, { ...saved.request, operationId: randomUUID() })).status, 402);
   });
@@ -184,7 +190,7 @@ describe('P1 quota and immutable history boundaries', () => {
   });
   it('editing an earlier same-month calculation never replaces the latest monthly row', async () => {
     const u = await db.user({ plan: 'unlimited', premium: '10 days' }); const a = await create(u); const b = await create(u, snapshot({ taxPercent: '12' }));
-    const before = await state(db, u); const latest = before.report_history.find(h => h.profit !== before.report_history.find(x => Number(x.profit) === 590.13)?.profit);
+    const before = await state(db, u); const latestId = before.calculation_operations.find(op => op.calculation_id === b.calculationId).report_history_id; const latest = before.report_history.find(h => h.id === latestId);
     assert.equal((await edit(u, a.calculationId)).status, 200);
     const now = await state(db, u);
     assert.deepEqual(now.report_history.find(h => h.id === latest.id), latest);
@@ -193,7 +199,7 @@ describe('P1 quota and immutable history boundaries', () => {
   });
   it('manual operation edits preserve revenue, marketplace and one charge; API edits rejected', async () => {
     const u = await db.user(); const r = await call(OPS, 'POST', u, { mode: 'manual', operationId: randomUUID(), inputs: manual });
-    assert.equal(r.status, 200); const id = r.body.calculationId;
+    assert.equal(r.status, 200); const id = r.body.data.calculationId;
     assert.equal((await call(CALCS, 'PATCH', u, { id, inputs: { ...manual, cost: 250 } })).status, 200);
     for (const inputs of [{ ...manual, revenue: 2000 }, { ...manual, marketplace: 'wb' }]) assert.equal((await call(CALCS, 'PATCH', u, { id, inputs })).status, 409);
     assert.equal((await state(db, u)).used, 1); assert.equal((await state(db, u)).report_history.length, 0);
@@ -216,6 +222,8 @@ describe('P1 migration defense in depth and compatibility', () => {
     const db = await freshDb({ extraMigrations: migrations.slice(0,2) }); const u = await db.user();
     await db.main.query('grant insert(user_id), update(profit) on public.calculations to public; grant insert(user_id), update(profit) on public.report_history to authenticated');
     await runScript(db.main, migrations[2]); await runScript(db.main, migrations[2]);
+    await db.main.query("insert into public.calculations(user_id,marketplace,mode,profit) values($1,'ozon','manual',12)",[u]);
+    await db.main.query("insert into public.report_history(user_id,report_month,profit) values($1,'2026-06-01',12)",[u]);
     for (const t of ['calculations','report_history']) {
       for (const role of ['anon','authenticated']) {
         const r = await db.main.query("select has_any_column_privilege($1,$2,'INSERT') as i, has_any_column_privilege($1,$2,'UPDATE') as u", [role, `public.${t}`]);
@@ -224,6 +232,7 @@ describe('P1 migration defense in depth and compatibility', () => {
       await db.main.query(`grant insert, update on public.${t} to authenticated; create policy test_broad on public.${t} for all to authenticated using(true) with check(true)`);
       await assert.rejects(asRole(db,'authenticated',u, `insert into public.${t}(user_id) values($1)`,[u]), {code:'42501'});
       assert.equal((await asRole(db,'authenticated',u,`update public.${t} set profit=999 returning id`)).rowCount,0);
+      assert.equal(Number((await db.main.query(`select profit from public.${t} where user_id=$1`,[u])).rows[0].profit),12);
     }
     await db.main.query('grant execute on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb) to authenticated');
     await assert.rejects(asRole(db,'authenticated',u,'select public.edit_calculation_operation($1,$2,$3,null)',[u,randomUUID(),{}]), {code:'42501'});

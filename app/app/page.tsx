@@ -51,7 +51,6 @@ import {
   loadCalculationsFromCloud,
   deleteCalculationFromCloud,
   clearCalculationsFromCloud,
-  saveUploadedReportToCloud,
   loadUploadedReportsFromCloud,
   saveManualCalculationOperation,
   getSavedOperationStatus,
@@ -88,7 +87,6 @@ import {
   type OperationStore,
 } from "./lib/accrual/operation-store"
 import {
-  parseOzonReport,
   type OzonDebugInfo,
   type OzonProductRow,
   type OzonEstimate,
@@ -768,12 +766,6 @@ const FIELDS: { key: string; label: string; hint?: string }[] = [
   { key: "other", label: "Прочие расходы" },
 ];
 
-const UPLOAD_STAGES = [
-  "Читаем отчёт…",
-  "Анализируем продажи…",
-  "Проверяем комиссии…",
-  "Формируем финансовую модель…",
-];
 
 // ===== Финальный калькулятор чистой прибыли (после расчёта 3 файлов) =====
 // Поля доп. расходов, которые продавец вносит вручную поверх данных из отчётов.
@@ -1522,7 +1514,6 @@ export default function AppPage() {
 
   // ===== Upload report (UI-заготовка, без реального парсинга) =====
   // ===== Legacy single-file state (для обратной совместимости и demo) =====
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadDragActive, setUploadDragActive] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<
     "idle" | "ready" | "processing" | "success" | "error"
@@ -1595,12 +1586,6 @@ export default function AppPage() {
    */
   const [reportProductDetailComplete, setReportProductDetailComplete] =
     useState(true);
-  /** Тоталы (estimate) последнего отчёта — источник общих расходов для
-   *  распределения по SKU в блоке «Чистая прибыль по товарам». Ставится вместе
-   *  с reportProducts в обоих flow, сбрасывается там же. */
-  const [reportEstimate, setReportEstimate] = useState<OzonEstimate | null>(
-    null
-  );
   /** Сумма себестоимости по сматченным товарам (каталог cost_price × кол-во),
    *  поднятая из блока «Чистая прибыль по товарам». Источник автозаполнения
    *  поля «Себестоимость товара» в форме доп. расходов. null — ещё не известна
@@ -2319,12 +2304,9 @@ export default function AppPage() {
   };
 
   /**
-   * Клик по строке истории, относящейся к 3-file расчёту: восстанавливаем
-   * редактируемое состояние (combinedResult + форма чистой прибыли) из
-   * ai_insights, чтобы пользователь мог поменять себестоимость/налог/расходы и
-   * нажать «Сохранить результат» — обновится ТА ЖЕ строка (lastUploadCalc),
-   * а не создастся новая. Записи без net-profit разбора (ручной/API расчёт)
-   * не восстанавливаются — guard возвращает null и handler выходит.
+   * Открытие исторического 3-file расчёта для просмотра и PDF.
+   * Сохранённые расходы остаются неизменными; редактирование недоступно.
+   * Записи без net-profit разбора не восстанавливаются этим обработчиком.
    */
   const restoreUploadCalc = (item: CalcResult) => {
     const b = asNetProfitBreakdown(item.aiInsights);
@@ -2357,15 +2339,12 @@ export default function AppPage() {
     // прибыль по товарам» честно покажет недоступность вместо ложного нуля.
     setReportProductDetailComplete(b.productDetailComplete ?? false);
     setReportLoyaltyPayoutPerSkuKnown(b.loyaltyPayoutPerSkuKnown ?? false);
-    setReportEstimate(b.estimate ?? null);
     // Сбрасываем ключевые товары — OzonProductBreakdown пересчитает и пробросит
     // свежие best/worst (или оставит null, если совпадений нет).
     setReportKeyProducts(null);
     setReportCostCoverage(null);
     setProfitInputs({
-      // b.costPrice — fallback: если per-SKU строк нет или в каталоге нет
-      // совпадений (COGS=0), остаётся сохранённое значение. При наличии строк
-      // и совпадений его перезапишет автосинк с COGS (см. ниже).
+      // Preserve the historical cost saved with this calculation.
       costPrice: s(b.costPrice),
       taxPercent: s(b.taxPercent),
       ads: s(b.ads),
@@ -2374,12 +2353,8 @@ export default function AppPage() {
       salary: s(b.salary),
       other: s(b.other),
     });
-    // Есть per-SKU строки → разблокируем автосинк с COGS: OzonProductBreakdown
-    // загрузит актуальный каталог, посчитает totals.cogs и через onCogsTotal
-    // обновит «Себестоимость товара» свежим значением → чистая прибыль и блок
-    // «Товары без себестоимости» пересчитаются. Нет строк (старый снапшот) →
-    // оставляем сохранённое значение, автосинк его не трогает.
-    setCostPriceTouched(true); // Preserve the saved historical cost; do not sync today’s catalogue.
+    // Сохранённая себестоимость не заменяется текущими значениями каталога.
+    setCostPriceTouched(true);
     setShowProfitForm(true);
     setLastUploadCalc({ id: item.id, synced: item.synced });
     setSelectedId(item.id);
@@ -2529,24 +2504,15 @@ export default function AppPage() {
       showToast("Поддерживаются только XLSX и CSV", "err");
       return;
     }
-    setUploadFile(file);
     setUploadStatus("ready");
   };
 
   const removeUploadFile = () => {
-    setUploadFile(null);
     setUploadStatus("idle");
     setUploadStage(0);
   };
 
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024) return bytes + " B";
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-    return (bytes / (1024 * 1024)).toFixed(2) + " MB";
-  };
-
   const resetUploadFlow = () => {
-    setUploadFile(null);
     setUploadStatus("idle");
     setUploadStage(0);
     setUploadDetected(null);
@@ -2569,7 +2535,6 @@ export default function AppPage() {
     setReportProducts([]);
     setReportProductDetailComplete(true);
     setReportLoyaltyPayoutPerSkuKnown(false);
-    setReportEstimate(null);
     setReportKeyProducts(null);
     setReportCostCoverage(null);
     setReportCogsTotal(null);
@@ -10418,7 +10383,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 payoutSchedule
                               )}`,
                               value: signedRub(adj),
-                              hint: "ранняя выплата уменьшает прибыль · проверьте график перед сохранением",
+                              hint: "ранняя выплата уменьшает прибыль · сохранённый график выплат",
                             }
                           : payoutType === "deferred"
                           ? {
@@ -10427,13 +10392,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 payoutSchedule
                               )}`,
                               value: signedRub(adj),
-                              hint: "отсрочка увеличивает прибыль · проверьте график перед сохранением",
+                              hint: "отсрочка увеличивает прибыль · сохранённый график выплат",
                             }
                           : {
                               state: "ok",
                               label: "График выплат Ozon: Стандартный",
                               value: "0 ₽",
-                              hint: "корректировка 0 ₽ · обязательно проверьте график выплат перед сохранением",
+                              hint: "корректировка 0 ₽ · сохранённый график выплат",
                             },
                         taxWarn
                           ? {
@@ -10507,7 +10472,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                 <b>Недостаточно данных для точного расчёта</b>
                                 <em>
                                   Не загружено: {missingCore.join(", ")}.
-                                  Сохранить можно, но прибыль будет неточной.
+                                  Исторический результат может быть неточным.
                                 </em>
                               </span>
                             </div>
@@ -10516,8 +10481,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                               <span className="calc-check-status-ico">⚠</span>
                               <span>
                                 <b>
-                                  Расчёт можно сохранить, но он может быть
-                                  неточным
+                                  Исторический расчёт может быть неточным
                                 </b>
                                 <em>Проверьте: {softIssues.join(", ")}.</em>
                               </span>
@@ -10526,7 +10490,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                             <div className="calc-check-status ok">
                               <span className="calc-check-status-ico">✓</span>
                               <span>
-                                <b>Расчёт готов к сохранению</b>
+                                <b>Сохранённый расчёт</b>
                                 <em>Все ключевые данные на месте.</em>
                               </span>
                             </div>
@@ -10555,8 +10519,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         Редактирование этого исторического расчёта временно недоступно. Исходные данные сохранены
                       </span>
                     </div>
-
-
 
                     <div className="save-hint">
                       <span className="save-hint-ico" aria-hidden="true">
