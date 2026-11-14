@@ -48,14 +48,11 @@ import {
 } from "./lib/accrual/snapshot"
 import {
   supabase,
-  saveCalculationToCloud,
-  updateCalculationInCloud,
   loadCalculationsFromCloud,
   deleteCalculationFromCloud,
   clearCalculationsFromCloud,
   saveUploadedReportToCloud,
   loadUploadedReportsFromCloud,
-  saveReportHistoryToCloud,
   saveManualCalculationOperation,
   getSavedOperationStatus,
   savedCalculationFromResponse,
@@ -1648,8 +1645,6 @@ export default function AppPage() {
   // (включая инлайн-сохранения в «Товары без себестоимости»). После ручной
   // правки — true, и автосинк прекращается (ручное значение не затираем).
   const [costPriceTouched, setCostPriceTouched] = useState(false);
-  const [profitSaving, setProfitSaving] = useState(false);
-  const [profitSaved, setProfitSaved] = useState(false);
   // Хэндл авто-сохранённой записи 3-файлового анализа, чтобы «Сохранить
   // результат» ОБНОВЛЯЛ её (один анализ = одна строка), а не плодил вторую.
   // synced=false → облачной строки нет, правим только локальную в истории.
@@ -1657,19 +1652,6 @@ export default function AppPage() {
     id: string;
     synced: boolean;
   } | null>(null);
-  const handleProfitInput = (key: keyof ProfitInputs, value: string) => {
-    setProfitInputs((prev) => ({ ...prev, [key]: value }));
-    // Ручная правка «Себестоимость товара» → отключаем автосинк с COGS каталога.
-    if (key === "costPrice") setCostPriceTouched(true);
-    // Любая правка расходов → разрешаем повторное сохранение нового результата.
-    setProfitSaved(false);
-  };
-  // Изменение графика выплат Ozon → меняет итоговую прибыль, поэтому тоже
-  // разрешаем повторное сохранение результата.
-  const updatePayoutSchedule = (patch: Partial<PayoutSchedule>) => {
-    setPayoutSchedule((prev) => ({ ...prev, ...patch }));
-    setProfitSaved(false);
-  };
   /** Итоговый расчёт чистой прибыли поверх данных из 3 отчётов. */
   const profitCalc = useMemo(() => {
     if (!combinedResult) return null;
@@ -1771,213 +1753,6 @@ export default function AppPage() {
    * пишем в jsonb `ai_insights`, чтобы ничего не терялось при перезагрузке.
    * consumeCalculation НЕ зовём — квота уже списана авто-сейвом в analyzeAllThree.
    */
-  const saveProfitResult = async () => {
-    if (!combinedResult || !profitCalc) return;
-    if (profitSaving) return;
-    setProfitSaving(true);
-
-    const now = new Date();
-    const incomeRevenue =
-      combinedResult.revenue + combinedResult.loyaltyPayouts;
-    // ads выносим в свою колонку, остальные ручные — в other_expenses.
-    const otherGroup =
-      profitCalc.packaging +
-      profitCalc.deliveryToWarehouse +
-      profitCalc.salary +
-      profitCalc.other;
-    // total_expenses включает Ozon-комиссии + все доп. расходы. График выплат
-    // вычитаем как корректировку расходов (комиссия за раннюю выплату → расходы
-    // растут; скидка за отсрочку → падают), чтобы тождество
-    // profit = revenue − total_expenses = netProfit сохранялось.
-    const totalExpenses =
-      combinedResult.updServicesTotal +
-      combinedResult.updCommissionTotal +
-      profitCalc.costPrice +
-      profitCalc.tax +
-      profitCalc.ads +
-      otherGroup -
-      profitCalc.payoutScheduleAdjustment;
-
-    const breakdown: NetProfitBreakdown = {
-      kind: "net-profit-3file",
-      roi: profitCalc.roi,
-      taxPercent: profitCalc.taxPercent,
-      costPrice: profitCalc.costPrice,
-      tax: profitCalc.tax,
-      ads: profitCalc.ads,
-      packaging: profitCalc.packaging,
-      deliveryToWarehouse: profitCalc.deliveryToWarehouse,
-      salary: profitCalc.salary,
-      other: profitCalc.other,
-      updServicesTotal: combinedResult.updServicesTotal,
-      updCommissionTotal: combinedResult.updCommissionTotal,
-      revenueOzon: combinedResult.revenue,
-      loyaltyPayouts: combinedResult.loyaltyPayouts,
-      profitBeforeCost: combinedResult.profitBeforeCost,
-      payoutSchedule,
-      payoutScheduleAdjustment: profitCalc.payoutScheduleAdjustment,
-      reportPeriod: combinedResult.period,
-      // Per-SKU строки + estimate — чтобы восстановление из истории пересчитало
-      // себестоимость по актуальному каталогу (не по застывшему снапшоту).
-      products: reportProducts,
-      // Из state, НЕ хардкод true: при пересохранении УЖЕ восстановленного
-      // старого расчёта (без повторной загрузки файлов) reportProducts — это
-      // всё ещё старые несовершенные данные, пересохранение не должно ложно
-      // подтверждать полноту.
-      productDetailComplete: reportProductDetailComplete,
-      loyaltyPayoutPerSkuKnown: reportLoyaltyPayoutPerSkuKnown,
-      estimate: reportEstimate,
-      // Пропускаем признак комплекта документов как есть (не переосмысливаем
-      // источник при пересохранении: свежий single-upd остаётся single-upd,
-      // восстановленный старый dual-upd остаётся dual-upd).
-      docFormat: combinedResult.docFormat,
-      // Аналогично — известность разбивки УПД пропускаем как есть, не
-      // «чиним» задним числом при пересохранении восстановленной записи.
-      commissionKnown: combinedResult.commissionKnown,
-    };
-
-    // Поля записи — идентичны для update и insert.
-    const payload = {
-      marketplace: "ozon" as const,
-      mode: "upload" as CloudCalcMode,
-      revenue: incomeRevenue,
-      commission: combinedResult.updServicesTotal,
-      logistics: combinedResult.updCommissionTotal,
-      ads: profitCalc.ads,
-      storage: 0,
-      tax: profitCalc.tax,
-      cost: profitCalc.costPrice,
-      other_expenses: otherGroup,
-      total_expenses: totalExpenses,
-      profit: profitCalc.netProfit,
-      margin: profitCalc.margin,
-      ai_insights: breakdown,
-    };
-
-    const canPersist = !!user?.id;
-    let cloudCalcId: string | null = null;
-    let cloudCreatedAt: string | null = null;
-    let synced = false;
-    let calcErrMsg: string | null = null;
-
-    if (canPersist) {
-      // Есть облачная запись этого анализа → ОБНОВЛЯЕМ её (один анализ = одна
-      // строка). Если её нет / update не нашёл строку — вставляем (fallback).
-      if (lastUploadCalc?.synced) {
-        const upRes = await updateCalculationInCloud(
-          lastUploadCalc.id,
-          payload,
-          user!.id
-        );
-        if (upRes.data?.id) {
-          cloudCalcId = upRes.data.id;
-          cloudCreatedAt = upRes.data.created_at;
-          synced = true;
-        } else {
-          calcErrMsg = upRes.error?.message ?? null;
-        }
-      }
-      if (!synced) {
-        const saveRes = await saveCalculationToCloud(payload, user!.id);
-        if (saveRes.error) {
-          calcErrMsg = saveRes.error.message;
-        } else if (saveRes.data?.id) {
-          cloudCalcId = saveRes.data.id;
-          cloudCreatedAt = saveRes.data.created_at;
-          synced = true;
-          calcErrMsg = null;
-        }
-      }
-    }
-
-    // id строки в истории: облачный (после update/insert) → иначе id авто-записи
-    // (правим её на месте) → иначе новый локальный.
-    const targetId = lastUploadCalc?.id ?? null;
-    const res: CalcResult = {
-      id: cloudCalcId ?? targetId ?? makeLocalId(),
-      marketplace: "ozon",
-      revenue: incomeRevenue,
-      commission: combinedResult.updServicesTotal,
-      logistics: combinedResult.updCommissionTotal,
-      storage: 0,
-      ads: profitCalc.ads,
-      cost: profitCalc.costPrice,
-      tax: profitCalc.tax,
-      other: otherGroup,
-      expenses: totalExpenses,
-      profit: profitCalc.netProfit,
-      margin: profitCalc.margin,
-      aiInsights: breakdown,
-      date: now.toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-      createdAt: cloudCreatedAt ?? now.toISOString(),
-      synced,
-    };
-
-    // Обновляем СУЩЕСТВУЮЩУЮ строку на её месте (позицию и время анализа не
-    // меняем). Если строки нет (edge: её удалили) — добавляем как новую.
-    setHistory((prev) => {
-      const idx = targetId ? prev.findIndex((h) => h.id === targetId) : -1;
-      if (idx === -1) return [res, ...prev].slice(0, 50);
-      const next = [...prev];
-      next[idx] = { ...res, date: prev[idx].date, createdAt: prev[idx].createdAt };
-      return next;
-    });
-    setLastUploadCalc({ id: res.id, synced });
-
-    // История по месяцам: снимок (выручка/расходы/прибыль/маржа) с привязкой к
-    // месяцу отчёта — для блока «Аналитика по месяцам». Best-effort: не блокирует
-    // основной сейв и не влияет на расчёт. UI группирует по месяцу (последняя
-    // запись за месяц), поэтому повторные сохранения того же отчёта корректны.
-    if (canPersist && user?.id) {
-      // Месяц отчёта по приоритету: период из XLSX → имя файла Ozon. Если ни
-      // один источник не дал месяц — НЕ сохраняем снимок с фейковым текущим
-      // месяцем (это сливало бы отчёты разных месяцев в одну точку и ломало
-      // график динамики). Пропуск снимка не блокирует основной сейв расчёта.
-      const reportMonth = resolveReportMonth(
-        combinedResult.period,
-        combinedResult.sourceFileName
-      );
-      if (reportMonth) {
-        const { error: histErr } = await saveReportHistoryToCloud(
-          {
-            report_month: reportMonth,
-            revenue: incomeRevenue,
-            expenses: totalExpenses,
-            profit: profitCalc.netProfit,
-            margin: profitCalc.margin,
-          },
-          user.id
-        );
-        if (!histErr) setHistoryRefresh((k) => k + 1);
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn(
-          "[report-history] месяц отчёта не распознан — снимок за месяц пропущен",
-          {
-            period: combinedResult.period,
-            fileName: combinedResult.sourceFileName,
-          }
-        );
-      }
-    }
-
-    setProfitSaving(false);
-    setProfitSaved(true);
-
-    if (synced) {
-      showToast("Чистая прибыль сохранена", "ok");
-    } else if (canPersist && calcErrMsg) {
-      showToast("Облако: " + calcErrMsg, "warn");
-    } else {
-      showToast("Сохранено локально", "warn");
-    }
-  };
-
   /**
    * Скачать PDF-отчёт о чистой прибыли (3-file расчёт). Доступно только когда
    * combinedStatus === "success" и есть profitCalc (кнопка отрендерена внутри
@@ -2604,12 +2379,10 @@ export default function AppPage() {
     // обновит «Себестоимость товара» свежим значением → чистая прибыль и блок
     // «Товары без себестоимости» пересчитаются. Нет строк (старый снапшот) →
     // оставляем сохранённое значение, автосинк его не трогает.
-    setCostPriceTouched(restoredProducts.length === 0);
+    setCostPriceTouched(true); // Preserve the saved historical cost; do not sync today’s catalogue.
     setShowProfitForm(true);
     setLastUploadCalc({ id: item.id, synced: item.synced });
     setSelectedId(item.id);
-    setProfitSaved(false);
-    setProfitSaving(false);
   };
 
   /**
@@ -2772,290 +2545,6 @@ export default function AppPage() {
     return (bytes / (1024 * 1024)).toFixed(2) + " MB";
   };
 
-  const analyzeUpload = async () => {
-    if (!uploadFile || uploadStatus === "processing") {
-      // eslint-disable-next-line no-console
-      console.warn("[upload] analyzeUpload guard exit", {
-        hasFile: !!uploadFile,
-        uploadStatus,
-      });
-      return;
-    }
-    if (!canCalculate) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[upload] analyzeUpload blocked by paywall (canCalculate=false)"
-      );
-      openTariffModal(null);
-      return;
-    }
-
-    setUploadStatus("processing");
-    setUploadStage(0);
-    setUploadErrorMsg("");
-    setUploadDebugInfo(null);
-    setReportProducts([]);
-    setReportProductDetailComplete(true);
-    setReportLoyaltyPayoutPerSkuKnown(false);
-    setReportEstimate(null);
-    setReportKeyProducts(null);
-    setReportCostCoverage(null);
-
-    // Запускаем парсинг параллельно со стадиями анимации — пока крутятся
-    // фейковые «стадии AI», файл уже реально читается. К концу анимации
-    // у нас обычно уже есть результат.
-    const parsePromise = parseOzonReport(uploadFile);
-
-    const reduced =
-      typeof window !== "undefined" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-
-    if (reduced) {
-      setUploadStage(UPLOAD_STAGES.length - 1);
-      await new Promise((r) => setTimeout(r, 600));
-    } else {
-      for (let i = 1; i < UPLOAD_STAGES.length; i++) {
-        await new Promise((r) => setTimeout(r, 750));
-        setUploadStage(i);
-      }
-      await new Promise((r) => setTimeout(r, 700));
-    }
-
-    const parseResult = await parsePromise;
-    // Сохраняем debugInfo всегда — в DEV MODE он отрисуется на ошибочном
-    // экране для диагностики реальных файлов Ozon.
-    setUploadDebugInfo(parseResult.debugInfo);
-
-    // eslint-disable-next-line no-console
-    console.log("[upload] parseResult shape:", {
-      ok: parseResult.ok,
-      error: parseResult.error,
-      hasReport: !!parseResult.report,
-      reportEstimate: parseResult.report?.estimate ?? null,
-      reportRowsCount: parseResult.report?.rowsCount ?? null,
-      debugRowsParsed: parseResult.debugInfo.rowsParsed,
-      debugFailedAt: parseResult.debugInfo.failedAt,
-      debugWarnings: parseResult.debugInfo.aggregationWarnings.length,
-    });
-
-    if (!parseResult.ok || !parseResult.report) {
-      // eslint-disable-next-line no-console
-      console.warn("[upload] → setUploadStatus('error') (parser returned !ok)", {
-        ok: parseResult.ok,
-        error: parseResult.error,
-        hasReport: !!parseResult.report,
-        failedAt: parseResult.debugInfo.failedAt,
-        rowsParsed: parseResult.debugInfo.rowsParsed,
-      });
-      setUploadStatus("error");
-      setUploadErrorMsg(
-        parseResult.error ||
-          "Не удалось распознать отчёт Ozon. Проверьте, что это XLSX-файл из личного кабинета Ozon."
-      );
-      return;
-    }
-
-    // Парс прошёл. Списываем расчёт server-authoritative ДО сохранения/выдачи —
-    // кредит не сгорает на ошибке парсинга (consume только после успешного парса).
-    const consumed = await consumeCalculation();
-    if (!consumed.ok) {
-      // eslint-disable-next-line no-console
-      console.warn("[upload] consume blocked → paywall", consumed.reason);
-      setUploadStatus("ready");
-      openTariffModal(null);
-      return;
-    }
-
-    // eslint-disable-next-line no-console
-    console.log("[upload] SUCCESS FLOW START", {
-      mp: parseResult.report.marketplace,
-      estimate: parseResult.report.estimate,
-      rowsCount: parseResult.report.rowsCount,
-      period: parseResult.report.period,
-    });
-
-    const report = parseResult.report;
-    const mp: Marketplace = report.marketplace;
-    const est = report.estimate;
-
-    // Per-SKU слой для блока «Чистая прибыль по товарам» (best-effort: пусто,
-    // если колонки артикула в отчёте не распознаны — тогда блок не показывается).
-    setReportProducts(report.products);
-    setReportProductDetailComplete(true);
-    setReportLoyaltyPayoutPerSkuKnown(report.loyaltyPayoutPerSkuKnown);
-    // estimate — источник общих расходов для распределения по SKU.
-    setReportEstimate(est);
-
-    // Финансовая модель из реального отчёта (cost обычно 0 — Ozon не отдаёт
-    // себестоимость, юзер может дозаполнить в ручном расчёте).
-    const revenue = est.revenue;
-    const commission = est.commission;
-    const logistics = est.logistics;
-    const storage = est.storage;
-    const ads = est.ads;
-    const cost = est.cost;
-    const tax = est.tax;
-    const other = est.other;
-    const expensesSum =
-      commission + logistics + storage + ads + cost + tax + other;
-    const profit = revenue - expensesSum;
-    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
-    const now = new Date();
-
-    // Подставляем значения в форму — юзер сможет переключиться на ручной
-    // режим и увидеть распарсенные числа.
-    setMarketplace(mp);
-    setForm({
-      revenue: String(Math.round(revenue)),
-      commission: String(Math.round(commission)),
-      logistics: String(Math.round(logistics)),
-      storage: String(Math.round(storage)),
-      ads: String(Math.round(ads)),
-      cost: String(Math.round(cost)),
-      tax: String(Math.round(tax)),
-      other: String(Math.round(other)),
-    });
-
-    // eslint-disable-next-line no-console
-    console.log("[debug] analyzeUpload user.id =", user?.id ?? "(anonymous)");
-
-    const canPersist = !!user?.id;
-
-    let cloudCalcId: string | null = null;
-    let cloudCreatedAt: string | null = null;
-    let uploadSynced = false;
-    let calcErrMsg: string | null = null;
-
-    if (canPersist) {
-      const saveRes = await saveCalculationToCloud(
-        {
-          marketplace: mp,
-          mode: "upload" as CloudCalcMode,
-          revenue,
-          commission,
-          logistics,
-          ads,
-          storage,
-          tax,
-          cost,
-          other_expenses: other,
-          total_expenses: expensesSum,
-          profit,
-          margin,
-        },
-        user!.id
-      );
-
-      if (saveRes.error) {
-        calcErrMsg = saveRes.error.message;
-      } else if (saveRes.data?.id) {
-        cloudCalcId = saveRes.data.id;
-        cloudCreatedAt = saveRes.data.created_at;
-        uploadSynced = true;
-      }
-    }
-
-    {
-      const res: CalcResult = {
-        id: cloudCalcId ?? makeLocalId(),
-        marketplace: mp,
-        revenue,
-        commission,
-        logistics,
-        storage,
-        ads,
-        cost,
-        tax,
-        other,
-        expenses: expensesSum,
-        profit,
-        margin,
-        date: now.toLocaleString("ru-RU", {
-          day: "2-digit",
-          month: "short",
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-        createdAt: cloudCreatedAt ?? now.toISOString(),
-        synced: uploadSynced,
-      };
-
-      setResult(res);
-      setHistory((prev) => [res, ...prev].slice(0, 50));
-      setJustCalculated(true);
-      window.setTimeout(() => setJustCalculated(false), 2200);
-      dismissOnboarding();
-
-      // Период — из парсера, иначе fallback на месяц текущей даты загрузки
-      const monthName = now.toLocaleString("ru-RU", { month: "long" });
-      const period =
-        report.period ?? `За ${monthName} ${now.getFullYear()}`;
-      const rowsCount = report.rowsCount;
-
-      // eslint-disable-next-line no-console
-      console.log("[upload] → setUploadStatus('success')", {
-        mp,
-        period,
-        rowsCount,
-        profit,
-        margin,
-        synced: uploadSynced,
-      });
-      setUploadDetected({ marketplace: mp, period, rowsCount });
-      setUploadStatus("success");
-
-      // Сохраняем uploaded_report в облако (если есть user и cloud calc id);
-      // ID отчёта — либо из облака, либо локальный.
-      let reportId: string = makeLocalId();
-      if (canPersist) {
-        const repRes = await saveUploadedReportToCloud(
-          {
-            file_name: uploadFile.name,
-            file_size: formatFileSize(uploadFile.size),
-            marketplace: mp,
-            period,
-            rows_count: rowsCount,
-            calculation_id: cloudCalcId, // может быть null если cloud calc упал
-          },
-          user!.id
-        );
-        if (repRes.data?.id) {
-          reportId = repRes.data.id;
-        } else if (repRes.error) {
-          console.warn(
-            "analyzeUpload: uploaded_report save failed",
-            repRes.error
-          );
-        }
-      }
-
-      setUploadedReports((prev) =>
-        [
-          {
-            id: reportId,
-            filename: uploadFile.name,
-            marketplace: mp,
-            profit,
-            margin,
-            rowsCount,
-            period,
-            date: res.date,
-          },
-          ...prev,
-        ].slice(0, 6)
-      );
-
-      if (uploadSynced) {
-        showToast("Отчёт сохранён", "ok");
-      } else if (canPersist && calcErrMsg) {
-        showToast("Облако: " + calcErrMsg, "warn");
-      } else {
-        // Soft fallback (anon / DEV)
-        showToast("Отчёт сохранён локально", "warn");
-      }
-    }
-  };
-
   const resetUploadFlow = () => {
     setUploadFile(null);
     setUploadStatus("idle");
@@ -3073,7 +2562,7 @@ export default function AppPage() {
   // ===== Document flow: остаётся только сброс. Новые расчёты идут по одному XLSX
   // «Отчёт по начислениям» (useAccrualUploadSession); прежний расчёт по отчёту о
   // реализации + УПД больше не запускается — код ниже нужен лишь для ОТКРЫТИЯ и
-  // пересохранения старых записей из истории (restoreUploadCalc/saveProfitResult).
+  // просмотра старых записей из истории (restoreUploadCalc).
   const resetCombinedFlow = () => {
     setCombinedStatus("idle");
     setCombinedResult(null);
@@ -3088,8 +2577,6 @@ export default function AppPage() {
     setProfitInputs({ ...EMPTY_PROFIT });
     setPayoutSchedule({ ...DEFAULT_PAYOUT_SCHEDULE });
     setCostPriceTouched(false);
-    setProfitSaving(false);
-    setProfitSaved(false);
     setLastUploadCalc(null);
   };
 
@@ -10331,7 +9818,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         className="upload-3-btn primary np-hero-btn"
                         onClick={() => setShowProfitForm(true)}
                       >
-                        Добавить себестоимость и налог →
+                        Показать сохранённые расходы →
                       </button>
                     </>
                   )}
@@ -10445,7 +9932,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 >
                   {showProfitForm
                     ? "Свернуть форму ↑"
-                    : "Добавить себестоимость и налог →"}
+                    : "Показать сохранённые расходы →"}
                 </button>
 
                 {showProfitForm && profitCalc && (
@@ -10463,9 +9950,8 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                               inputMode="decimal"
                               placeholder="0"
                               value={profitInputs[f.key]}
-                              onChange={(e) =>
-                                handleProfitInput(f.key, e.target.value)
-                              }
+                              readOnly
+                              disabled
                             />
                             <span className="in-cur">{f.unit}</span>
                           </div>
@@ -10504,7 +9990,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                               "payout-chip" +
                               (payoutSchedule.type === t.k ? " active" : "")
                             }
-                            onClick={() => updatePayoutSchedule({ type: t.k })}
+                            disabled
                           >
                             {t.l}
                           </button>
@@ -10526,9 +10012,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                     ? " active"
                                     : "")
                                 }
-                                onClick={() =>
-                                  updatePayoutSchedule({ earlyVariant: v.key })
-                                }
+                                disabled
                               >
                                 {v.label}
                               </button>
@@ -10549,9 +10033,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                   "payout-chip" +
                                   (payoutSchedule.bank === b.k ? " active" : "")
                                 }
-                                onClick={() =>
-                                  updatePayoutSchedule({ bank: b.k })
-                                }
+                                disabled
                               >
                                 {b.l}
                               </button>
@@ -10575,9 +10057,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                                     ? " active"
                                     : "")
                                 }
-                                onClick={() =>
-                                  updatePayoutSchedule({ deferredDays: d })
-                                }
+                                disabled
                               >
                                 {d} дн.
                               </button>
@@ -11072,25 +10552,11 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         </svg>
                       </span>
                       <span className="save-hint-text">
-                        После сохранения расчёт появится в истории: период
-                        отчёта, чистая прибыль, маржинальность, график выплат
-                        Ozon и статус точности.
+                        Редактирование этого исторического расчёта временно недоступно. Исходные данные сохранены
                       </span>
                     </div>
 
-                    <button
-                      type="button"
-                      className="upload-3-btn primary"
-                      onClick={saveProfitResult}
-                      disabled={profitSaving}
-                      style={{ marginTop: 14, width: "100%" }}
-                    >
-                      {profitSaving
-                        ? "Сохранение…"
-                        : profitSaved
-                        ? "Сохранено ✓"
-                        : "Сохранить результат"}
-                    </button>
+
 
                     <div className="save-hint">
                       <span className="save-hint-ico" aria-hidden="true">

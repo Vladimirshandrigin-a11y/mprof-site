@@ -281,7 +281,7 @@ describe("нет списания и нет записи: ошибки файл�
 });
 
 describe("успешный расчёт списывает ровно один раз; повторное сохранение не списывает", () => {
-  it("сохранить → изменить ставку → сохранить ещё раз: consume 1, insert 1, update 1, история 2", async () => {
+  it("сохранить → изменить ставку → сохранить ещё раз: consume 1, insert 1, update 1, история 1", async () => {
     const cloud = makeMockCloud();
     const ctl = startedCtl(cloud);
     const a = pipeline({ buf: basicBuf() }).evaluation;
@@ -292,7 +292,7 @@ describe("успешный расчёт списывает ровно один �
     assert.equal(second.status, "saved");
     assert.equal(second.created, false);
     assert.equal(second.row.id, first.row.id);
-    assert.deepEqual([cloud.log.consume, cloud.log.inserts.length, cloud.log.updates.length, cloud.log.histories.length, cloud.log.dup], [1, 1, 1, 2, 1]);
+    assert.deepEqual([cloud.log.consume, cloud.log.inserts.length, cloud.log.updates.length, cloud.log.histories.length, cloud.log.dup], [1, 1, 1, 1, 1]);
     // строка обновлена значениями второго расчёта
     assert.equal(cloud.rows.get(first.row.id).tax, 120);
     assert.equal(S.asAccrualSnapshot(cloud.rows.get(first.row.id).ai_insights).tax.kopecks, 12000);
@@ -487,7 +487,7 @@ describe("жизненный цикл: повторное «Сохранить»
     assert.deepEqual(cloud.counts(), before);
   });
 
-  it("правка ставки: одно обновление той же строки и одна дописанная сводка, без списания; повтор той же правки — unchanged; возврат к прежним значениям — снова обновление", async () => {
+  it("правка ставки: одно обновление той же строки и обновление связанной сводки, без списания; повтор той же правки — unchanged; возврат к прежним значениям — снова обновление", async () => {
     const cloud = makeMockCloud();
     const ctl = startedCtl(cloud);
     const a = A();
@@ -497,12 +497,12 @@ describe("жизненный цикл: повторное «Сохранить»
     assert.equal(upd.status, "saved");
     assert.equal(upd.calculationWrite, "update");
     assert.equal(upd.row.id, first.row.id);
-    assert.deepEqual(cloud.counts(), { ...ZERO, consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 1, updates: 1, historyTry: 2, histories: 2, calcRows: 1 });
+    assert.deepEqual(cloud.counts(), { ...ZERO, consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 1, updates: 1, historyTry: 2, histories: 1, calcRows: 1 });
     const same = cloud.counts();
     assert.equal((await ctl.save(req(edited))).status, "unchanged");
     assert.deepEqual(cloud.counts(), same);
     assert.equal((await ctl.save(req(a))).calculationWrite, "update");
-    assert.deepEqual(cloud.counts(), { ...same, updateTry: 2, updates: 2, historyTry: 3, histories: 3 });
+    assert.deepEqual(cloud.counts(), { ...same, updateTry: 2, updates: 2, historyTry: 3, histories: 1 });
     assert.equal(cloud.rows.get(first.row.id).tax, 84); // строка держит ПОСЛЕДНИЕ значения
   });
 
@@ -568,7 +568,7 @@ describe("жизненный цикл: повторное «Сохранить»
   });
 });
 
-describe("жизненный цикл: первое сохранение — одна операция; частичный сбой возможен только при обновлении", () => {
+describe("жизненный цикл: первое сохранение и правки атомарны", () => {
   const A = () => pipeline({ buf: basicBuf() });
   const req = (p) => ({ snapshot: p.evaluation.snapshot, ready: p.evaluation.readyToSave, userId: "u1" });
 
@@ -612,31 +612,31 @@ describe("жизненный цикл: первое сохранение — о�
     assert.equal(S.asAccrualSnapshot(cloud.rows.get(out.row.id).ai_insights).tax.kopecks, edited.evaluation.snapshot.tax.kopecks);
   });
 
-  it("сбой сводки ПОСЛЕ обновления при правке: повтор дописывает только сводку (второй update не идёт)", async () => {
+  it("сбой сводки при правке откатывает расчёт; повтор атомарно обновляет обе строки", async () => {
     const cloud = makeMockCloud();
     const ctl = startedCtl(cloud);
     const a = A();
     const edited = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, taxPercent: "10" } });
     await ctl.save(req(a));
     cloud.cfg.historyError = "500";
-    assert.equal((await ctl.save(req(edited))).historyWrite, "failed");
+    assert.equal((await ctl.save(req(edited))).status, "save_failed");
     cloud.cfg.historyError = null;
     const done = await ctl.save(req(edited));
-    assert.deepEqual([done.calculationWrite, done.historyWrite], ["none", "written"]);
-    assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 1, updates: 1, historyTry: 3, histories: 2, calcRows: 1 });
+    assert.deepEqual([done.calculationWrite, done.historyWrite], ["update", "written"]);
+    assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 2, updates: 1, historyTry: 3, histories: 1, calcRows: 1 });
   });
 
-  it("возврат к уже записанным значениям после сбоя сводки на правке: calculations обновляется, а сводка НЕ дублируется (последняя запись сводки уже равна этим значениям)", async () => {
+  it("возврат к исходным значениям после отката правки не требует новой записи", async () => {
     const cloud = makeMockCloud();
     const ctl = startedCtl(cloud);
     const a = A();
     const edited = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, taxPercent: "10" } });
     await ctl.save(req(a)); // calculations K1 + сводка K1
     cloud.cfg.historyError = "500";
-    assert.equal((await ctl.save(req(edited))).historyWrite, "failed"); // calculations K2, сводка осталась K1
+    assert.equal((await ctl.save(req(edited))).status, "save_failed"); // обе строки остались K1
     cloud.cfg.historyError = null;
     const back = await ctl.save(req(a)); // снова K1
-    assert.deepEqual([back.calculationWrite, back.historyWrite], ["update", "written"]);
+    assert.equal(back.status, "unchanged");
     assert.equal(cloud.log.histories.length, 1, "в сводке по-прежнему одна запись K1");
     assert.equal(cloud.log.historyTry, 2, "лишнего обращения к сводке нет");
     assert.equal(cloud.rows.get(back.row.id).tax, 84);
@@ -668,7 +668,7 @@ describe("жизненный цикл: первое сохранение — о�
     assert.deepEqual([cloud.log.updateTry, cloud.log.historyTry], [1, 1]);
     cloud.cfg.updateError = null;
     assert.equal((await ctl.save(req(edited))).calculationWrite, "update");
-    assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 2, updates: 1, historyTry: 2, histories: 2, calcRows: 1 });
+    assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 2, updates: 1, historyTry: 2, histories: 1, calcRows: 1 });
   });
 });
 
@@ -805,7 +805,7 @@ describe("жизненный цикл: отметка «списано» при�
     assert.deepEqual(cloud.counts(), { consume: 1, dup: 1, insertTry: 1, inserts: 1, updateTry: 0, updates: 0, historyTry: 1, histories: 1, calcRows: 0 });
     const again = await ctl.save(req(a));
     assert.deepEqual([again.status, again.created], ["saved", true]);
-    assert.deepEqual(cloud.counts(), { consume: 2, dup: 2, insertTry: 2, inserts: 2, updateTry: 0, updates: 0, historyTry: 2, histories: 2, calcRows: 1 });
+    assert.deepEqual(cloud.counts(), { consume: 2, dup: 2, insertTry: 2, inserts: 2, updateTry: 0, updates: 0, historyTry: 2, histories: 1, calcRows: 1 });
     assert.equal(cloud.log.opIds.length, 2, "новая операция — новый ключ");
   });
 });

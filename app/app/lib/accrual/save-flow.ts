@@ -124,7 +124,6 @@ export interface AccrualSaveDeps {
   /** Статус выполненной операции (удалён ли её расчёт из истории — решает сервер). */
   operationStatus(operationId: string, requestHash: string): Promise<CalculationOperationStatus>;
   updateCalculation(id: string, cols: AccrualCalculationColumns): Promise<CloudResult<CloudRow>>;
-  insertReportHistory(cols: AccrualReportHistoryColumns): Promise<CloudResult<unknown>>;
   /** id для записи, не попавшей в облако (аноним). */
   newLocalId(): string;
   nowIso(): string;
@@ -461,44 +460,22 @@ export class AccrualSaveController {
         // У оплаченной попытки аккаунта строка есть всегда; удалённая заново не создаётся.
         return { status: "save_failed", error: "сохранённый расчёт не найден", charge: "kept" };
       }
-      let row: SavedRef;
-      let calculationWrite: CalculationWrite;
-      if (at.calcKey === key) {
-        // calculations уже содержит именно этот результат (сбой был на сводке) — не пишем второй раз.
-        row = at.saved;
-        calculationWrite = "none";
-      } else {
-        const up = await this.deps.updateCalculation(at.saved.id, columns);
-        if (up.error || !up.data) {
-          return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт", charge: "kept" };
-        }
-        row = { id: up.data.id, synced: true, createdAt: up.data.created_at };
-        calculationWrite = "update";
+      const up = await this.deps.updateCalculation(at.saved.id, columns);
+      if (up.error || !up.data) {
+        // Both rows rolled back; retry the complete edit, never fall back to INSERT.
+        return { status: "save_failed", error: up.error?.message ?? "Не удалось обновить расчёт", charge: "kept" };
       }
+      const row = { id: up.data.id, synced: true, createdAt: up.data.created_at };
       at.saved = row;
-      at.calcKey = key;
-
-      // report_history — best-effort: не отменяет уже сохранённый расчёт. Повтор
-      // дописывает только недостающую запись (historyKey ≠ key).
-      let historyWrite: HistoryWrite = "written";
-      let historyWarning: string | null = null;
-      if (at.historyKey !== key) {
-        const hist = await this.deps.insertReportHistory(accrualSnapshotToReportHistoryColumns(snapshot));
-        if (hist.error) {
-          historyWrite = "failed";
-          historyWarning = `Расчёт сохранён, но сводка по месяцам не обновилась: ${hist.error.message}`;
-        } else {
-          at.historyKey = key;
-        }
-      }
+      at.calcKey = at.historyKey = key;
       return {
         status: "saved",
         row,
         created: false,
         local: false,
-        calculationWrite,
-        historyWrite,
-        historyWarning,
+        calculationWrite: "update",
+        historyWrite: "written",
+        historyWarning: null,
         columns,
       };
     } finally {

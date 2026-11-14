@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../_lib/auth";
+import { parseCalculationEdit } from "../_lib/calculation-edit";
 
 // ============================================================================
 // /api/cloud/calculations  — серверный прокси для истории расчётов.
 //   GET   — чтение (история);
-//   POST  — сохранение нового расчёта (insert);
-//   PATCH — обновление существующего расчёта (update).
+//   POST  — закрыт: новый расчёт только через атомарную операцию;
+//   PATCH — согласованная правка расчёта и истории через RPC.
 //
 // Браузер из РФ без VPN ходит сюда (Timeweb), а не напрямую в Supabase (AWS),
 // где прямой маршрут виснет/рвётся («Failed to fetch»). Сервер сам обращается
@@ -31,22 +32,6 @@ function parseLimit(raw: string | null): number {
   const n = raw ? parseInt(raw, 10) : DEFAULT_LIMIT;
   if (!Number.isFinite(n) || n <= 0) return DEFAULT_LIMIT;
   return Math.min(n, MAX_LIMIT);
-}
-
-function apiModeRejected() {
-  return NextResponse.json(
-    { error: "Расчёт через Ozon API сохраняет только сервер", code: "api_mode_forbidden" },
-    { status: 400, headers: NO_STORE }
-  );
-}
-
-/** Поля, которые клиент НЕ вправе задавать сам (ставит/фильтрует сервер). */
-function stripServerFields(obj: Record<string, unknown>): Record<string, unknown> {
-  const out = { ...obj };
-  delete out.user_id;
-  delete out.id;
-  delete out.created_at;
-  return out;
 }
 
 export async function GET(req: NextRequest) {
@@ -78,90 +63,50 @@ export async function GET(req: NextRequest) {
   );
 }
 
-// POST — сохранить новый расчёт. Тело = поля calculation (без user_id).
+// New calculations must use an atomic, metered operation.
 export async function POST(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
-  const { admin, userId } = auth;
-
-  let body: Record<string, unknown>;
-  try {
-    body = (await req.json()) as Record<string, unknown>;
-  } catch {
-    return NextResponse.json(
-      { error: "Некорректный JSON в теле запроса" },
-      { status: 400, headers: NO_STORE }
-    );
-  }
-
-  if (body.mode === "api") return apiModeRejected();
-  // user_id всегда из токена — клиентское значение игнорируем.
-  const payload = { ...stripServerFields(body), user_id: userId };
-
-  const { data, error } = await admin
-    .from("calculations")
-    .insert([payload])
-    .select()
-    .single();
-
-  if (error) {
-    // eslint-disable-next-line no-console
-    console.error("[api/cloud/calculations] insert error", error);
-    return NextResponse.json(
-      { error: error.message || "Ошибка сохранения" },
-      { status: 502, headers: NO_STORE }
-    );
-  }
-
-  return NextResponse.json({ data }, { headers: NO_STORE });
+  return NextResponse.json(
+    { error: "Для нового расчёта используйте операцию расчёта", code: "calculation_operation_required" },
+    { status: 410, headers: NO_STORE }
+  );
 }
 
-// PATCH — обновить существующий расчёт. Тело = { id, fields }.
 export async function PATCH(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
-  const { admin, userId } = auth;
-
-  let body: { id?: unknown; fields?: unknown };
-  try {
-    body = (await req.json()) as { id?: unknown; fields?: unknown };
-  } catch {
-    return NextResponse.json(
-      { error: "Некорректный JSON в теле запроса" },
-      { status: 400, headers: NO_STORE }
-    );
-  }
-
-  const id = typeof body.id === "string" ? body.id : "";
-  if (!id) {
-    return NextResponse.json(
-      { error: "Не указан id записи" },
-      { status: 400, headers: NO_STORE }
-    );
-  }
-  const fields =
-    body.fields && typeof body.fields === "object"
-      ? stripServerFields(body.fields as Record<string, unknown>)
-      : {};
-  if (fields.mode === "api") return apiModeRejected();
-
-  const { data, error } = await admin
-    .from("calculations")
-    .update(fields)
-    .eq("id", id)
-    .eq("user_id", userId) // правим только свою строку
-    .neq("mode", "api") // API-расчёт не редактируется клиентом
-    .select()
-    .single();
-
+  let body: unknown;
+  try { body = await req.json(); } catch { body = null; }
+  const edit = parseCalculationEdit(body);
+  if (!edit) return NextResponse.json(
+    { error: "Некорректный запрос", code: "bad_request" }, { status: 400, headers: NO_STORE }
+  );
+  const { data, error } = await auth.admin.rpc("edit_calculation_operation", {
+    p_user_id: auth.userId,
+    p_calculation_id: edit.id,
+    p_calculation: edit.calculation,
+    p_history: edit.history,
+  });
   if (error) {
-    // eslint-disable-next-line no-console
-    console.error("[api/cloud/calculations] update error", error);
+    const missing = error.code === "PGRST202" || error.code === "42883";
+    console.error("[api/cloud/calculations] edit RPC failed", error.code);
     return NextResponse.json(
-      { error: error.message || "Ошибка обновления" },
-      { status: 502, headers: NO_STORE }
+      { error: "Сохранение изменений временно недоступно", code: missing ? "migration_missing" : "rpc_failed" },
+      { status: missing ? 503 : 502, headers: NO_STORE }
     );
   }
-
-  return NextResponse.json({ data }, { headers: NO_STORE });
+  if (data?.ok !== true) {
+    const reason = typeof data?.reason === "string" ? data.reason : "rpc_failed";
+    const status = reason === "not_found" ? 404 : reason === "legacy_read_only" || reason === "api_mode_forbidden" ? 403
+      : reason === "source_conflict" || reason === "history_missing" ? 409 : reason === "bad_request" ? 400 : 502;
+    return NextResponse.json({
+      code: reason,
+      error: reason === "legacy_read_only"
+        ? "Редактирование этого исторического расчёта временно недоступно. Исходные данные сохранены"
+        : reason === "source_conflict" ? "Исходные данные изменились — выполните новый расчёт"
+        : "Не удалось сохранить изменения расчёта",
+    }, { status, headers: NO_STORE });
+  }
+  return NextResponse.json({ data: data.calculation }, { headers: NO_STORE });
 }

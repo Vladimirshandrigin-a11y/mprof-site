@@ -1012,13 +1012,13 @@ describe("граница доверия: клиент не пишет API-рас
       headers: { "content-type": "application/json", authorization: `Bearer ${userJwt(u)}` },
       body: JSON.stringify({ marketplace: "ozon", mode: "api", profit: 1 }),
     }));
-    assert.deepEqual([post.status, (await post.json()).code], [400, "api_mode_forbidden"]);
+    assert.deepEqual([post.status, (await post.json()).code], [410, "calculation_operation_required"]);
     const patchApi = await CALCS_ROUTE.PATCH(new NextRequest("http://localhost/api/cloud/calculations", {
       method: "PATCH",
       headers: { "content-type": "application/json", authorization: `Bearer ${userJwt(u)}` },
       body: JSON.stringify({ id: apiRow.id, fields: { profit: 1 } }),
     }));
-    assert.equal(patchApi.status, 502, "строка api через маршрут не редактируется");
+    assert.equal(patchApi.status, 400, "строка api через маршрут не редактируется");
     const toApi = await CALCS_ROUTE.PATCH(new NextRequest("http://localhost/api/cloud/calculations", {
       method: "PATCH",
       headers: { "content-type": "application/json", authorization: `Bearer ${userJwt(u)}` },
@@ -1193,6 +1193,7 @@ describe("совместимость и миграция", () => {
       return JSON.stringify([f.rows, k.rows, pol.rows]);
     };
     const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    await runScript(migrated.main, read("supabase/migrations/20261113221918_quota_atomic_edits.sql"));
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_manual_calculation_operation"));
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));

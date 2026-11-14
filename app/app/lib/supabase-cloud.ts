@@ -645,32 +645,7 @@ export async function consumeCalculation(): Promise<ConsumeResult> {
 // ============================================================================
 // Calculations
 // ============================================================================
-export async function saveCalculationToCloud(
-  input: CalculationInsertInput,
-  userId: string
-): Promise<CloudResult<CloudCalculation>> {
-  // eslint-disable-next-line no-console
-  console.log("[cloud] saveCalculationToCloud", { userId });
-  const res = await cloudSend<CloudCalculation>(
-    "/api/cloud/calculations",
-    "POST",
-    input
-  );
-  if (res.error) {
-    // eslint-disable-next-line no-console
-    console.error("[cloud] saveCalculationToCloud error", res.error);
-  }
-  return res;
-}
-
-/**
- * Точечный UPDATE существующего calculation. Используется, чтобы «черновик»
- * 3-файлового анализа превратить в финальную чистую прибыль, не создавая
- * вторую строку. RLS-политика `calculations_update_own` разрешает апдейт
- * только своих строк (auth.uid() = user_id). Никогда не бросает.
- * Если строка не найдена (например, была удалена) — `.single()` вернёт error,
- * вызывающий код делает fallback на insert.
- */
+/** Atomic edit of an operation-backed XLSX calculation and its linked history. */
 export async function updateCalculationInCloud(
   calculationId: string,
   fields: Partial<CalculationInsertInput>,
@@ -681,7 +656,7 @@ export async function updateCalculationInCloud(
   const res = await cloudSend<CloudCalculation>(
     "/api/cloud/calculations",
     "PATCH",
-    { id: calculationId, fields }
+    { id: calculationId, snapshot: fields.ai_insights }
   );
   if (res.error) {
     // eslint-disable-next-line no-console
@@ -956,24 +931,6 @@ export type ReportHistoryInsertInput = Omit<
   CloudReportHistory,
   "id" | "user_id" | "created_at"
 >;
-
-export async function saveReportHistoryToCloud(
-  input: ReportHistoryInsertInput,
-  userId: string
-): Promise<CloudResult<CloudReportHistory>> {
-  // eslint-disable-next-line no-console
-  console.log("[cloud] saveReportHistoryToCloud", { userId });
-  const res = await cloudSend<CloudReportHistory>(
-    "/api/cloud/report-history",
-    "POST",
-    input
-  );
-  if (res.error) {
-    // eslint-disable-next-line no-console
-    console.error("[cloud] saveReportHistoryToCloud error", res.error);
-  }
-  return res;
-}
 
 export async function loadReportHistoryFromCloud(
   userId: string

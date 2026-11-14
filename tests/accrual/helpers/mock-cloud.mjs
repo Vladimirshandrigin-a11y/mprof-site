@@ -9,7 +9,7 @@
 // report_history фиксируются вместе, сбой записи откатывает списание; dropResponse —
 // COMMIT прошёл, а ответ «потерян» (kind: failed).
 
-import { snapshot as S } from "./modules.mjs";
+import { snapshot as S, columns as COL } from "./modules.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -148,7 +148,7 @@ export function makeMockCloud(over = {}) {
       rows.set(row.id, { ...row, ...clone(req.calculation) });
       log.inserts.push(row.id);
       log.histories.push(clone(req.history));
-      ops.set(req.operationId, { requestHash: req.requestHash, payload: payloadOf(req), rowId: row.id });
+      ops.set(req.operationId, { requestHash: req.requestHash, payload: payloadOf(req), rowId: row.id, historyIndex: log.histories.length - 1 });
       if (cfg.dropResponse) return { kind: "failed", message: "ответ потерян" };
       return { kind: "ok", replay: false, row, snapshot: null, contentMatch: true };
     },
@@ -175,15 +175,15 @@ export function makeMockCloud(over = {}) {
       if (cfg.updateError) return { data: null, error: { message: cfg.updateError } };
       const prev = rows.get(id);
       if (!prev) return { data: null, error: { message: "row not found" } };
-      rows.set(id, { ...prev, ...clone(cols) });
-      log.updates.push(id);
-      return { data: { id, created_at: prev.created_at }, error: null };
-    },
-    insertReportHistory: async (cols) => {
       log.historyTry++;
       if (cfg.historyError) return { data: null, error: { message: cfg.historyError } };
-      log.histories.push(clone(cols));
-      return { data: {}, error: null };
+      const op = [...ops.values()].find((o) => o.rowId === id);
+      const history = COL.accrualSnapshotToReportHistoryColumns(S.asAccrualSnapshot(cols.ai_insights));
+      rows.set(id, { ...prev, ...clone(cols) });
+      log.histories[op.historyIndex] = clone(history);
+      op.payload = payloadOf({ calculation: cols, history });
+      log.updates.push(id);
+      return { data: { id, created_at: prev.created_at }, error: null };
     },
     newLocalId: () => `local-${++seq}`,
     nowIso: () => "2026-07-01T10:00:00.000Z",

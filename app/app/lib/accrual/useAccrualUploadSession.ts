@@ -30,7 +30,6 @@ import { browserOperationStorage, createOperationStore, newOperationId, type Ope
 import {
   accrualSnapshotToCalculationColumns,
   type AccrualCalculationColumns,
-  type AccrualReportHistoryColumns,
 } from "./columns";
 import {
   DELETED_NOTE,
@@ -63,7 +62,6 @@ export interface AccrualUploadServices {
   parseFile(file: File): Promise<AccrualParseResult>;
   loadCatalog(userId: string): Promise<{ entries: CatalogEntry[]; error: string | null }>;
   updateCalculation(id: string, cols: AccrualCalculationColumns, userId: string): Promise<CloudResult<CloudRow>>;
-  insertReportHistory(cols: AccrualReportHistoryColumns, userId: string): Promise<CloudResult<unknown>>;
   /** Списание + сохранение одной транзакцией на сервере (идемпотентно по ключу операции). */
   saveCalculationOperation(req: CalculationOperationRequest): Promise<CalculationOperationResult>;
   /** Статус операции по ключу (восстановление после перезагрузки). */
@@ -145,10 +143,6 @@ const DEFAULT_SERVICES: AccrualUploadServices = {
     const { updateCalculationInCloud } = await import("../supabase-cloud");
     const r = await updateCalculationInCloud(id, cols, userId);
     return { data: r.data ? { id: r.data.id, created_at: r.data.created_at } : null, error: r.error };
-  },
-  async insertReportHistory(cols, userId) {
-    const { saveReportHistoryToCloud } = await import("../supabase-cloud");
-    return saveReportHistoryToCloud(cols, userId);
   },
   async saveCalculationOperation(req) {
     const { saveCalculationOperation } = await import("../supabase-cloud");
@@ -251,8 +245,6 @@ export function useAccrualUploadSession(opts: AccrualUploadSessionOptions): Accr
           resolveServices(optsRef.current).calculationOperationStatus(operationId, requestHash),
         updateCalculation: (id, cols) =>
           resolveServices(optsRef.current).updateCalculation(id, cols, optsRef.current.userId ?? ""),
-        insertReportHistory: (cols) =>
-          resolveServices(optsRef.current).insertReportHistory(cols, optsRef.current.userId ?? ""),
         newLocalId: makeLocalId,
         nowIso: () => new Date().toISOString(),
       } satisfies AccrualSaveDeps);
