@@ -3,6 +3,7 @@
 import { createClient } from "@supabase/supabase-js";
 import type { User } from "@supabase/supabase-js";
 import type {
+  CalculationEditRequest,
   CalculationOperationRequest,
   CalculationOperationResult,
   CalculationOperationStatus,
@@ -61,6 +62,7 @@ export interface UserProfile {
 }
 
 export interface CloudCalculation {
+  edit_version?: number;
   id: string;
   user_id: string;
   marketplace: Marketplace;
@@ -380,7 +382,7 @@ export async function saveCalculationOperation(
         return {
           kind: "ok",
           replay: d.replay === true,
-          row: { id: d.calculationId, created_at: d.createdAt },
+          row: { id: d.calculationId, created_at: d.createdAt, edit_version: savedCalculationOf(d.calculation)?.edit_version },
           snapshot: asAccrualSnapshot(d.snapshot),
           contentMatch: d.contentMatch === true,
         };
@@ -421,7 +423,7 @@ export async function getCalculationOperationStatus(
       if (!d.calculationId || !d.createdAt) return { kind: "failed", message: "Сервер не вернул сохранённый расчёт" };
       return {
         kind: "done",
-        row: { id: d.calculationId, created_at: d.createdAt },
+        row: { id: d.calculationId, created_at: d.createdAt, edit_version: savedCalculationOf(d.calculation)?.edit_version },
         snapshot: asAccrualSnapshot(d.snapshot),
       };
     }
@@ -462,6 +464,8 @@ function savedCalculationOf(v: unknown): CloudCalculation | null {
   const num = (x: unknown): number => (typeof x === "number" ? x : Number(x ?? 0) || 0);
   return {
     id: c.id,
+    ...(typeof c.edit_version === "number" && Number.isInteger(c.edit_version) && c.edit_version >= 0
+      ? { edit_version: c.edit_version } : {}),
     user_id: typeof c.user_id === "string" ? c.user_id : "",
     marketplace: (c.marketplace === "wb" ? "wb" : "ozon") as Marketplace,
     mode: (c.mode === "api" || c.mode === "upload" ? c.mode : "manual") as CalcMode,
@@ -649,14 +653,15 @@ export async function consumeCalculation(): Promise<ConsumeResult> {
 export async function updateCalculationInCloud(
   calculationId: string,
   fields: Partial<CalculationInsertInput>,
-  userId: string
+  userId: string,
+  edit: CalculationEditRequest
 ): Promise<CloudResult<CloudCalculation>> {
   // eslint-disable-next-line no-console
   console.log("[cloud] updateCalculationInCloud", { calculationId, userId });
   const res = await cloudSend<CloudCalculation>(
     "/api/cloud/calculations",
     "PATCH",
-    { id: calculationId, snapshot: fields.ai_insights }
+    { id: calculationId, snapshot: fields.ai_insights, ...edit }
   );
   if (res.error) {
     // eslint-disable-next-line no-console

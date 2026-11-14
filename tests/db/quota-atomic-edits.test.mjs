@@ -50,7 +50,8 @@ async function create(u, s = snapshot()) {
   assert.equal(typeof result.body.data?.calculationId, 'string');
   return { ...result.body.data, request: body };
 }
-const edit = (u, id, s = snapshot({ taxPercent: '10', cost: 120 })) => call(CALCS, 'PATCH', u, { id, snapshot: s });
+const editMeta = (expectedVersion = 0) => ({ expectedVersion, editOperationId: randomUUID() });
+const edit = (u, id, s = snapshot({ taxPercent: '10', cost: 120 }), meta = editMeta()) => call(CALCS, 'PATCH', u, { id, snapshot: s, ...meta });
 async function asRole(db, role, u, sql, args = []) {
   const c = await db.client(role);
   await c.query("select set_config('request.jwt.claim.sub', $1, false)", [u ?? '']);
@@ -89,7 +90,7 @@ describe('P1 quota and immutable history boundaries', () => {
       await assert.rejects(asRole(db, role, u, 'update public.calculations set profit=999 where id=$1', [id]), { code: '42501' });
       await assert.rejects(asRole(db, role, u, 'insert into public.report_history(user_id) values($1)', [u]), { code: '42501' });
       await assert.rejects(asRole(db, role, u, 'update public.report_history set profit=999 where user_id=$1', [u]), { code: '42501' });
-      await assert.rejects(asRole(db, role, u, 'select public.edit_calculation_operation($1,$2,$3,null)', [u, id, {}]), { code: '42501' });
+      await assert.rejects(asRole(db, role, u, 'select public.edit_calculation_operation($1,$2,$3,null,0,gen_random_uuid())', [u, id, {}]), { code: '42501' });
     }
     assert.equal((await asRole(db, 'authenticated', other, 'select id from public.calculations where id=$1', [id])).rowCount, 0);
     assert.equal((await asRole(db, 'authenticated', u, 'select id from public.calculations where id=$1', [id])).rowCount, 1);
@@ -130,9 +131,18 @@ describe('P1 quota and immutable history boundaries', () => {
     assert.equal((await edit(null, saved.calculationId)).status, 401);
     assert.equal((await edit(foreign, saved.calculationId)).status, 404);
     for (const body of [null, [], { id: saved.calculationId, fields: { profit: 1 } }, { id: saved.calculationId, snapshot: snapshot(), user_id: u }, { id: saved.calculationId, inputs: { ...manual, user_id: u } }]) {
-      assert.equal((await call(CALCS, 'PATCH', u, body)).status, 400);
+      assert.equal((await call(CALCS, 'PATCH', u, body && !Array.isArray(body) ? { ...body, ...editMeta() } : body)).status, 400);
     }
     assert.deepEqual(await state(db, u), before);
+  });
+  it('edit version and operation key are mandatory and strictly validated', async () => {
+    const u = await db.user(); const saved = await create(u); const before = await state(db,u);
+    for (const meta of [{}, { ...editMeta(), expectedVersion: -1 }, { ...editMeta(), expectedVersion: 0.5 },
+      { ...editMeta(), expectedVersion: '0' }, { ...editMeta(), expectedVersion: 2147483647 },
+      { expectedVersion: 0, editOperationId: 'not-a-uuid' }]) {
+      assert.equal((await call(CALCS,'PATCH',u,{id:saved.calculationId,snapshot:snapshot(),...meta})).status,400);
+    }
+    assert.deepEqual(await state(db,u),before);
   });
   it('source/period/marketplace/mode changes and damaged snapshots fail closed', async () => {
     const u = await db.user(); const saved = await create(u); const before = await state(db, u);
@@ -145,7 +155,7 @@ describe('P1 quota and immutable history boundaries', () => {
     assert.equal((await edit(u, saved.calculationId, broken)).status, 400);
     const service = await db.service();
     for (const patch of [{ mode: 'manual' }, { marketplace: 'wb' }, { revenue: 999 }]) {
-      const r = await service.query('select public.edit_calculation_operation($1,$2,$3,$4) as r', [u, saved.calculationId, { ...saved.request.calculation, ...patch }, saved.request.history]);
+      const r = await service.query('select public.edit_calculation_operation($1,$2,$3,$4,0,gen_random_uuid()) as r', [u, saved.calculationId, { ...saved.request.calculation, ...patch }, saved.request.history]);
       assert.equal(r.rows[0].r.reason, 'source_conflict');
     }
     assert.deepEqual(await state(db, u), before);
@@ -170,23 +180,67 @@ describe('P1 quota and immutable history boundaries', () => {
     assert.equal((await edit(u, saved.calculationId)).body.code, 'history_missing');
   });
   it('database failure in history rolls back calculation, operation hash and quota; retry succeeds', async () => {
-    const u = await db.user(); const saved = await create(u); const before = await state(db, u);
+    const u = await db.user(); const saved = await create(u); const before = await state(db, u); const meta = editMeta();
     await db.main.query("create function public.fail_history_edit() returns trigger language plpgsql as $$ begin raise exception 'test history failure'; end $$; create trigger fail_edit before update on public.report_history for each row execute function public.fail_history_edit()");
-    try { assert.equal((await edit(u, saved.calculationId)).status, 502); assert.deepEqual(await state(db, u), before); }
+    try { assert.equal((await edit(u, saved.calculationId, snapshot(), meta)).status, 502); assert.deepEqual(await state(db, u), before); }
     finally { await db.main.query('drop trigger fail_edit on public.report_history; drop function public.fail_history_edit()'); }
-    assert.equal((await edit(u, saved.calculationId)).status, 200);
+    assert.equal((await db.main.query('select count(*)::int as n from public.calculation_edit_operations where user_id=$1',[u])).rows[0].n,0);
+    assert.equal((await edit(u, saved.calculationId, snapshot(), meta)).status, 200);
     assert.equal((await state(db, u)).used, 1);
   });
-  it('parallel edits stay consistent; lost response retry does not insert or charge', async () => {
+  it('parallel edits of one version accept exactly one; duplicate edit replays once', async () => {
     const u = await db.user(); const saved = await create(u);
     const results = await Promise.all(['8','9','10','11'].map(taxPercent => edit(u, saved.calculationId, snapshot({ taxPercent }))));
-    assert.ok(results.every(r => r.status === 200), JSON.stringify(results));
-    let st = await state(db, u); assert.equal(st.calculations[0].profit, st.report_history[0].profit);
+    assert.equal(results.filter(r => r.status === 200).length, 1);
+    assert.equal(results.filter(r => r.status === 409 && r.body.code === 'version_conflict').length, 3);
+    const meta = editMeta(1);
+    const duplicates = await Promise.all([edit(u, saved.calculationId, snapshot(), meta), edit(u, saved.calculationId, snapshot(), meta)]);
+    assert.ok(duplicates.every(r => r.status === 200), JSON.stringify(duplicates));
+    const st = await state(db, u);
+    assert.equal(st.calculations[0].edit_version, 2);
+    assert.equal(st.calculations[0].profit, st.report_history[0].profit);
+    assert.equal(st.used, 1); assert.equal(st.calculations.length, 1); assert.equal(st.report_history.length, 1);
+    assert.equal((await db.main.query('select count(*)::int as n from public.calculation_edit_operations where user_id=$1',[u])).rows[0].n, 2);
+  });
+  it('A commits / response lost / B succeeds / replay A cannot overwrite B or charge', async () => {
+    const u = await db.user(); const saved = await create(u); const a = editMeta();
     net.state.dropAfterCommit = r => r.url.includes('/rpc/edit_calculation_operation');
-    assert.equal((await edit(u, saved.calculationId)).status, 502);
+    assert.equal((await edit(u, saved.calculationId, snapshot({ taxPercent: '8' }), a)).status, 502);
     net.state.dropAfterCommit = null;
+    assert.equal((await edit(u, saved.calculationId, snapshot({ taxPercent: '10' }), editMeta(1))).status, 200);
+    const b = await state(db, u);
+    const retry = await edit(u, saved.calculationId, snapshot({ taxPercent: '8' }), a);
+    assert.deepEqual([retry.status, retry.body.code], [409, 'version_conflict']);
+    assert.deepEqual(await state(db, u), b);
+    assert.equal(b.calculations[0].ai_insights.tax.ratePercent, 10); assert.equal(b.used, 1);
+    assert.equal((await edit(u, saved.calculationId, snapshot({ taxPercent: '8' }), editMeta())).status, 409);
+    // Same edit key with another payload never becomes another edit.
+    assert.equal((await edit(u, saved.calculationId, snapshot({ taxPercent: '12' }), a)).body.code, 'edit_operation_conflict');
+  });
+  it('lost edit response immediately replays the same receipt, without another write', async () => {
+    const u = await db.user(); const saved = await create(u); const meta = editMeta();
+    net.state.dropAfterCommit = r => r.url.includes('/rpc/edit_calculation_operation');
+    assert.equal((await edit(u, saved.calculationId, snapshot(), meta)).status, 502);
+    net.state.dropAfterCommit = null;
+    const committed = await state(db, u);
+    assert.equal((await edit(u, saved.calculationId, snapshot(), meta)).status, 200);
+    assert.deepEqual(await state(db, u), committed); assert.equal(committed.calculations[0].edit_version, 1);
+  });
+  it('edit receipts and version cannot be forged via direct Supabase roles', async () => {
+    const u = await db.user(); const saved = await create(u);
+    for (const role of ['anon','authenticated']) {
+      for (const sql of ['select * from public.calculation_edit_operations',
+        "insert into public.calculation_edit_operations(id,user_id,calculation_id,request_hash,result_version) values(gen_random_uuid(),$1,$2,'fake',1)",
+        'update public.calculation_edit_operations set result_version=99 where user_id=$1',
+        'delete from public.calculation_edit_operations where user_id=$1']) {
+        const args = sql.includes('$2') ? [u,saved.calculationId] : sql.includes('$1') ? [u] : [];
+        await assert.rejects(asRole(db,role,u,sql,args), {code:'42501'});
+      }
+      await assert.rejects(asRole(db,role,u,'update public.calculations set edit_version=99 where id=$1',[saved.calculationId]), {code:'42501'});
+    }
     assert.equal((await edit(u, saved.calculationId)).status, 200);
-    st = await state(db, u); assert.equal(st.used, 1); assert.equal(st.calculations.length, 1); assert.equal(st.report_history.length, 1);
+    assert.equal((await asRole(db,'authenticated',u,'delete from public.calculations where id=$1 returning id',[saved.calculationId])).rowCount,1);
+    assert.equal((await db.main.query('select count(*)::int as n from public.calculation_edit_operations where user_id=$1',[u])).rows[0].n,0);
   });
   it('editing an earlier same-month calculation never replaces the latest monthly row', async () => {
     const u = await db.user({ plan: 'unlimited', premium: '10 days' }); const a = await create(u); const b = await create(u, snapshot({ taxPercent: '12' }));
@@ -200,8 +254,8 @@ describe('P1 quota and immutable history boundaries', () => {
   it('manual operation edits preserve revenue, marketplace and one charge; API edits rejected', async () => {
     const u = await db.user(); const r = await call(OPS, 'POST', u, { mode: 'manual', operationId: randomUUID(), inputs: manual });
     assert.equal(r.status, 200); const id = r.body.data.calculationId;
-    assert.equal((await call(CALCS, 'PATCH', u, { id, inputs: { ...manual, cost: 250 } })).status, 200);
-    for (const inputs of [{ ...manual, revenue: 2000 }, { ...manual, marketplace: 'wb' }]) assert.equal((await call(CALCS, 'PATCH', u, { id, inputs })).status, 409);
+    assert.equal((await call(CALCS, 'PATCH', u, { id, inputs: { ...manual, cost: 250 }, ...editMeta() })).status, 200);
+    for (const inputs of [{ ...manual, revenue: 2000 }, { ...manual, marketplace: 'wb' }]) assert.equal((await call(CALCS, 'PATCH', u, { id, inputs, ...editMeta(1) })).status, 409);
     assert.equal((await state(db, u)).used, 1); assert.equal((await state(db, u)).report_history.length, 0);
     const apiId = (await db.main.query("insert into public.calculations(user_id,marketplace,mode) values($1,'ozon','api') returning id", [u])).rows[0].id;
     assert.equal((await edit(u, apiId)).body.code, 'api_mode_forbidden');
@@ -234,15 +288,17 @@ describe('P1 migration defense in depth and compatibility', () => {
       assert.equal((await asRole(db,'authenticated',u,`update public.${t} set profit=999 returning id`)).rowCount,0);
       assert.equal(Number((await db.main.query(`select profit from public.${t} where user_id=$1`,[u])).rows[0].profit),12);
     }
-    await db.main.query('grant execute on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb) to authenticated');
-    await assert.rejects(asRole(db,'authenticated',u,'select public.edit_calculation_operation($1,$2,$3,null)',[u,randomUUID(),{}]), {code:'42501'});
+    await db.main.query('grant execute on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb,integer,uuid) to authenticated');
+    await assert.rejects(asRole(db,'authenticated',u,'select public.edit_calculation_operation($1,$2,$3,null,0,gen_random_uuid())',[u,randomUUID(),{}]), {code:'42501'});
   });
   it('migration preserves old data verbatim; no migration => edit fails closed; full schema matches', async () => {
     const db = await freshDb({ extraMigrations: migrations.slice(0,2) }); net.state.pool = db.pool(4);
     const u = await db.user(); const saved = await create(u); const before = await state(db,u);
     assert.equal((await edit(u,saved.calculationId)).body.code, 'migration_missing');
     await runScript(db.main,migrations[2]); await runScript(db.main,migrations[2]);
-    assert.deepEqual(await state(db,u),before);
+    const afterMigration = await state(db,u);
+    for (const row of afterMigration.calculations) { assert.equal(row.edit_version,0); delete row.edit_version; }
+    assert.deepEqual(afterMigration,before);
     const full = await freshDb({ migrated:false, fullSchema:true });
     const fingerprint = async c => (await c.query("select pg_get_functiondef(oid) as def, proacl::text from pg_proc where proname in ('edit_calculation_operation','calculation_edit_source') order by proname")).rows;
     assert.deepEqual(await fingerprint(db.main),await fingerprint(full.main));

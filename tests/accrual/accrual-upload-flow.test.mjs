@@ -656,7 +656,7 @@ describe("жизненный цикл: первое сохранение и пр
     const back = await ctl.save(req(a)); // снова K1
     assert.equal(back.status, "saved");
     assert.equal(cloud.log.histories.length, 1, "в сводке по-прежнему одна запись K1");
-    assert.equal(cloud.log.historyTry, 3, "клиент не может отличить откат от потери ответа после COMMIT");
+    assert.equal(cloud.log.historyTry, 4, "сначала разрешается неопределённая правка исходным ключом, затем сохраняется новый ввод");
     assert.equal(cloud.rows.get(back.row.id).tax, 84);
     assert.equal((await ctl.save(req(a))).status, "unchanged");
   });
@@ -1247,4 +1247,21 @@ describe("проверка файла", () => {
     assert.match(lines[0], /Строки листа: \d+/);
     assert.doesNotMatch(lines.join(" "), /ART-|Товар/);
   });
+});
+
+it("client preserves B after A commits, loses its response, and is retried", async () => {
+  const cloud = makeMockCloud(); const ctl = startedCtl(cloud); const a = pipeline({ buf: basicBuf() });
+  const req = p => ({ snapshot: p.evaluation.snapshot, ready: p.evaluation.readyToSave, userId: "u1" });
+  const first = await ctl.save(req(a));
+  const editedA = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, taxPercent: "8" } });
+  const editedB = pipeline({ buf: basicBuf(), inputs: { ...INPUTS, taxPercent: "10" } });
+  cloud.cfg.dropEditResponse = true;
+  assert.equal((await ctl.save(req(editedA))).status,"save_failed");
+  cloud.cfg.dropEditResponse = false;
+  const b = await cloud.deps.updateCalculation(first.row.id, COL.accrualSnapshotToCalculationColumns(editedB.evaluation.snapshot), { expectedVersion: 1, editOperationId: "external-b" });
+  assert.equal(b.error,null);
+  const before = JSON.stringify([...cloud.rows]);
+  const retry = await ctl.save(req(editedA));
+  assert.equal(retry.status,"save_failed"); assert.match(retry.error,/version_conflict/);
+  assert.equal(JSON.stringify([...cloud.rows]),before); assert.equal(cloud.log.consume,1);
 });

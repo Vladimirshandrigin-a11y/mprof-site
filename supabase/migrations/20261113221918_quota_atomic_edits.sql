@@ -4,6 +4,23 @@
 -- No historical data is rewritten, inferred, deleted or charged by this migration.
 begin;
 
+-- Metadata only: financial values and historical operation links are unchanged.
+alter table public.calculations add column if not exists edit_version integer not null default 0 check (edit_version >= 0);
+create table if not exists public.calculation_edit_operations (
+  id uuid primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  calculation_id uuid not null references public.calculations(id) on delete cascade,
+  request_hash text not null,
+  result_version integer not null check (result_version > 0)
+);
+create index if not exists calculation_edit_operations_user_idx on public.calculation_edit_operations(user_id);
+create index if not exists calculation_edit_operations_calculation_idx on public.calculation_edit_operations(calculation_id);
+alter table public.calculation_edit_operations enable row level security;
+revoke all on public.calculation_edit_operations from public, anon, authenticated;
+grant select, insert on public.calculation_edit_operations to service_role;
+-- Remove the unsafe pre-version contract, including when upgrading a test install.
+drop function if exists public.edit_calculation_operation(uuid,uuid,jsonb,jsonb);
+
 -- Defense in depth: privileges AND restrictive policies. Column grants are
 -- independent of table grants, so revoke both (including PUBLIC inheritance).
 do $$
@@ -53,7 +70,8 @@ revoke all on function public.calculation_edit_source(jsonb) from public, anon, 
 grant execute on function public.calculation_edit_source(jsonb) to service_role;
 
 create or replace function public.edit_calculation_operation(
-  p_user_id uuid, p_calculation_id uuid, p_calculation jsonb, p_history jsonb
+  p_user_id uuid, p_calculation_id uuid, p_calculation jsonb, p_history jsonb,
+  p_expected_version integer, p_edit_operation_id uuid
 )
 returns jsonb language plpgsql security invoker
 set search_path = pg_catalog, pg_temp
@@ -62,6 +80,8 @@ declare
   c public.calculations%rowtype;
   op public.calculation_operations%rowtype;
   h public.report_history%rowtype;
+  receipt public.calculation_edit_operations%rowtype;
+  request_hash text;
   source_before jsonb;
   source_after jsonb;
 begin
@@ -69,7 +89,8 @@ begin
   if current_user <> 'service_role' then
     raise insufficient_privilege using message = 'server-only calculation edit';
   end if;
-  if p_user_id is null or p_calculation_id is null
+  if p_user_id is null or p_calculation_id is null or p_edit_operation_id is null
+     or p_expected_version is null or p_expected_version < 0
      or jsonb_typeof(p_calculation) is distinct from 'object' then
     return jsonb_build_object('ok', false, 'reason', 'bad_request');
   end if;
@@ -116,7 +137,28 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'bad_request');
   end if;
 
+  request_hash := encode(sha256(convert_to(jsonb_build_object(
+    'expectedVersion', p_expected_version, 'calculation', p_calculation,
+    'history', p_history
+  )::text, 'UTF8')), 'hex');
+  select * into receipt from public.calculation_edit_operations where id = p_edit_operation_id;
+  if found then
+    if receipt.user_id <> p_user_id or receipt.calculation_id <> c.id
+       or receipt.request_hash <> request_hash then
+      return jsonb_build_object('ok', false, 'reason', 'edit_operation_conflict');
+    end if;
+    -- Replay acknowledges only this revision, never replaces a later edit.
+    if c.edit_version <> receipt.result_version then
+      return jsonb_build_object('ok', false, 'reason', 'version_conflict');
+    end if;
+    return jsonb_build_object('ok', true, 'replay', true, 'calculation', to_jsonb(c));
+  end if;
+  if c.edit_version <> p_expected_version then
+    return jsonb_build_object('ok', false, 'reason', 'version_conflict');
+  end if;
+
   update public.calculations set
+    edit_version = c.edit_version + 1,
     commission = (p_calculation->>'commission')::numeric,
     logistics = (p_calculation->>'logistics')::numeric,
     ads = (p_calculation->>'ads')::numeric,
@@ -140,9 +182,14 @@ begin
     'snapshot', (p_calculation->'ai_insights') - 'generatedAt' - 'savedAt',
     'history', p_history
   )::text, 'UTF8')), 'hex') where id = op.id;
-  return jsonb_build_object('ok', true, 'calculation', to_jsonb(c));
+  insert into public.calculation_edit_operations(id,user_id,calculation_id,request_hash,result_version)
+    values(p_edit_operation_id,p_user_id,c.id,request_hash,c.edit_version);
+  return jsonb_build_object('ok', true, 'replay', false, 'calculation', to_jsonb(c));
 end;
 $$;
-revoke all on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb) from public, anon, authenticated;
-grant execute on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb) to service_role;
+revoke all on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb,integer,uuid) from public, anon, authenticated;
+grant execute on function public.edit_calculation_operation(uuid,uuid,jsonb,jsonb,integer,uuid) to service_role;
 commit;
+
+-- Delivered after COMMIT; PostgREST discovers the new RPC signature.
+notify pgrst, 'reload schema';

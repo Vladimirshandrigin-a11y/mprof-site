@@ -15,14 +15,18 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
  */
 export function parseCalculationEdit(body: unknown) {
   if (!isObject(body) || typeof body.id !== "string" || !UUID.test(body.id)) return null;
+  if (typeof body.editOperationId !== "string" || !UUID.test(body.editOperationId) ||
+      typeof body.expectedVersion !== "number" || !Number.isSafeInteger(body.expectedVersion) ||
+      body.expectedVersion < 0 || body.expectedVersion > 2147483646) return null;
+  const version = { expectedVersion: body.expectedVersion, editOperationId: body.editOperationId };
   const keys = Object.keys(body);
-  if (keys.some((k) => !["id", "snapshot", "inputs"].includes(k))) return null;
+  if (keys.some((k) => !["id", "snapshot", "inputs", "expectedVersion", "editOperationId"].includes(k))) return null;
   if (("snapshot" in body) === ("inputs" in body)) return null;
   if ("snapshot" in body) {
     const read = readAccrualSnapshot(body.snapshot);
     if (read.status !== "ok" || read.snapshot.preliminary || !read.snapshot.costCoverage.complete) return null;
     return {
-      id: body.id,
+      ...version, id: body.id,
       calculation: accrualSnapshotToCalculationColumns(read.snapshot),
       history: accrualSnapshotToReportHistoryColumns(read.snapshot),
     };
@@ -30,5 +34,5 @@ export function parseCalculationEdit(body: unknown) {
   const parsed = parseManualInputs(body.inputs);
   if (!parsed.ok || !isObject(body.inputs) ||
       Object.keys(body.inputs).some((k) => !(k in parsed.value))) return null;
-  return { id: body.id, calculation: computeManualColumns(parsed.value), history: null };
+  return { ...version, id: body.id, calculation: computeManualColumns(parsed.value), history: null };
 }

@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
 import appLoaderStyles from "./app-loader.module.css"
+import { LEGACY_DETAIL_UNAVAILABLE, readLegacyUpdProductDetail } from "./lib/legacy-upd-display"
+import type { ProductBreakdownRow } from "./lib/product-breakdown-calc"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
 import { AccrualUploadFlow } from "./components/AccrualUploadFlow"
 import { ApiCostGapNotice } from "./components/ApiCostGapNotice"
@@ -1565,6 +1567,7 @@ export default function AppPage() {
    *  себестоимости из каталога и блока «Прибыль по товарам». Заполняется в
    *  обоих flow (одиночный upload и 3-file). Пусто → блок не показывается. */
   const [reportProducts, setReportProducts] = useState<OzonProductRow[]>([]);
+  const [historicalProductDetail, setHistoricalProductDetail] = useState<ProductBreakdownRow[] | null>(null);
   /**
    * report.loyaltyPayoutPerSkuKnown последнего отчёта — true, когда колонки
    * «Выплаты при реализации» (G) и «Возврат выплат» (K) надёжно различены по
@@ -2225,7 +2228,7 @@ export default function AppPage() {
         ctx.fillText(pctv(p.margin), x + w - 16, cy + 106);
         ctx.textAlign = "left";
       };
-      const keyProducts = reportKeyProducts;
+      const keyProducts = historicalProductDetail ? reportKeyProducts : null;
       if (keyProducts?.best || keyProducts?.worst) {
         yAfter += 30;
         ctx.textAlign = "left";
@@ -2253,6 +2256,15 @@ export default function AppPage() {
           keyProducts.worst
         );
         yAfter += kcH;
+      }
+
+      if (!historicalProductDetail) {
+        yAfter += 22;
+        ctx.font = `400 11px ${SANS}`;
+        ctx.fillStyle = C.txt2;
+        ctx.fillText("Историческая детализация по товарам недоступна.", ML, yAfter);
+        yAfter += 16;
+        ctx.fillText("Себестоимость товаров не была сохранена; общий итог сохранён.", ML, yAfter);
       }
 
       // ── Примечание о методике расчёта ──
@@ -2330,9 +2342,10 @@ export default function AppPage() {
     });
     // Восстанавливаем выбранный график выплат (старые записи → стандартный 0%).
     setPayoutSchedule(b.payoutSchedule ?? { ...DEFAULT_PAYOUT_SCHEDULE });
-    // Восстанавливаем per-SKU строки + estimate из snapshot (если сохранены).
-    // Это даёт OzonProductBreakdown заново сопоставить товары с АКТУАЛЬНЫМ
-    // каталогом и пересчитать себестоимость (COGS) при открытии старого расчёта.
+    // Historical detail must come from saved financial rows, never today's catalog.
+    setHistoricalProductDetail(readLegacyUpdProductDetail(item.aiInsights, {
+      cost: item.cost, profit: item.profit, revenue: b.revenueOzon,
+    }));
     const restoredProducts = b.products ?? [];
     setReportProducts(restoredProducts);
     // productDetailComplete=false у старых записей (до этого поля) — «Чистая
@@ -2533,6 +2546,7 @@ export default function AppPage() {
     setCombinedStatus("idle");
     setCombinedResult(null);
     setReportProducts([]);
+    setHistoricalProductDetail(null);
     setReportProductDetailComplete(true);
     setReportLoyaltyPayoutPerSkuKnown(false);
     setReportKeyProducts(null);
@@ -10570,9 +10584,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             (productDetailComplete=true; иначе блок честно показывает
             недоступность, см. OzonProductBreakdown). Показывается, когда в
             распарсенном отчёте есть per-SKU строки. */}
-        {reportProducts.length > 0 && (
+        {historicalProductDetail ? (
           <OzonProductBreakdown
             products={reportProducts}
+            precomputedRows={historicalProductDetail}
             distributableExpenses={
               combinedResult
                 ? combinedResult.updServicesTotal +
@@ -10590,7 +10605,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             onKeyProducts={handleReportKeyProducts}
             onCostCoverage={handleReportCostCoverage}
           />
-        )}
+        ) : combinedResult ? <p role="status">{LEGACY_DETAIL_UNAVAILABLE}</p> : null}
 
         {/* Отдельный блок месячной сводки («Динамика прибыли») убран с экрана:
             у продавца бывает несколько магазинов/отчётов и несколько загрузок

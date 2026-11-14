@@ -87,6 +87,8 @@ export async function PATCH(req: NextRequest) {
     p_calculation_id: edit.id,
     p_calculation: edit.calculation,
     p_history: edit.history,
+    p_expected_version: edit.expectedVersion,
+    p_edit_operation_id: edit.editOperationId,
   });
   if (error) {
     const missing = error.code === "PGRST202" || error.code === "42883";
@@ -99,11 +101,13 @@ export async function PATCH(req: NextRequest) {
   if (data?.ok !== true) {
     const reason = typeof data?.reason === "string" ? data.reason : "rpc_failed";
     const status = reason === "not_found" ? 404 : reason === "legacy_read_only" || reason === "api_mode_forbidden" ? 403
-      : reason === "source_conflict" || reason === "history_missing" ? 409 : reason === "bad_request" ? 400 : 502;
+      : reason === "source_conflict" || reason === "history_missing" || reason === "version_conflict" || reason === "edit_operation_conflict" ? 409 : reason === "bad_request" ? 400 : 502;
     return NextResponse.json({
       code: reason,
       error: reason === "legacy_read_only"
         ? "Редактирование этого исторического расчёта временно недоступно. Исходные данные сохранены"
+        : reason === "version_conflict" || reason === "edit_operation_conflict"
+          ? "Расчёт изменился. Откройте сохранённый расчёт заново перед редактированием"
         : reason === "source_conflict" ? "Исходные данные изменились — выполните новый расчёт"
         : "Не удалось сохранить изменения расчёта",
     }, { status, headers: NO_STORE });

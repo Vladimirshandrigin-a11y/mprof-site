@@ -18,6 +18,7 @@ import { SCHEMA, buildRequire, payTestEnv, read, root, runScript } from "./helpe
 
 const OPS_MIGRATION = read("supabase/migrations/20260928_calculation_operations.sql");
 const MA_MIGRATION = read("supabase/migrations/20260929_calculation_operations_manual_api.sql");
+const P1_MIGRATION = read("supabase/migrations/20261113221918_quota_atomic_edits.sql");
 const MA_CHECKS = read("supabase/checks/calculation_operations_manual_api.sql");
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE_URL;
@@ -201,7 +202,7 @@ beforeEach(() => net.reset());
 describe("ручной расчёт: списание и запись — одна транзакция через настоящий маршрут", () => {
   let db;
   before(async () => {
-    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
   });
   beforeEach(() => {
     state.pool = db.pool(12);
@@ -402,7 +403,7 @@ describe("ручной расчёт: списание и запись — одн
 describe("Ozon API: Ozon вне транзакции, права + списание + запись — одна транзакция", () => {
   let db;
   before(async () => {
-    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
   });
   beforeEach(() => {
     state.pool = db.pool(12);
@@ -571,7 +572,7 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
 describe("себестоимость API по нетто-количеству: сохранение, восстановление, старые снимки", () => {
   let db;
   before(async () => {
-    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
   });
   beforeEach(() => {
     state.pool = db.pool(12);
@@ -730,7 +731,7 @@ describe("себестоимость API по нетто-количеству: �
 describe("503 на повтор, пока исходный запрос операции ещё может завершиться", () => {
   let db;
   before(async () => {
-    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
   });
   beforeEach(() => {
     state.pool = db.pool(12);
@@ -887,7 +888,7 @@ describe("503 на повтор, пока исходный запрос опер
 describe("граница доверия: клиент не пишет API-расчёт и не подменяет режим", () => {
   let db;
   before(async () => {
-    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
   });
   beforeEach(() => {
     state.pool = db.pool(6);
@@ -1001,12 +1002,12 @@ describe("граница доверия: клиент не пишет API-рас
     const u = await db.user();
     const denied = (e) => e.code === "42501";
     await assert.rejects(asUser(db, u, "insert into public.calculations (user_id, marketplace, mode) values ($1, 'ozon', 'api')", [u]), denied);
-    const [own] = await asUser(db, u, "insert into public.calculations (user_id, marketplace, mode) values ($1, 'ozon', 'manual') returning id", [u]);
+    await assert.rejects(asUser(db, u, "insert into public.calculations (user_id, marketplace, mode) values ($1, 'ozon', 'manual')", [u]), denied);
+    const own = (await db.main.query("insert into public.calculations (user_id, marketplace, mode) values ($1, 'ozon', 'manual') returning id", [u])).rows[0];
     await assert.rejects(asUser(db, u, "update public.calculations set mode = 'api' where id = $1", [own.id]), denied);
     const svc = await db.client("service_role");
     const apiRow = (await svc.query("insert into public.calculations (user_id, marketplace, mode, profit) values ($1, 'ozon', 'api', 5) returning id", [u])).rows[0];
-    const upd = await asUser(db, u, "update public.calculations set profit = 999 where id = $1 returning id", [apiRow.id]);
-    assert.deepEqual(upd, [], "строку api пользователь не меняет");
+    await assert.rejects(asUser(db, u, "update public.calculations set profit = 999 where id = $1 returning id", [apiRow.id]), denied);
     const post = await CALCS_ROUTE.POST(new NextRequest("http://localhost/api/cloud/calculations", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${userJwt(u)}` },
@@ -1035,7 +1036,7 @@ describe("граница доверия: клиент не пишет API-рас
 describe("общая бесплатная попытка между режимами", () => {
   let db;
   before(async () => {
-    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
   });
   beforeEach(() => {
     state.pool = db.pool(12);
@@ -1053,6 +1054,14 @@ describe("общая бесплатная попытка между режима
       assert.deepEqual([f.used, f.calcs, f.ops], [1, 1, 1]);
     });
   }
+
+  it("449 ₽: manual/API/XLSX concurrently save atomically without consuming credits", async () => {
+    const u = await apiUser(db, { unlimited: true, used: 7 });
+    const outs = await Promise.all([postManual(u),postApi(u),postXlsx(u)]);
+    assert.deepEqual(outs.map(o=>o.status),[200,200,200]);
+    const f = await facts(db,u);
+    assert.deepEqual([f.used,f.calcs,f.ops,f.history],[7,3,3,2]);
+  });
 
   it("один разовый кредит после бесплатной: ручной и XLSX делят кредит, API недоступен", async () => {
     const u = await apiUser(db, { used: 1, credits: 1 });
@@ -1094,7 +1103,7 @@ describe("совместимость и миграция", () => {
       return out;
     };
     const before = await run(await freshDb({ extraMigrations: [OPS_MIGRATION] }));
-    const after = await run(await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] }));
+    const after = await run(await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] }));
     assert.deepEqual(after, before);
   });
 
@@ -1131,7 +1140,7 @@ describe("совместимость и миграция", () => {
   });
 
   it("старый код после миграции: consume_calculation() + вставка ручной строки маршрутом, consume_api_calculation() + вставка API service role", async () => {
-    const db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    const db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
     const u = await db.user();
     await db.main.query("insert into public.subscriptions (user_id, plan, status) values ($1, 'single', 'active')", [u]);
     const [{ r: api }] = await asUser(db, u, "select public.consume_api_calculation() as r");
@@ -1192,7 +1201,7 @@ describe("совместимость и миграция", () => {
       const pol = await c.query("select policyname, cmd, qual, with_check from pg_policies where schemaname = 'public' and tablename = 'calculations' order by 1");
       return JSON.stringify([f.rows, k.rows, pol.rows]);
     };
-    const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION] });
+    const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
     await runScript(migrated.main, read("supabase/migrations/20261113221918_quota_atomic_edits.sql"));
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_manual_calculation_operation"));
