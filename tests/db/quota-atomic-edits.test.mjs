@@ -20,8 +20,13 @@ const SES = req('./app/lib/accrual/upload-session.js');
 const PARSER = req('./app/lib/report-parsers/accrual-xlsx-parser.js');
 const SNAP = req('./app/lib/accrual/snapshot.js');
 const net = installFetch();
+const originalEditSwitch = process.env.MPROF_CALCULATION_EDITS_ENABLED;
 const { freshDb } = payTestEnv();
-after(() => net.restore());
+after(() => {
+  net.restore();
+  if (originalEditSwitch === undefined) delete process.env.MPROF_CALCULATION_EDITS_ENABLED;
+  else process.env.MPROF_CALCULATION_EDITS_ENABLED = originalEditSwitch;
+});
 const migrations = ['20260928_calculation_operations.sql', '20260929_calculation_operations_manual_api.sql', '20261113221918_quota_atomic_edits.sql'].map(n => read(`supabase/migrations/${n}`));
 const manual = { marketplace: 'ozon', revenue: 1000, commission: 100, logistics: 10, storage: 0, ads: 20, cost: 200, tax: 60, other: 10 };
 function snapshot({ taxPercent = '7', cost = 100, other = '3.33' } = {}) {
@@ -66,7 +71,27 @@ async function state(db, u) {
 describe('P1 quota and immutable history boundaries', () => {
   let db;
   before(async () => { db = await freshDb({ extraMigrations: migrations }); });
-  beforeEach(() => { net.state.pool = db.pool(15); net.state.dropAfterCommit = null; });
+  beforeEach(() => {
+    net.state.pool = db.pool(15); net.state.dropAfterCommit = null;
+    process.env.MPROF_CALCULATION_EDITS_ENABLED = 'true';
+  });
+  it('disabled PATCH preserves calculation, history, receipt and quota; anonymous stays 401', async () => {
+    const u = await db.user(); const saved = await create(u); const before = await state(db, u);
+    const receipts = () => db.main.query('select count(*)::int as n from public.calculation_edit_operations where user_id=$1', [u]);
+    const beforeReceipts = (await receipts()).rows[0].n;
+    for (const value of [undefined, 'false', 'TRUE', ' true', '1']) {
+      if (value === undefined) delete process.env.MPROF_CALCULATION_EDITS_ENABLED;
+      else process.env.MPROF_CALCULATION_EDITS_ENABLED = value;
+      const r = await edit(u, saved.calculationId);
+      assert.deepEqual([r.status, r.body.code], [503, 'edits_disabled']);
+      assert.deepEqual(await state(db, u), before);
+      assert.equal((await receipts()).rows[0].n, beforeReceipts);
+      assert.equal((await call(CALCS, 'PATCH', null, {})).status, 401);
+    }
+    process.env.MPROF_CALCULATION_EDITS_ENABLED = 'true';
+    assert.equal((await edit(u, saved.calculationId)).status, 200);
+    assert.equal((await state(db, u)).used, before.used);
+  });
   it('old POST routes are closed, require authentication, and never insert/consume', async () => {
     const u = await db.user();
     const before = await state(db, u);

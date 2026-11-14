@@ -76,6 +76,13 @@ export async function POST(req: NextRequest) {
 export async function PATCH(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
+  // Read on every request; only an explicit server-side opt-in enables edits.
+  if (process.env.MPROF_CALCULATION_EDITS_ENABLED !== "true") {
+    return NextResponse.json(
+      { error: "Редактирование расчётов временно отключено", code: "edits_disabled" },
+      { status: 503, headers: NO_STORE }
+    );
+  }
   let body: unknown;
   try { body = await req.json(); } catch { body = null; }
   const edit = parseCalculationEdit(body);

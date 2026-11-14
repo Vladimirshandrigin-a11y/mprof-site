@@ -36,7 +36,7 @@ A regression test reproduced this before the fix. The controller now invalidates
 
 Also removed unused remnants of the deleted legacy saving path and corrected legacy UI labels that still promised saving. No tariff, financial formula, payment implementation or dependency versions changed.
 
-## Final checks
+## Full checks at 1b79a1d (before the emergency switch)
 
 | Check | Result |
 | --- | --- |
@@ -60,7 +60,7 @@ The sandbox initially blocked PostgreSQL localhost connections and Turbopack's i
 
 - This PR is for review only. No merge, deployment or production SQL has been performed. The original local repository, `work` branch and old cloud workspace remain untouched.
 - `supabase/migrations/20261113221918_quota_atomic_edits.sql` requires a separately authorized production migration. It changes privileges/policies and adds functions; it does not rewrite existing financial records or invent operation links.
-- After separate release approval, release the API/client that closes generic writes, then apply the migration in the approved release window. Until the migration is applied, edits fail closed with 503 `migration_missing`; existing atomic creation routes remain available. The direct-table bypass is closed only when the migration is applied. Do not treat the code-only release as a completed P1 rollout.
+- After separate release approval, release the API/client that closes generic writes with `MPROF_CALCULATION_EDITS_ENABLED=false`, then apply the migration in the approved window. Edits return 503 `edits_disabled` until explicitly enabled. With the flag enabled but SQL absent, they fail closed with 503 `migration_missing`. Existing atomic creation routes remain available. The direct-table bypass is closed only when SQL is applied. Do not treat code-only release as a completed P1 rollout.
 - Old clients using generic creation/history endpoints receive 410 and must reload. Historical calculations without a verified operation remain view/PDF-only. Missing/shared history links fail closed rather than recreate history.
 - Do not roll back to the old generic service-role write endpoints: that would reopen the bypass even with restrictive client RLS. Any rollback must retain the closed endpoints and write restrictions.
 - Local PostgreSQL proves transaction/grant/RLS behavior, not the deployed platform configuration. Production migration and post-release smoke checks still require approval. Browser end-to-end interaction and PDF download were not exercised in this verification run.
@@ -87,10 +87,20 @@ The integration test requires an actual binary and fails rather than silently sk
 
 ### Release and rollback
 
-1. After separate release approval, deploy the matching Next.js API/client to all instances. Generic POSTs must be closed everywhere. Before SQL, edits return 503; the direct-table bypass is not yet closed. Old edit clients lacking concurrency metadata must reload.
+1. After separate release approval, deploy the matching Next.js API/client to all instances with `MPROF_CALCULATION_EDITS_ENABLED=false`. Generic POSTs must be closed everywhere and PATCH returns 503 `edits_disabled`. Before SQL, the direct-table bypass is not yet closed. Old edit clients lacking concurrency metadata must reload.
 2. Apply the reviewed migration in the approved window. It adds concurrency metadata/receipts and restrictions without changing monetary columns. Allow for the table DDL lock; if migration fails, keep edits closed and investigate rather than restoring generic writes.
-3. Let the post-COMMIT NOTIFY refresh PostgREST; verify the six-argument RPC resolves with the intended service/browser permissions. Until it resolves, 503 is expected.
+3. Let the post-COMMIT NOTIFY refresh PostgREST; verify the six-argument RPC resolves with intended service/browser permissions. Only then explicitly enable edits with the exact value `true` and restart/replace all serving instances. Keep edits disabled if readiness is uncertain.
 4. Check creation/replay, conflict 409, history IDs/dates, quota and tariff behavior through the deployed API using approved test accounts. Only then declare P1 released.
 5. Rollback retains closed generic endpoints and SQL write restrictions. Disable edits temporarily or deploy a compatible fix. Do not restore the old four-argument edit RPC or service-role generic writes, remove receipts, or reset versions. Retain edit receipts for the calculation lifetime; deleting a calculation cascades its receipts.
 
 Remaining limits: no production SQL or deploy, no managed Supabase/GoTrue smoke checks, and no browser/PDF-download E2E. UI/PDF use the same validated saved detail path; local tests cover the saved/missing/corrupt detail contract. Existing 24 lint errors remain, with no new diagnostics.
+
+## Emergency switch verification
+
+The follow-up adds only a server guard before PATCH body parsing/RPC. Missing or
+non-exact `true` values disable edits. Targeted switch/API/client tests pass 11/11;
+the isolated PostgreSQL P1 group passes 19/19; financial/client regressions pass
+605/605. TypeScript, production build and diff-check pass. ESLint remains exactly
+24 errors / 195 warnings, with no new diagnostics. The full 160-test DB run above
+belongs to the preceding SHA; unchanged payment groups were not rerun for this
+guard. See [operation and fixed-source fallback instructions](p1-edit-switch-release.md).
