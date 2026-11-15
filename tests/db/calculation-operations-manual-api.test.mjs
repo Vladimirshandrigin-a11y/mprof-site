@@ -998,7 +998,14 @@ describe("граница доверия: клиент не пишет API-рас
     assert.deepEqual(modes, ["manual"]);
   });
 
-  it("RLS и маршрут: пользователь не может вставить или изменить строку mode='api'; сервер (service_role) — может; удаление своих — как раньше", async () => {
+  it("RLS и маршрут: пользователь не может вставить или изменить строку mode='api'; сервер (service_role) — может; удаление своих — как раньше", async (t) => {
+    // Exercise the parser/RLS boundary, rather than stopping at the edit switch.
+    const previous = process.env.MPROF_CALCULATION_EDITS_ENABLED;
+    process.env.MPROF_CALCULATION_EDITS_ENABLED = "true";
+    t.after(() => {
+      if (previous === undefined) delete process.env.MPROF_CALCULATION_EDITS_ENABLED;
+      else process.env.MPROF_CALCULATION_EDITS_ENABLED = previous;
+    });
     const u = await db.user();
     const denied = (e) => e.code === "42501";
     await assert.rejects(asUser(db, u, "insert into public.calculations (user_id, marketplace, mode) values ($1, 'ozon', 'api')", [u]), denied);
@@ -1203,6 +1210,7 @@ describe("совместимость и миграция", () => {
     };
     const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
     await runScript(migrated.main, read("supabase/migrations/20261113221918_quota_atomic_edits.sql"));
+    await runScript(migrated.main, read("supabase/migrations/20261115180805_operation_saved_edit_version.sql"));
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_manual_calculation_operation"));
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));
