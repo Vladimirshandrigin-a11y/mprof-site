@@ -1,7 +1,7 @@
 // Real API handlers -> supabase-js -> isolated PostgreSQL, never production.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { after, before, beforeEach, describe, it } from 'node:test';
+import { after, before, beforeEach, afterEach, describe, it } from 'node:test';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { buildRequire as req, payTestEnv, read, root, runScript } from './helpers/pay-db.mjs';
@@ -19,6 +19,8 @@ const COL = req('./app/lib/accrual/columns.js');
 const SES = req('./app/lib/accrual/upload-session.js');
 const PARSER = req('./app/lib/report-parsers/accrual-xlsx-parser.js');
 const SNAP = req('./app/lib/accrual/snapshot.js');
+const CLIENT = req('./app/lib/supabase-cloud.js');
+const { AccrualSaveController } = req('./app/lib/accrual/save-flow.js');
 const net = installFetch();
 const originalEditSwitch = process.env.MPROF_CALCULATION_EDITS_ENABLED;
 const { freshDb } = payTestEnv();
@@ -28,6 +30,7 @@ after(() => {
   else process.env.MPROF_CALCULATION_EDITS_ENABLED = originalEditSwitch;
 });
 const migrations = ['20260928_calculation_operations.sql', '20260929_calculation_operations_manual_api.sql', '20261113221918_quota_atomic_edits.sql'].map(n => read(`supabase/migrations/${n}`));
+const versionMigration = read('supabase/migrations/20261115180805_operation_saved_edit_version.sql');
 const manual = { marketplace: 'ozon', revenue: 1000, commission: 100, logistics: 10, storage: 0, ads: 20, cost: 200, tax: 60, other: 10 };
 function snapshot({ taxPercent = '7', cost = 100, other = '3.33' } = {}) {
   const parsed = PARSER.parseAccrualXlsxBuffer(new Uint8Array(scenario('basic')));
@@ -328,5 +331,199 @@ describe('P1 migration defense in depth and compatibility', () => {
     const fingerprint = async c => (await c.query("select pg_get_functiondef(oid) as def, proacl::text from pg_proc where proname in ('edit_calculation_operation','calculation_edit_source') order by proname")).rows;
     assert.deepEqual(await fingerprint(db.main),await fingerprint(full.main));
     assert.equal((await edit(u,saved.calculationId)).status,200);
+  });
+});
+
+// Real client + save controller -> actual Next handlers -> supabase-js -> SQL.
+// Only auth and the PostgREST transport are local adapters; responses/versions,
+// financial snapshots, transactions, grants and row locks come from PostgreSQL.
+describe('operation version: creation -> history -> client PATCH -> replay/conflict', () => {
+  let db, user, http, dropEditResponse, pgFetch;
+  const originalSession = CLIENT.supabase.auth.getSession;
+  const operationId = randomUUID();
+  const request = (s = snapshot(), id = operationId) => ({ ...uploadBody(s), operationId: id });
+  const saveRequest = (s = snapshot()) => ({ snapshot: s, ready: true, userId: user });
+  const lastPatch = () => http.filter(x => x.method === 'PATCH').at(-1);
+  function controller(id = operationId) {
+    let pending = true;
+    const ctl = new AccrualSaveController({
+      canCalculate: () => true,
+      confirmNoMonthDuplicate: async () => true,
+      consume: async () => assert.fail('account path must never consume separately'),
+      saveOperation: CLIENT.saveCalculationOperation,
+      operationIdFor: () => id,
+      operationSettled: () => { pending = false; },
+      hasPendingOperation: () => pending,
+      operationStatus: CLIENT.getCalculationOperationStatus,
+      newEditOperationId: randomUUID,
+      updateCalculation: (id, cols, meta) => CLIENT.updateCalculationInCloud(id, cols, user, meta),
+      newLocalId: () => assert.fail('account path must never create a local fallback'),
+      nowIso: () => new Date().toISOString(),
+    });
+    ctl.beginAttempt('source-basic-2026-06');
+    return ctl;
+  }
+  async function recover(id = operationId) {
+    const done = await CLIENT.getCalculationOperationStatus(id, 'source-basic-2026-06');
+    assert.equal(done.kind, 'done');
+    const ctl = controller(id);
+    assert.equal(ctl.adoptSaved('source-basic-2026-06', { ...done, operationId: id }), true);
+    return ctl;
+  }
+  async function receipts() {
+    return (await db.main.query('select * from public.calculation_edit_operations where user_id=$1 order by id', [user])).rows;
+  }
+  before(() => {
+    pgFetch = globalThis.fetch;
+    CLIENT.supabase.auth.getSession = async () => ({ data: { session: { access_token: userJwt(user) } }, error: null });
+    globalThis.fetch = async (input, init = {}) => {
+      if (typeof input !== 'string' || !input.startsWith('/api/cloud/')) return pgFetch(input, init);
+      const method = init.method ?? 'GET';
+      const pathname = new URL(input, 'http://app.test').pathname;
+      const route = pathname === '/api/cloud/calculation-operations' ? OPS
+        : pathname === '/api/cloud/calculations' ? CALCS : HISTORY;
+      const res = await route[method](new NextRequest('http://app.test' + input, init));
+      http.push({ method, status: res.status, body: init.body ? JSON.parse(init.body) : null, response: await res.clone().json() });
+      if (method === 'PATCH' && res.ok && dropEditResponse) {
+        dropEditResponse = false;
+        throw new TypeError('response lost after successful API/SQL COMMIT');
+      }
+      return res;
+    };
+  });
+  beforeEach(async () => {
+    db = await freshDb({ extraMigrations: [...migrations, versionMigration] });
+    user = await db.user(); net.state.pool = db.pool(8); net.reset();
+    http = []; dropEditResponse = false;
+    process.env.MPROF_CALCULATION_EDITS_ENABLED = 'true'; // isolated handlers only
+  });
+  afterEach(() => { net.reset(); });
+  after(() => {
+    globalThis.fetch = pgFetch;
+    CLIENT.supabase.auth.getSession = originalSession;
+    CLIENT.supabase.auth.stopAutoRefresh();
+  });
+  it('new creation, sequential/concurrent replay expose real version through the client', async () => {
+    const body = request();
+    const first = await CLIENT.saveCalculationOperation(body);
+    assert.equal(first.kind, 'ok');
+    assert.equal(first.row.edit_version, 0); // fails against current production SQL
+    const before = await state(db, user);
+    const replies = [await CLIENT.saveCalculationOperation(body),
+      ...await Promise.all([CLIENT.saveCalculationOperation(body), CLIENT.saveCalculationOperation(body)])];
+    for (const r of replies) {
+      assert.equal(r.kind, 'ok'); assert.equal(r.replay, true);
+      assert.equal(r.row.id, first.row.id); assert.equal(r.row.edit_version, 0);
+    }
+    const done = await CLIENT.getCalculationOperationStatus(operationId, body.requestHash);
+    assert.equal(done.kind, 'done'); assert.equal(done.row.edit_version, 0);
+    assert.deepEqual(await state(db, user), before);
+    assert.deepEqual([before.used, before.calculations.length, before.report_history.length], [1, 1, 1]);
+  });
+  it('history recovery, edit, same-key replay and stale-version HTTP 409 preserve one charge', async () => {
+    const firstTab = controller();
+    assert.equal((await firstTab.save(saveRequest())).status, 'saved');
+    const initial = await state(db, user);
+    const list = await CLIENT.loadCalculationsFromCloud(user);
+    assert.equal(list.error, null); assert.equal(list.data[0].edit_version, 0);
+    assert.deepEqual(list.data[0].ai_insights, snapshot());
+    const tab = await recover();
+    const edited = snapshot({ taxPercent: '10', cost: 120 });
+    assert.equal((await tab.save(saveRequest(edited))).status, 'saved');
+    const patch = lastPatch();
+    assert.equal(patch.status, 200); assert.equal(patch.body.expectedVersion, 0);
+    assert.equal(patch.response.data.edit_version, 1);
+    const after = await state(db, user);
+    assert.equal(after.calculations[0].id, initial.calculations[0].id);
+    assert.equal(after.report_history[0].id, initial.report_history[0].id);
+    assert.equal(after.report_history[0].created_at, initial.report_history[0].created_at);
+    assert.equal(Number(after.calculations[0].profit), 514.13);
+    assert.equal(Number(after.report_history[0].profit), 514.13);
+    const replayEdit = await CLIENT.updateCalculationInCloud(patch.body.id, COL.accrualSnapshotToCalculationColumns(edited), user,
+      { expectedVersion: patch.body.expectedVersion, editOperationId: patch.body.editOperationId });
+    assert.equal(replayEdit.error, null); assert.equal(replayEdit.data.edit_version, 1);
+    assert.equal((await receipts()).length, 1);
+    assert.deepEqual(await state(db, user), after);
+    const done = await CLIENT.getCalculationOperationStatus(operationId, 'source-basic-2026-06');
+    assert.equal(done.row.edit_version, 1); assert.deepEqual(done.snapshot, edited);
+    const replayCreate = await CLIENT.saveCalculationOperation(request());
+    assert.equal(replayCreate.row.edit_version, 1); assert.equal(replayCreate.contentMatch, false);
+    assert.equal((await firstTab.save(saveRequest(snapshot({ taxPercent: '9' })))).status, 'save_failed');
+    assert.equal(lastPatch().status, 409); assert.equal(lastPatch().response.code, 'version_conflict');
+    assert.deepEqual(await state(db, user), after); assert.equal(after.used, 1);
+  });
+  it('manual creation, saved-status and replay expose the current version too', async () => {
+    const id = randomUUID();
+    const result = await CLIENT.saveManualCalculationOperation({ operationId: id, inputs: manual });
+    assert.equal(result.kind, 'ok'); assert.equal(result.calculation.edit_version, 0);
+    const hash = req('./app/lib/calc-operation-keys.js').manualRequestHash(manual);
+    const st = await CLIENT.getSavedOperationStatus(id, hash);
+    assert.equal(st.kind, 'done'); assert.equal(st.calculation.edit_version, 0);
+    const edited = await call(CALCS, 'PATCH', user, { id: st.calculation.id, inputs: { ...manual, cost: 250 }, ...editMeta(st.calculation.edit_version) });
+    assert.equal(edited.status, 200); assert.equal(edited.body.data.edit_version, 1);
+    const after = await state(db, user);
+    const replay = await CLIENT.saveManualCalculationOperation({ operationId: id, inputs: manual });
+    assert.equal(replay.kind, 'ok'); assert.equal(replay.replay, true); assert.equal(replay.calculation.edit_version, 1);
+    assert.equal((await CLIENT.getSavedOperationStatus(id, hash)).calculation.edit_version, 1);
+    assert.deepEqual(await state(db, user), after); assert.equal(after.used, 1);
+  });
+  it('A commit/lost response -> B recovered version/success -> A original-key retry returns 409', async () => {
+    const a = controller(); assert.equal((await a.save(saveRequest())).status, 'saved');
+    const sa = snapshot({ taxPercent: '8' });
+    dropEditResponse = true;
+    assert.equal((await a.save(saveRequest(sa))).status, 'save_failed');
+    const original = lastPatch().body;
+    const b = await recover();
+    const sb = snapshot({ taxPercent: '10', cost: 120 });
+    assert.equal((await b.save(saveRequest(sb))).status, 'saved');
+    assert.equal(lastPatch().body.expectedVersion, 1);
+    const committedB = await state(db, user);
+    assert.equal((await a.save(saveRequest(sa))).status, 'save_failed');
+    assert.deepEqual(lastPatch().body, original);
+    assert.equal(lastPatch().status, 409); assert.equal(lastPatch().response.code, 'version_conflict');
+    assert.deepEqual(await state(db, user), committedB);
+    assert.deepEqual(committedB.calculations[0].ai_insights, sb);
+    assert.equal(committedB.calculations[0].edit_version, 2); assert.equal(committedB.used, 1);
+    assert.equal((await receipts()).length, 2);
+  });
+  it('client retry after a lost edit response reuses the original version/key without another write', async () => {
+    const ctl = controller(); assert.equal((await ctl.save(saveRequest())).status, 'saved');
+    const s = snapshot({ taxPercent: '8' }); dropEditResponse = true;
+    assert.equal((await ctl.save(saveRequest(s))).status, 'save_failed');
+    const original = lastPatch().body; const committed = await state(db, user);
+    assert.equal((await ctl.save(saveRequest(s))).status, 'saved');
+    assert.deepEqual(lastPatch().body, original); assert.equal(lastPatch().response.data.edit_version, 1);
+    assert.deepEqual(await state(db, user), committed); assert.equal((await receipts()).length, 1);
+  });
+  it('foreign status/read/edit and disabled PATCH stay closed through real client and SQL', async () => {
+    const ctl = controller(); assert.equal((await ctl.save(saveRequest())).status, 'saved');
+    const owner = user; const original = await state(db, owner);
+    user = await db.user();
+    assert.equal((await CLIENT.getCalculationOperationStatus(operationId, 'source-basic-2026-06')).kind, 'none');
+    assert.deepEqual((await CLIENT.loadCalculationsFromCloud(user)).data, []);
+    const foreign = await CLIENT.updateCalculationInCloud(original.calculations[0].id,
+      COL.accrualSnapshotToCalculationColumns(snapshot({ taxPercent: '10' })), user, editMeta());
+    assert.ok(foreign.error); assert.equal(lastPatch().status, 404);
+    assert.deepEqual(await state(db, owner), original);
+    user = owner; process.env.MPROF_CALCULATION_EDITS_ENABLED = 'false';
+    assert.equal((await ctl.save(saveRequest(snapshot({ taxPercent: '10' })))).status, 'save_failed');
+    assert.equal(lastPatch().status, 503); assert.equal(lastPatch().response.code, 'edits_disabled');
+    assert.deepEqual(await state(db, owner), original); assert.deepEqual(await receipts(), []);
+  });
+  it('upgrade from current production schema fixes existing rows without data/grant/role drift', async () => {
+    db = await freshDb({ extraMigrations: migrations }); user = await db.user(); net.state.pool = db.pool(5);
+    const saved = await CLIENT.saveCalculationOperation(request());
+    assert.equal(saved.kind, 'ok'); assert.equal(saved.row.edit_version, undefined);
+    const before = await state(db, user);
+    const acl = () => db.main.query("select proowner,proacl::text,prosecdef,provolatile,proconfig from pg_proc where oid='public.calculation_operation_saved(uuid)'::regprocedure");
+    const oldAcl = (await acl()).rows;
+    await runScript(db.main, versionMigration); await runScript(db.main, versionMigration);
+    assert.deepEqual((await acl()).rows, oldAcl); assert.deepEqual(await state(db, user), before);
+    const ctl = await recover();
+    assert.equal((await CLIENT.getCalculationOperationStatus(operationId, 'source-basic-2026-06')).row.edit_version, 0);
+    assert.equal((await ctl.save(saveRequest(snapshot({ taxPercent: '10', cost: 120 })))).status, 'saved');
+    const full = await freshDb({ migrated: false, fullSchema: true });
+    const definition = async c => (await c.query("select pg_get_functiondef(oid) as definition,proacl::text from pg_proc where oid='public.calculation_operation_saved(uuid)'::regprocedure")).rows;
+    assert.deepEqual(await definition(db.main), await definition(full.main));
   });
 });
