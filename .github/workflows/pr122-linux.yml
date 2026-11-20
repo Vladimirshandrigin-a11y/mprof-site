@@ -1,0 +1,89 @@
+name: PR 122 exact SHA Linux verification
+on:
+  push:
+    branches: [ci/pr122-linux-smoke]
+permissions:
+  contents: read
+jobs:
+  linux-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      TARGET_SHA: e7af73adbc98d08b9780c7658347a4a558dc1e36
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:39463
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: isolated-test-publishable-key
+      SUPABASE_SERVICE_ROLE_KEY: isolated-test-service-key
+      NEXT_PUBLIC_SITE_URL: http://127.0.0.1:39464
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: e7af73adbc98d08b9780c7658347a4a558dc1e36
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Check source, Linux x64 and glibc
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD
+          uname -sm
+          getconf GNU_LIBC_VERSION
+          node --version
+          npm --version
+          node -e 'const assert=require("node:assert/strict"); assert.equal(process.platform,"linux"); assert.equal(process.arch,"x64"); assert.ok(process.report.getReport().header.glibcVersionRuntime)'
+      - name: Clean install and check native dependencies
+        shell: bash
+        run: |
+          test ! -e node_modules
+          npm ci --no-audit --no-fund
+          git diff --exit-code -- package.json package-lock.json
+          sha256sum package-lock.json
+          node <<'NODE'
+          const assert=require('node:assert/strict');
+          const {createRequire}=require('node:module');
+          const fs=require('node:fs');
+          const nextPath=require.resolve('next/package.json');
+          const sharp=createRequire(nextPath)('sharp');
+          const lock=JSON.parse(fs.readFileSync('package-lock.json','utf8'));
+          assert.equal(require(nextPath).version,'16.4.5');
+          assert.equal(sharp.versions.sharp,'0.35.5');
+          assert.equal(lock.packages['node_modules/@img/sharp-linux-x64'].version,'0.35.5');
+          const image=Object.keys(require.cache).find(path=>path.endsWith('/sharp-linux-x64-0.35.5.node'));
+          assert.ok(image,'glibc x64 native sharp module was not loaded');
+          console.log(JSON.stringify({next:require(nextPath).version,sharp:sharp.versions.sharp,vips:sharp.versions.vips,nativeImage: image.split('/').pop()}));
+          sharp({create:{width:80,height:64,channels:3,background:'#c84'}}).png().toFile('public/pr122-linux-check.png').catch(error=>{console.error(error);process.exitCode=1;});
+          NODE
+      - name: Linux production build
+        run: npm run build
+      - name: Start and HTTP smoke
+        shell: bash
+        run: |
+          node_modules/.bin/next start -H 127.0.0.1 -p 39464 > "$RUNNER_TEMP/next.log" 2>&1 &
+          app_pid=$!
+          trap 'kill "$app_pid" 2>/dev/null || true; cat "$RUNNER_TEMP/next.log"' EXIT
+          origin=http://127.0.0.1:39464
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 --max-time 4 "$origin/" -o /dev/null
+          node <<'NODE'
+          const assert=require('node:assert/strict');
+          const {createRequire}=require('node:module');
+          const sharp=createRequire(require.resolve('next/package.json'))('sharp');
+          (async()=>{
+            const origin='http://127.0.0.1:39464';
+            for(const [path,status,type] of [['/',200,'text/html'],['/app',200,'text/html'],['/auth/update-password',200,'text/html'],['/api/cloud/profile',401,'application/json']]) {
+              const res=await fetch(origin+path,{signal:AbortSignal.timeout(5000)});
+              assert.equal(res.status,status,path);
+              assert.ok(res.headers.get('content-type')?.startsWith(type),path);
+              assert.ok((await res.text()).length>0,path);
+              console.log(`HTTP ${path} -> ${status} PASS`);
+            }
+            const image=await fetch(origin+'/_next/image?url=%2Fpr122-linux-check.png&w=64&q=75',{headers:{accept:'image/webp'},signal:AbortSignal.timeout(8000)});
+            assert.equal(image.status,200);
+            assert.equal(image.headers.get('content-type'),'image/webp');
+            const meta=await sharp(Buffer.from(await image.arrayBuffer())).metadata();
+            assert.deepEqual([meta.format,meta.width,meta.height],['webp',64,51]);
+            console.log('Next.js image optimization: PNG 80x64 -> WebP 64x51 PASS');
+          })().catch(error=>{console.error(error);process.exitCode=1;});
+          NODE
