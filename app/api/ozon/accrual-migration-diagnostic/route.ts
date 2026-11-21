@@ -1,3 +1,4 @@
+import { requireOzonEntitlement } from "../_lib/entitlement";
 // ============================================================================
 // ВРЕМЕННАЯ read-only диагностика миграции Ozon Seller API (accrual + posting v3/v4).
 //
@@ -546,6 +547,9 @@ export async function POST(req: NextRequest) {
   // Owner-only: fail-closed ДО чтения ozon_connections/decrypt/любых Ozon-запросов.
   // Клиентскому GET-чеку НЕ доверяем — POST перепроверяет allowlist сам.
   if (!isDiagnosticOwner(userId)) return notFound();
+
+  const denied = await requireOzonEntitlement(auth);
+  if (denied) return denied;
 
   if (!isEncryptionConfigured()) {
     return NextResponse.json(

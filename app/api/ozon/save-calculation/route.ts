@@ -1,6 +1,7 @@
+import { ozonEntitlementDenied, requireOzonEntitlement } from "../_lib/entitlement";
 import { randomUUID } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { authenticateRequest } from "../../cloud/_lib/auth";
+import { authenticateRequest, type AuthSuccess } from "../../cloud/_lib/auth";
 import { apiRequestHash } from "../../../app/lib/calc-operation-keys";
 import { decryptOzonApiKey, isEncryptionConfigured } from "../_lib/crypto";
 import { isMonthInFuture, monthToRange } from "../_lib/finance";
@@ -138,6 +139,24 @@ function savedOperationResponse(r: OperationResult): NextResponse {
   );
 }
 
+async function completedOperation(
+  admin: AuthSuccess["admin"],
+  userId: string,
+  operationId: string,
+  requestHash: string,
+): Promise<NextResponse | null> {
+  const { data, error } = await admin.rpc("api_calculation_operation_status", {
+    p_user_id: userId,
+    p_operation_id: operationId,
+    p_request_hash: requestHash,
+  });
+  if (error) return operationRpcFailure(error, "status");
+  const result = (data ?? {}) as OperationResult;
+  if (result.status === "conflict") return operationConflict();
+  if (result.status === "done" || result.status === "deleted") return savedOperationResponse(result);
+  return null;
+}
+
 export async function POST(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
@@ -208,15 +227,15 @@ export async function POST(req: NextRequest) {
   const requestHash = apiRequestHash(month, manualExpenses);
 
   // ---- 0) завершённая операция → сохранённый расчёт ДО обращений к Ozon ----
-  const { data: stData, error: stErr } = await admin.rpc("api_calculation_operation_status", {
-    p_user_id: userId,
-    p_operation_id: operationId,
-    p_request_hash: requestHash,
-  });
-  if (stErr) return operationRpcFailure(stErr, "status");
-  const st = (stData ?? {}) as OperationResult;
-  if (st.status === "conflict") return operationConflict();
-  if (st.status === "done" || st.status === "deleted") return savedOperationResponse(st);
+  const restored = await completedOperation(admin, userId, operationId, requestHash);
+  if (restored) return restored;
+
+  const denied = await requireOzonEntitlement(auth);
+  if (denied) {
+    // A concurrent replay may have committed and consumed the last attempt
+    // between the first lookup and the entitlement check.
+    return (await completedOperation(admin, userId, operationId, requestHash)) ?? denied;
+  }
 
   // ---- подключение Ozon текущего пользователя (ключ ТОЛЬКО отсюда) ----
   const { data: conn, error: connErr } = await admin
@@ -481,18 +500,13 @@ export async function POST(req: NextRequest) {
         { status: 500, headers: NO_STORE }
       );
     }
-    // Нет доступа → ничего не записано и не списано. Фронт откроет окно тарифа.
-    const notAuth = op.reason === "not_authenticated";
-    return NextResponse.json(
-      {
-        error: notAuth
-          ? "Сессия недействительна"
-          : "API-расчёт доступен на тарифе «Безлимит» (449 ₽/мес) или как первый бесплатный пробный расчёт. Оформите тариф, чтобы продолжить.",
-        code: notAuth ? "not_authenticated" : "limit_reached",
-        consume: { ok: false, reason: op.reason, used: op.used, allowance: op.allowance },
-      },
-      { status: notAuth ? 401 : 402, headers: NO_STORE }
-    );
+    if (op.reason === "not_authenticated") {
+      return NextResponse.json(
+        { error: "Сессия недействительна", code: "not_authenticated" },
+        { status: 401, headers: NO_STORE },
+      );
+    }
+    return ozonEntitlementDenied(op.reason ?? "limit_reached", op.used, op.allowance);
   }
   // Параллельный запрос той же операции успел раньше — его сохранённый расчёт.
   if (op.replay === true || op.status === "deleted") return savedOperationResponse(op);

@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  consumeCalculation as consumeCalculationRpc,
   getCurrentUser,
   getUserProfile,
   readActiveSingleCredits,
@@ -35,10 +34,7 @@ export interface Entitlements {
   /** Проверить права ещё раз сейчас (без параллельных одинаковых запросов). */
   recheck: () => Promise<void>;
   /**
-   * Списать один расчёт. Для залогиненного — server-authoritative (RPC
-   * consume_calculation, инкремент в БД под row-lock); для анонима — localStorage.
-   * Вызывать ПЕРЕД сохранением/выдачей результата; при ok=false → paywall, результат
-   * не показывать.
+   * Учесть локальную попытку гостевого XLSX. Квота аккаунта списывается при сохранении.
    */
   consumeCalculation: () => Promise<{ ok: boolean; reason?: string }>;
 }
@@ -236,15 +232,7 @@ export function useEntitlements(): Entitlements {
     ok: boolean;
     reason?: string;
   }> => {
-    // Залогинен — авторитетное списание на сервере (RPC). Локальный счётчик
-    // синхронизируем из ответа и при успехе, и при limit_reached — чтобы кнопка
-    // мгновенно стала paywall, если другой таб уже израсходовал кредит.
-    if (userId) {
-      const res = await consumeCalculationRpc();
-      if (typeof res.used === "number") setCalcCount(res.used);
-      else if (res.ok && !res.unlimited) setCalcCount((prev) => prev + 1);
-      return { ok: res.ok, reason: res.reason };
-    }
+    if (userId) return { ok: false, reason: "calculation_operation_required" };
 
     // Аноним — лимит из localStorage, без сервера: кредитов/премиума нет,
     // allowance = FREE_CALCULATIONS_LIMIT. Проверяем и инкрементим локально.
