@@ -24,7 +24,6 @@ import {
   type CalculationOperationStatus,
   type CloudResult,
   type CloudRow,
-  type ConsumeResult,
   type SavedRef,
 } from "./save-flow";
 import { browserOperationStorage, createOperationStore, newOperationId, type OperationStore } from "./operation-store";
@@ -86,7 +85,7 @@ export interface AccrualUploadSessionOptions {
   userId: string | null;
   /** Право на ещё одну попытку (paywall). */
   canCalculate: boolean;
-  consumeCalculation: () => Promise<ConsumeResult>;
+  consumeCalculation: () => ReturnType<AccrualSaveDeps["consume"]>;
   confirmNoMonthDuplicate: (monthKey: string | null) => Promise<boolean>;
   /** Открыть окно тарифов (нет попытки / списание отклонено). */
   onPaywall: () => void;

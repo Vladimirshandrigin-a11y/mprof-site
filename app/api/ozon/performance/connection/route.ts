@@ -1,3 +1,4 @@
+import { requireOzonEntitlement } from "../../_lib/entitlement";
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest } from "../../../cloud/_lib/auth";
 import {
@@ -66,6 +67,9 @@ export async function POST(req: NextRequest) {
   const auth = await authenticateRequest(req);
   if (!auth.ok) return auth.response;
   const { admin, userId } = auth;
+
+  const denied = await requireOzonEntitlement(auth);
+  if (denied) return denied;
 
   if (!isEncryptionConfigured()) {
     return NextResponse.json(
