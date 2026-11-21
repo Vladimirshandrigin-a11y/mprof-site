@@ -125,10 +125,10 @@ export function installFetch() {
         const where = [];
         for (const [k, v] of u.searchParams) {
           if (k === "select" || k === "on_conflict" || k === "columns" || k === "order" || k === "limit") continue;
-          const m = /^(eq|neq)\.(.*)$/.exec(v);
+          const m = /^(eq|neq|gt)\.(.*)$/.exec(v);
           if (!m) throw new Error(`фильтр ${k}=${v} не поддержан`);
           params.push(m[2]);
-          where.push(`${ident(k)} ${m[1] === "eq" ? "=" : "<>"} $${params.length}`);
+          where.push(`${ident(k)} ${m[1] === "eq" ? "=" : m[1] === "gt" ? ">" : "<>"} $${params.length}`);
         }
         // Prefer: return=representation → строки в ответе; Accept object+json → ровно одна.
         const wantRows = (req.headers.prefer ?? "").includes("return=representation");

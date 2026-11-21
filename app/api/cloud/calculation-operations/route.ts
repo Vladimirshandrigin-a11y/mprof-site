@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getUserScopedClient } from "../_lib/auth";
+import { readAccrualSnapshot } from "../../../app/lib/accrual/snapshot";
+import {
+  accrualSnapshotToCalculationColumns,
+  accrualSnapshotToReportHistoryColumns,
+} from "../../../app/lib/accrual/columns";
+import { percentOfKopecks, percentToBasisPoints } from "../../../app/lib/accrual/money";
 import {
   computeManualColumns,
   manualRequestHash,
@@ -93,12 +99,30 @@ export async function POST(req: NextRequest) {
     return json({ error: "Некорректный запрос", code: "bad_request" }, 400);
   }
 
+  const read = readAccrualSnapshot(calculation.ai_insights);
+  if (read.status !== "ok" || read.snapshot.preliminary || !read.snapshot.costCoverage.complete) {
+    return json({ error: "Финансовый снимок не прошёл проверку", code: "bad_request" }, 400);
+  }
+  const { snapshot } = read;
+  const rate = percentToBasisPoints(snapshot.tax.ratePercent);
+  if (rate === null || percentOfKopecks(snapshot.taxRevenueBaseKopecks, rate) !== snapshot.tax.kopecks) {
+    return json({ error: "Налог в финансовом снимке не сходится", code: "bad_request" }, 400);
+  }
+  const savedCalculation = accrualSnapshotToCalculationColumns(snapshot);
+  const savedHistory = accrualSnapshotToReportHistoryColumns(snapshot);
+  if (
+    Object.entries(savedCalculation).some(([key, value]) => key !== "ai_insights" && calculation[key] !== value) ||
+    Object.entries(savedHistory).some(([key, value]) => history[key] !== value)
+  ) {
+    return json({ error: "Суммы расчёта и истории не сходятся со снимком", code: "bad_request" }, 400);
+  }
+
   const { data, error } = await client.rpc("save_calculation_operation", {
     p_operation_id: operationId,
     p_mode: "upload",
     p_request_hash: requestHash,
-    p_calculation: calculation,
-    p_history: history,
+    p_calculation: savedCalculation,
+    p_history: savedHistory,
   });
   if (error) return rpcFailure(error, "save");
   return operationResponse(data, "Операция не совпадает с этим файлом");

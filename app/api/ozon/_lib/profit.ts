@@ -203,6 +203,10 @@ export function accrualErrorResponse(code: AccrualLoadErrorCode): NextResponse {
       status: 502,
       error: "Загрузка начислений Ozon за месяц потребовала слишком много запросов. Попробуйте ещё раз позже.",
     },
+    pagination_loop: {
+      status: 502,
+      error: "Ozon повторил страницу начислений. Полный период не загружен, попытка не списана.",
+    },
     pagination_truncated: {
       status: 502,
       error: "Начислений Ozon за один из дней месяца оказалось больше, чем расчёт может безопасно обработать.",

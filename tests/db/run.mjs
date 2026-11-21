@@ -63,6 +63,7 @@ const tsc = spawnSync(
     "app/api/payment/webhook/route.ts",
     "app/api/cloud/calculation-operations/route.ts",
     "app/api/cloud/calculations/route.ts",
+    "app/api/cloud/financial-summary/route.ts",
     "app/api/cloud/consume/route.ts",
     "app/api/cloud/report-history/route.ts",
     "app/app/lib/accrual/upload-session.ts",
