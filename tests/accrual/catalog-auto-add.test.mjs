@@ -470,6 +470,7 @@ function stubOzon(state) {
 
 function setupApi({ userId = "u1", catalog = [], rows = REALIZATION, extraTables = {} } = {}) {
   const fake = makeFakeSupabase({
+    profiles: [{ id: userId, plan: "free", premium_until: null, calculations_used: 0 }],
     ozon_connections: [{ user_id: userId, client_id: "c1", api_key_encrypted: "enc" }],
     products: catalog,
     ...extraTables,

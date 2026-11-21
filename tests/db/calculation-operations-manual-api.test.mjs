@@ -19,6 +19,7 @@ import { SCHEMA, buildRequire, payTestEnv, read, root, runScript } from "./helpe
 const OPS_MIGRATION = read("supabase/migrations/20260928_calculation_operations.sql");
 const MA_MIGRATION = read("supabase/migrations/20260929_calculation_operations_manual_api.sql");
 const P1_MIGRATION = read("supabase/migrations/20261113221918_quota_atomic_edits.sql");
+const QUOTA_ACL_MIGRATION = read("supabase/migrations/20261121100841_restrict_standalone_calculation_quota.sql");
 const MA_CHECKS = read("supabase/checks/calculation_operations_manual_api.sql");
 
 process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE_URL;
@@ -30,6 +31,7 @@ delete process.env.OZON_FINANCE_ACCRUAL_ENABLED; // финансы Ozon — lega
 const OPS_ROUTE = buildRequire("./api/cloud/calculation-operations/route.js");
 const SAVE_API = buildRequire("./api/ozon/save-calculation/route.js");
 const CALCS_ROUTE = buildRequire("./api/cloud/calculations/route.js");
+const CONSUME_ROUTE = buildRequire("./api/cloud/consume/route.js");
 const CRYPTO = buildRequire("./api/ozon/_lib/crypto.js");
 const KEYS = buildRequire("./app/lib/calc-operation-keys.js");
 // Правила ключа на странице (localStorage, исход запроса → судьба ключа) — те же модули.
@@ -441,6 +443,7 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     const u = await apiUser(db, { used: 1, credits: 2 });
     const out = await postApi(u);
     assert.deepEqual([out.status, out.body.code], [402, "limit_reached"]);
+    assert.equal(net.ozonCalls().length, 0);
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 0, history: 0, ops: 0 });
     const manual = await postManual(u);
     assert.deepEqual([manual.status, manual.body.data.used], [200, 2]);
@@ -553,7 +556,25 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     const retry = await postApi(u, { operationId });
     assert.deepEqual([retry.status, retry.body.replay, retry.body.status], [200, true, "done"]);
     assert.equal(net.ozonCalls().length, ozonMid, "повтор завершённой операции не обращается к Ozon");
-    assert.ok(ozonMid > ozonBefore, "новая операция к Ozon обращалась (до отказа)");
+    assert.equal(ozonMid, ozonBefore, "новая операция без квоты не обращалась к Ozon");
+    assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
+  });
+
+  it("одинаковый ключ: если квоту списал запрос между статусом и проверкой прав, второй получает готовый расчёт", async () => {
+    const u = await apiUser(db);
+    const operationId = randomUUID();
+    let profileReads = 0;
+    const pause = gate((r) => r.path === "/rest/v1/profiles" && profileReads++ === 0);
+    state.gates.push(pause);
+    const retry = postApi(u, { operationId });
+    await pause.reached;
+    const saved = await postApi(u, { operationId });
+    const beforeReplay = net.ozonCalls().length;
+    pause.open();
+    const replay = await retry;
+    assert.equal(saved.status, 200);
+    assert.deepEqual([replay.status, replay.body.replay, replay.body.calculationId], [200, true, saved.body.calculationId]);
+    assert.equal(net.ozonCalls().length, beforeReplay);
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
   });
 
@@ -1081,6 +1102,85 @@ describe("общая бесплатная попытка между режима
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+describe("права Ozon и отдельное списание", () => {
+  let db;
+  before(async () => {
+    const editVersion = read("supabase/migrations/20261115180805_operation_saved_edit_version.sql");
+    db = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION, editVersion, QUOTA_ACL_MIGRATION] });
+  });
+  beforeEach(() => {
+    state.pool = db.pool();
+    state.ozon = ozonOk;
+  });
+
+  const ozonRequest = (name, uid) => buildRequire(`./api/ozon/${name}/route.js`).POST(new NextRequest(
+    `http://localhost/api/ozon/${name}`,
+    { method: "POST", headers: { authorization: `Bearer ${userJwt(uid)}`, "content-type": "application/json" },
+      body: JSON.stringify({ month: "2026-06" }) },
+  ));
+
+  it("истёкший безлимит и разовый кредит после бесплатной попытки не запускают Ozon-маршруты", async () => {
+    const expired = await apiUser(db, { used: 1 });
+    await db.main.query("update public.profiles set plan = 'unlimited', premium_until = now() - interval '1 day' where id = $1", [expired]);
+    const single = await apiUser(db, { used: 1, credits: 1 });
+    const routes = [
+      "accrual-migration-diagnostic", "connection", "connection/verify", "import-missing-products",
+      "performance/ads-spend-diagnostic", "performance/connection", "performance/connection/verify",
+      "postings-match-diagnostic",
+    ];
+    const allowlist = process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS;
+    process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS = `${expired},${single}`;
+    try {
+      for (const uid of [expired, single]) {
+        assert.equal((await postApi(uid)).status, 402);
+        for (const route of routes) assert.equal((await ozonRequest(route, uid)).status, 402, route);
+        assert.deepEqual(await facts(db, uid), { used: 1, calcs: 0, history: 0, ops: 0 });
+      }
+      assert.ok(state.log.every((r) => r.url.startsWith(SUPABASE_URL)));
+    } finally {
+      if (allowlist === undefined) delete process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS;
+      else process.env.OZON_ACCRUAL_DIAGNOSTIC_USER_IDS = allowlist;
+    }
+  });
+
+  it("справочная диагностика доступна с бесплатной попыткой и безлимитом, списания нет", async () => {
+    for (const options of [{}, { unlimited: true, used: 1 }]) {
+      const user = await apiUser(db, options);
+      const before = net.ozonCalls().length;
+      const res = await ozonRequest("postings-match-diagnostic", user);
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).source, "ozon_postings_match_diagnostic_v1");
+      assert.ok(net.ozonCalls().length > before);
+      assert.deepEqual(await facts(db, user), { used: options.used ?? 0, calcs: 0, history: 0, ops: 0 });
+    }
+  });
+
+  it("сбой чтения профиля закрывает Ozon до внешних вызовов, попытка сохранена", async () => {
+    const user = await apiUser(db);
+    state.override = (r) => r.path === "/rest/v1/profiles" ? jsonRes({ message: "profile unavailable" }, 400) : undefined;
+    const out = await postApi(user);
+    assert.deepEqual([out.status, out.body.code], [503, "entitlement_check_failed"]);
+    assert.equal(net.ozonCalls().length, 0);
+    assert.deepEqual(await facts(db, user), { used: 0, calcs: 0, history: 0, ops: 0 });
+  });
+
+  it("маршрут списания закрыт, прямые обёртки недоступны, штатное сохранение использует кредит", async () => {
+    const user = await apiUser(db, { used: 1, credits: 1 });
+    assert.equal((await CONSUME_ROUTE.POST()).status, 410);
+    assert.equal(net.dbRequests().length, 0);
+    for (const role of ["anon", "authenticated", "service_role"]) {
+      const roles = await db.client(role);
+      for (const fn of ["consume_calculation", "consume_api_calculation"]) {
+        await assert.rejects(roles.query(`select public.${fn}()`), { code: "42501" });
+      }
+    }
+    assert.deepEqual(await facts(db, user), { used: 1, calcs: 0, history: 0, ops: 0 });
+    assert.equal((await postManual(user)).status, 200);
+    assert.equal((await postManual(user)).status, 402);
+    assert.deepEqual(await facts(db, user), { used: 2, calcs: 1, history: 0, ops: 1 });
+  });
+});
+
 describe("совместимость и миграция", () => {
   it("правила списания не изменились: consume_calculation() и consume_api_calculation() дают те же ответы и счётчики, что до миграции", async () => {
     const cases = [
@@ -1211,6 +1311,7 @@ describe("совместимость и миграция", () => {
     const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, MA_MIGRATION, P1_MIGRATION] });
     await runScript(migrated.main, read("supabase/migrations/20261113221918_quota_atomic_edits.sql"));
     await runScript(migrated.main, read("supabase/migrations/20261115180805_operation_saved_edit_version.sql"));
+    await runScript(migrated.main, QUOTA_ACL_MIGRATION);
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_manual_calculation_operation"));
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));

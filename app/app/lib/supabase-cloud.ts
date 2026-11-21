@@ -151,8 +151,7 @@ function fmtError(err: unknown): CloudErrorInfo {
 // CloudResult.error (UI уже умеет показать ошибку и погасить спиннер).
 //
 // Применяется к сетевым шагам cloud-proxy: чтения (история/каталог/аналитика/
-// профиль/кредиты), записи и проксированный RPC списания квоты
-// (/api/cloud/consume). Благодаря этому спиннер анализа гаснет, даже если
+// профиль/кредиты) и записи. Благодаря этому спиннер анализа гаснет, даже если
 // маршрут Timeweb→Supabase молчит. clearTimeout снимает таймер, если запрос
 // успел ответить раньше; поздний ответ проигравшего гонку запроса игнорируется
 // Promise.race (реакция уже навешана — unhandledrejection не возникает).
@@ -578,72 +577,6 @@ export async function getSavedOperationStatus(
 /** Сохранённая строка из ответа /api/ozon/save-calculation (повтор завершённой операции). */
 export function savedCalculationFromResponse(v: unknown): CloudCalculation | null {
   return savedCalculationOf(v);
-}
-
-/** Ответ RPC consume_calculation() (см. supabase/schema.sql). */
-export interface ConsumeResult {
-  ok: boolean;
-  /** При ok=false: 'limit_reached' | 'not_authenticated' | текст ошибки RPC. */
-  reason?: string;
-  /** Новое значение profiles.calculations_used после списания. */
-  used?: number;
-  /** Текущий лимит = 1 бесплатный + число активных single-кредитов. */
-  allowance?: number;
-  /** true, если списания не было — активный unlimited. */
-  unlimited?: boolean;
-}
-
-/**
- * Server-authoritative списание одного расчёта через RPC consume_calculation().
- * Единственный путь расхода квоты для залогиненного пользователя: клиент больше
- * НЕ пишет profiles.calculations_used напрямую (UPDATE на profiles ему отозван
- * в schema.sql). Сервер атомарно под row-lock проверяет право и инкрементит
- * счётчик; для unlimited со свежим premium_until — не списывает.
- *
- * Fail-closed: любая ошибка RPC → ok=false (не выдаём бесплатный расчёт при сбое).
- * Вызывать РОВНО один раз на расчёт, ПЕРЕД сохранением/выдачей результата.
- */
-export async function consumeCalculation(): Promise<ConsumeResult> {
-  // Идём через cloud-proxy POST /api/cloud/consume (Timeweb → Supabase), а НЕ
-  // напрямую в Supabase: прямой RPC из РФ без VPN висел без ответа, из-за чего
-  // analyzeAllThree ждал вечно («бесконечный анализ»). withReadTimeout гасит
-  // ожидание за READ_TIMEOUT_MS. Ответ RPC (включая limit_reached) приходит как
-  // тело { data } с HTTP 200 — маппим его 1:1, как раньше.
-  try {
-    const token = await getAccessToken();
-    if (!token) return { ok: false, reason: "not_authenticated" };
-    const r = await withReadTimeout<Partial<ConsumeResult>>(
-      (async () => {
-        const res = await fetch("/api/cloud/consume", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          cache: "no-store",
-          body: "{}",
-        });
-        const parsed = (await res.json().catch(() => ({}))) as {
-          data?: Partial<ConsumeResult>;
-          error?: string;
-        };
-        if (!res.ok) {
-          throw new Error(parsed.error || `Ошибка сервера (${res.status})`);
-        }
-        return (parsed.data ?? {}) as Partial<ConsumeResult>;
-      })()
-    );
-    return {
-      ok: r.ok === true,
-      reason: r.reason,
-      used: typeof r.used === "number" ? r.used : undefined,
-      allowance: typeof r.allowance === "number" ? r.allowance : undefined,
-      unlimited: r.unlimited === true,
-    };
-  } catch (e) {
-    // fail-closed: таймаут/сбоя сети → ok:false (не выдаём бесплатный расчёт).
-    return { ok: false, reason: fmtError(e).message };
-  }
 }
 
 // ============================================================================

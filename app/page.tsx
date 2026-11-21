@@ -990,7 +990,7 @@ a{color:inherit;text-decoration:none}
               Посчитайте свою прибыль <em>прямо сейчас</em>
             </h2>
             <p className="ln-section-sub" style={{ marginBottom: "1.8rem", maxWidth: 520, marginLeft: "auto", marginRight: "auto" }}>
-              Первый расчёт бесплатно. Без обязательной регистрации и привязки карты.
+              Первый расчёт бесплатно. Заполните форму, затем войдите или создайте аккаунт. Привязка карты не нужна.
             </p>
             <Link href="/app" className="ln-btn ln-btn-gold">
               Попробовать бесплатно

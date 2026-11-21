@@ -119,14 +119,6 @@ const SHOW_PERFORMANCE_API_BLOCK = false;
 // поставив флаг обратно в true.
 const SHOW_REALIZATION_DIAGNOSTIC = false;
 
-/** Локальный id для расчётов, которые не попали в облако (offline/DEV). */
-function makeLocalId(): string {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return "local-" + crypto.randomUUID();
-  }
-  return "local-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-}
-
 /** Mapping облачной строки в локальный CalcResult shape (используется в UI). */
 function cloudToLocal(c: CloudCalculation): CalcResult {
   const created = new Date(c.created_at);
@@ -963,6 +955,16 @@ const AI_STAGES = [
   "Ищем слабые места…",
   "Формируем рекомендации…",
 ];
+
+const MANUAL_DRAFT_KEY = "mprof_manual_before_sign_in";
+
+function clearManualDraft() {
+  try {
+    window.sessionStorage.removeItem(MANUAL_DRAFT_KEY);
+  } catch {
+    // The current form still works if storage is unavailable.
+  }
+}
 
 const EMPTY: Record<string, string> = {
   revenue: "",
@@ -2999,12 +3001,35 @@ export default function AppPage() {
   }, [reportsFiltered, reportsMonthly]);
 
   const [authLoading, setAuthLoading] = useState(true);
+  const [manualSignInRequired, setManualSignInRequired] = useState(false);
+  const authEmailRef = useRef<HTMLInputElement | null>(null);
 
   // 1) Восстанавливаем сессию из localStorage через Supabase getSession()
   //    + слушаем все последующие изменения auth (SIGNED_IN / SIGNED_OUT / TOKEN_REFRESHED)
   useEffect(() => {
     let mounted = true;
     let loadingCleared = false;
+
+    queueMicrotask(() => {
+      if (!mounted) return;
+      try {
+        const raw = window.sessionStorage.getItem(MANUAL_DRAFT_KEY);
+        if (!raw) return;
+        const draft = JSON.parse(raw);
+        if (draft?.marketplace !== "ozon" && draft?.marketplace !== "wb") return;
+        const values = { ...EMPTY };
+        for (const key of Object.keys(values)) {
+          const value = draft.form?.[key];
+          if (typeof value === "string") values[key] = value;
+        }
+        setMarketplace(draft.marketplace);
+        setForm(values);
+        setCalcMode("manual");
+        setManualSignInRequired(true);
+      } catch {
+        // Ignore an unavailable or invalid local draft.
+      }
+    });
 
     // "Проверяем сессию…" ОБЯЗАНО сняться при любом исходе. Раньше
     // setAuthLoading(false) вызывался ТОЛЬКО внутри getSession().then(...), без
@@ -3079,6 +3104,8 @@ export default function AppPage() {
         }, 0);
       }
       if (event === "SIGNED_OUT") {
+        clearManualDraft();
+        setManualSignInRequired(false);
         setHistory([]);
         setResult(null);
         setOzonClientId("");
@@ -3193,7 +3220,9 @@ export default function AppPage() {
       } else if (!data.session) {
         // Подтверждение email включено: письмо ушло, сессии пока нет.
         setAuthMessage(
-          "Аккаунт создан. Подтвердите email по ссылке в письме, затем войдите."
+          manualSignInRequired
+            ? "Подтвердите email по ссылке в письме, затем вернитесь в эту вкладку к расчёту."
+            : "Аккаунт создан. Подтвердите email по ссылке в письме, затем войдите."
         );
       }
       // Если session есть — onAuthStateChange(SIGNED_IN) сам покажет дашборд /app.
@@ -4347,6 +4376,8 @@ export default function AppPage() {
         return;
       }
       if (res.kind === "ok") {
+        clearManualDraft();
+        setManualSignInRequired(false);
         if (res.replay) {
           showSavedCalculation(res.calculation, ui.note);
           return;
@@ -4473,91 +4504,20 @@ export default function AppPage() {
 
   const calculate = async () => {
     if (isCalculating) return;
-    // Аккаунт: списание и сохранение — одна операция на сервере (повтор безопасен).
-    if (user?.id) {
+    if (!user?.id) {
       try {
-        await calculateManualSaved(user.id);
-      } finally {
-        refreshPendingOps(user.id);
+        window.sessionStorage.setItem(MANUAL_DRAFT_KEY, JSON.stringify({ marketplace, form }));
+      } catch {
+        // The draft remains in the form for an in-place sign-in.
       }
+      setManualSignInRequired(true);
+      authEmailRef.current?.focus();
       return;
     }
-    // Аноним — как раньше: локальный счётчик попыток и локальный результат.
-    // Защита: UI подменяет кнопку на paywall, но на всякий случай.
-    if (!canCalculate) {
-      openTariffModal(null);
-      return;
-    }
-    // PR #25: дубль-гард. Ручной расчёт всегда относится к ТЕКУЩЕМУ месяцу
-    // (периода отчёта нет → calcMonthKey берёт месяц создания записи). «Отмена» →
-    // выходим ДО setIsCalculating/consumeCalculation: попытка НЕ списывается.
-    if (!(await confirmNoMonthDuplicate(currentMonthKey(), marketplace))) return;
-    setIsCalculating(true);
-
     try {
-      // Ручной расчёт не парсит файлы (арифметика не падает) — списываем сразу,
-      // ДО выдачи результата. !ok → paywall, результата нет.
-      const consumed = await consumeCalculation();
-      if (!consumed.ok) {
-        // eslint-disable-next-line no-console
-        console.warn("[calc] consume blocked → paywall", consumed.reason);
-        openTariffModal(null);
-        return;
-      }
-
-      const revenue = num(form.revenue);
-      const expenses =
-        num(form.commission) +
-        num(form.logistics) +
-        num(form.storage) +
-        num(form.ads) +
-        num(form.cost) +
-        num(form.tax) +
-        num(form.other);
-      const profit = revenue - expenses;
-      const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
-
-      const now = new Date();
-      const localResult: CalcResult = {
-        id: makeLocalId(),
-        marketplace,
-        revenue,
-        commission: num(form.commission),
-        logistics: num(form.logistics),
-        storage: num(form.storage),
-        ads: num(form.ads),
-        cost: num(form.cost),
-        tax: num(form.tax),
-        other: num(form.other),
-        expenses,
-        profit,
-        margin,
-        date: now.toLocaleString("ru-RU", {
-          day: "2-digit",
-          month: "short",
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-        createdAt: now.toISOString(),
-        synced: false,
-      };
-
-      // 5 стадий × 700мс — минимальная задержка для AI processing overlay.
-      await new Promise<void>((r) => setTimeout(r, 3600));
-
-      setResult(localResult);
-      setHistory((prev) => [localResult, ...prev].slice(0, 50));
-      // Не залогинен — расчёт только на этом устройстве.
-      showToast("Расчёт сохранён локально", "warn");
-
-      // success state — короткий glow + бейдж-shine
-      setJustCalculated(true);
-      window.setTimeout(() => setJustCalculated(false), 2200);
-
-      // онбординг свернётся после первого успешного расчёта
-      dismissOnboarding();
+      await calculateManualSaved(user.id);
     } finally {
-      setIsCalculating(false);
+      refreshPendingOps(user.id);
     }
   };
 
@@ -4580,6 +4540,10 @@ export default function AppPage() {
     recheck: recheckEntitlements,
     consumeCalculation,
   } = useEntitlements();
+
+  useEffect(() => {
+    if (user?.id && entitlementsLoaded) void recheckEntitlements();
+  }, [user?.id, entitlementsLoaded, recheckEntitlements]);
   // Доступ к расчёту через Ozon API (только отображение; решает сервер).
   const apiAccess = apiCalcAccess({
     loaded: entitlementsLoaded,
@@ -4696,6 +4660,7 @@ export default function AppPage() {
   };
 
   const clearForm = () => {
+    clearManualDraft();
     setForm({ ...EMPTY });
     setResult(null);
     setLoadedApiView(null);
@@ -8040,9 +8005,15 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
         {!authLoading && !user && (
           <div className="card auth-card">
             <h3 className="auth-title">Вход в аккаунт</h3>
+            {manualSignInRequired && (
+              <p className="auth-msg" role="status">
+                Войдите или создайте аккаунт, чтобы получить первый расчёт бесплатно. Введённые данные останутся в этой вкладке.
+              </p>
+            )}
 
             <div className="auth-fields">
               <input
+                ref={authEmailRef}
                 className="auth-input"
                 type="email"
                 placeholder="Ваш email"
@@ -8892,7 +8863,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     Очистить форму
                   </button>
                 </div>
-              ) : canCalculate || !entitlementsLoaded ? (
+              ) : !user || canCalculate || !entitlementsLoaded ? (
                 <div className="btn-row mcalc-actions">
                   <button
                     className="btn-gold mcalc-calc"
@@ -8905,7 +8876,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         Считаем…
                       </span>
                     ) : (
-                      "Рассчитать чистую прибыль"
+                      user ? "Рассчитать чистую прибыль" : "Войти и рассчитать"
                     )}
                   </button>
                   <button
