@@ -13,6 +13,7 @@ jobs:
     timeout-minutes: 20
     env:
       TARGET_SHA: 93ba9b87318b21401737ec8a0eeb86d357998228
+      BASE_SHA: b1f93efaad93379c22f041ffbcaa3bacbeabfd24
       NEXT_TELEMETRY_DISABLED: '1'
       NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:39473
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: synthetic-test-publishable-key
@@ -70,12 +71,14 @@ jobs:
           sha256sum package-lock.json
 
       - name: TypeScript
+        id: typescript
         run: ./node_modules/.bin/tsc --noEmit
 
       - name: Financial regressions
         run: npm run test:accrual
 
       - name: Isolated PostgreSQL regressions
+        id: postgres-tests
         env:
           TEST_DATABASE_URL: postgresql://postgres:synthetic-local-postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
         shell: bash
@@ -103,10 +106,33 @@ jobs:
           npm run test:db
 
       - name: Production build with Turbopack
+        if: ${{ !cancelled() && steps.typescript.outcome == 'success' }}
         run: npm run build -- --turbopack
 
       - name: Confirm tested SHA and tracked source
+        if: ${{ !cancelled() && steps.typescript.outcome == 'success' }}
         shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           git diff --exit-code HEAD --
+
+      - name: Diagnose PostgreSQL failures against BASE
+        if: ${{ !cancelled() && steps.postgres-tests.outcome == 'failure' }}
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:synthetic-local-postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
+        shell: bash
+        run: |
+          base_checkout="$RUNNER_TEMP/pr124-base-verification"
+          git worktree add --detach "$base_checkout" "$BASE_SHA"
+          cd "$base_checkout"
+          test "$(git rev-parse HEAD)" = "$BASE_SHA"
+          printf 'Diagnostic BASE checkout %s\n' "$(git rev-parse HEAD)"
+          npm ci --no-audit --no-fund
+          if npm run test:db > "$RUNNER_TEMP/pr124-baseline-postgresql.log" 2>&1; then
+            baseline_result=0
+          else
+            baseline_result=$?
+          fi
+          printf 'BASE npm run test:db exit status: %s\n' "$baseline_result"
+          grep -E 'ℹ (tests|pass|fail)|✖|задокументированное|actual:|expected:' \
+            "$RUNNER_TEMP/pr124-baseline-postgresql.log" || true
