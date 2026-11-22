@@ -299,7 +299,7 @@ describe("миграция и read-only проверка конфликтов", 
     await migrate(); // миграция поверх — без ошибок (идемпотентна)
   });
 
-  it("ключ БД совпадает с нормализацией расчёта на реалистичных артикулах; расхождение — только на экзотических символах", async () => {
+  it("ключи обычных артикулов совпадают с расчётом, а Unicode-артикулы уникальны по ключу БД", async () => {
     await migrate();
     const realistic = ["ART-1", "art-1", " Art-1 ", "ART\u00a01", "a\tb\nc", "Товар-10", "ТОВАР  10", "SKU_123/XL", "12345", "Футболка «Лето» M", "ÉCLAIR-1", "Straße-5", "x\u3000y\ufeff", "\u2003ёж\u2009Ёж"];
     for (const s of realistic) {
@@ -309,11 +309,24 @@ describe("миграция и read-only проверка конфликтов", 
     for (const s of ["", "   ", "\u00a0"]) {
       assert.equal((await main.query("select public.canonical_article($1) as k", [s])).rows[0].k, null);
     }
-    const exotic = ["İ", "ΟΔΟΣ", "ǅ"];
-    for (const s of exotic) {
-      const k = (await main.query("select public.canonical_article($1) as k", [s])).rows[0].k;
-      assert.notEqual(k, CI.normArticle(s), `ожидаемое (задокументированное) расхождение: ${s}`);
+    // PostgreSQL lower() uses the database locale, so equality with JS can vary.
+    const unicode = [["İ", "i\u0307"], ["ΟΔΟΣ", "οδος"], ["ǅ", "ǆ"], ["ǆ", "ǆ"]];
+    const dbKeys = new Map();
+    for (const [article, jsKey] of unicode) {
+      const { rows: [{ key, locale_key }] } = await main.query(
+        "select public.canonical_article(' ' || $1::text || ' ') as key, lower($1::text) as locale_key",
+        [article]
+      );
+      assert.equal(CI.normArticle(` ${article} `), jsKey, article);
+      assert.equal(key, locale_key, article);
+      dbKeys.set(article, key);
     }
+    assert.equal(dbKeys.get("ǆ"), "ǆ");
+
+    const distinctKeys = new Set([dbKeys.get("ǅ"), dbKeys.get("ǆ")]).size;
+    assert.equal((await importInsert(main, U1, ["ǅ", "ǆ"])).length, distinctKeys);
+    assert.deepEqual(await importInsert(main, U1, [" ǅ ", " ǆ "]), []);
+    assert.equal((await importInsert(main, U2, ["ǆ"])).length, 1);
   });
 });
 
