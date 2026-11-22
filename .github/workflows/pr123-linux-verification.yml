@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      TARGET_SHA: 93ba9b87318b21401737ec8a0eeb86d357998228
+      TARGET_SHA: 39f035de5e3e1875cd6245c54efbc4179eda882a
       BASE_SHA: b1f93efaad93379c22f041ffbcaa3bacbeabfd24
       NEXT_TELEMETRY_DISABLED: '1'
       NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:39473
