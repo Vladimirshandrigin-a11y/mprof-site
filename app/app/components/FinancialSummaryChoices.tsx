@@ -10,6 +10,7 @@ function SummaryDecision({ row, shops, choice, onChoice }: {
   const [shop, setShop] = useState(row.knownStore ?? choice?.shop ?? "");
   const [label, setLabel] = useState(choice?.shop.startsWith("label:") ? choice.shop.slice(6) : "");
   const [month, setMonth] = useState(choice?.month ?? row.month ?? "");
+  const [acceptActualDates, setAcceptActualDates] = useState(choice?.acceptActualDates === true);
   const format = (n: number) => n.toLocaleString("ru-RU", { maximumFractionDigits: 2 });
   const source = row.mode === "api" ? "Ozon API" : "Документы";
   const chosenShop = shop === "label" || shop.startsWith("label:") ? "label:" + label.trim() : shop;
@@ -19,6 +20,13 @@ function SummaryDecision({ row, shops, choice, onChoice }: {
         {" · сохранён "}{new Date(row.createdAt).toLocaleDateString("ru-RU")}
         {" · "}{row.included ? "учтён" : "исключён"}</p>
       <p>{row.period ? `${row.period.from} — ${row.period.to}` : "Точные границы периода неизвестны."}</p>
+      {row.periodConflict && (
+        <p role="alert">
+          Даты операций выходят за заявленный период
+          {row.declaredPeriod ? ` (${row.declaredPeriod.from} — ${row.declaredPeriod.to})` : ""}.
+          В строке выше показаны фактические даты.
+        </p>
+      )}
       {!row.knownStore && (
         <label>Магазин{" "}
           <select value={shop.startsWith("label:") ? "label" : shop} onChange={e => setShop(e.target.value)}>
@@ -38,9 +46,19 @@ function SummaryDecision({ row, shops, choice, onChoice }: {
           <input type="month" value={month} onChange={e => setMonth(e.target.value)} />
         </label>
       )}
+      {row.periodConflict && (
+        <label>
+          <input type="checkbox" checked={acceptActualDates} onChange={e => setAcceptActualDates(e.target.checked)} />
+          {" "}Подтверждаю фактические даты операций
+        </label>
+      )}
       {" "}<button type="button" className="reports-pill"
-        disabled={!chosenShop || chosenShop === "label:" || (!row.hasPeriod && !month)}
-        onClick={() => onChoice(row.id, { id: row.id, shop: chosenShop, ...(row.hasPeriod ? {} : { month }) })}>
+        disabled={!chosenShop || chosenShop === "label:" || (!row.hasPeriod && !month) ||
+          (row.periodConflict && !acceptActualDates)}
+        onClick={() => onChoice(row.id, {
+          id: row.id, shop: chosenShop, ...(row.hasPeriod ? {} : { month }),
+          ...(row.periodConflict && acceptActualDates ? { acceptActualDates: true } : {}),
+        })}>
         Подтвердить магазин и учесть расчёт
       </button>
       {choice && <button type="button" className="reports-pill" onClick={() => onChoice(row.id, null)}>Снять подтверждение</button>}
@@ -56,7 +74,10 @@ export function FinancialSummaryChoices({ result, page, choices, onPage, onChoic
   if (!result.decisionCount) return null;
   return (
     <details className="reports-warn">
-      <summary>Проверка расчётов для сводки · исключено {result.excludedCount} из {result.decisionCount}</summary>
+      <summary>
+        Проверка расчётов для сводки · исключено {result.excludedCount} из {result.decisionCount}
+        {result.excludedPeriodConflicts > 0 ? ` · конфликт дат: ${result.excludedPeriodConflicts}` : ""}
+      </summary>
       <p>Подтвердите магазин и период для каждой спорной записи, которую нужно учесть.
         Если для одного магазина периоды пересекаются, сводка учитывает последнее подтверждение.
         Выбор сохраняется в этом браузере. Исходные расчёты остаются в истории.</p>

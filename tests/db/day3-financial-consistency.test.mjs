@@ -48,8 +48,8 @@ const rows = [
   row("Другие услуги и штрафы", "Отгрузка в нерекомендованный слот", "-12", "F1"),
   row("Прочие начисления", "Корректировка стоимости услуг", "-8", "F2"),
 ];
-const register = () => ({ operationId: randomUUID(), requestHash: "2026-06:fixture",
-  ...xlsxSaveFixture({ rows, cost: 150, packaging: "15", ads: "20" }) });
+const register = (preamble) => ({ operationId: randomUUID(), requestHash: "2026-06:fixture",
+  ...xlsxSaveFixture({ rows, cost: 150, packaging: "15", ads: "20", preamble }) });
 const fetchJson = async (route, uid, payload, query = "") => {
   const req = new NextRequest("http://localhost/tests" + query, {
     method: payload ? "POST" : "GET",
@@ -97,7 +97,10 @@ function upstream(scenario = "normal") {
     if (endpoint === "/v1/finance/accrual/by-day") {
       if (body.date !== day) return Response.json({ accruals: [], last_id: "" });
       if (scenario === "normal") return Response.json({ accruals: ledger, last_id: "" });
+      if (scenario === "omitted-initial") return Response.json({ accruals: ledger });
       if (!body.last_id) return Response.json({ accruals: ledger, last_id: "1" });
+      if (scenario === "omitted-after-cursor") return Response.json({ accruals: [] });
+      if (scenario === "terminal-empty") return Response.json({ accruals: [], last_id: "" });
       if (scenario === "http") return Response.json({}, { status: 500 });
       if (scenario === "timeout") throw new DOMException("test timeout", "AbortError");
       if (scenario === "empty-continues") {
@@ -152,14 +155,35 @@ describe("Day 3 financial P1", () => {
     const good = register();
     const mismatch = { ...good, calculation: { ...good.calculation, profit: 500, total_expenses: 750 },
       history: { ...good.history, profit: 600, expenses: 650 } };
-    assert.equal((await fetchJson(ops, uid, mismatch)).status, 400);
     const client = await db.client("authenticated");
     await client.query("select set_config('request.jwt.claim.sub', $1, false)", [uid]);
     const callRpc = async ({ operationId, requestHash, calculation, history }) => (await client.query(
       "select public.save_calculation_operation($1,'upload',$2,$3,$4) as result", [operationId, requestHash, calculation, history]
     )).rows[0].result;
-    assert.deepEqual(await callRpc(mismatch), { ok: false, reason: "bad_request" });
-    assert.deepEqual(await state(uid), [0, 0, 0, 0]);
+    const changeSnapshot = (mutate) => {
+      const bad = structuredClone(good);
+      mutate(bad.calculation.ai_insights);
+      return bad;
+    };
+    const invalid = [
+      ["projections", mismatch],
+      ["unsupported version", changeSnapshot(snapshot => { snapshot.version = 999; })],
+      ["missing version", changeSnapshot(snapshot => { delete snapshot.version; })],
+      ["unknown source", changeSnapshot(snapshot => { snapshot.source.type = "other"; })],
+      ["absent actual date", changeSnapshot(snapshot => { delete snapshot.period.dateFrom; })],
+      ["invalid calendar date", changeSnapshot(snapshot => { snapshot.period.dateFrom = "2026-06-00"; })],
+      ["net profit", changeSnapshot(snapshot => { snapshot.netProfitKopecks++; })],
+      ["inconsistent margin", changeSnapshot(snapshot => { snapshot.marginPercent = 38.601; })],
+      ["inconsistent quantity", changeSnapshot(snapshot => { snapshot.quantities.net++; })],
+      ["false cost coverage", changeSnapshot(snapshot => { snapshot.costCoverage.missingCost++; })],
+      ["inconsistent product totals", changeSnapshot(snapshot => { snapshot.productTotals.profitKopecks++; })],
+      ["inconsistent product cost", changeSnapshot(snapshot => { snapshot.products[0].cogsKopecks++; })],
+    ];
+    for (const [name, bad] of invalid) {
+      assert.equal((await fetchJson(ops, uid, bad)).status, 400, name);
+      assert.deepEqual(await callRpc(bad), { ok: false, reason: "bad_request" }, name);
+      assert.deepEqual(await state(uid), [0, 0, 0, 0], name);
+    }
     const [first, second] = await Promise.all([fetchJson(ops, uid, good), fetchJson(ops, uid, good)]);
     assert.deepEqual([first.status, second.status], [200, 200]);
     assert.equal([first, second].filter(r => r.body.data.replay).length, 1);
@@ -180,6 +204,7 @@ describe("Day 3 financial P1", () => {
     for (const [scenario, expected] of [
       ["repeat", "pagination_loop"], ["cycle", "pagination_loop"], ["http", "malformed_response"],
       ["limit", "pagination_truncated"], ["timeout", "deadline_exceeded"],
+      ["omitted-initial", "malformed_response"], ["omitted-after-cursor", "malformed_response"],
     ]) {
       network.state.ozon = upstream(scenario);
       const failure = await withoutPacing(() => saveApi(uid));
@@ -187,6 +212,13 @@ describe("Day 3 financial P1", () => {
       assert.equal(failure.body.code, expected, scenario);
       assert.deepEqual(await state(uid), [0, 0, 0, 0]);
     }
+    const terminalUser = await ozonUser();
+    network.state.ozon = upstream("terminal-empty");
+    const terminal = await withoutPacing(() => saveApi(terminalUser));
+    assert.equal(terminal.status, 200, JSON.stringify(terminal));
+    assert.equal(terminal.body.result.netProfit, 482.5);
+    assert.deepEqual(await state(terminalUser), [1, 1, 1, 1]);
+
     network.state.ozon = upstream("empty-continues");
     const complete = await withoutPacing(() => saveApi(uid));
     assert.equal(complete.status, 200, JSON.stringify(complete));
@@ -229,14 +261,75 @@ describe("Day 3 financial P1", () => {
     assert.equal((await fetchJson(calcs, uid)).body.data.length, 7, "all original versions remain in history");
   });
 
+  it("XLSX copies at 482.50 with conflicting headers require explicit acceptance of actual dates", async () => {
+    const uid = await db.user({ plan: "unlimited", premium: "10 days" });
+    const first = register([["Период: 01.06.2026-10.06.2026"]]);
+    const second = register([["Период: 11.06.2026-30.06.2026"]]);
+    assert.equal(first.calculation.profit, 482.5);
+    assert.equal(second.calculation.profit, 482.5);
+    assert.ok(second.calculation.ai_insights.warnings.some(w => w.code === "dates_outside_declared_period"));
+    const a = await fetchJson(ops, uid, first);
+    const b = await fetchJson(ops, uid, second);
+    assert.deepEqual([a.status, b.status], [200, 200]);
+    const firstChoice = { id: a.body.data.calculationId, shop: "label:Same store" };
+    const secondChoice = { id: b.body.data.calculationId, shop: firstChoice.shop };
+    const defaultView = (await summary(uid)).body.data;
+    assert.equal(defaultView.excludedCount, 2);
+    assert.equal(defaultView.summary, null);
+    const confirmedShopOnly = (await summary(uid, { choices: [firstChoice, secondChoice] })).body.data;
+    assert.equal(confirmedShopOnly.summary.profit, 482.5);
+    assert.equal(confirmedShopOnly.excludedPeriodConflicts, 1);
+    const conflict = confirmedShopOnly.decisions.find(row => row.id === secondChoice.id);
+    assert.deepEqual([conflict.included, conflict.periodConflict], [false, true]);
+    assert.deepEqual(conflict.period, { from: "2026-06-10", to: "2026-06-10" });
+    assert.deepEqual(conflict.declaredPeriod, { from: "2026-06-11", to: "2026-06-30" });
+    const resolved = (await summary(uid, {
+      choices: [firstChoice, { ...secondChoice, acceptActualDates: true }],
+    })).body.data;
+    assert.deepEqual([resolved.summary.profit, resolved.summary.count, resolved.excludedCount], [482.5, 1, 1]);
+    assert.equal(resolved.decisions.find(row => row.id === secondChoice.id).included, true);
+    const history = (await fetchJson(calcs, uid)).body.data;
+    assert.deepEqual(history.map(row => row.profit), [482.5, 482.5]);
+    assert.deepEqual(await state(uid), [0, 2, 2, 2]);
+  });
+
+  it("latest-version order uses PostgreSQL microseconds before the stable UUID tie-breaker", async () => {
+    const uid = await db.user();
+    const lowerId = "00000000-0000-0000-0000-000000000001";
+    const higherId = "00000000-0000-0000-0000-000000000002";
+    const snapshot = { kind: "ozon-api-v1", reportStoreKey: "c".repeat(64),
+      period: { dateFrom: "2026-06-01", dateTo: "2026-06-30" }, preliminary: { taxRevenueBase: 1250 } };
+    await sql(`insert into public.calculations(id,user_id,marketplace,mode,profit,created_at,ai_insights)
+      values($1,$3,'ozon','api',500,'2026-07-02T00:00:00.123999Z',$4),
+            ($2,$3,'ozon','api',482.5,'2026-07-02T03:00:00.123001+03:00',$4)`,
+      [lowerId, higherId, uid, snapshot]);
+    assert.equal((await summary(uid)).body.data.summary.profit, 500);
+    await sql("update public.calculations set created_at='2026-07-02T00:00:00.123999Z' where id=$1", [higherId]);
+    assert.equal((await summary(uid)).body.data.summary.profit, 482.5);
+    assert.equal((await fetchJson(calcs, uid)).body.data.length, 2);
+  });
+
+  it("Moscow calendar groups manual records at month and year boundaries", async () => {
+    const uid = await db.user();
+    await sql(`insert into public.calculations(user_id,marketplace,mode,profit,created_at)
+      values($1,'ozon','manual',150,'2025-12-31T20:59:59Z'),
+            ($1,'ozon','manual',250,'2026-01-01T00:15:00+03:00'),
+            ($1,'ozon','manual',400,'2026-01-31T21:00:00Z')`, [uid]);
+    const y26 = (await summary(uid)).body.data;
+    assert.deepEqual(y26.monthly.map(row => [row.key, row.profit]), [["2026-01", 250], ["2026-02", 400]]);
+    assert.equal(y26.summary.profit, 650);
+    const y25 = (await summary(uid, { year: "2025" })).body.data;
+    assert.deepEqual(y25.monthly.map(row => [row.key, row.profit]), [["2025-12", 150]]);
+  });
+
   it("P1-4 aggregates beyond 50 and the backend page size, respects year/month and account boundary", async () => {
     const uid = await db.user();
     const outsider = await db.user();
     await sql(`insert into public.calculations(user_id,marketplace,mode,profit,created_at)
       select $1,'ozon','manual',case when n=0 then 250 else 100 end,
-        '2026-01-31T23:59:00Z'::timestamptz + n*interval '1 minute' from generate_series(0,50) n`, [uid]);
+        '2026-01-31T23:59:00+03:00'::timestamptz + n*interval '1 minute' from generate_series(0,50) n`, [uid]);
     await sql(`insert into public.calculations(user_id,marketplace,mode,profit,created_at)
-      select $1,'ozon','manual',25,'2025-12-31T23:59:00Z'::timestamptz from generate_series(1,60)`, [uid]);
+      select $1,'ozon','manual',25,'2025-12-31T23:59:00+03:00'::timestamptz from generate_series(1,60)`, [uid]);
     await sql("insert into public.calculations(user_id,marketplace,mode,profit,created_at) values($1,'ozon','manual',9999,'2026-02-01Z')", [outsider]);
     assert.equal((await fetchJson(calcs, uid)).body.data.length, 50);
     const response = await summary(uid);

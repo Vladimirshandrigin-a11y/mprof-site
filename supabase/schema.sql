@@ -1912,6 +1912,11 @@ declare
   manual_total numeric;
   margin numeric;
   month text := snapshot #>> '{period,month}';
+  date_from text := snapshot #>> '{period,dateFrom}';
+  date_to text := snapshot #>> '{period,dateTo}';
+  declared_from text := snapshot #>> '{period,declaredFrom}';
+  declared_to text := snapshot #>> '{period,declaredTo}';
+  day text;
   common jsonb;
   bad_request constant jsonb := '{"ok":false,"reason":"bad_request"}'::jsonb;
 begin
@@ -1919,10 +1924,22 @@ begin
     return jsonb_build_object('ok', false, 'reason', 'not_authenticated');
   end if;
   if p_mode is distinct from 'upload'
-     or snapshot ->> 'kind' is distinct from 'ozon-accrual-xlsx-v1'
+     or snapshot @> '{"kind":"ozon-accrual-xlsx-v1","version":1,
+                        "source":{"type":"ozon-accrual-report-xlsx"}}'::jsonb is distinct from true
+     or jsonb_typeof(snapshot -> 'products') is distinct from 'array'
+     or jsonb_typeof(snapshot -> 'warnings') is distinct from 'array'
+     or jsonb_typeof(snapshot -> 'unknownTaxonomy') is distinct from 'array'
+     or jsonb_typeof(snapshot #> '{source,sheet}') is distinct from 'string'
+     or char_length(snapshot #>> '{source,sheet}') > 60
+     or jsonb_typeof(snapshot #> '{period,periodComplete}') is distinct from 'boolean'
      or snapshot -> 'preliminary' is distinct from 'false'::jsonb
      or snapshot #> '{costCoverage,complete}' is distinct from 'true'::jsonb
-     or month is null or month !~ '^[0-9]{4}-(0[1-9]|1[0-2])$'
+     or snapshot #> '{costCoverage,missingCost}' is distinct from '0'::jsonb
+     or snapshot #> '{costCoverage,unattributedNetQuantity}' is distinct from '0'::jsonb
+     or month is null or month !~ '^[0-9]{4}-(0[1-9]|1[0-2])$' or left(month, 4) = '0000'
+     or date_from is null or date_to is null or date_from > date_to
+     or (declared_from is null) <> (declared_to is null)
+     or declared_from > declared_to
      or jsonb_typeof(buckets) is distinct from 'object'
      or jsonb_typeof(manual) is distinct from 'object'
      or jsonb_typeof(p_history) is distinct from 'object'
@@ -1930,12 +1947,25 @@ begin
     return bad_request;
   end if;
 
+  foreach day in array array_remove(array[date_from, date_to, declared_from, declared_to], null) loop
+    if day !~ ('^' || month || '-[0-9]{2}$') then
+      return bad_request;
+    end if;
+    begin
+      perform day::date;
+    exception when datetime_field_overflow or invalid_datetime_format then
+      return bad_request;
+    end;
+  end loop;
+
   -- All money in the snapshot is signed integer kopecks, except rate and margin.
   if exists (
     select 1 from unnest(array[
       snapshot -> 'taxRevenueBaseKopecks', snapshot -> 'netProfitKopecks',
       snapshot -> 'productionCostKopecks', snapshot -> 'netOzonOperationsKopecks',
-      snapshot -> 'salesRevenueKopecks', snapshot -> 'returnsRevenueKopecks',
+      snapshot -> 'salesRevenueKopecks', snapshot -> 'returnsRevenueKopecks', snapshot #> '{source,rowCount}',
+      snapshot #> '{quantities,sold}', snapshot #> '{quantities,returned}', snapshot #> '{quantities,net}',
+      snapshot #> '{costCoverage,requiredProducts}', snapshot #> '{costCoverage,withCost}',
       snapshot #> '{tax,kopecks}', manual -> 'totalKopecks',
       manual -> 'packagingKopecks', manual -> 'deliveryToWarehouseKopecks',
       manual -> 'salaryKopecks', manual -> 'otherKopecks',
@@ -1963,6 +1993,12 @@ begin
   margin := (snapshot ->> 'marginPercent')::numeric;
 
   if base <= 0
+     or (snapshot #>> '{source,rowCount}')::numeric < 0
+     or (snapshot #>> '{quantities,returned}')::numeric < 0
+     or (snapshot #>> '{quantities,net}')::numeric <>
+        (snapshot #>> '{quantities,sold}')::numeric - (snapshot #>> '{quantities,returned}')::numeric
+     or (snapshot #>> '{costCoverage,requiredProducts}')::numeric < 0
+     or snapshot #> '{costCoverage,requiredProducts}' <> snapshot #> '{costCoverage,withCost}'
      or base <> (buckets ->> 'salesRevenue')::numeric + (buckets ->> 'returnsRevenue')::numeric
      or snapshot -> 'salesRevenueKopecks' <> buckets -> 'salesRevenue'
      or snapshot -> 'returnsRevenueKopecks' <> buckets -> 'returnsRevenue'
@@ -1990,6 +2026,39 @@ begin
      -- JavaScript Math.round rounds ties toward +infinity.
      or margin <> floor(profit * 10000 / base + 0.5) / 100
   then
+    return bad_request;
+  end if;
+
+  -- Validate the monetary product reconciliation independently of HTTP.
+  if not (snapshot @> jsonb_build_object(
+    'productTotals', jsonb_build_object('productCount', jsonb_array_length(snapshot -> 'products'),
+      'profitComplete', true, 'profitKopecks', profit),
+    'reconciliation', jsonb_build_object('reconciles', true, 'productProfitSumKopecks', profit)
+  )) or exists (
+    select 1 from jsonb_array_elements(snapshot -> 'products') as products(product)
+    cross join lateral unnest(array[
+      'cogsKopecks', 'profitKopecks', 'directKopecks', 'allocatedGeneralKopecks',
+      'allocatedTaxKopecks', 'allocatedManualKopecks'
+    ]) as checked(key)
+    where case when jsonb_typeof(product -> key) = 'number'
+      then (product ->> key)::numeric <> trunc((product ->> key)::numeric)
+           or abs((product ->> key)::numeric) > 9007199254740991
+      else true end
+  ) then
+    return bad_request;
+  end if;
+
+  if exists (
+    select 1 from jsonb_array_elements(snapshot -> 'products') as products(product)
+    where (product ->> 'profitKopecks')::numeric <>
+      (product ->> 'directKopecks')::numeric + (product ->> 'allocatedGeneralKopecks')::numeric -
+      (product ->> 'cogsKopecks')::numeric - (product ->> 'allocatedTaxKopecks')::numeric -
+      (product ->> 'allocatedManualKopecks')::numeric
+  ) or not exists (
+    select 1 from jsonb_array_elements(snapshot -> 'products') as products(product)
+    having sum((product ->> 'cogsKopecks')::numeric) = cost
+       and sum((product ->> 'profitKopecks')::numeric) = profit
+  ) then
     return bad_request;
   end if;
 

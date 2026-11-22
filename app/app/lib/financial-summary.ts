@@ -4,7 +4,7 @@ import { extractReportMonthFromText } from "./report-month";
 import type { CloudCalculation } from "./supabase-cloud";
 
 export type SummaryMode = "all" | "manual" | "upload" | "api";
-export type SummaryChoice = { id: string; shop: string; month?: string };
+export type SummaryChoice = { id: string; shop: string; month?: string; acceptActualDates?: true };
 export type SummaryQuery = { year: string; mode: SummaryMode; choices: SummaryChoice[]; page: number };
 
 type FinancialRow = Pick<CloudCalculation,
@@ -14,12 +14,18 @@ type FinancialRow = Pick<CloudCalculation,
 >;
 
 type Period = { from: string; to: string };
-type Report = { row: FinancialRow; month: string | null; period: Period | null; store: string | null };
+type Report = {
+  row: FinancialRow; month: string | null; period: Period | null; store: string | null;
+  periodConflict: boolean; declaredPeriod: Period | null;
+};
 type ConfirmedReport = Report & { period: Period; store: string; choiceOrder: number };
 const MONTH = /^\d{4}-(?:0[1-9]|1[0-2])$/;
 const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const SHOP_KEY = /^[0-9a-f]{64}$/;
 const PAGE_SIZE = 25;
+const MOSCOW_CALENDAR = new Intl.DateTimeFormat("en", {
+  timeZone: "Europe/Moscow", year: "numeric", month: "2-digit",
+});
 const amount = (v: unknown) => Number(v) || 0;
 const object = (v: unknown): Record<string, unknown> =>
   v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
@@ -32,11 +38,12 @@ export function parseSummaryQuery(body: unknown): SummaryQuery | null {
       !Array.isArray(choices) || choices.length > 2000) return null;
   const parsed: SummaryChoice[] = [];
   for (const entry of choices) {
-    const { id, shop, month } = object(entry);
+    const { id, shop, month, acceptActualDates } = object(entry);
     if (typeof id !== "string" || !UUID.test(id) || typeof shop !== "string" ||
         !(SHOP_KEY.test(shop) || /^label:[^\p{Cc}]{1,80}$/u.test(shop)) ||
-        (month !== undefined && (typeof month !== "string" || !MONTH.test(month)))) return null;
-    parsed.push({ id, shop, month });
+        (month !== undefined && (typeof month !== "string" || !MONTH.test(month))) ||
+        (acceptActualDates !== undefined && acceptActualDates !== true)) return null;
+    parsed.push({ id, shop, month, acceptActualDates });
   }
   return { year, mode, choices: parsed, page };
 }
@@ -48,24 +55,42 @@ function isoDay(value: unknown): string | null {
   return Number.isFinite(timestamp) && new Date(timestamp).toISOString().startsWith(day) ? day : null;
 }
 
+function readPeriod(fromValue: unknown, toValue: unknown): Period | null {
+  const from = isoDay(fromValue);
+  const to = isoDay(toValue);
+  return from && to && from <= to ? { from, to } : null;
+}
+
+function moscowMonth(timestamp: string): string | null {
+  const instant = Date.parse(timestamp);
+  if (!Number.isFinite(instant)) return null;
+  const parts = MOSCOW_CALENDAR.formatToParts(instant);
+  const year = parts.find(part => part.type === "year")?.value;
+  const month = parts.find(part => part.type === "month")?.value;
+  return year && month ? `${year}-${month}` : null;
+}
+
 function reportFor(row: FinancialRow): Report {
   const snapshot = object(row.ai_insights);
   const p = object(snapshot.period);
   const api = row.mode === "api" && snapshot.kind === "ozon-api-v1";
   const xlsx = row.mode === "upload" && snapshot.kind === "ozon-accrual-xlsx-v1";
-  const from = api || xlsx ? isoDay(p.declaredFrom ?? p.dateFrom) : null;
-  const to = api || xlsx ? isoDay(p.declaredTo ?? p.dateTo) : null;
-  const period = from && to && from <= to ? { from, to } : null;
+  const actual = api || xlsx ? readPeriod(p.dateFrom, p.dateTo) : null;
+  const declaredPeriod = xlsx ? readPeriod(p.declaredFrom, p.declaredTo) : null;
+  const hasDeclaredDates = p.declaredFrom != null || p.declaredTo != null;
+  const periodConflict = xlsx && actual !== null && hasDeclaredDates &&
+    (!declaredPeriod || actual.from < declaredPeriod.from || actual.to > declaredPeriod.to);
+  // A conflicting header cannot make copies of the same operations disjoint.
+  const period = xlsx && (!actual || periodConflict) ? actual : declaredPeriod ?? actual;
   const store = api && typeof snapshot.reportStoreKey === "string" && SHOP_KEY.test(snapshot.reportStoreKey)
     ? snapshot.reportStoreKey : null;
-  const created = Date.parse(row.created_at);
   const month = row.mode === "manual"
-    ? Number.isFinite(created) ? new Date(created).toISOString().slice(0, 7) : null
+    ? moscowMonth(row.created_at)
     : period?.to.slice(0, 7) ??
       (typeof p.month === "string" && MONTH.test(p.month) ? p.month : null) ??
       extractReportMonthFromText(typeof snapshot.reportPeriod === "string" ? snapshot.reportPeriod : null)?.slice(0, 7) ??
       null;
-  return { row, month, period, store };
+  return { row, month, period, store, periodConflict, declaredPeriod };
 }
 
 function fullMonth(month: string): Period {
@@ -74,8 +99,16 @@ function fullMonth(month: string): Period {
   return { from: month + "-01", to: month + "-" + String(last).padStart(2, "0") };
 }
 
+function timestampMicrosecondsWithinMillisecond(value: string): number {
+  const fraction = /[T ]\d{2}:\d{2}:\d{2}\.(\d+)/.exec(value)?.[1] ?? "";
+  return Number(fraction.padEnd(6, "0").slice(3, 6));
+}
+
 function compareLatest(a: FinancialRow, b: FinancialRow): number {
-  return Date.parse(b.created_at) - Date.parse(a.created_at) || b.id.localeCompare(a.id);
+  // PostgreSQL preserves six fractional digits; JS Date.parse keeps only three.
+  return Date.parse(b.created_at) - Date.parse(a.created_at) ||
+    timestampMicrosecondsWithinMillisecond(b.created_at) - timestampMicrosecondsWithinMillisecond(a.created_at) ||
+    b.id.localeCompare(a.id);
 }
 
 function overlaps(a: Period, b: Period): boolean {
@@ -177,8 +210,8 @@ export function buildFinancialSummary(rows: FinancialRow[], query: SummaryQuery)
     const assertedShop = choice && (shops.has(choice.shop) || choice.shop.startsWith("label:")) ? choice.shop : null;
     const store = r.store ?? assertedShop;
     const candidate = { ...r, period, month, store };
-    if (!r.store || !r.period) decisions.set(r.row.id, candidate);
-    if (!store || !period) continue;
+    if (!r.store || !r.period || r.periodConflict) decisions.set(r.row.id, candidate);
+    if (!store || !period || (r.periodConflict && choice?.acceptActualDates !== true)) continue;
     const key = JSON.stringify([r.row.marketplace, store]);
     const group = byStore.get(key) ?? [];
     group.push({ ...candidate, period, store, choiceOrder: choice?.order ?? -1 });
@@ -211,12 +244,14 @@ export function buildFinancialSummary(rows: FinancialRow[], query: SummaryQuery)
 
   const allDecisions = [...decisions.values()].sort((a, b) =>
     (b.month ?? "").localeCompare(a.month ?? "") || compareLatest(a.row, b.row));
+  const excluded = allDecisions.filter(r => !includedIds.has(r.row.id));
   const start = query.page * PAGE_SIZE;
   return {
     ...summarize(included),
     years: [...years].sort().reverse(),
     decisionCount: allDecisions.length,
-    excludedCount: allDecisions.filter(r => !includedIds.has(r.row.id)).length,
+    excludedCount: excluded.length,
+    excludedPeriodConflicts: excluded.filter(r => r.periodConflict).length,
     decisionPageSize: PAGE_SIZE,
     shops: [...shops].sort(([a], [b]) => a.localeCompare(b)).map(([key, label]) => ({ key, label })),
     decisions: allDecisions.slice(start, start + PAGE_SIZE).map(r => {
@@ -225,6 +260,7 @@ export function buildFinancialSummary(rows: FinancialRow[], query: SummaryQuery)
         id: r.row.id, mode: r.row.mode, marketplace: r.row.marketplace,
         createdAt: r.row.created_at, period: r.period, month: r.month, profit: amount(r.row.profit),
         knownStore: original.store, hasPeriod: original.period !== null,
+        periodConflict: original.periodConflict, declaredPeriod: original.declaredPeriod,
         included: includedIds.has(r.row.id),
       };
     }),

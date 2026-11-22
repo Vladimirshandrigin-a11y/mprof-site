@@ -9,9 +9,9 @@ const columns = buildRequire("./app/lib/accrual/columns.js");
 export function xlsxSaveFixture({
   rows = [accrualRow("2026-06-10", "Продажи", "Выручка", "ART-A", 1, "850.00", "S-1")],
   article = "ART-A", taxPercent = "7", cost = 100, packaging = "40.50", ads = "",
-  generatedAt = "2026-07-01T10:00:00.000Z",
+  generatedAt = "2026-07-01T10:00:00.000Z", preamble,
 } = {}) {
-  const parsed = parseAccrualXlsxBuffer(buildReport(rows));
+  const parsed = parseAccrualXlsxBuffer(buildReport(rows, { preamble }));
   assert.equal(parsed.ok, true);
   const report = parsed.report;
   const result = evaluateAccrual({

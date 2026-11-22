@@ -671,11 +671,11 @@ export async function loadAccrualDraft(
       }
       const accruals = rootObj.accruals;
       if (!Array.isArray(accruals)) return { ok: false, code: "malformed_response" };
-      const rawLastId = rootObj.last_id;
-      if (rawLastId !== undefined && typeof rawLastId !== "string") {
+      // An omitted cursor provides no evidence that the day is complete.
+      const nextId = rootObj.last_id;
+      if (!Object.prototype.hasOwnProperty.call(rootObj, "last_id") || typeof nextId !== "string") {
         return { ok: false, code: "malformed_response" };
       }
-      const nextId = typeof rawLastId === "string" ? rawLastId : "";
       if (nextId !== "" && seenCursors.has(nextId)) {
         return { ok: false, code: "pagination_loop" };
       }
