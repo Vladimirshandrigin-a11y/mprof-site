@@ -1,75 +1,112 @@
-name: PR 123 exact SHA Linux verification
+name: PR 124 exact SHA Linux verification
+
 on:
   push:
-    branches: [ci/pr123-linux-verification]
+    branches: [ci/pr124-linux-verification]
+
 permissions:
   contents: read
+
 jobs:
-  linux-smoke:
+  linux-financial-verification:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
-      TARGET_SHA: 10a806f97f37708b400f26b9f901c960171cb0ec
+      TARGET_SHA: 93ba9b87318b21401737ec8a0eeb86d357998228
       NEXT_TELEMETRY_DISABLED: '1'
       NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:39473
       NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: synthetic-test-publishable-key
       SUPABASE_SERVICE_ROLE_KEY: synthetic-test-service-key
       NEXT_PUBLIC_SITE_URL: http://127.0.0.1:39472
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: synthetic-local-postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Checkout exact PR HEAD
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: 10a806f97f37708b400f26b9f901c960171cb0ec
+          ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
           persist-credentials: false
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '22'
-      - name: Verify source and environment
+
+      - name: Verify SHA and Linux x64 environment
+        shell: bash
         run: |
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           test -z "$(git status --porcelain)"
           git rev-parse HEAD
+          git rev-parse 'HEAD^{tree}'
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          printf '%s\n' "$PRETTY_NAME"
           uname -sm
           getconf GNU_LIBC_VERSION
           node --version
           npm --version
-          node -e 'const a=require("node:assert/strict"); a.equal(process.platform,"linux"); a.equal(process.arch,"x64"); a.ok(process.report.getReport().header.glibcVersionRuntime)'
-      - name: Clean lockfile install
+          node -e 'const a=require("node:assert/strict"); a.equal(process.platform,"linux"); a.equal(process.arch,"x64"); a.ok(process.report.getReport().header.glibcVersionRuntime); a.equal(process.versions.node.split(".")[0],"22")'
+
+      - name: Clean npm ci from lockfile
+        shell: bash
         run: |
           test ! -e node_modules
           npm ci --no-audit --no-fund
           git diff --exit-code -- package-lock.json package.json
           sha256sum package-lock.json
-          node -e 'console.log("Next "+require("next/package.json").version)'
-      - name: Production build
-        run: npm run build
-      - name: Prepare isolated browser
-        run: |
-          npm install --prefix "$RUNNER_TEMP/browser" --no-audit --no-fund playwright@1.65.1
-          "$RUNNER_TEMP/browser/node_modules/.bin/playwright" install --with-deps chromium
-          git show "$GITHUB_EVENT_AFTER:.github/verification/pr123-guest-smoke.cjs" > "$RUNNER_TEMP/guest-smoke.cjs"
+
+      - name: TypeScript
+        run: ./node_modules/.bin/tsc --noEmit
+
+      - name: Financial regressions
+        run: npm run test:accrual
+
+      - name: Isolated PostgreSQL regressions
         env:
-          GITHUB_EVENT_AFTER: ${{ github.sha }}
-      - name: HTTP smoke and guest authentication gate
+          TEST_DATABASE_URL: postgresql://postgres:synthetic-local-postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
+        shell: bash
         run: |
-          ./node_modules/.bin/next start -H 127.0.0.1 -p 39472 > "$RUNNER_TEMP/next.log" 2>&1 &
-          app_pid=$!
-          trap 'kill "$app_pid" 2>/dev/null || true; cat "$RUNNER_TEMP/next.log"' EXIT
-          origin=http://127.0.0.1:39472
-          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 --max-time 5 "$origin/" -o /dev/null
           node <<'NODE'
           const assert = require("node:assert/strict");
+          const { Client } = require("pg");
           (async () => {
-            const origin = "http://127.0.0.1:39472";
-            for (const [path, method, status] of [
-              ["/", "GET", 200], ["/app", "GET", 200], ["/api/cloud/profile", "GET", 401],
-              ["/api/cloud/calculation-operations", "POST", 401], ["/api/cloud/consume", "POST", 410],
-              ["/api/ozon/save-calculation", "POST", 401], ["/api/ozon/postings-match-diagnostic", "POST", 401]
-            ]) {
-              const result = await fetch(origin + path, { method, signal: AbortSignal.timeout(5000) });
-              assert.equal(result.status, status, method + " " + path);
-              console.log(method + " " + path + " -> " + status + " PASS");
+            const url = new URL(process.env.TEST_DATABASE_URL);
+            assert.equal(url.protocol, "postgresql:");
+            assert.equal(url.hostname, "127.0.0.1");
+            assert.equal(url.pathname, "/postgres");
+            const db = new Client({ connectionString: url.href });
+            await db.connect();
+            try {
+              const result = await db.query("show server_version");
+              const version = result.rows[0].server_version;
+              assert.match(version, /^17\./);
+              console.log("Isolated PostgreSQL " + version);
+            } finally {
+              await db.end();
             }
-          })().catch(error => { console.error(error); process.exitCode = 1; });
+          })().catch(error => { console.error(error.message); process.exitCode = 1; });
           NODE
-          node "$RUNNER_TEMP/guest-smoke.cjs" "$RUNNER_TEMP/browser/node_modules/playwright"
+          npm run test:db
+
+      - name: Production build with Turbopack
+        run: npm run build -- --turbopack
+
+      - name: Confirm tested SHA and tracked source
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git diff --exit-code HEAD --
