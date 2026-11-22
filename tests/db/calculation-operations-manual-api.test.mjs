@@ -1,3 +1,4 @@
+import { xlsxSaveFixture } from "./helpers/xlsx-save-fixture.mjs";
 // Атомарное списание и сохранение ручного расчёта и Ozon API — настоящие обработчики
 // (скомпилированы run.mjs):
 //   • app/api/cloud/calculation-operations/route.ts (ручной, mode "manual");
@@ -71,12 +72,7 @@ async function opStatus(userId, operationId, requestHash) {
 const xlsxBody = (requestHash = "2026-06:12:fileA") => ({
   operationId: randomUUID(),
   requestHash,
-  calculation: {
-    marketplace: "ozon", mode: "upload", revenue: 850, commission: 180, logistics: 67, ads: 60, storage: 0, tax: 59.5,
-    cost: 100, other_expenses: 15.55, total_expenses: 200, profit: 650, margin: 76.47,
-    ai_insights: { kind: "ozon-accrual-xlsx-v1", generatedAt: "2026-07-01T10:00:00.000Z", profitKopecks: 65000 },
-  },
-  history: { report_month: "2026-06-01", revenue: 850, expenses: 200, profit: 650, margin: 76.47 },
+  ...xlsxSaveFixture(),
 });
 async function postXlsx(userId, body = xlsxBody()) {
   const req = new NextRequest("http://localhost/api/cloud/calculation-operations", {
@@ -1312,6 +1308,7 @@ describe("совместимость и миграция", () => {
     await runScript(migrated.main, read("supabase/migrations/20261113221918_quota_atomic_edits.sql"));
     await runScript(migrated.main, read("supabase/migrations/20261115180805_operation_saved_edit_version.sql"));
     await runScript(migrated.main, QUOTA_ACL_MIGRATION);
+    await runScript(migrated.main, read("supabase/migrations/20261121154206_verify_xlsx_financial_consistency.sql"));
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_manual_calculation_operation"));
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));

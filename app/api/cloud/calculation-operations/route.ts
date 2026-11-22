@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getUserScopedClient } from "../_lib/auth";
+import { readAccrualSnapshot } from "../../../app/lib/accrual/snapshot";
+import {
+  accrualSnapshotToCalculationColumns,
+  accrualSnapshotToReportHistoryColumns,
+} from "../../../app/lib/accrual/columns";
+import { percentOfKopecks, percentToBasisPoints, ratioPercent } from "../../../app/lib/accrual/money";
 import {
   computeManualColumns,
   manualRequestHash,
@@ -65,6 +71,12 @@ function rpcFailure(error: RpcError, where: string) {
   return json({ error: "Ошибка сохранения расчёта", code: "rpc_failed" }, 502);
 }
 
+function isDayInMonth(value: string, month: string): boolean {
+  if (!value.startsWith(month + "-") || month.startsWith("0000")) return false;
+  const day = Date.parse(value + "T00:00:00Z");
+  return Number.isFinite(day) && new Date(day).toISOString().slice(0, 10) === value;
+}
+
 export async function POST(req: NextRequest) {
   const token = bearer(req);
   if (!token) return json({ error: "Требуется авторизация" }, 401);
@@ -93,12 +105,57 @@ export async function POST(req: NextRequest) {
     return json({ error: "Некорректный запрос", code: "bad_request" }, 400);
   }
 
+  const read = readAccrualSnapshot(calculation.ai_insights);
+  if (read.status !== "ok" || read.snapshot.preliminary || !read.snapshot.costCoverage.complete) {
+    return json({ error: "Финансовый снимок не прошёл проверку", code: "bad_request" }, 400);
+  }
+  const { snapshot } = read;
+  const { month, dateFrom, dateTo, declaredFrom, declaredTo } = snapshot.period;
+  if (!isDayInMonth(dateFrom, month) || !isDayInMonth(dateTo, month) || dateFrom > dateTo ||
+      (declaredFrom === null) !== (declaredTo === null) ||
+      (declaredFrom !== null && declaredTo !== null &&
+        (!isDayInMonth(declaredFrom, month) || !isDayInMonth(declaredTo, month) || declaredFrom > declaredTo))) {
+    return json({ error: "Некорректные даты финансового снимка", code: "bad_request" }, 400);
+  }
+  const rate = percentToBasisPoints(snapshot.tax.ratePercent);
+  const margin = ratioPercent(snapshot.netProfitKopecks, snapshot.taxRevenueBaseKopecks);
+  if (rate === null || snapshot.tax.ratePercent !== rate / 100 ||
+      percentOfKopecks(snapshot.taxRevenueBaseKopecks, rate) !== snapshot.tax.kopecks ||
+      snapshot.marginPercent !== margin ||
+      !snapshot.productTotals.profitComplete || snapshot.reconciliation.reconciles !== true ||
+      snapshot.productTotals.profitKopecks !== snapshot.netProfitKopecks ||
+      snapshot.reconciliation.productProfitSumKopecks !== snapshot.netProfitKopecks) {
+    return json({ error: "Итоги финансового снимка не сходятся", code: "bad_request" }, 400);
+  }
+  let productCost = 0;
+  let productProfit = 0;
+  for (const product of snapshot.products) {
+    if (product.cogsKopecks === null || product.profitKopecks !==
+        product.directKopecks + product.allocatedGeneralKopecks - product.cogsKopecks -
+        product.allocatedTaxKopecks - product.allocatedManualKopecks) {
+      return json({ error: "Итоги по товарам не сходятся", code: "bad_request" }, 400);
+    }
+    productCost += product.cogsKopecks;
+    productProfit += product.profitKopecks;
+  }
+  if (productCost !== snapshot.productionCostKopecks || productProfit !== snapshot.netProfitKopecks) {
+    return json({ error: "Сумма по товарам не сходится с финансовым снимком", code: "bad_request" }, 400);
+  }
+  const savedCalculation = accrualSnapshotToCalculationColumns(snapshot);
+  const savedHistory = accrualSnapshotToReportHistoryColumns(snapshot);
+  if (
+    Object.entries(savedCalculation).some(([key, value]) => key !== "ai_insights" && calculation[key] !== value) ||
+    Object.entries(savedHistory).some(([key, value]) => history[key] !== value)
+  ) {
+    return json({ error: "Суммы расчёта и истории не сходятся со снимком", code: "bad_request" }, 400);
+  }
+
   const { data, error } = await client.rpc("save_calculation_operation", {
     p_operation_id: operationId,
     p_mode: "upload",
     p_request_hash: requestHash,
-    p_calculation: calculation,
-    p_history: history,
+    p_calculation: savedCalculation,
+    p_history: savedHistory,
   });
   if (error) return rpcFailure(error, "save");
   return operationResponse(data, "Операция не совпадает с этим файлом");

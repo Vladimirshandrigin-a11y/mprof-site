@@ -19,6 +19,8 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import { SUPABASE_URL, installFetch, userJwt } from "./helpers/fetch-stub.mjs";
 import { SCHEMA, buildRequire, payTestEnv, read, root, runScript } from "./helpers/pay-db.mjs";
 
+import { xlsxSaveFixture } from "./helpers/xlsx-save-fixture.mjs";
+
 const OPS_MIGRATION = read("supabase/migrations/20260928_calculation_operations.sql");
 const OPS_CHECKS = read("supabase/checks/calculation_operations.sql");
 
@@ -34,34 +36,11 @@ const net = installFetch();
 const { state } = net;
 const { freshDb } = payTestEnv();
 
-/**
- * Колонки строки calculations / report_history (как accrualSnapshotTo*Columns): налог,
- * реклама и себестоимость — и в колонках, и в снимке ai_insights.
- */
-const calcCols = ({ profit = 650, tax = 59.5, ads = 60, cost = 100, generatedAt = "2026-07-01T10:00:00.000Z" } = {}) => ({
-  marketplace: "ozon",
-  mode: "upload",
-  revenue: 850,
-  commission: 180,
-  logistics: 67,
-  ads,
-  storage: 0,
-  tax,
-  cost,
-  other_expenses: 15.55,
-  total_expenses: 850 - profit,
-  profit,
-  margin: 76.47,
-  ai_insights: { kind: "ozon-accrual-xlsx-v1", generatedAt, taxKopecks: tax * 100, adsKopecks: ads * 100, costKopecks: cost * 100, profitKopecks: profit * 100 },
-});
-const histCols = (profit = 650) => ({ report_month: "2026-06-01", revenue: 850, expenses: 850 - profit, profit, margin: 76.47 });
-
 function body(over = {}) {
   return {
     operationId: randomUUID(),
     requestHash: "2026-06:12:fileA",
-    calculation: calcCols(),
-    history: histCols(),
+    ...xlsxSaveFixture(),
     ...over,
   };
 }
@@ -198,7 +177,7 @@ describe("операция расчёта через настоящий марш
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 }, "в БД всё зафиксировано");
     state.dropAfterCommit = null;
     // Повтор после перезагрузки: снимок собран заново (другое время формирования) — данные те же.
-    const retry = await post(u, { ...b, calculation: calcCols({ generatedAt: "2026-07-01T10:05:00.000Z" }) });
+    const retry = await post(u, { ...b, ...xlsxSaveFixture({ generatedAt: "2026-07-01T10:05:00.000Z" }) });
     assert.equal(retry.status, 200);
     assert.deepEqual([retry.body.data.status, retry.body.data.replay, retry.body.data.contentMatch], ["done", true, true]);
     assert.deepEqual(retry.body.data.snapshot, b.calculation.ai_insights, "возвращён сохранённый снимок");
@@ -242,18 +221,17 @@ describe("операция расчёта через настоящий марш
   it("тот же ключ и файл, но другие данные (налог, реклама, себестоимость, снимок): ничего не перезаписано и не создано — возвращён сохранённый снимок, contentMatch=false", async () => {
     const u = await db.user();
     await db.main.query("insert into public.subscriptions (user_id, plan, status) values ($1, 'single', 'active')", [u]);
-    const b = body({ calculation: calcCols({ tax: 42.5, ads: 250.75 }) });
+    const b = body(xlsxSaveFixture({ taxPercent: "5", ads: "250.75" }));
     const first = await post(u, b);
     assert.equal(first.status, 200);
     const snapBefore = await dbState(db);
     const opBefore = await opRow(db, b.operationId);
     for (const changed of [
-      calcCols({ tax: 99, ads: 250.75 }),
-      calcCols({ tax: 42.5, ads: 10 }),
-      calcCols({ tax: 42.5, ads: 250.75, cost: 555 }),
-      { ...calcCols({ tax: 42.5, ads: 250.75 }), ai_insights: { ...calcCols({ tax: 42.5, ads: 250.75 }).ai_insights, profitKopecks: 1 } },
+      xlsxSaveFixture({ taxPercent: "11.65", ads: "250.75" }),
+      xlsxSaveFixture({ taxPercent: "5", ads: "10" }),
+      xlsxSaveFixture({ taxPercent: "5", ads: "250.75", cost: 555 }),
     ]) {
-      const r = await post(u, { ...b, calculation: changed });
+      const r = await post(u, { ...b, ...changed });
       assert.equal(r.status, 200);
       assert.deepEqual(
         [r.body.data.status, r.body.data.replay, r.body.data.contentMatch, r.body.data.calculationId, r.body.data.charged],
@@ -261,8 +239,8 @@ describe("операция расчёта через настоящий марш
       );
       assert.deepEqual(r.body.data.snapshot, b.calculation.ai_insights, "показан сохранённый снимок, а не присланный");
     }
-    const changedHistory = await post(u, { ...b, history: histCols(1) });
-    assert.equal(changedHistory.body.data.contentMatch, false);
+    const changedHistory = await post(u, { ...b, history: { ...b.history, profit: 1 } });
+    assert.equal(changedHistory.status, 400);
     assert.equal(await dbState(db), snapBefore, "ни одной записи: calculations, report_history, profiles, журнал");
     assert.deepEqual(await opRow(db, b.operationId), opBefore, "операция по-прежнему связана с первыми данными");
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
@@ -309,7 +287,7 @@ describe("операция расчёта через настоящий марш
       body({ history: null }),
       body({ requestHash: "" }),
       body({ calculation: [1] }),
-      body({ calculation: { ...calcCols(), ai_insights: null } }),
+      body({ calculation: { ...xlsxSaveFixture().calculation, ai_insights: null } }),
     ]) {
       const r = await post(u, bad);
       assert.equal(r.status, 400);
@@ -353,7 +331,7 @@ describe("удалённый расчёт: журнал остаётся, пов
       [replay.body.data.status, replay.body.data.replay, replay.body.data.calculationId, replay.body.data.snapshot, replay.body.data.charged],
       ["deleted", true, null, null, true]
     );
-    const twice = await post(u, { ...b, calculation: calcCols({ tax: 1 }) });
+    const twice = await post(u, { ...b, ...xlsxSaveFixture({ taxPercent: "1" }) });
     assert.equal(twice.body.data.status, "deleted", "и с другими данными — тоже не создаётся");
     assert.equal(await dbState(db), snap, "повтор ничего не записал и не списал");
     assert.deepEqual(await facts(db, u), { used: 1, calcs: 0, history: 1, ops: 1 });
@@ -452,7 +430,7 @@ describe("доступ, миграция и совместимость", () => {
     for (const [k, v] of Object.entries(cons)) if (k.endsWith("_mismatch")) assert.equal(v, "0", k);
   });
 
-  it("итоговые секции schema.sql совпадают с миграциями 20260928 + 20260929 (таблица, функции, права)", async () => {
+  it("итоговые секции schema.sql совпадают с миграциями операций XLSX (таблица, функции, права)", async () => {
     const describeDb = async (c) => {
       const f = await c.query(`select p.proname, pg_get_functiondef(p.oid) as d, p.proacl::text as acl
         from pg_proc p join pg_namespace n on n.oid = p.pronamespace
@@ -462,8 +440,10 @@ describe("доступ, миграция и совместимость", () => {
       const k = await c.query("select conname, pg_get_constraintdef(oid) as d from pg_constraint where conrelid = 'public.calculation_operations'::regclass order by 1");
       return JSON.stringify([f.rows, t.rows, a.rows, k.rows]);
     };
-    // schema.sql — итоговое состояние: #107 и следующая миграция (ручной расчёт и API).
-    const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION, read("supabase/migrations/20260929_calculation_operations_manual_api.sql")] });
+    const migrated = await freshDb({ extraMigrations: [OPS_MIGRATION,
+      read("supabase/migrations/20260929_calculation_operations_manual_api.sql"),
+      read("supabase/migrations/20261121154206_verify_xlsx_financial_consistency.sql"),
+    ] });
     const full = await freshDb({ migrated: false, fullSchema: true });
     assert.ok(SCHEMA.includes("save_calculation_operation"));
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));

@@ -7,7 +7,10 @@ import appLoaderStyles from "./app-loader.module.css"
 import { LEGACY_DETAIL_UNAVAILABLE, readLegacyUpdProductDetail } from "./lib/legacy-upd-display"
 import type { ProductBreakdownRow } from "./lib/product-breakdown-calc"
 import { AnalyticsBlock } from "./components/AnalyticsBlock"
+import { FinancialSummaryChoices } from "./components/FinancialSummaryChoices"
+import { ozonRealizationRevenue, type FinancialSummary, type SummaryChoice, type SummaryMode } from "./lib/financial-summary"
 import { AccrualUploadFlow } from "./components/AccrualUploadFlow"
+import { extractReportMonthFromText } from "./lib/report-month"
 import { ApiCostGapNotice } from "./components/ApiCostGapNotice"
 import { parseApiCostGap, type ApiCostGap } from "./lib/api-cost-gap"
 import {
@@ -51,6 +54,7 @@ import {
 import {
   supabase,
   loadCalculationsFromCloud,
+  loadFinancialSummary,
   deleteCalculationFromCloud,
   clearCalculationsFromCloud,
   loadUploadedReportsFromCloud,
@@ -388,49 +392,6 @@ function isApiCalcUnsafeToLoad(h: CalcResult): boolean {
   return (Number(h.other) || 0) < 0;
 }
 
-/**
- * Годовые агрегаты для честной taxonomy-модели отчётов (PR B). Чистая функция:
- * для каждой записи берёт gross charges/income из валидной financeTaxonomy, иначе
- * flat. Без double count. Вынесена из useMemo, чтобы не раздувать render-компонент.
- */
-function aggregateReportsTaxonomy(items: CalcResult[]): {
-  logisticsCharges: number;
-  adsCharges: number;
-  otherCharges: number;
-  manualExtraExpenses: number;
-  ozonIncome: number;
-} {
-  const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
-  let lc = 0;
-  let ac = 0;
-  let oc = 0;
-  let me = 0;
-  let inc = 0;
-  for (const h of items) {
-    const tv = ozonTaxonomyView(h);
-    if (tv) {
-      lc += tv.logisticsCharges;
-      ac += tv.adsCharges;
-      oc += tv.otherCharges;
-      me += tv.manualExtraExpenses;
-      inc += tv.ozonIncome;
-    } else {
-      // Старая запись без валидной taxonomy: flat один раз, без выдуманного дохода
-      // и без выдуманных ручных доп-расходов.
-      lc += Number(h.logistics) || 0;
-      ac += Number(h.ads) || 0;
-      oc += Number(h.other) || 0;
-    }
-  }
-  return {
-    logisticsCharges: round2(lc),
-    adsCharges: round2(ac),
-    otherCharges: round2(oc),
-    manualExtraExpenses: round2(me),
-    ozonIncome: round2(inc),
-  };
-}
-
 function buildHistDetailRows(
   h: CalcResult,
   breakdown: NetProfitBreakdown | null
@@ -519,8 +480,12 @@ function buildHistDetailRows(
   const tv = ozonTaxonomyView(h);
   if (tv) {
     const trows: HistDetailRow[] = [
-      { label: "Выручка", value: h.revenue, kind: "income" },
+      { label: "Выручка по начислениям", value: h.revenue, kind: "income" },
     ];
+    const basis = ozonRealizationRevenue(h.aiInsights);
+    if (basis !== null) trows.push({
+      label: "Выручка после возвратов для маржи", value: basis, kind: "neutral",
+    });
     const pushExp = (label: string, value: number) => {
       if (value > 0) trows.push({ label, value, kind: "expense" });
     };
@@ -565,82 +530,6 @@ function buildHistDetailRows(
   return rows;
 }
 
-/**
- * Извлекает месяц отчёта из ПРОИЗВОЛЬНОГО текста (строка периода из XLSX,
- * report_period или ИМЯ ФАЙЛА Ozon) и нормализует в первое число месяца
- * 'YYYY-MM-01' — формат колонки report_history.report_month (тип date в БД;
- * MonthlyAnalytics группирует записи по 'YYYY-MM' = report_month.slice(0, 7)).
- * Возвращает null, если месяц распознать НЕ удалось.
- *
- * Поддерживаемые форматы (всё → 'YYYY-MM-01'):
- *   диапазон   «01.04.2026 - 30.04.2026», «01.04.2026 — 30.04.2026»,
- *              «01.04.2026 по 30.04.2026»  → берём месяц КОНЕЧНОЙ даты;
- *   компактный «20260430», в т.ч. внутри имени файла
- *              «Отчет о реализации товара_20260430.xlsx»,
- *              «Отчет о реализации товара_20260430 2.xlsx»;
- *   ISO        «2026-04-30», «2026/04», «2026.04» (год впереди);
- *   ДД.ММ.ГГГГ «30.04.2026» (день впереди);
- *   русские    «Апрель 2026», «за апрель 2026».
- *
- * Почему месяц КОНЕЧНОЙ даты диапазона: отчёт Ozon за месяц имеет период вида
- * 01.04.2026–30.04.2026 — обе даты в одном месяце, результат однозначен. Если
- * период вдруг пересекает два месяца, конечная дата вернее отражает, к какому
- * расчётному месяцу относятся выручка и выплаты.
- */
-function extractReportMonthFromText(
-  text: string | null | undefined
-): string | null {
-  if (!text) return null;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const p = text.toLowerCase();
-  // Собрать 'YYYY-MM-01' с валидацией номера месяца (отсекает мусор вроде 99).
-  const mk = (year: string, month: number): string | null =>
-    month >= 1 && month <= 12 ? `${year}-${pad(month)}-01` : null;
-
-  // 1) Диапазон ДД.ММ.ГГГГ … ДД.ММ.ГГГГ → месяц КОНЕЧНОЙ даты (группы 4,5,6).
-  const range = p.match(
-    /(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})\s*(?:-|—|–|по|до|to)\s*(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})/
-  );
-  if (range) {
-    const res = mk(range[6], Number(range[5]));
-    if (res) return res;
-  }
-
-  // 2) Компактный YYYYMMDD (в т.ч. в имени файла «_20260430.xlsx»).
-  const compact = p.match(/(20\d{2})(\d{2})(\d{2})/);
-  if (compact) {
-    const res = mk(compact[1], Number(compact[2]));
-    if (res) return res;
-  }
-
-  // 3) ISO — год впереди: 2026-04-30 / 2026/04 / 2026.04.
-  const iso = p.match(/(20\d{2})[-./](\d{1,2})/);
-  if (iso) {
-    const res = mk(iso[1], Number(iso[2]));
-    if (res) return res;
-  }
-
-  // 4) Одиночная ДД.ММ.ГГГГ — день впереди: 30.04.2026.
-  const dmy = p.match(/(\d{1,2})[.\-/](\d{1,2})[.\-/](20\d{2})/);
-  if (dmy) {
-    const res = mk(dmy[3], Number(dmy[2]));
-    if (res) return res;
-  }
-
-  // 5) Русские месяцы (порядок основ важен: специфичные раньше короткой «ма»).
-  const MONTHS = [
-    "январ", "феврал", "март", "апрел", "ма", "июн", "июл",
-    "август", "сентябр", "октябр", "ноябр", "декабр",
-  ];
-  const yearM = p.match(/20\d{2}/);
-  if (yearM) {
-    for (let i = 0; i < MONTHS.length; i++) {
-      if (p.includes(MONTHS[i])) return mk(yearM[0], i + 1);
-    }
-  }
-
-  return null;
-}
 
 /**
  * Определяет месяц отчёта ('YYYY-MM-01') по ПРИОРИТЕТУ источников:
@@ -2850,155 +2739,56 @@ export default function AppPage() {
         filteredHistory.length
       : 0;
 
-  /* ===== Вкладка «Отчёты»: годовая сводка =====
-     Всё считается ТОЛЬКО на фронте по уже загруженной истории (history). Новых
-     запросов, таблиц и изменений сохранения нет. Денежные поля, которых в
-     расчётах фактически нет (нулевые суммы), в сводке НЕ показываем — данные не
-     выдумываем. Фильтры: год (по calcMonthKey) + тип расчёта (mode). */
-  type ReportsType = "all" | "api" | "manual" | "upload";
-  const [reportsYear, setReportsYear] = useState<string>("all");
+  type ReportsType = SummaryMode;
+  const [reportsYear, setReportsYear] = useState("all");
   const [reportsType, setReportsType] = useState<ReportsType>("all");
+  const [summaryPage, setSummaryPage] = useState(0);
+  const [summaryRevision, setSummaryRevision] = useState(0);
+  const [summaryChoices, setSummaryChoices] = useState<{ owner: string; values: SummaryChoice[] } | null>(null);
+  const [summaryResult, setSummaryResult] = useState<{
+    key: string; owner: string; data: FinancialSummary | null; choices: SummaryChoice[];
+  } | null>(null);
+  const summaryOwner = user?.id;
+  const summaryStorageKey = summaryOwner ? `mprof:summary-choices:${summaryOwner}` : "";
+  const summaryKey = JSON.stringify([summaryOwner, reportsYear, reportsType, summaryPage, summaryRevision]);
+  const currentSummary = summaryResult?.key === summaryKey ? summaryResult : null;
+  const reportsYears = (summaryResult?.owner === summaryOwner ? summaryResult?.data?.years : null) ?? [];
+  const yearlySummary = currentSummary?.data?.summary ?? null;
+  const reportsMonthly = currentSummary?.data?.monthly ?? [];
 
-  // Годы, за которые реально есть расчёты (новые сверху). Только UI-деривация.
-  const reportsYears = useMemo(() => {
-    const set = new Set<string>();
-    for (const h of history) {
-      const k = calcMonthKey(h);
-      if (k) set.add(k.slice(0, 4));
-    }
-    return Array.from(set).sort((a, b) => Number(b) - Number(a));
-  }, [history]);
-
-  // Если выбранный год пропал из данных (например, после очистки истории) —
-  // молча сбрасываем фильтр на «всё время», чтобы вкладка не оказалась пустой.
   useEffect(() => {
-    if (reportsYear !== "all" && !reportsYears.includes(reportsYear)) {
-      setReportsYear("all");
+    if (mainTab !== "reports" || !summaryOwner) return;
+    let active = true;
+    let choices: SummaryChoice[] = [];
+    if (summaryChoices?.owner === summaryOwner) {
+      choices = summaryChoices.values;
+    } else {
+      try {
+        const stored: unknown = JSON.parse(localStorage.getItem(summaryStorageKey) ?? "[]");
+        if (Array.isArray(stored)) choices = stored;
+      } catch {
+        // The live report still works when browser storage is unavailable.
+      }
     }
-  }, [reportsYear, reportsYears]);
-
-  // История под фильтрами «Отчётов» (год + тип). Базируется на полном history,
-  // НЕ на filteredHistory, чтобы фильтры вкладки были независимы от фильтров
-  // детальной аналитики (период/маркетплейс/результат).
-  const reportsFiltered = useMemo(() => {
-    return history.filter((h) => {
-      if (reportsType !== "all" && (h.mode ?? "manual") !== reportsType) {
-        return false;
-      }
-      if (reportsYear !== "all") {
-        const k = calcMonthKey(h);
-        if (!k || k.slice(0, 4) !== reportsYear) return false;
-      }
-      return true;
+    void loadFinancialSummary({ year: reportsYear, mode: reportsType, choices, page: summaryPage }).then(result => {
+      if (active) setSummaryResult({ key: summaryKey, owner: summaryOwner, data: result.data, choices });
     });
-  }, [history, reportsYear, reportsType]);
+    return () => { active = false; };
+  }, [mainTab, history, summaryOwner, summaryStorageKey, summaryKey, summaryChoices,
+    reportsYear, reportsType, summaryPage]);
 
-  // Помесячная разбивка прибыли/выручки (для графика и лучшего/худшего месяца).
-  // Записи без распознанного месяца в разбивку не попадают (но остаются в общих
-  // суммах сводки). Хронологический порядок: старый месяц слева → новый справа.
-  const reportsMonthly = useMemo(() => {
-    const map = new Map<
-      string,
-      { key: string; profit: number; revenue: number; count: number }
-    >();
-    for (const h of reportsFiltered) {
-      const k = calcMonthKey(h);
-      if (!k) continue;
-      const cur =
-        map.get(k) ?? { key: k, profit: 0, revenue: 0, count: 0 };
-      cur.profit += Number(h.profit) || 0;
-      cur.revenue += Number(h.revenue) || 0;
-      cur.count += 1;
-      map.set(k, cur);
+  const selectSummaryChoice = (id: string, choice: SummaryChoice | null) => {
+    if (!summaryOwner || !currentSummary) return;
+    const choices = currentSummary.choices.filter(existing => existing.id !== id);
+    if (choice) choices.push(choice);
+    setSummaryChoices({ owner: summaryOwner, values: choices });
+    setSummaryRevision(value => value + 1);
+    try {
+      localStorage.setItem(summaryStorageKey, JSON.stringify(choices));
+    } catch {
+      // Keep the confirmed choices for the current session.
     }
-    return Array.from(map.values()).sort((a, b) =>
-      a.key < b.key ? -1 : a.key > b.key ? 1 : 0
-    );
-  }, [reportsFiltered]);
-
-  // Годовая сводка. null — под фильтром нет расчётов. Денежные агрегаты
-  // отдаём как есть; решение «показывать ли карточку» (sum>0) принимает UI.
-  const yearlySummary = useMemo(() => {
-    const items = reportsFiltered;
-    const count = items.length;
-    if (count === 0) return null;
-    const sum = (sel: (h: CalcResult) => number) =>
-      items.reduce((s, h) => s + (Number(sel(h)) || 0), 0);
-    const revenue = sum((h) => h.revenue);
-    const profit = sum((h) => h.profit);
-    const cost = sum((h) => h.cost);
-    const expenses = sum((h) => h.expenses);
-    const commission = sum((h) => h.commission);
-    const logistics = sum((h) => h.logistics);
-    const storage = sum((h) => h.storage);
-    const ads = sum((h) => h.ads);
-    const tax = sum((h) => h.tax);
-    const other = sum((h) => h.other);
-    // Комиссии и логистика Ozon = комиссия + логистика + хранение.
-    const ozonFees = commission + logistics + storage;
-
-    // PR B: taxonomy-aware gross-разбивка для честного отчёта (чистая функция
-    // модульного уровня). Для записей с валидной financeTaxonomy — gross charges
-    // и отдельный доход-компенсации; для старых — flat без выдуманного дохода.
-    // Без double count: расходы берут charges, доход вычитается один раз, итог =
-    // stored total_expenses.
-    const taxAgg = aggregateReportsTaxonomy(items);
-    const logisticsCharges = taxAgg.logisticsCharges;
-    const adsCharges = taxAgg.adsCharges;
-    const otherCharges = taxAgg.otherCharges;
-    const manualExtraExpenses = taxAgg.manualExtraExpenses;
-    const ozonIncome = taxAgg.ozonIncome;
-    // «Комиссии и логистика Ozon» для честной модели — на gross-логистике.
-    const ozonFeesCharges =
-      Math.round((commission + logisticsCharges + storage) * 100) / 100;
-    // Средняя маржинальность: по выручке, если она есть; иначе среднее по margin.
-    // Fallback — среднее по ИЗВЕСТНЫМ маржам: у расчёта по начислениям маржа
-    // берётся из снимка (null не считается нулём); прежние записи — колонка margin.
-    const knownMargins = items
-      .map((h) => effectiveHistoryMargin(h.aiInsights, Number(h.margin) || 0))
-      .filter((m): m is number => m !== null);
-    const avgMargin =
-      revenue > 0
-        ? (profit / revenue) * 100
-        : knownMargins.length > 0
-        ? knownMargins.reduce((s, m) => s + m, 0) / knownMargins.length
-        : 0;
-    let best: { key: string; profit: number } | null = null;
-    let worst: { key: string; profit: number } | null = null;
-    for (const m of reportsMonthly) {
-      if (!best || m.profit > best.profit) best = { key: m.key, profit: m.profit };
-      if (!worst || m.profit < worst.profit) worst = { key: m.key, profit: m.profit };
-    }
-    // Лучший/худший месяц имеет смысл только при ≥2 месяцах с данными.
-    if (reportsMonthly.length < 2) {
-      best = null;
-      worst = null;
-    }
-    return {
-      count,
-      revenue,
-      profit,
-      cost,
-      expenses,
-      commission,
-      logistics,
-      storage,
-      ads,
-      tax,
-      other,
-      ozonFees,
-      // PR B: honest taxonomy-aware поля (аддитивно; старые поля не тронуты).
-      logisticsCharges,
-      adsCharges,
-      otherCharges,
-      manualExtraExpenses,
-      ozonIncome,
-      ozonFeesCharges,
-      avgMargin,
-      best,
-      worst,
-    };
-  }, [reportsFiltered, reportsMonthly]);
+  };
 
   const [authLoading, setAuthLoading] = useState(true);
   const [manualSignInRequired, setManualSignInRequired] = useState(false);
@@ -4017,6 +3807,7 @@ export default function AppPage() {
       showToast("История очищена локально", "warn");
       return;
     }
+    setSummaryRevision(value => value + 1);
     setUploadedReports([]); // cascade: uploaded_reports.calculation_id → null уже в DB
     showToast("История очищена", "ok");
   };
@@ -8132,32 +7923,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
           Считаем по сохранённым расчётам — без выдуманных данных.
         </p>
 
-        <div className="reports-warn" role="note">
-          <svg
-            className="reports-warn-ico"
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 8v5" />
-            <path d="M12 16.5v.5" />
-          </svg>
-          <span>
-            Если за один месяц есть несколько расчётов разными способами,
-            итоговая аналитика может суммировать их. Для финальной сверки
-            используйте один основной расчёт за месяц. API и документы могут
-            отличаться из-за разных источников данных — для автоматического
-            расчёта ориентируйтесь на API.
-          </span>
-        </div>
-
         {/* ===== Годовая сводка (новый блок вкладки «Отчёты») ===== */}
         <div className="reports-hero">
           <div className="reports-filters" role="region" aria-label="Фильтры отчётов">
@@ -8167,7 +7932,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 <button
                   type="button"
                   className={"reports-pill" + (reportsYear === "all" ? " active" : "")}
-                  onClick={() => setReportsYear("all")}
+                  onClick={() => { setReportsYear("all"); setSummaryPage(0); }}
                   aria-pressed={reportsYear === "all"}
                 >
                   Всё время
@@ -8177,7 +7942,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     type="button"
                     key={y}
                     className={"reports-pill" + (reportsYear === y ? " active" : "")}
-                    onClick={() => setReportsYear(y)}
+                    onClick={() => { setReportsYear(y); setSummaryPage(0); }}
                     aria-pressed={reportsYear === y}
                   >
                     {y}
@@ -8200,7 +7965,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     type="button"
                     key={v}
                     className={"reports-pill" + (reportsType === v ? " active" : "")}
-                    onClick={() => setReportsType(v)}
+                    onClick={() => { setReportsType(v); setSummaryPage(0); }}
                     aria-pressed={reportsType === v}
                   >
                     {label}
@@ -8210,16 +7975,33 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
             </div>
           </div>
 
-          {history.length === 0 ? (
-            <div className="reports-empty">
-              Здесь появится годовая сводка после первого сохранённого расчёта.
+          {currentSummary?.data && <FinancialSummaryChoices
+            result={currentSummary.data} page={summaryPage} choices={currentSummary.choices}
+            onPage={setSummaryPage} onChoice={selectSummaryChoice}
+          />}
+          {!currentSummary ? (
+            <p className="reports-empty" role="status">Загружаем финансовую сводку…</p>
+          ) : !currentSummary.data ? (
+            <div className="reports-empty" role="alert">
+              Не удалось загрузить полную сводку.{" "}
+              <button type="button" className="reports-pill" onClick={() => setSummaryRevision(value => value + 1)}>
+                Повторить
+              </button>
             </div>
           ) : !yearlySummary ? (
             <div className="reports-empty">
-              За выбранный период и тип расчёта данных нет. Измените фильтры выше.
+              {currentSummary.data.excludedCount
+                ? "Подтвердите расчёты выше, чтобы включить их в сводку."
+                : "За выбранный период и тип расчёта данных нет."}
             </div>
           ) : (
             <>
+              {yearlySummary.missingRealizationBase > 0 && (
+                <p className="reports-warn" role="note">
+                  У части старых API-расчётов в снимке нет выручки после возвратов.
+                  Для этих записей сводка использует сохранённую выручку по начислениям.
+                </p>
+              )}
               <div className="reports-summary">
                 <div className="fin-card">
                   <div className="fin-card-title">
@@ -8235,7 +8017,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                     </thead>
                     <tbody>
                       <tr className="fin-row">
-                        <th scope="row">Выручка</th>
+                        <th scope="row">Выручка для расчёта маржи</th>
                         <td className="fin-val">
                           {fmt(Math.round(yearlySummary.revenue))} ₽
                         </td>
@@ -8308,6 +8090,13 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                         </tr>
                       )}
 
+                      {yearlySummary.revenueBasisAdjustment !== 0 && (
+                        <tr className="fin-row">
+                          <th scope="row">Разница выручки по реализации и начислениям Ozon</th>
+                          <td className="fin-val">{fmt(Math.round(yearlySummary.revenueBasisAdjustment))} ₽</td>
+                        </tr>
+                      )}
+
                       {yearlySummary.expenses > 0 && (
                         <tr className="fin-row fin-row--subtotal">
                           <th scope="row">Все расходы</th>
@@ -8349,7 +8138,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                   <div className="fin-card-title">Статистика</div>
                   {(() => {
                     // Все вычисления ниже — display-only и локальные: они НЕ
-                    // меняют yearlySummary / reportsMonthly / reportsFiltered /
+                    // меняют сводку и помесячный ряд /
                     // историю / БД. Делитель средних — число МЕСЯЦЕВ с расчётами
                     // (reportsMonthly.length), а не число отдельных расчётов.
                     const months = reportsMonthly.length;

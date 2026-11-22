@@ -1,5 +1,7 @@
 "use client";
 
+import type { FinancialSummary, SummaryQuery } from "./financial-summary";
+
 import { createClient } from "@supabase/supabase-js";
 import type { User } from "@supabase/supabase-js";
 import type {
@@ -601,6 +603,10 @@ export async function updateCalculationInCloud(
     console.error("[cloud] updateCalculationInCloud error", res.error);
   }
   return res;
+}
+
+export function loadFinancialSummary(query: SummaryQuery) {
+  return cloudSend<FinancialSummary>("/api/cloud/financial-summary", "POST", query);
 }
 
 export async function loadCalculationsFromCloud(

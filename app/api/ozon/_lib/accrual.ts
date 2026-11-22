@@ -119,6 +119,7 @@ export type AccrualLoadErrorCode =
   | "rate_limited" // 429, ограниченные повторы (MAX_429_RETRIES_PER_CALL) исчерпаны
   | "deadline_exceeded" // общий мягкий бюджет DEADLINE_MS истёк до/во время загрузки
   | "request_limit_exceeded" // NEW_API_MAX_REQUESTS исчерпан
+  | "pagination_loop" // повтор непустого курсора
   | "pagination_truncated" // BY_DAY_MAX_PAGES_PER_DAY исчерпан для какого-то дня
   | "malformed_response" // невалидная форма ответа / обязательное поле не распарсилось
   | "reconciliation_mismatch" // сумма корзин не сошлась с netTruth (округление/инвариант)
@@ -649,18 +650,11 @@ export async function loadAccrualDraft(
   // ---- 2) by-day по дням месяца ----
   const records: unknown[] = [];
   const seenAccrualIds = new Set<number>();
-  // Fetch-уровневый guard (НЕ record-уровневый): если один и тот же (day,
-  // lastId-курсор-ДО-запроса) почему-то запрошен повторно, его записи не
-  // добавляются ВТОРОЙ раз. Это НЕ дедуп разных операций одной отправки (они
-  // всегда живут ВНУТРИ одного record — см. doc-comment safeAccrualId) и НЕ
-  // дедуп по accrual_id самих записей (см. отдельный seenAccrualIds ниже) —
-  // это защита именно от повторной обработки ОДНОГО и того же HTTP-ответа.
-  const seenPageKeys = new Set<string>();
-
   for (const day of days) {
+    const seenCursors = new Set<string>();
     let lastId = "";
     for (let p = 0; p < BY_DAY_MAX_PAGES_PER_DAY; p++) {
-      const pageKey = `${day}:${lastId}`;
+      seenCursors.add(lastId);
       const r = await fetchPage(day, lastId);
       if (!r.ok) return { ok: false, code: r.code };
       // Строгий контракт КАЖДОГО HTTP 200: root — объект с СОБСТВЕННЫМ массивом accruals.
@@ -677,29 +671,26 @@ export async function loadAccrualDraft(
       }
       const accruals = rootObj.accruals;
       if (!Array.isArray(accruals)) return { ok: false, code: "malformed_response" };
-      if (!seenPageKeys.has(pageKey)) {
-        seenPageKeys.add(pageKey);
-        for (const it of accruals) {
-          const idRaw = asObj(it).accrual_id;
-          const id = safeAccrualId(idRaw);
-          // id===null (отсутствует/невалиден) → record НЕ дедуплицируется (не
-          // рискуем молча отбросить легитимную запись из-за отсутствия ID).
-          if (id !== null) {
-            if (seenAccrualIds.has(id)) continue; // уже учтён — повтор страницы/id
-            seenAccrualIds.add(id);
-          }
-          records.push(it);
-        }
-      }
-      // last_id: если присутствует — обязан быть строкой (доказанный тип пагинации).
-      const rawLastId = rootObj.last_id;
-      if (rawLastId !== undefined && typeof rawLastId !== "string") {
+      // An omitted cursor provides no evidence that the day is complete.
+      const nextId = rootObj.last_id;
+      if (!Object.prototype.hasOwnProperty.call(rootObj, "last_id") || typeof nextId !== "string") {
         return { ok: false, code: "malformed_response" };
       }
-      const prevLastId = lastId;
-      const nextId = typeof rawLastId === "string" ? rawLastId : "";
-      if (nextId === "" || nextId === prevLastId || accruals.length === 0) break; // конец дня
-      if (p === BY_DAY_MAX_PAGES_PER_DAY - 1) return { ok: false, code: "pagination_truncated" };
+      if (nextId !== "" && seenCursors.has(nextId)) {
+        return { ok: false, code: "pagination_loop" };
+      }
+      if (nextId !== "" && p === BY_DAY_MAX_PAGES_PER_DAY - 1) {
+        return { ok: false, code: "pagination_truncated" };
+      }
+      for (const it of accruals) {
+        const id = safeAccrualId(asObj(it).accrual_id);
+        if (id !== null) {
+          if (seenAccrualIds.has(id)) continue;
+          seenAccrualIds.add(id);
+        }
+        records.push(it);
+      }
+      if (nextId === "") break;
       lastId = nextId;
     }
   }

@@ -1,5 +1,6 @@
 import { ozonEntitlementDenied, requireOzonEntitlement } from "../_lib/entitlement";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { maskClientId } from "../_lib/shape";
 import { NextRequest, NextResponse } from "next/server";
 import { authenticateRequest, type AuthSuccess } from "../../cloud/_lib/auth";
 import { apiRequestHash } from "../../../app/lib/calc-operation-keys";
@@ -421,6 +422,10 @@ export async function POST(req: NextRequest) {
   const snapshot = {
     kind: "ozon-api-v1",
     source: "ozon_api",
+    reportStoreKey: createHash("sha256")
+      .update(JSON.stringify(["ozon", userId, clientId.trim()]))
+      .digest("hex"),
+    reportStoreLabel: maskClientId(clientId.trim()),
     period: { month, dateFrom: range.dateFrom, dateTo: range.dateTo },
     apiTotals: {
       ozonAccruals: t.revenue,
@@ -483,8 +488,10 @@ export async function POST(req: NextRequest) {
     p_calculation: calcRow,
     p_history: {
       report_month: `${month}-01`, // первое число месяца отчёта (date)
-      revenue,
-      expenses: totalExpensesCol,
+      // Сводка и маржа используют реализацию после возвратов. Колонки расчёта
+      // сохраняют исходную базу начислений для существующей разбивки Ozon.
+      revenue: c.taxRevenueBase,
+      expenses: round2(c.taxRevenueBase - c.netProfit),
       profit: c.netProfit,
       margin: c.margin,
     },
