@@ -1,8 +1,8 @@
-name: Day 4 final merged Linux verification
+name: Day 4 Ozon realization Linux verification
 
 on:
   push:
-    branches: [ci/day4-final-merged]
+    branches: [ci/day4-realization-verification]
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - {label: Final, sha: 'c1869909eb9f9d958d3188cb66d63403669d8f84'}
+          - {label: Final, sha: '53bb69ca9d1d4c0ad592010498e544f826b033e8'}
     env:
       TARGET_SHA: ${{ matrix.target.sha }}
       NEXT_TELEMETRY_DISABLED: '1'
