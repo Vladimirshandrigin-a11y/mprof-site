@@ -1,3 +1,4 @@
+import { numberedReportFixture, REPORT_LINES } from "../accrual/helpers/numbered-report-fixture.mjs";
 import { xlsxSaveFixture } from "./helpers/xlsx-save-fixture.mjs";
 // Атомарное списание и сохранение ручного расчёта и Ozon API — настоящие обработчики
 // (скомпилированы run.mjs):
@@ -45,8 +46,10 @@ const { createClient } = rootRequire("@supabase/supabase-js");
 const realizationLib = buildRequire("./api/ozon/_lib/realization.js");
 const loadRealization = realizationLib.loadRealizationDiagnosticWithProducts;
 let verifiedFixture = true;
-const fixtureMock = mock.method(realizationLib, "loadRealizationDiagnosticWithProducts", async (...args) => {
-  const result = await loadRealization(...args);
+let numberedFixture = false;
+const fixtureMock = mock.method(realizationLib, "loadRealizationDiagnosticWithProducts", async (params) => {
+  if (numberedFixture) return loadRealization(params);
+  const result = await loadRealization({ ...params, source: "legacy_diagnostic" });
   if (verifiedFixture) result.diagnostic.completeness = "verified";
   return result;
 });
@@ -206,6 +209,7 @@ after(() => {
 });
 beforeEach(() => {
   verifiedFixture = true;
+  numberedFixture = false;
   net.reset();
 });
 
@@ -421,6 +425,66 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     state.ozon = ozonOk;
   });
 
+  for (const [kind, opts, expected] of [
+    ["first free", {}, { used: 1, charged: true }],
+    ["active unlimited", { unlimited: true, used: 3 }, { used: 3, charged: false }],
+  ]) {
+    it("numbered Ozon report saves with the existing tariff and replay rules: " + kind, async t => {
+      const uid = await apiUser(db, opts);
+      // Give every fixture a separate client scope, as in production.
+      await db.main.query("update public.ozon_connections set client_id=$2 where user_id=$1", [uid, uid]);
+      numberedFixture = true;
+      const upstream = numberedReportFixture();
+      state.ozon = r => r.path.includes("/report/") || r.url.startsWith("https://ir.ozone.ru/")
+        ? upstream.upstream(r)
+        : ozonOk(r);
+      let now = Date.now();
+      t.mock.method(Date, "now", () => now);
+      const first = await postApi(uid);
+      assert.deepEqual([first.status, first.body.code], [503, "realization_pending"]);
+      assert.match(first.body.error, /XLSX/);
+      assert.deepEqual(await facts(db, uid), { used: opts.used ?? 0, calcs: 0, history: 0, ops: 0 });
+      assert.ok(!net.ozonCalls().some(r => r.path.includes("/finance/transaction/")));
+      now += 45_000;
+      const saved = await postApi(uid, { operationId: first.operationId });
+      assert.equal(saved.status, 200, JSON.stringify(saved.body));
+      assert.equal(saved.body.profit.costDraft.matchedCostTotal, 1070);
+      assert.equal(saved.body.profit.preliminary.taxRevenueBase, 2200);
+      assert.equal((await opRow(db, first.operationId)).charged, expected.charged);
+      assert.deepEqual(await facts(db, uid), { used: expected.used, calcs: 1, history: 1, ops: 1 });
+      const priorCalls = net.ozonCalls().length;
+      const replay = await postApi(uid, { operationId: first.operationId });
+      assert.equal(replay.body.replay, true);
+      assert.equal(net.ozonCalls().length, priorCalls);
+    });
+  }
+
+  it("incomplete numbered response prevents charge, history, and catalog auto-import", async t => {
+    const uid = await apiUser(db);
+    await db.main.query("update public.ozon_connections set client_id=$2 where user_id=$1", [uid, uid]);
+    await db.main.query("delete from public.products where user_id=$1", [uid]);
+    numberedFixture = true;
+    const upstream = numberedReportFixture({ postingLines: REPORT_LINES.slice(0, -1) });
+    state.ozon = upstream.upstream;
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const first = await postApi(uid);
+    now += 45_000;
+    const failure = await postApi(uid, { operationId: first.operationId });
+    assert.deepEqual([first.status, failure.status, failure.body.code], [503, 422, "realization_incomplete"]);
+    assert.deepEqual(await facts(db, uid), { used: 0, calcs: 0, history: 0, ops: 0 });
+    assert.equal((await db.main.query("select id from public.products where user_id=$1", [uid])).rowCount, 0);
+  });
+
+  it("paid 149 ₽ credit grants no access to numbered Ozon requests", async () => {
+    const uid = await apiUser(db, { used: 1, credits: 1 });
+    numberedFixture = true;
+    const rejected = await postApi(uid);
+    assert.equal(rejected.status, 402);
+    assert.equal(net.ozonCalls().length, 0);
+    assert.deepEqual(await facts(db, uid), { used: 1, calcs: 0, history: 0, ops: 0 });
+  });
+
   it("успех (общая бесплатная попытка): строка api со снимком, сводка, отметка операции — одно списание; пользователь из токена", async () => {
     const u = await apiUser(db);
     const out = await postApi(u);
@@ -511,6 +575,7 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
       const operationId = randomUUID();
       const requested = [];
       state.ozon = (req) => {
+        if (req.path === "/v2/finance/realization") return ozonOk(req);
         assert.ok(req.url.endsWith("/v3/finance/transaction/list"));
         const { page } = req.body;
         requested.push(page);

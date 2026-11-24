@@ -33,6 +33,8 @@
 import type { OzonFinanceErrorCode } from "./finance";
 import type { CatalogRow } from "./postings";
 
+import { fetchNumberedRealization, type NumberedRealizationError } from "./numbered-realization";
+
 const REALIZATION_URL = "https://api-seller.ozon.ru/v2/finance/realization";
 const TIMEOUT_MS = 25000;
 const MAX_SAMPLE = 12; // сколько строк показать в примере (без денежных секретов)
@@ -71,7 +73,7 @@ type RealizationItem = {
   sku?: number;
 };
 
-type RealizationRow = {
+export type RealizationRow = {
   row_number?: number;
   rowNumber?: number; // v2 отдаёт camelCase
   // v2: идентификаторы товара ВЛОЖЕНЫ в item (item.offer_id / item.sku).
@@ -103,11 +105,13 @@ type RealizationResponse = {
 // Публичные типы
 // ---------------------------------------------------------------------------
 
+export type RealizationSourceError = OzonFinanceErrorCode | NumberedRealizationError;
+
 export type RealizationCompleteness = "verified" | "unverified" | "period_mismatch";
 
 export type RealizationFetchResult =
   | { ok: true; rows: RealizationRow[]; rawRowCount: number; completeness: RealizationCompleteness }
-  | { ok: false; code: OzonFinanceErrorCode; status?: number };
+  | { ok: false; code: RealizationSourceError; status?: number };
 
 /** Какие поля реально пришли (виден хотя бы один непустой раз). Для отчёта
  *  «каких полей не хватает», если структура не даёт количество/артикул. */
@@ -146,7 +150,7 @@ export type RealizationDiagnostic = {
   /** true — endpoint ответил 200 и отдал разбираемый result. */
   connected: boolean;
   /** код ошибки Ozon, если запрос не удался (connected=false). */
-  errorCode?: OzonFinanceErrorCode;
+  errorCode?: RealizationSourceError;
   month: number;
   year: number;
   rowCount: number;
@@ -764,7 +768,7 @@ export async function loadRealizationDiagnostic(params: {
   catalog: CatalogRow[];
   deadlineMs?: number;
 }): Promise<RealizationDiagnostic> {
-  return (await loadRealizationDiagnosticWithProducts(params)).diagnostic;
+  return (await loadRealizationDiagnosticWithProducts({ ...params, source: "legacy_diagnostic" })).diagnostic;
 }
 
 /**
@@ -779,6 +783,7 @@ export async function loadRealizationDiagnosticWithProducts(params: {
   month: string; // "YYYY-MM"
   catalog: CatalogRow[];
   deadlineMs?: number;
+  source?: "legacy_diagnostic";
 }): Promise<{ diagnostic: RealizationDiagnostic; unmatched: RealizationUnmatchedSummary }> {
   const { clientId, apiKey, month, catalog, deadlineMs } = params;
   const m = /^(\d{4})-(\d{2})$/.exec(month);
@@ -790,7 +795,8 @@ export async function loadRealizationDiagnosticWithProducts(params: {
       unmatched: { products: [], rowsWithoutOfferId: 0 },
     };
   }
-  const fetched = await fetchRealizationReport(clientId, apiKey, monthNum, year, deadlineMs);
+  const fetchReport = params.source === "legacy_diagnostic" ? fetchRealizationReport : fetchNumberedRealization;
+  const fetched = await fetchReport(clientId, apiKey, monthNum, year, deadlineMs);
   return {
     diagnostic: buildRealizationDiagnostic(fetched, catalog, monthNum, year),
     unmatched: collectUnmatchedRealizationProducts(fetched, catalog),

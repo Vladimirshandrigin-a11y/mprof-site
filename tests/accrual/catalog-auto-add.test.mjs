@@ -488,15 +488,13 @@ function setupApi({ userId = "u1", catalog = [], rows = REALIZATION, extraTables
     return fakeRpc(name, args);
   };
   stubOzon(state);
-  if (verifiedFixture) {
-    // Known-complete synthetic input for downstream catalog and save tests.
-    const load = realizationLib.loadRealizationDiagnosticWithProducts;
-    patch(realizationLib, "loadRealizationDiagnosticWithProducts", async (...args) => {
-      const result = await load(...args);
-      result.diagnostic.completeness = "verified";
-      return result;
-    });
-  }
+  // Feed the known complete legacy fixture into the downstream catalog tests.
+  const load = realizationLib.loadRealizationDiagnosticWithProducts;
+  patch(realizationLib, "loadRealizationDiagnosticWithProducts", async (params) => {
+    const result = await load({ ...params, source: "legacy_diagnostic" });
+    if (verifiedFixture) result.diagnostic.completeness = "verified";
+    return result;
+  });
   asUser(fake, userId);
   patch(cryptoLib, "isEncryptionConfigured", () => true);
   patch(cryptoLib, "decryptOzonApiKey", () => "plain-api-key");
@@ -537,7 +535,7 @@ describe("сценарий API: автодобавление в save-calculation
     const { fake, state, post } = setupApi();
     await post();
     assert.ok(state.calls.some((u) => u.includes("/v2/finance/realization")));
-    assert.ok(state.calls.some((u) => u.includes("/v2/posting/fbo/list")), "отправления запрашивались и вернули пусто");
+    assert.ok(!state.calls.some((u) => u.includes("/v2/posting/fbo/list")), "расчёт остановился до запроса справочных отправлений");
     assert.equal(fake.rowsOf("products", "u1").length, 3);
   });
 
