@@ -170,7 +170,7 @@ export function errorResponse(code: OzonFinanceErrorCode): NextResponse {
       error: "Слишком много запросов к Ozon. Подождите немного и попробуйте снова",
     },
     timeout: { status: 504, error: "Ozon не ответил вовремя. Попробуйте ещё раз" },
-    bad_response: { status: 502, error: "Ozon вернул неожиданный ответ" },
+    bad_response: { status: 502, error: "Ozon вернул неожиданный или неполный ответ" },
     unavailable: { status: 502, error: "Ozon временно недоступен" },
     // deadline — недостижим отсюда: save-calculation/loadAndComputeApiProfit
     // никогда не передаёт deadlineMs в fetchOzonTransactions (см. finance.ts).
@@ -679,8 +679,7 @@ export async function loadAndComputeApiProfit(
   });
 
   // 1) финансы Ozon → OzonDraftAggregate.
-  //    Флаг ВЫКЛЮЧЕН (текущий прод, 2026-09) → legacy control-flow БЕЗ ИЗМЕНЕНИЙ,
-  //    byte-for-byte как раньше (единственный путь ниже, идентичен предыдущей версии).
+  //    При выключенном флаге legacy также отклоняет неполный период до расчёта.
   //    Флаг ВКЛЮЧЁН (или opts.forceAccrual — см. doc-comment выше) → ТОЛЬКО
   //    accrual-источник (/v1/finance/accrual/by-day). Отката на legacy при его
   //    неудаче БОЛЬШЕ НЕТ: /v3/finance/transaction/list официально отключён Ozon
