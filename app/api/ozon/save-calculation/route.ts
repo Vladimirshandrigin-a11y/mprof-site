@@ -328,6 +328,10 @@ export async function POST(req: NextRequest) {
       return errorResponse(r.ozonErrorCode);
     }
     const msgByCode: Record<string, string> = {
+      period_mismatch:
+        "Отчёт о реализации Ozon не покрывает выбранный месяц. Расчёт не сохранён, попытка не списана.",
+      unverified_realization:
+        "Полноту отчёта о реализации Ozon подтвердить не удалось. Расчёт не сохранён, попытка не списана. Для расчёта используйте полный отчёт по начислениям XLSX.",
       not_connected:
         "Не удалось получить отчёт о реализации Ozon для расчёта себестоимости. Расчёт не сделан, попытка не списана.",
       no_rows:

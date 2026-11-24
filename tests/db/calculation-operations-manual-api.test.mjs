@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { after, before, beforeEach, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it, mock } from "node:test";
 import { SERVICE_KEY, SUPABASE_URL, gate, installFetch, userJwt } from "./helpers/fetch-stub.mjs";
 import { SCHEMA, buildRequire, payTestEnv, read, root, runScript } from "./helpers/pay-db.mjs";
 
@@ -41,6 +41,15 @@ const NOTES = buildRequire("./app/lib/calc-operation-notes.js");
 const rootRequire = createRequire(path.join(root, "package.json"));
 const { NextRequest } = rootRequire("next/server");
 const { createClient } = rootRequire("@supabase/supabase-js");
+
+const realizationLib = buildRequire("./api/ozon/_lib/realization.js");
+const loadRealization = realizationLib.loadRealizationDiagnosticWithProducts;
+let verifiedFixture = true;
+const fixtureMock = mock.method(realizationLib, "loadRealizationDiagnosticWithProducts", async (...args) => {
+  const result = await loadRealization(...args);
+  if (verifiedFixture) result.diagnostic.completeness = "verified";
+  return result;
+});
 
 const net = installFetch();
 const { state } = net;
@@ -192,9 +201,13 @@ after(() => {
   console.error = realConsoleError;
   console.warn = realConsoleWarn;
   console.log = realConsoleLog;
+  fixtureMock.mock.restore();
   net.restore();
 });
-beforeEach(() => net.reset());
+beforeEach(() => {
+  verifiedFixture = true;
+  net.reset();
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 describe("ручной расчёт: списание и запись — одна транзакция через настоящий маршрут", () => {
@@ -692,6 +705,25 @@ describe("себестоимость API по нетто-количеству: �
     if (u.includes("/v3/posting/fbs/list")) return jsonRes({ result: { postings: [], has_next: false } });
     return jsonRes({}, 404);
   };
+  it("неподтверждённый отчёт и обрезанный ответ не записываются и не расходуют бесплатную попытку", async () => {
+    verifiedFixture = false;
+    const u = await apiUser(db);
+    const header = { start_date: "2026-06-01", stop_date: "2026-06-30" };
+    for (const [report, reason] of [
+      [{ header, rows: REALIZATION }, "unverified_realization"],
+      [{ header, rows: REALIZATION.slice(0, 1), total_rows: 1, has_next: false }, "unverified_realization"],
+      [{ header: { ...header, stop_date: "2026-06-20" }, rows: REALIZATION }, "period_mismatch"],
+      [{ header, rows: [] }, "no_rows"],
+    ]) {
+      state.ozon = (req) => req.url.includes("/v2/finance/realization")
+        ? jsonRes({ result: report })
+        : ozonOk(req);
+      const out = await postApi(u);
+      assert.deepEqual([out.status, out.body.code, out.body.reason], [422, "realization_unavailable", reason]);
+      assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+    }
+  });
+
   const opAmount = (amount) => ({ operation_type: "OperationItemReturn", type: "returns", accruals_for_sale: 0, sale_commission: 0, amount, services: [] });
   const NO_EXPENSES = { tax: 0, packaging: 0, warehouseDelivery: 0, salary: 0, other: 0 };
   async function userWithCatalog(prices) {

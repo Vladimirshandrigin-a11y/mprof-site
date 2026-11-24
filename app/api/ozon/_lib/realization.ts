@@ -94,7 +94,7 @@ type RealizationRow = {
 
 type RealizationResponse = {
   result?: {
-    header?: unknown;
+    header?: { start_date?: unknown; stop_date?: unknown };
     rows?: RealizationRow[];
   };
 };
@@ -103,8 +103,10 @@ type RealizationResponse = {
 // Публичные типы
 // ---------------------------------------------------------------------------
 
+export type RealizationCompleteness = "verified" | "unverified" | "period_mismatch";
+
 export type RealizationFetchResult =
-  | { ok: true; rows: RealizationRow[]; rawRowCount: number }
+  | { ok: true; rows: RealizationRow[]; rawRowCount: number; completeness: RealizationCompleteness }
   | { ok: false; code: OzonFinanceErrorCode; status?: number };
 
 /** Какие поля реально пришли (виден хотя бы один непустой раз). Для отчёта
@@ -148,6 +150,7 @@ export type RealizationDiagnostic = {
   month: number;
   year: number;
   rowCount: number;
+  completeness: RealizationCompleteness;
   sums: {
     /** Σ количество продаж (delivery quantity). */
     saleQuantity: number;
@@ -264,9 +267,26 @@ export async function fetchRealizationReport(
     } catch {
       return { ok: false, code: "bad_response" };
     }
-    const data = (json as RealizationResponse) ?? {};
-    const rows = Array.isArray(data.result?.rows) ? (data.result!.rows as RealizationRow[]) : [];
-    return { ok: true, rows, rawRowCount: rows.length };
+    const { header, rows } = (json as RealizationResponse | null)?.result ?? {};
+    if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))) {
+      return { ok: false, code: "bad_response" };
+    }
+
+    const monthStart = year + "-" + String(month).padStart(2, "0") + "-01";
+    const monthEnd = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+    const start = typeof header?.start_date === "string" ? header.start_date.slice(0, 10) : undefined;
+    const end = typeof header?.stop_date === "string" ? header.stop_date.slice(0, 10) : undefined;
+    const periodMismatch =
+      (start !== undefined && start !== monthStart) || (end !== undefined && end !== monthEnd);
+
+    // Корректные даты и последовательные номера не доказывают, что v2
+    // вернул последнюю строку. В ответе нет независимого контроля полноты.
+    return {
+      ok: true,
+      rows,
+      rawRowCount: rows.length,
+      completeness: periodMismatch ? "period_mismatch" : "unverified",
+    };
   } catch (e) {
     const aborted = e instanceof Error && e.name === "AbortError";
     if (!aborted) return { ok: false, code: "unavailable" };
@@ -437,6 +457,7 @@ export function buildRealizationDiagnostic(
       month,
       year,
       rowCount: 0,
+      completeness: "unverified",
       sums: {
         saleQuantity: 0,
         returnQuantity: 0,
@@ -636,6 +657,7 @@ export function buildRealizationDiagnostic(
 
   return {
     connected: true,
+    completeness: fetched.completeness,
     month,
     year,
     rowCount: rows.length,
@@ -728,7 +750,7 @@ export function collectUnmatchedRealizationProducts(
 
 /**
  * Удобная обёртка: распарсить "YYYY-MM", получить отчёт и собрать диагностику.
- * Используется gated-роутом save-calculation ПОСЛЕ успешного списания/сохранения.
+ * Диагностика исходных строк. Наличие строк не подтверждает полноту отчёта.
  * Никогда не бросает — при любой ошибке вернёт connected:false с кодом.
  *
  * deadlineMs — ОПЦИОНАЛЬНЫЙ, см. doc-comment fetchRealizationReport. undefined →

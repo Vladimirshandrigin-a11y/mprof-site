@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { after, describe, before, it } from "node:test";
+import { after, describe, before, it, mock } from "node:test";
 import path from "node:path";
 import { accrualRow } from "../accrual/helpers/fixtures.mjs";
 import { xlsxSaveFixture } from "./helpers/xlsx-save-fixture.mjs";
@@ -19,6 +19,14 @@ const calcs = buildRequire("./api/cloud/calculations/route.js");
 const summaries = buildRequire("./api/cloud/financial-summary/route.js");
 const ozon = buildRequire("./api/ozon/save-calculation/route.js");
 const { encryptOzonApiKey } = buildRequire("./api/ozon/_lib/crypto.js");
+const realizationLib = buildRequire("./api/ozon/_lib/realization.js");
+const loadRealization = realizationLib.loadRealizationDiagnosticWithProducts;
+const fixtureMock = mock.method(realizationLib, "loadRealizationDiagnosticWithProducts", async (...args) => {
+  // The fixture is the entire known input for these downstream finance tests.
+  const result = await loadRealization(...args);
+  result.diagnostic.completeness = "verified";
+  return result;
+});
 const network = installFetch();
 const { freshDb } = payTestEnv();
 const migrations = [
@@ -131,7 +139,7 @@ describe("Day 3 financial P1", () => {
     db = await freshDb({ extraMigrations: migrations });
     network.state.pool = db.pool();
   });
-  after(() => network.restore());
+  after(() => { fixtureMock.mock.restore(); network.restore(); });
   const sql = (...args) => db.main.query(...args);
   async function state(uid) {
     const [[profile], [calcs], [history], [ops]] = await Promise.all([

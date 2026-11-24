@@ -468,7 +468,7 @@ function stubOzon(state) {
   });
 }
 
-function setupApi({ userId = "u1", catalog = [], rows = REALIZATION, extraTables = {} } = {}) {
+function setupApi({ userId = "u1", catalog = [], rows = REALIZATION, extraTables = {}, verifiedFixture = true } = {}) {
   const fake = makeFakeSupabase({
     profiles: [{ id: userId, plan: "free", premium_until: null, calculations_used: 0 }],
     ozon_connections: [{ user_id: userId, client_id: "c1", api_key_encrypted: "enc" }],
@@ -488,6 +488,15 @@ function setupApi({ userId = "u1", catalog = [], rows = REALIZATION, extraTables
     return fakeRpc(name, args);
   };
   stubOzon(state);
+  if (verifiedFixture) {
+    // Known-complete synthetic input for downstream catalog and save tests.
+    const load = realizationLib.loadRealizationDiagnosticWithProducts;
+    patch(realizationLib, "loadRealizationDiagnosticWithProducts", async (...args) => {
+      const result = await load(...args);
+      result.diagnostic.completeness = "verified";
+      return result;
+    });
+  }
   asUser(fake, userId);
   patch(cryptoLib, "isEncryptionConfigured", () => true);
   patch(cryptoLib, "decryptOzonApiKey", () => "plain-api-key");
@@ -666,6 +675,16 @@ describe("разбор ответа incomplete_cost для экрана API (par
     assert.deepEqual(GAP.parseApiCostGap({}), { status: undefined, unmatchedItems: 0, matchedNoCostCount: 0, catalogImport: { attempted: false } });
     assert.deepEqual(GAP.parseApiCostGap({ unmatchedItems: "5", catalogImport: { attempted: "yes" } }).catalogImport, { attempted: false });
     assert.equal(GAP.parseApiCostGap({ catalogImport: { attempted: true, ok: false } }).catalogImport.error, "Сервер не подтвердил добавление");
+  });
+});
+
+describe("неподтверждённая реализация", () => {
+  it("останавливает сохранение и автоимпорт до первой записи", async () => {
+    const { fake, rpc, post } = setupApi({ verifiedFixture: false });
+    const { status, json } = await post();
+    assert.deepEqual([status, json.code, json.reason], [422, "realization_unavailable", "unverified_realization"]);
+    assert.deepEqual(rpc, []);
+    assert.deepEqual(fake.ops.filter((op) => op.op !== "select"), []);
   });
 });
 

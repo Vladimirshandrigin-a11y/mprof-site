@@ -383,6 +383,8 @@ export function computeApiProfit(
 export type RealizationCostErrorCode =
   | "not_connected"
   | "no_rows"
+  | "period_mismatch"
+  | "unverified_realization"
   | "no_offer_id"
   | "unmatched"
   | "no_cost"
@@ -744,7 +746,16 @@ export async function loadAndComputeApiProfit(
   ]);
   const realization = realizationLoaded.diagnostic;
   realizationAndPostingsMs = Date.now() - tParallel0;
-  const resolution = resolveRealizationProductionCost(realization);
+  const rejectedPeriod = realization.completeness === "period_mismatch";
+  const missingProof = realization.rowCount > 0 && realization.completeness !== "verified";
+  const resolution: RealizationCostResolution = rejectedPeriod || missingProof
+    ? {
+        ok: false,
+        code: rejectedPeriod ? "period_mismatch" : "unverified_realization",
+        unmatchedRows: 0,
+        noCostRows: 0,
+      }
+    : resolveRealizationProductionCost(realization);
   if (!resolution.ok) {
     return {
       ok: false,
