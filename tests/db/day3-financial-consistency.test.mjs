@@ -91,12 +91,15 @@ function upstream(scenario = "normal") {
   return ({ url, body }) => {
     const endpoint = new URL(url).pathname;
     if (endpoint === "/v1/finance/accrual/types") {
-      return Response.json({ types: [{ type_id: 1, name: "Оплата за клик" },
+      const adName = scenario === "review-promotion" ? "Сбор первых отзывов" : "Оплата за клик";
+      return Response.json({ types: [{ type_id: 1, name: adName },
         { type_id: 2, name: "Начисление по спору" }, { type_id: 3, name: "Эквайринг" }] });
     }
     if (endpoint === "/v1/finance/accrual/by-day") {
       if (body.date !== day) return Response.json({ accruals: [], last_id: "" });
-      if (scenario === "normal") return Response.json({ accruals: ledger, last_id: "" });
+      if (scenario === "normal" || scenario === "review-promotion") {
+        return Response.json({ accruals: ledger, last_id: "" });
+      }
       if (scenario === "omitted-initial") return Response.json({ accruals: ledger });
       if (!body.last_id) return Response.json({ accruals: ledger, last_id: "1" });
       if (scenario === "omitted-after-cursor") return Response.json({ accruals: [] });
@@ -352,6 +355,33 @@ describe("Day 3 financial P1", () => {
     } finally {
       network.state.override = null;
     }
+  });
+
+  it("first review promotion is shown as advertising in XLSX and API history without changing profit", async () => {
+    const uid = await ozonUser({ plan: "unlimited", premium: "10 days" });
+    const xlsxRows = rows.map(line => line[3] === "Оплата за клик"
+      ? line.map((cell, index) => index === 3 ? "Сбор первых отзывов" : cell) : line);
+    const fixture = xlsxSaveFixture({ rows: xlsxRows, cost: 150, packaging: "15", ads: "20" });
+    const reference = register();
+    for (const field of ["revenue", "commission", "logistics", "ads", "cost", "tax",
+      "other_expenses", "total_expenses", "profit", "margin"]) {
+      assert.equal(fixture.calculation[field], reference.calculation[field], field);
+    }
+    const savedXlsx = await fetchJson(ops, uid, { ...reference, ...fixture });
+    assert.equal(savedXlsx.status, 200, JSON.stringify(savedXlsx));
+
+    network.state.ozon = upstream("review-promotion");
+    const savedApi = await withoutPacing(() => saveApi(uid));
+    assert.equal(savedApi.status, 200, JSON.stringify(savedApi));
+    const { rows: written } = await sql(
+      "select mode, profit::float8, logistics::float8, ads::float8, ai_insights from public.calculations where user_id=$1 order by mode",
+      [uid]
+    );
+    assert.deepEqual(written.map(r => [r.mode, r.profit, r.logistics, r.ads]),
+      [["api", 482.5, 110, 50], ["upload", 482.5, 110, 70]]);
+    assert.deepEqual(written[0].ai_insights.financeTaxonomy.breakdown.ads,
+      { signedTotal: -50, charges: 60, credits: 10 });
+    assert.equal((await fetchJson(calcs, uid)).body.data.length, 2);
   });
 
   it("P1-5 stores 1250 return-adjusted revenue and keeps 482.50 profit, 38.60 margin and historical cost on replay", async () => {

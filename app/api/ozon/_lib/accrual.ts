@@ -88,6 +88,7 @@ const ADS_TYPE_NAMES: ReadonlySet<string> = new Set([
   "Продвижение с оплатой за заказ",
   "Оплата за клик",
   "Ускоренный сбор отзывов",
+  "Сбор первых отзывов",
 ]);
 const ADJUSTMENT_TYPE_NAMES: ReadonlySet<string> = new Set([
   "Начисление по спору",
