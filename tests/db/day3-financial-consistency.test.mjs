@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { after, describe, before, it } from "node:test";
+import { after, describe, before, it, mock } from "node:test";
 import path from "node:path";
+import { numberedReportFixture } from "../accrual/helpers/numbered-report-fixture.mjs";
 import { accrualRow } from "../accrual/helpers/fixtures.mjs";
 import { xlsxSaveFixture } from "./helpers/xlsx-save-fixture.mjs";
 import { buildRequire, payTestEnv, read, root } from "./helpers/pay-db.mjs";
@@ -19,6 +20,16 @@ const calcs = buildRequire("./api/cloud/calculations/route.js");
 const summaries = buildRequire("./api/cloud/financial-summary/route.js");
 const ozon = buildRequire("./api/ozon/save-calculation/route.js");
 const { encryptOzonApiKey } = buildRequire("./api/ozon/_lib/crypto.js");
+const realizationLib = buildRequire("./api/ozon/_lib/realization.js");
+const loadRealization = realizationLib.loadRealizationDiagnosticWithProducts;
+let useNumbered = false;
+const fixtureMock = mock.method(realizationLib, "loadRealizationDiagnosticWithProducts", async (params) => {
+  if (useNumbered) return loadRealization(params);
+  // The fixture is the entire known input for these downstream finance tests.
+  const result = await loadRealization({ ...params, source: "legacy_diagnostic" });
+  result.diagnostic.completeness = "verified";
+  return result;
+});
 const network = installFetch();
 const { freshDb } = payTestEnv();
 const migrations = [
@@ -131,7 +142,7 @@ describe("Day 3 financial P1", () => {
     db = await freshDb({ extraMigrations: migrations });
     network.state.pool = db.pool();
   });
-  after(() => network.restore());
+  after(() => { fixtureMock.mock.restore(); network.restore(); });
   const sql = (...args) => db.main.query(...args);
   async function state(uid) {
     const [[profile], [calcs], [history], [ops]] = await Promise.all([
@@ -382,6 +393,33 @@ describe("Day 3 financial P1", () => {
     assert.deepEqual(written[0].ai_insights.financeTaxonomy.breakdown.ads,
       { signedTotal: -50, charges: 60, credits: 10 });
     assert.equal((await fetchJson(calcs, uid)).body.data.length, 2);
+  });
+
+  it("numbered realization plus the production accrual source preserves the October-style financial fields", async t => {
+    const uid = await ozonUser();
+    useNumbered = true;
+    const numbered = numberedReportFixture({ lines: [
+      ["ART-A", 111, "fixture-barcode", "Fixture", 3, 1500, 1, 250],
+    ] });
+    const accrual = upstream();
+    network.state.ozon = req => req.path.includes("/report/") || req.url.startsWith("https://ir.ozone.ru/")
+      ? numbered.upstream(req) : accrual(req);
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const id = randomUUID();
+    try {
+      const pending = await saveApi(uid, id);
+      assert.deepEqual([pending.status, pending.body.code], [503, "realization_pending"]);
+      assert.deepEqual(await state(uid), [0, 0, 0, 0]);
+      now += 45_000;
+      const result = await withoutPacing(() => saveApi(uid, id));
+      assert.equal(result.status, 200, JSON.stringify(result));
+      assert.equal(result.body.result.netProfit, 482.5);
+      assert.equal(result.body.profit.preliminary.taxRevenueBase, 1250);
+      assert.deepEqual(await state(uid), [1, 1, 1, 1]);
+    } finally {
+      useNumbered = false;
+    }
   });
 
   it("P1-5 stores 1250 return-adjusted revenue and keeps 482.50 profit, 38.60 margin and historical cost on replay", async () => {

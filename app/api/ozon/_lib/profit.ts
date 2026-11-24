@@ -17,6 +17,7 @@ import {
 import {
   loadRealizationDiagnosticWithProducts,
   type RealizationDiagnostic,
+  type RealizationSourceError,
   type RealizationUnmatchedSummary,
 } from "./realization";
 import {
@@ -50,13 +51,13 @@ const LEGACY_FINANCE_SOURCE: FinanceSourceMeta = {
 // поэтому повторно его НЕ прибавляем):
 //   ozonOperationsTotal = revenue + commission + logistics + services + storage + other
 //   productionCost      = себестоимость из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
-//                         (/v2/finance/realization → candidateCogs.byNetQty:
+//                         (сверенные выгрузки по номеру → candidateCogs.byNetQty:
 //                         Σ по товарам round((продано − возвращено) × cost_price)
 //                         по offer_id — то же правило, что в XLSX «Отчёте по
 //                         начислениям»; возврат без продажи уменьшает себестоимость).
 //   profitBeforeManualExpenses = ozonOperationsTotal − productionCost
 //   realizationRevenueForTax = выручка ОТЧЁТА О РЕАЛИЗАЦИИ за вычетом возвратов
-//                         (/v2/finance/realization → sums.taxRevenueBase =
+//                         (сверенные выгрузки по номеру → sums.taxRevenueBase =
 //                         deliveryAmount − returnAmount), близка к строке
 //                         «Итого реализовано за вычетом возвратов» док-расчёта.
 //   taxAmount           = realizationRevenueForTax × tax% / 100  (налог задаётся
@@ -160,8 +161,15 @@ export function parseManualExpenses(
 }
 
 /** Код ошибки Ozon → человеко-понятный текст + HTTP-статус. */
-export function errorResponse(code: OzonFinanceErrorCode): NextResponse {
-  const map: Record<OzonFinanceErrorCode, { status: number; error: string }> = {
+export function errorResponse(code: RealizationSourceError, suggestXlsx = false): NextResponse {
+  const useXlsx = " Попытка не списана. Для расчёта можно загрузить полный XLSX «Отчёт по начислениям».";
+  const map: Record<RealizationSourceError, { status: number; error: string }> = {
+    realization_period_unavailable: { status: 422, error: "Расчёт через Ozon API доступен за закрытый календарный месяц." },
+    realization_report_missing: { status: 422, error: "Ozon ещё не предоставил отчёт о реализации за выбранный период." },
+    realization_reports_ambiguous: { status: 422, error: "Ozon вернул несколько версий или частей отчёта. Подтвердить полноту месяца не удалось." },
+    realization_pending: { status: 503, error: "Ozon готовит отчёты. Повторите расчёт позже." },
+    realization_no_activity: { status: 422, error: "В сверенных отчётах Ozon нет продаж или возвратов за выбранный месяц." },
+    realization_incomplete: { status: 422, error: "Отчёты Ozon не прошли проверку полноты или согласованности." },
     not_connected: { status: 400, error: "Подключение Ozon не найдено" },
     invalid_key: { status: 400, error: "Ozon отклонил ключ" },
     forbidden: { status: 400, error: "Недостаточно прав у ключа" },
@@ -179,7 +187,7 @@ export function errorResponse(code: OzonFinanceErrorCode): NextResponse {
     deadline: { status: 504, error: "Ozon не ответил вовремя. Попробуйте ещё раз" },
   };
   const { status, error } = map[code];
-  return NextResponse.json({ error, code }, { status, headers: NO_STORE });
+  return NextResponse.json({ error: suggestXlsx ? error + useXlsx : error, code }, { status, headers: NO_STORE });
 }
 
 /**
@@ -361,7 +369,7 @@ export function computeApiProfit(
 // ---------------------------------------------------------------------------
 // Боевая себестоимость из отчёта о реализации Ozon: валидация + резолюция.
 //
-// Себестоимость для API-прибыли берётся из /v2/finance/realization
+// Себестоимость для API-прибыли берётся из сверенного отчёта по номеру
 // (candidateCogs.byNetQty — продано − возвращено). Прежде чем использовать её как боевую, проверяем
 // НАДЁЖНОСТЬ. Любая из проблем → боевой расчёт останавливается понятной ошибкой
 // (мы НЕ показываем неверную прибыль и НЕ используем postings как тихий фолбэк):
@@ -383,6 +391,8 @@ export function computeApiProfit(
 export type RealizationCostErrorCode =
   | "not_connected"
   | "no_rows"
+  | "period_mismatch"
+  | "unverified_realization"
   | "no_offer_id"
   | "unmatched"
   | "no_cost"
@@ -404,7 +414,7 @@ export type RealizationCostResolution =
       /** Кол-во сопоставленных строк без себестоимости (cost=0). */
       noCostRows: number;
       /** Код ошибки Ozon, если отчёт реализации не получен (not_connected). */
-      ozonErrorCode?: OzonFinanceErrorCode;
+      ozonErrorCode?: RealizationSourceError;
     };
 
 /**
@@ -678,7 +688,48 @@ export async function loadAndComputeApiProfit(
     totalMs: Date.now() - t0,
   });
 
-  // 1) финансы Ozon → OzonDraftAggregate.
+  // Каталог себестоимости пользователя (read-only, только свои строки) — нужен
+  //    и для сопоставления отчёта реализации, и для справочной себестоимости.
+  const tCatalog0 = Date.now();
+  const { data: catalog, error: catErr } = await admin
+    .from("products")
+    .select("sku, name, cost_price")
+    .eq("user_id", userId);
+  catalogMs = Date.now() - tCatalog0;
+  if (catErr) {
+    // eslint-disable-next-line no-console
+    console.error("[ozon/profit] products select error", catErr);
+    return { ok: false, kind: "catalog", timings: timingsNow() };
+  }
+  const catalogRows = (catalog ?? []) as CatalogRow[];
+
+  // Do not load the accrual ledger while the numbered report is still pending.
+  const tRealization = Date.now();
+  const realizationLoaded = await loadRealizationDiagnosticWithProducts({ clientId, apiKey, month, catalog: catalogRows });
+  const realization = realizationLoaded.diagnostic;
+  realizationAndPostingsMs = Date.now() - tRealization;
+  const rejectedPeriod = realization.completeness === "period_mismatch";
+  const missingProof = realization.rowCount > 0 && realization.completeness !== "verified";
+  const resolution: RealizationCostResolution = rejectedPeriod || missingProof
+    ? {
+        ok: false,
+        code: rejectedPeriod ? "period_mismatch" : "unverified_realization",
+        unmatchedRows: 0,
+        noCostRows: 0,
+      }
+    : resolveRealizationProductionCost(realization);
+  const rejectRealization = (failure: Extract<RealizationCostResolution, { ok: false }>): ApiProfitLoaded => ({
+    ok: false,
+    kind: "realization_cost",
+    resolution: failure,
+    unmatched: realizationLoaded.unmatched,
+    timings: timingsNow(),
+  });
+  if (!resolution.ok && (!realization.connected || realization.completeness !== "verified")) {
+    return rejectRealization(resolution);
+  }
+
+  // Финансы Ozon → OzonDraftAggregate.
   //    При выключенном флаге legacy также отклоняет неполный период до расчёта.
   //    Флаг ВКЛЮЧЁН (или opts.forceAccrual — см. doc-comment выше) → ТОЛЬКО
   //    accrual-источник (/v1/finance/accrual/by-day). Отката на legacy при его
@@ -714,48 +765,14 @@ export async function loadAndComputeApiProfit(
     financeSource = LEGACY_FINANCE_SOURCE;
   }
 
-  // 2) каталог себестоимости пользователя (read-only, только свои строки) — нужен
-  //    и для сопоставления отчёта реализации, и для справочной себестоимости.
-  const tCatalog0 = Date.now();
-  const { data: catalog, error: catErr } = await admin
-    .from("products")
-    .select("sku, name, cost_price")
-    .eq("user_id", userId);
-  catalogMs = Date.now() - tCatalog0;
-  if (catErr) {
-    // eslint-disable-next-line no-console
-    console.error("[ozon/profit] products select error", catErr);
-    return { ok: false, kind: "catalog", timings: timingsNow() };
-  }
-  const catalogRows = (catalog ?? []) as CatalogRow[];
-
-  // 3+4) БОЕВАЯ себестоимость из отчёта о реализации Ozon (валидация надёжности
-  //    ниже) и СПРАВОЧНАЯ себестоимость по отправлениям (postings, best-effort,
-  //    НЕ участвует в прибыли и НЕ гейтит расчёт) — ДВА НЕЗАВИСИМЫХ похода к
-  //    Ozon (ни один не читает результат другого), раньше шли строго
-  //    последовательно без причины. Запускаем одновременно: итоговые числа не
-  //    меняются, меняется только порядок выполнения. Draft (шаг 1) и каталог
-  //    (шаг 2) остаются ДО этого места намеренно — при их ошибке функция уже
-  //    вышла раньше и не тратит лишние живые запросы к Ozon на realization/postings.
-  const tParallel0 = Date.now();
-  const [realizationLoaded, postings] = await Promise.all([
-    loadRealizationDiagnosticWithProducts({ clientId, apiKey, month, catalog: catalogRows }),
-    fetchMonthPostings(clientId, apiKey, range),
-  ]);
-  const realization = realizationLoaded.diagnostic;
-  realizationAndPostingsMs = Date.now() - tParallel0;
-  const resolution = resolveRealizationProductionCost(realization);
-  if (!resolution.ok) {
-    return {
-      ok: false,
-      kind: "realization_cost",
-      resolution,
-      unmatched: realizationLoaded.unmatched,
-      timings: timingsNow(),
-    };
-  }
+  // Catalog auto-import is handled by the caller. A valid realization alone
+  // must not trigger it while the accrual ledger is missing or incomplete.
+  if (!resolution.ok) return rejectRealization(resolution);
   const productionCost = resolution.productionCost;
   const realizationRevenueForTax = resolution.realizationRevenueForTax;
+  const tPostings = Date.now();
+  const postings = await fetchMonthPostings(clientId, apiKey, range);
+  realizationAndPostingsMs += Date.now() - tPostings;
   const cost = aggregateProfitCostDraft(
     postings.fatalCode ? [] : postings.items,
     postings.warnings,

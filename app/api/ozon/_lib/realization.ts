@@ -33,6 +33,8 @@
 import type { OzonFinanceErrorCode } from "./finance";
 import type { CatalogRow } from "./postings";
 
+import { fetchNumberedRealization, type NumberedRealizationError } from "./numbered-realization";
+
 const REALIZATION_URL = "https://api-seller.ozon.ru/v2/finance/realization";
 const TIMEOUT_MS = 25000;
 const MAX_SAMPLE = 12; // сколько строк показать в примере (без денежных секретов)
@@ -71,7 +73,7 @@ type RealizationItem = {
   sku?: number;
 };
 
-type RealizationRow = {
+export type RealizationRow = {
   row_number?: number;
   rowNumber?: number; // v2 отдаёт camelCase
   // v2: идентификаторы товара ВЛОЖЕНЫ в item (item.offer_id / item.sku).
@@ -94,7 +96,7 @@ type RealizationRow = {
 
 type RealizationResponse = {
   result?: {
-    header?: unknown;
+    header?: { start_date?: unknown; stop_date?: unknown };
     rows?: RealizationRow[];
   };
 };
@@ -103,9 +105,13 @@ type RealizationResponse = {
 // Публичные типы
 // ---------------------------------------------------------------------------
 
+export type RealizationSourceError = OzonFinanceErrorCode | NumberedRealizationError;
+
+export type RealizationCompleteness = "verified" | "unverified" | "period_mismatch";
+
 export type RealizationFetchResult =
-  | { ok: true; rows: RealizationRow[]; rawRowCount: number }
-  | { ok: false; code: OzonFinanceErrorCode; status?: number };
+  | { ok: true; rows: RealizationRow[]; rawRowCount: number; completeness: RealizationCompleteness }
+  | { ok: false; code: RealizationSourceError; status?: number };
 
 /** Какие поля реально пришли (виден хотя бы один непустой раз). Для отчёта
  *  «каких полей не хватает», если структура не даёт количество/артикул. */
@@ -144,10 +150,11 @@ export type RealizationDiagnostic = {
   /** true — endpoint ответил 200 и отдал разбираемый result. */
   connected: boolean;
   /** код ошибки Ozon, если запрос не удался (connected=false). */
-  errorCode?: OzonFinanceErrorCode;
+  errorCode?: RealizationSourceError;
   month: number;
   year: number;
   rowCount: number;
+  completeness: RealizationCompleteness;
   sums: {
     /** Σ количество продаж (delivery quantity). */
     saleQuantity: number;
@@ -264,9 +271,26 @@ export async function fetchRealizationReport(
     } catch {
       return { ok: false, code: "bad_response" };
     }
-    const data = (json as RealizationResponse) ?? {};
-    const rows = Array.isArray(data.result?.rows) ? (data.result!.rows as RealizationRow[]) : [];
-    return { ok: true, rows, rawRowCount: rows.length };
+    const { header, rows } = (json as RealizationResponse | null)?.result ?? {};
+    if (!Array.isArray(rows) || rows.some((row) => !row || typeof row !== "object" || Array.isArray(row))) {
+      return { ok: false, code: "bad_response" };
+    }
+
+    const monthStart = year + "-" + String(month).padStart(2, "0") + "-01";
+    const monthEnd = new Date(Date.UTC(year, month, 0)).toISOString().slice(0, 10);
+    const start = typeof header?.start_date === "string" ? header.start_date.slice(0, 10) : undefined;
+    const end = typeof header?.stop_date === "string" ? header.stop_date.slice(0, 10) : undefined;
+    const periodMismatch =
+      (start !== undefined && start !== monthStart) || (end !== undefined && end !== monthEnd);
+
+    // Корректные даты и последовательные номера не доказывают, что v2
+    // вернул последнюю строку. В ответе нет независимого контроля полноты.
+    return {
+      ok: true,
+      rows,
+      rawRowCount: rows.length,
+      completeness: periodMismatch ? "period_mismatch" : "unverified",
+    };
   } catch (e) {
     const aborted = e instanceof Error && e.name === "AbortError";
     if (!aborted) return { ok: false, code: "unavailable" };
@@ -437,6 +461,7 @@ export function buildRealizationDiagnostic(
       month,
       year,
       rowCount: 0,
+      completeness: "unverified",
       sums: {
         saleQuantity: 0,
         returnQuantity: 0,
@@ -636,6 +661,7 @@ export function buildRealizationDiagnostic(
 
   return {
     connected: true,
+    completeness: fetched.completeness,
     month,
     year,
     rowCount: rows.length,
@@ -728,7 +754,7 @@ export function collectUnmatchedRealizationProducts(
 
 /**
  * Удобная обёртка: распарсить "YYYY-MM", получить отчёт и собрать диагностику.
- * Используется gated-роутом save-calculation ПОСЛЕ успешного списания/сохранения.
+ * Диагностика исходных строк. Наличие строк не подтверждает полноту отчёта.
  * Никогда не бросает — при любой ошибке вернёт connected:false с кодом.
  *
  * deadlineMs — ОПЦИОНАЛЬНЫЙ, см. doc-comment fetchRealizationReport. undefined →
@@ -742,7 +768,7 @@ export async function loadRealizationDiagnostic(params: {
   catalog: CatalogRow[];
   deadlineMs?: number;
 }): Promise<RealizationDiagnostic> {
-  return (await loadRealizationDiagnosticWithProducts(params)).diagnostic;
+  return (await loadRealizationDiagnosticWithProducts({ ...params, source: "legacy_diagnostic" })).diagnostic;
 }
 
 /**
@@ -757,6 +783,7 @@ export async function loadRealizationDiagnosticWithProducts(params: {
   month: string; // "YYYY-MM"
   catalog: CatalogRow[];
   deadlineMs?: number;
+  source?: "legacy_diagnostic";
 }): Promise<{ diagnostic: RealizationDiagnostic; unmatched: RealizationUnmatchedSummary }> {
   const { clientId, apiKey, month, catalog, deadlineMs } = params;
   const m = /^(\d{4})-(\d{2})$/.exec(month);
@@ -768,7 +795,8 @@ export async function loadRealizationDiagnosticWithProducts(params: {
       unmatched: { products: [], rowsWithoutOfferId: 0 },
     };
   }
-  const fetched = await fetchRealizationReport(clientId, apiKey, monthNum, year, deadlineMs);
+  const fetchReport = params.source === "legacy_diagnostic" ? fetchRealizationReport : fetchNumberedRealization;
+  const fetched = await fetchReport(clientId, apiKey, monthNum, year, deadlineMs);
   return {
     diagnostic: buildRealizationDiagnostic(fetched, catalog, monthNum, year),
     unmatched: collectUnmatchedRealizationProducts(fetched, catalog),

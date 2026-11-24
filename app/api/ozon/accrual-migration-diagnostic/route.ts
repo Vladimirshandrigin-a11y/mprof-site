@@ -1602,15 +1602,11 @@ export async function POST(req: NextRequest) {
       catalog: [] as CatalogRow[],
       deadlineMs: budget.deadline,
     });
-    // HTTP 200 (connected:true) САМ ПО СЕБЕ не значит «данные полны»: отчёт мог
-    // прийти пустым или без нужных полей. dataComplete требует РЕАЛЬНЫХ строк,
-    // присутствия идентификатора/количества/суммы И положительной базы налога
-    // (taxRevenueBase = deliveryAmount − returnAmount) — это то, что боевому
-    // расчёту реально нужно от этого отчёта (см. resolveRealizationProductionCost
-    // в profit.ts). Совпадение с каталогом (себестоимость конкретных товаров) —
-    // ОТДЕЛЬНЫЙ шаг, эта проверка каталог не запрашивает (см. выше).
+    // HTTP 200 и заполненные поля позволяют сверять суммы, но полнота
+    // периода требует независимого подтверждения.
     const dataComplete =
       rz.connected &&
+      rz.completeness === "verified" &&
       rz.rowCount > 0 &&
       rz.fieldsPresent.offerId &&
       rz.fieldsPresent.deliveryQuantity &&
@@ -1622,6 +1618,7 @@ export async function POST(req: NextRequest) {
       errorCode: rz.errorCode ?? null,
       period: { month: rz.month, year: rz.year },
       rowCount: rz.rowCount,
+      completeness: rz.completeness,
       dataComplete,
       fieldsPresent: rz.fieldsPresent,
       sums: rz.sums,

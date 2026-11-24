@@ -16,6 +16,7 @@ export const SUPABASE_URL = "http://supabase.test";
 export const SERVICE_KEY = "test-service-role-key";
 const YOOKASSA = "https://api.yookassa.ru/";
 const OZON = "https://api-seller.ozon.ru/";
+const isOzon = url => url.startsWith(OZON) || url.startsWith("https://ir.ozone.ru/");
 
 /** Полезная нагрузка JWT без проверки подписи (тестовые токены). */
 function jwtClaims(token) {
@@ -208,7 +209,7 @@ export function installFetch() {
       if (!claims?.sub) return json(401, { code: 401, msg: "invalid JWT" });
       return json(200, { id: claims.sub, aud: "authenticated", role: "authenticated", email: `${claims.sub.slice(0, 8)}@example.test`, app_metadata: {}, user_metadata: {}, created_at: "2026-01-01T00:00:00Z" });
     }
-    if (url.startsWith(OZON)) {
+    if (isOzon(url)) {
       if (!state.ozon) throw new Error(`обращение к Ozon в этом тесте не ожидалось: ${url}`);
       return state.ozon(req);
     }
@@ -224,7 +225,7 @@ export function installFetch() {
     dbRequests: () => state.log.filter((r) => r.url.startsWith(SUPABASE_URL)),
     rpcCalls: () => state.log.filter((r) => r.path.startsWith("/rest/v1/rpc/")),
     /** Обращения к Ozon Seller API. */
-    ozonCalls: () => state.log.filter((r) => r.url.startsWith(OZON)),
+    ozonCalls: () => state.log.filter((r) => isOzon(r.url)),
     reset() {
       state.log.length = 0;
       state.gates.length = 0;

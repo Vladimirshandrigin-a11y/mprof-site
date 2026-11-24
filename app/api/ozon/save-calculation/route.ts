@@ -29,7 +29,7 @@ import { syncMissingRealizationProducts } from "../_lib/realization-catalog-sync
 //                    − Налог от выручки реализации − Внешние расходы вручную.
 //   • Итого Ozon (ozonOperationsTotal) — из финопераций Ozon API;
 //   • Себестоимость (productionCost) — из ОТЧЁТА О РЕАЛИЗАЦИИ Ozon
-//     (/v2/finance/realization → candidateCogs.byNetQty: продано − возвращено,
+//     (сверенные выгрузки по номеру → candidateCogs.byNetQty: продано − возвращено,
 //     как в XLSX «Отчёте по начислениям»), сопоставленного с
 //     каталогом по item.offer_id; postings delivered-only COGS БОЛЬШЕ НЕ боевая
 //     (остаётся только справочной строкой postingsReferenceCost);
@@ -325,9 +325,13 @@ export async function POST(req: NextRequest) {
       );
     }
     if (r.code === "not_connected" && r.ozonErrorCode) {
-      return errorResponse(r.ozonErrorCode);
+      return errorResponse(r.ozonErrorCode, true);
     }
     const msgByCode: Record<string, string> = {
+      period_mismatch:
+        "Отчёт о реализации Ozon не покрывает выбранный месяц. Расчёт не сохранён, попытка не списана.",
+      unverified_realization:
+        "Полноту отчёта о реализации Ozon подтвердить не удалось. Расчёт не сохранён, попытка не списана. Для расчёта используйте полный отчёт по начислениям XLSX.",
       not_connected:
         "Не удалось получить отчёт о реализации Ozon для расчёта себестоимости. Расчёт не сделан, попытка не списана.",
       no_rows:
