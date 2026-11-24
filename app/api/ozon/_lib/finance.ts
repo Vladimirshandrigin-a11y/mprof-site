@@ -49,7 +49,7 @@ export type OzonFinanceErrorCode =
 /** Минимальная форма операции — читаем ТОЛЬКО нужные поля. Всё опционально:
  *  если Ozon вернёт иначе, мягко коалесцируем в 0/пусто, а не падаем. */
 export type OzonOperation = {
-  operation_id?: number;
+  operation_id?: number | string;
   operation_type?: string;
   operation_type_name?: string;
   operation_date?: string;
@@ -74,7 +74,7 @@ export type OzonFinanceFetchResult =
   | {
       ok: true;
       operations: OzonOperation[];
-      partial: boolean;
+      partial: false;
       pageCount: number;
       rowCount: number;
     }
@@ -251,11 +251,10 @@ async function fetchPage(
 }
 
 /**
- * Все операции за период с безопасной пагинацией. Если страниц больше лимита —
- * возвращаем partial:true (то, что успели), без бесконечного цикла.
+ * Успех только после получения всех объявленных страниц и операций.
+ * Число страниц и строк должно совпадать во всех ответах.
  *
- * deadlineMs — ОПЦИОНАЛЬНЫЙ, см. doc-comment fetchPage. undefined → поведение
- * НЕ МЕНЯЕТСЯ (существующие вызовы из save-calculation/profit.ts его не передают).
+ * deadlineMs — общий дедлайн, который передаёт диагностика.
  */
 export async function fetchOzonTransactions(
   clientId: string,
@@ -264,28 +263,61 @@ export async function fetchOzonTransactions(
   deadlineMs?: number
 ): Promise<OzonFinanceFetchResult> {
   const operations: OzonOperation[] = [];
-  let pageCount = 1;
-  let rowCount = 0;
+  const operationIds = new Set<string>();
+  let pagination: { pageCount: number; rowCount: number } | undefined;
 
   for (let page = 1; page <= MAX_PAGES; page++) {
     const r = await fetchPage(clientId, apiKey, range, page, deadlineMs);
     if (!r.ok) return r;
 
-    const result = r.data.result ?? {};
-    const ops = Array.isArray(result.operations) ? result.operations : [];
-    operations.push(...ops);
-    pageCount = typeof result.page_count === "number" ? result.page_count : page;
-    rowCount =
-      typeof result.row_count === "number" ? result.row_count : operations.length;
+    const { operations: ops, page_count: pageCount, row_count: rowCount } = r.data.result ?? {};
+    if (
+      !Array.isArray(ops) ||
+      ops.length > PAGE_SIZE ||
+      typeof pageCount !== "number" || !Number.isSafeInteger(pageCount) ||
+      typeof rowCount !== "number" || !Number.isSafeInteger(rowCount) ||
+      pageCount < 0 || pageCount > MAX_PAGES ||
+      rowCount < 0 || rowCount > Math.max(1, pageCount) * PAGE_SIZE ||
+      (pagination && (pageCount !== pagination.pageCount || rowCount !== pagination.rowCount))
+    ) {
+      return { ok: false, code: "bad_response" };
+    }
+    pagination = { pageCount, rowCount };
 
-    // Достигли последней страницы (или Ozon отдал пусто) → полный результат.
-    if (page >= pageCount || ops.length === 0) {
+    if (ops.length === 0) {
+      // Пустой месяц допустим. Пустая страница внутри непустого периода — ошибка.
+      return page === 1 && pageCount <= 1 && rowCount === 0
+        ? { ok: true, operations, partial: false, pageCount, rowCount }
+        : { ok: false, code: "bad_response" };
+    }
+    const received = operations.length + ops.length;
+    if (pageCount === 0 || (page === pageCount ? received !== rowCount : received >= rowCount)) {
+      return { ok: false, code: "bad_response" };
+    }
+
+    for (const op of ops) {
+      if (op === null || typeof op !== "object" || Array.isArray(op)) {
+        return { ok: false, code: "bad_response" };
+      }
+      const id = op.operation_id;
+      const key = typeof id === "number" && Number.isSafeInteger(id) && id > 0
+        ? String(id)
+        : typeof id === "string" && /^[1-9]\d*$/.test(id) ? id : null;
+      // Несколько страниц без стабильных идентификаторов нельзя отличить от повтора.
+      if (key === null) {
+        if (pageCount > 1) return { ok: false, code: "bad_response" };
+      } else {
+        if (operationIds.has(key)) return { ok: false, code: "bad_response" };
+        operationIds.add(key);
+      }
+    }
+    operations.push(...ops);
+    if (page === pageCount) {
       return { ok: true, operations, partial: false, pageCount, rowCount };
     }
   }
 
-  // Вышли по лимиту страниц, а данных больше → частичный черновик.
-  return { ok: true, operations, partial: true, pageCount, rowCount };
+  return { ok: false, code: "bad_response" };
 }
 
 // ---------------------------------------------------------------------------

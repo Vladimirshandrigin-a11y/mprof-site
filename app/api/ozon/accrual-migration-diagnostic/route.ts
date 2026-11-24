@@ -1552,6 +1552,7 @@ export async function POST(req: NextRequest) {
         tx.code === "deadline" ? "budget_exhausted"
         : tx.code === "timeout" ? "request_timeout"
         : tx.code === "rate_limited" ? "rate_limited"
+        : tx.code === "bad_response" ? "invalid_response"
         : typeof tx.status === "number" ? "ozon_http_error"
         : "network_error";
       legacy = {
