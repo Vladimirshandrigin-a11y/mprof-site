@@ -718,15 +718,17 @@ export async function loadAndComputeApiProfit(
         noCostRows: 0,
       }
     : resolveRealizationProductionCost(realization);
-  if (!resolution.ok) {
-    return {
-      ok: false,
-      kind: "realization_cost",
-      resolution,
-      unmatched: realizationLoaded.unmatched,
-      timings: timingsNow(),
-    };
+  const rejectRealization = (failure: Extract<RealizationCostResolution, { ok: false }>): ApiProfitLoaded => ({
+    ok: false,
+    kind: "realization_cost",
+    resolution: failure,
+    unmatched: realizationLoaded.unmatched,
+    timings: timingsNow(),
+  });
+  if (!resolution.ok && (!realization.connected || realization.completeness !== "verified")) {
+    return rejectRealization(resolution);
   }
+
   // Финансы Ozon → OzonDraftAggregate.
   //    При выключенном флаге legacy также отклоняет неполный период до расчёта.
   //    Флаг ВКЛЮЧЁН (или opts.forceAccrual — см. doc-comment выше) → ТОЛЬКО
@@ -763,6 +765,9 @@ export async function loadAndComputeApiProfit(
     financeSource = LEGACY_FINANCE_SOURCE;
   }
 
+  // Catalog auto-import is handled by the caller. A valid realization alone
+  // must not trigger it while the accrual ledger is missing or incomplete.
+  if (!resolution.ok) return rejectRealization(resolution);
   const productionCost = resolution.productionCost;
   const realizationRevenueForTax = resolution.realizationRevenueForTax;
   const tPostings = Date.now();

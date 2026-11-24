@@ -476,6 +476,25 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     assert.equal((await db.main.query("select id from public.products where user_id=$1", [uid])).rowCount, 0);
   });
 
+  it("a verified numbered report does not trigger auto-import when accruals are incomplete", async t => {
+    const uid = await apiUser(db);
+    await db.main.query("update public.ozon_connections set client_id=$2 where user_id=$1", [uid, uid]);
+    await db.main.query("delete from public.products where user_id=$1", [uid]);
+    numberedFixture = true;
+    const numbered = numberedReportFixture();
+    state.ozon = req => req.path.includes("/finance/transaction/")
+      ? jsonRes({ result: { operations: OPERATIONS, page_count: 2, row_count: 1 } })
+      : numbered.upstream(req);
+    let now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const first = await postApi(uid);
+    now += 45_000;
+    const failed = await postApi(uid, { operationId: first.operationId });
+    assert.deepEqual([first.status, failed.status, failed.body.code], [503, 502, "bad_response"]);
+    assert.deepEqual(await facts(db, uid), { used: 0, calcs: 0, history: 0, ops: 0 });
+    assert.equal((await db.main.query("select id from public.products where user_id=$1", [uid])).rowCount, 0);
+  });
+
   it("paid 149 ₽ credit grants no access to numbered Ozon requests", async () => {
     const uid = await apiUser(db, { used: 1, credits: 1 });
     numberedFixture = true;
