@@ -1,0 +1,129 @@
+name: Day 4 Linux release verification
+
+on:
+  push:
+    branches: [ci/day4-final-review]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Linux x64 / ${{ matrix.target.label }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - {label: PR125, sha: 'c6fd9b0fa9bd01ceb0bca7571375f1c2b7b8e5bc'}
+          - {label: PR126, sha: '20a93fe0459d67725edfe92a75f3059cde67cfc6'}
+          - {label: PR127, sha: '01f504f53c1a4e602ff69fef7c5b6fafc120367c'}
+          - {label: Combined, sha: '42048f18d873e1c4e0bea3b7c6708284ffb98f08'}
+    env:
+      TARGET_SHA: ${{ matrix.target.sha }}
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXT_PUBLIC_SUPABASE_URL: http://127.0.0.1:39473
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: synthetic-test-publishable-key
+      NEXT_PUBLIC_SITE_URL: http://127.0.0.1:39472
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: synthetic-local-postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout exact tested commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ matrix.target.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+
+      - name: Record Linux environment and exact tree
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD 'HEAD^{tree}'
+          . /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 24.04
+          printf '%s\n' "$PRETTY_NAME"
+          uname -sm
+          getconf GNU_LIBC_VERSION
+          node -v
+          npm -v
+          node -e 'const a=require("node:assert/strict"); a.equal(process.platform,"linux"); a.equal(process.arch,"x64"); a.ok(process.report.getReport().header.glibcVersionRuntime)'
+
+      - name: Clean npm ci with empty cache
+        run: |
+          test ! -e node_modules
+          npm ci --cache "$RUNNER_TEMP/day4-npm-cache" --no-audit --no-fund
+          git diff --exit-code -- package.json package-lock.json
+          node -p 'require("xlsx").version'
+
+      - name: SheetJS SRI and catalog/template compatibility
+        if: ${{ matrix.target.label == 'PR125' || matrix.target.label == 'Combined' }}
+        run: |
+          curl --fail --silent --show-error --location --max-time 60 https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz --output "$RUNNER_TEMP/day4-sheetjs.tgz"
+          node - "$RUNNER_TEMP/day4-sheetjs.tgz" <<'NODE'
+          const assert = require("node:assert/strict");
+          const {createHash} = require("node:crypto");
+          const {readFileSync} = require("node:fs");
+          const lock = require("./package-lock.json").packages["node_modules/xlsx"];
+          assert.equal(lock.version, "0.20.3");
+          assert.equal(lock.resolved, "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz");
+          const actual = "sha512-" + createHash("sha512").update(readFileSync(process.argv[2])).digest("base64");
+          assert.equal(actual, lock.integrity);
+          const sheetjs = require("xlsx");
+          const styled = require("xlsx-js-style");
+          assert.equal(sheetjs.version, "0.20.3");
+          const source = [["Артикул", "Себестоимость"], ["000007", 123.45], ["ART Б", "89,10"]];
+          for (const writer of [sheetjs, styled]) {
+            const workbook = writer.utils.book_new();
+            const sheet = writer.utils.aoa_to_sheet(source);
+            sheet.A1.s = {font: {bold: true}};
+            writer.utils.book_append_sheet(workbook, sheet, "Каталог");
+            const buffer = writer.write(workbook, {type: "buffer", bookType: "xlsx"});
+            const read = sheetjs.read(buffer, {type: "buffer"});
+            assert.deepEqual(sheetjs.utils.sheet_to_json(read.Sheets["Каталог"], {header: 1}), source);
+          }
+          console.log("Official SRI and SheetJS import + both export writers: PASS");
+          NODE
+
+      - name: TypeScript
+        run: ./node_modules/.bin/tsc --noEmit
+
+      - name: Financial, XLSX and Ozon regressions
+        run: npm run test:accrual
+
+      - name: PostgreSQL, Ozon HTTP and history regressions
+        env:
+          PGPORT: ${{ job.services.postgres.ports[5432] }}
+          PGPASSWORD: synthetic-local-postgres
+          PGUSER: postgres
+          PGHOST: 127.0.0.1
+          TEST_DATABASE_URL: postgresql://postgres:synthetic-local-postgres@127.0.0.1:${{ job.services.postgres.ports[5432] }}/postgres
+        run: |
+          node -e '(async()=>{const c=new (require("pg").Client)();await c.connect();const r=await c.query("show server_version");console.log("Isolated PostgreSQL "+r.rows[0].server_version);require("node:assert/strict").match(r.rows[0].server_version,/^17\./);await c.end()})().catch(e=>{console.error(e.message);process.exit(1)})'
+          npm run test:db
+
+      - name: Production build with Turbopack
+        run: npm run build -- --turbopack
+
+      - name: Confirm tracked sources
+        run: |
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git diff --exit-code HEAD --
