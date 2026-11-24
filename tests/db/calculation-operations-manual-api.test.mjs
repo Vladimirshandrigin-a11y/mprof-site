@@ -455,6 +455,67 @@ describe("Ozon API: Ozon вне транзакции, права + списан�
     assert.ok(!net.rpcCalls().some((r) => r.path === "/rest/v1/rpc/save_api_calculation_operation"));
   });
 
+  const firstPage = [{ ...OPERATIONS[0], operation_id: 1 }];
+  const secondPage = [{ operation_id: 2, amount: 0 }];
+  const legacyPage = (operations, page_count, row_count) =>
+    jsonRes({ result: { operations, page_count, row_count } });
+
+  it("полный legacy-период из двух страниц сохраняет прежнюю прибыль и списывает один расчёт", async () => {
+    const u = await apiUser(db);
+    const reference = await postApi(u);
+    assert.equal(reference.status, 200);
+
+    const other = await apiUser(db);
+    const pages = [];
+    state.ozon = (req) => {
+      if (!req.url.endsWith("/v3/finance/transaction/list")) return ozonOk(req);
+      const { page } = req.body;
+      pages.push(page);
+      return legacyPage(page === 1 ? firstPage : secondPage, 2, 2);
+    };
+    const out = await postApi(other);
+    assert.deepEqual(pages, [1, 2]);
+    assert.equal(out.status, 200, JSON.stringify(out.body).slice(0, 300));
+    assert.deepEqual(out.body.profit, {
+      ...reference.body.profit,
+      apiTotals: { ...reference.body.profit.apiTotals, operationCount: 2 },
+    });
+    assert.deepEqual(await facts(db, other), { used: 1, calcs: 1, history: 1, ops: 1 });
+  });
+
+  for (const [label, pages] of [
+    ["больше лимита страниц", [() => legacyPage(firstPage, 21, 21)]],
+    ["пустая промежуточная страница", [() => legacyPage(firstPage, 3, 3), () => legacyPage([], 3, 3)]],
+    ["нет метаданных пагинации", [() => legacyPage(firstPage, undefined, undefined)]],
+    ["изменился заявленный размер периода", [() => legacyPage(firstPage, 2, 2), () => legacyPage(secondPage, 2, 3)]],
+    ["получено меньше заявленных строк", [() => legacyPage(firstPage, 2, 3), () => legacyPage(secondPage, 2, 3)]],
+    ["повтор транзакции на другой странице", [() => legacyPage(firstPage, 2, 2), () => legacyPage([{ ...firstPage[0], operation_id: "1" }], 2, 2)]],
+    ["нет идентификатора на второй странице", [() => legacyPage(firstPage, 2, 2), () => legacyPage([{ amount: 0 }], 2, 2)]],
+    ["HTTP-ошибка посреди периода", [() => legacyPage(firstPage, 2, 2), () => jsonRes({}, 503)]],
+  ]) {
+    it(`legacy — ${label}: отказ до сохранения, нет списания, повтор возможен`, async () => {
+      const u = await apiUser(db);
+      const operationId = randomUUID();
+      const requested = [];
+      state.ozon = (req) => {
+        assert.ok(req.url.endsWith("/v3/finance/transaction/list"));
+        const { page } = req.body;
+        requested.push(page);
+        return pages[page - 1]();
+      };
+      const out = await postApi(u, { operationId });
+      const errorCode = label === "HTTP-ошибка посреди периода" ? "unavailable" : "bad_response";
+      assert.deepEqual([out.status, out.body.code], [502, errorCode]);
+      assert.deepEqual(requested, pages.map((_, i) => i + 1));
+      assert.deepEqual(await facts(db, u), { used: 0, calcs: 0, history: 0, ops: 0 });
+      assert.ok(!net.rpcCalls().some((r) => r.path === "/rest/v1/rpc/save_api_calculation_operation"));
+
+      state.ozon = ozonOk;
+      assert.equal((await postApi(u, { operationId })).status, 200);
+      assert.deepEqual(await facts(db, u), { used: 1, calcs: 1, history: 1, ops: 1 });
+    });
+  }
+
   it("сбой записи внутри операции: откат — ни списания, ни строк, ни сводки", async () => {
     const u = await apiUser(db);
     await db.main.query(`
