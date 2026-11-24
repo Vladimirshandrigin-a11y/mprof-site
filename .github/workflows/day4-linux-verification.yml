@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - {label: Final, sha: 'ede74e0c90414f383072b6cfaab22476b6751001'}
+          - {label: Final, sha: 'cb7405af3962d6763c788a7d42499768a802c695'}
     env:
       TARGET_SHA: ${{ matrix.target.sha }}
       NEXT_TELEMETRY_DISABLED: '1'
