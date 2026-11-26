@@ -1,0 +1,52 @@
+name: DAY 5 payments and regression
+
+on:
+  pull_request:
+    branches: [mprof-production]
+  push:
+    branches: [fix/day5-payment-intents-2026-11-25]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+      NEXT_PUBLIC_SUPABASE_URL: https://example.supabase.co
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: isolated-ci-publishable-key
+      MPROF_CALCULATION_EDITS_ENABLED: "false"
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Financial and client regressions
+        run: npm run test:accrual
+      - name: PostgreSQL payments and security regressions
+        run: npm run test:db
+      - name: TypeScript
+        run: npx --no-install tsc --noEmit
+      - name: Production build
+        run: npm run build

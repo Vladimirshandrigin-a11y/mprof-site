@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { supabase } from "../app/lib/supabase-cloud";
-import { PAY_MSG, paymentCreateOutcome } from "./payment-create-result";
+import { PAY_MSG } from "./payment-create-result";
+import { createCheckoutController } from "./payment-intent-client";
 
 export type TariffTier = "single" | "unlimited";
 /** Откуда открыто окно. "api" — расчёт через Ozon API: предлагаем только безлимит. */
@@ -63,12 +64,34 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
   // Реальная оплата через POST /api/payment/create → redirect в ЮKassa.
   const [loadingPlan, setLoadingPlan] = useState<TariffTier | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [newPurchasePlan, setNewPurchasePlan] = useState<TariffTier | null>(null);
   // Запрос создания платежа уже идёт (или идёт переход в ЮKassa): второй не
   // отправляем — ни повторным кликом, ни после закрытия и открытия окна.
   const payInFlight = useRef(false);
+  const checkout = useRef<ReturnType<typeof createCheckoutController> | null>(null);
+  if (!checkout.current) checkout.current = createCheckoutController({
+    storage: () => window.localStorage,
+    withIntentLock: async (scope, operation) => {
+      if (!window.navigator.locks) throw new Error("checkout_lock_unavailable");
+      return window.navigator.locks.request(scope, { mode: "exclusive" }, operation);
+    },
+    createId: () => window.crypto.randomUUID(),
+    getSession: async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      return session ? { userId: session.user.id, token: session.access_token } : null;
+    },
+    request: async (body, token) => {
+      const response = await fetch("/api/payment/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: await response.json().catch(() => null) };
+    },
+  });
 
   // «Назад» со страницы ЮKassa может вернуть страницу из bfcache в состоянии
-  // перехода — снимаем его, чтобы оплату можно было начать снова.
+  // перехода — снимаем его, чтобы продолжить прежнее платёжное намерение.
   useEffect(() => {
     const onPageShow = (e: PageTransitionEvent) => {
       if (!e.persisted) return;
@@ -84,6 +107,7 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
     if (open) {
       if (!payInFlight.current) setLoadingPlan(null);
       setError(null);
+      setNewPurchasePlan(null);
     }
   }, [open, tier, context]);
 
@@ -128,10 +152,11 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
   // Создаёт платёж на бэкенде и редиректит в ЮKassa. Сумма и провайдер —
   // на сервере (PLAN_PRICING); сюда приходит только confirmationUrl. Какой
   // тариф оплачивать — приходит из нажатой кнопки (payPlan).
-  const handlePay = async (payPlan: TariffTier) => {
+  const handlePay = async (payPlan: TariffTier, newPurchase = false) => {
     if (payInFlight.current) return;
     payInFlight.current = true;
     setError(null);
+    setNewPurchasePlan(null);
     setLoadingPlan(payPlan);
     const fail = (message: string) => {
       payInFlight.current = false;
@@ -139,43 +164,18 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
       setLoadingPlan(null);
     };
 
-    let token: string | undefined;
-    try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      token = session?.access_token;
-    } catch {
-      fail(PAY_MSG.failed);
+    const result = await checkout.current!.pay(payPlan, newPurchase);
+    if ("busy" in result) {
+      fail(PAY_MSG.processing);
       return;
     }
-    if (!token) {
-      fail(PAY_MSG.noSession);
-      return;
-    }
-
-    let res: Response;
-    try {
-      res = await fetch("/api/payment/create", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ plan: payPlan }),
-      });
-    } catch {
-      // Запрос не дошёл до сервера (нет сети, обрыв соединения).
-      fail(PAY_MSG.network);
-      return;
-    }
-    const body: unknown = await res.json().catch(() => null);
-    const outcome = paymentCreateOutcome(res.status, body);
+    const { outcome } = result;
     if ("redirect" in outcome) {
       // Уходим на страницу оплаты ЮKassa — loadingPlan и защиту от повтора не снимаем.
       window.location.href = outcome.redirect;
       return;
     }
+    if (outcome.terminal) setNewPurchasePlan(payPlan);
     fail(outcome.message);
   };
 
@@ -662,6 +662,18 @@ export function TariffModal({ open, tier, context = null, onClose }: Props) {
                   </button>
                 </div>
               </>
+            )}
+            {newPurchasePlan && (
+              <div className="tm-actions">
+                <button
+                  type="button"
+                  className="tm-btn tm-btn-ghost"
+                  onClick={() => handlePay(newPurchasePlan, true)}
+                  disabled={loadingPlan !== null}
+                >
+                  Создать новую покупку — {TIER_DATA[newPurchasePlan].priceNumber} ₽
+                </button>
+              </div>
             )}
           </div>
         </div>

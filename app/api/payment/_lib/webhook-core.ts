@@ -11,10 +11,9 @@
 //       premium_until = max(текущий срок, now() БД) + 30 дней и статус подписки.
 //       Повтор того же платежа ничего не начисляет; разные платежи одного
 //       пользователя складываются. Срок НЕ считается в JavaScript.
-//   • single    → подписку в active БЕЗ срока (expires_at=null) и БЕЗ записи в
-//       profiles. Один оплаченный разовый расчёт = сама active single-подписка;
-//       useEntitlements/consume_calculation считают их как +1 к лимиту. Повтор
-//       просто ещё раз ставит active (no-op) и НЕ начисляет лишних расчётов.
+//   • single → grant_single_payment(): одна active single-подписка без срока
+//       плюс private receipt в одной транзакции. Повтор выдаёт granted=false;
+//       profiles/premium_until и правила лимита не меняются.
 //   • status canceled → ещё не оплаченную (pending) подписку в cancelled;
 //   • прочие статусы  → 200, игнорируем.
 //
@@ -28,7 +27,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { PLAN_PRICING, type PaymentPlan, type YooKassaPayment } from "./yookassa";
 
-const SUB_COLS = "id, user_id, plan, status, starts_at, expires_at";
+const SUB_COLS = "id, user_id, plan, status, starts_at, expires_at, provider, provider_payment_id";
 
 type SubRow = {
   id: string;
@@ -37,6 +36,8 @@ type SubRow = {
   status: string;
   starts_at: string | null;
   expires_at: string | null;
+  provider: string | null;
+  provider_payment_id: string | null;
 };
 
 export type Outcome = { http: number; body: Record<string, unknown> };
@@ -48,6 +49,7 @@ type GrantResult = {
   reason?: string;
   activated_at?: string | null;
   premium_until?: string | null;
+  status?: string;
 };
 
 // Сумма из ЮKassa сходится с серверной ценой тарифа (защита от подмены цены).
@@ -57,9 +59,10 @@ export function amountMatches(
   currency: string
 ): boolean {
   if (currency !== "RUB") return false;
-  const paid = Number.parseFloat(value);
-  if (!Number.isFinite(paid)) return false;
-  return Math.abs(paid - PLAN_PRICING[plan].amount) < 0.005;
+  if (!/^(0|[1-9]\d*)(?:\.\d{1,2})?$/.test(value)) return false;
+  const [whole, fractional = ""] = value.split(".");
+  const kopecks = Number(whole) * 100 + Number(fractional.padEnd(2, "0"));
+  return Number.isSafeInteger(kopecks) && kopecks === PLAN_PRICING[plan].amount * 100;
 }
 
 async function findSubscription(
@@ -99,7 +102,7 @@ export async function handleVerifiedPayment(
     return handleVerifiedSucceeded(admin, payment);
   }
   if (payment.status === "canceled") {
-    return handleCanceled(admin, payment.id, payment.metadata?.subscription_id);
+    return handleCanceled(admin, payment);
   }
   // pending / waiting_for_capture / прочее — оплата не подтверждена, не активируем.
   return { http: 200, body: { ok: true, ignored: true, status: payment.status } };
@@ -118,6 +121,14 @@ async function handleVerifiedSucceeded(
   if (dbError) return { http: 500, body: { ok: false, error: "db_error" } };
   if (!sub)
     return { http: 200, body: { ok: false, reason: "subscription_not_found" } };
+
+  if (sub.provider !== "yookassa" ||
+      (sub.provider_payment_id !== null && sub.provider_payment_id !== payment.id)) {
+    return { http: 200, body: { ok: false, reason: "payment_mismatch" } };
+  }
+  if (sub.plan !== "single" && sub.plan !== "unlimited") {
+    return { http: 200, body: { ok: false, reason: "plan_mismatch" } };
+  }
 
   // Источник правды о тарифе — sub.plan из БД. metadata.plan платежа проверяем
   // ТОЛЬКО как мягкую сверку и ТОЛЬКО если он реально пришёл. Если metadata
@@ -157,7 +168,7 @@ async function handleVerifiedSucceeded(
 
   return sub.plan === "unlimited"
     ? activateUnlimited(admin, sub, payment.id)
-    : activateSingle(admin, sub);
+    : activateSingle(admin, sub, payment.id);
 }
 
 // PostgREST: функции нет в схеме (миграция не применена) / PostgreSQL: undefined_function.
@@ -219,63 +230,68 @@ async function activateUnlimited(
   };
 }
 
-// single — один оплаченный разовый расчёт. Кредит = сама active single-подписка
-// (её считает consume_calculation через count active single). profiles и
-// premium_until НЕ трогаем; срок не ставим (expires_at=null) — кредит действует
-// до использования. Идемпотентно: повтор просто ещё раз ставит active (no-op).
+// The single credit and its receipt are committed together under a row lock.
+// A retry after an uncertain response cannot reactivate an expired legacy credit
+// or attach a second provider payment to the same local order.
 async function activateSingle(
   admin: SupabaseClient,
-  sub: SubRow
+  sub: SubRow,
+  paymentId: string
 ): Promise<Outcome> {
-  if (sub.status !== "active") {
-    const startsAt = new Date().toISOString();
-    const { error: subErr } = await admin
-      .from("subscriptions")
-      .update({ status: "active", starts_at: startsAt, expires_at: null })
-      .eq("id", sub.id);
-    if (subErr) {
-      // eslint-disable-next-line no-console
-      console.error("[payment/webhook] single activate error", subErr);
-      return { http: 500, body: { ok: false, error: "sub_update_failed" } };
-    }
+  const { data, error } = await admin.rpc("grant_single_payment", {
+    p_subscription_id: sub.id,
+    p_payment_id: paymentId,
+  });
+  if (error) return {
+    http: 500,
+    body: { ok: false, error: isMissingFunction(error) ? "migration_missing" : "grant_failed" },
+  };
+  const r = data as GrantResult | null;
+  if (!r || typeof r.ok !== "boolean") {
+    return { http: 500, body: { ok: false, error: "grant_failed" } };
   }
-
+  if (!r.ok) return { http: 200, body: { ok: false, reason: r.reason ?? "grant_refused" } };
   return {
     http: 200,
-    body: { ok: true, subscriptionId: sub.id, plan: "single", status: "active" },
+    body: { ok: true, subscriptionId: sub.id, plan: "single", status: r.status ?? (r.granted === true ? "active" : sub.status), granted: r.granted === true },
   };
 }
 
 async function handleCanceled(
   admin: SupabaseClient,
-  paymentId: string,
-  metaSubId: string | undefined
+  payment: YooKassaPayment
 ): Promise<Outcome> {
-  const { sub, dbError } = await findSubscription(admin, paymentId, metaSubId);
+  const { sub, dbError } = await findSubscription(admin, payment.id, payment.metadata?.subscription_id);
   if (dbError) return { http: 500, body: { ok: false, error: "db_error" } };
-  if (!sub)
-    return { http: 200, body: { ok: false, reason: "subscription_not_found" } };
-
-  // Отменяем только ещё не оплаченную (pending). Активную подписку не трогаем —
-  // защита от даунгрейда уже оплаченного доступа (идемпотентность/безопасность).
-  if (sub.status === "pending") {
-    const { error: subErr } = await admin
-      .from("subscriptions")
-      .update({ status: "cancelled" })
-      .eq("id", sub.id);
-    if (subErr) {
-      // eslint-disable-next-line no-console
-      console.error("[payment/webhook] subscription cancel error", subErr);
-      return { http: 500, body: { ok: false, error: "sub_update_failed" } };
-    }
-    return {
-      http: 200,
-      body: { ok: true, subscriptionId: sub.id, status: "cancelled" },
-    };
+  if (!sub) return { http: 200, body: { ok: false, reason: "subscription_not_found" } };
+  if (sub.provider !== "yookassa" ||
+      (sub.provider_payment_id !== null && sub.provider_payment_id !== payment.id)) {
+    return { http: 200, body: { ok: false, reason: "payment_mismatch" } };
   }
-
-  return {
-    http: 200,
-    body: { ok: true, subscriptionId: sub.id, status: sub.status },
+  if (payment.metadata?.subscription_id && payment.metadata.subscription_id !== sub.id) {
+    return { http: 200, body: { ok: false, reason: "subscription_mismatch" } };
+  }
+  if (payment.metadata?.plan && payment.metadata.plan !== sub.plan) {
+    return { http: 200, body: { ok: false, reason: "plan_mismatch" } };
+  }
+  if (!amountMatches(sub.plan, payment.amount.value, payment.amount.currency)) {
+    return { http: 200, body: { ok: false, reason: "amount_mismatch" } };
+  }
+  // The RPC rechecks binding under the same row lock as grant_single_payment /
+  // grant_unlimited_payment. A stale cancellation cannot overwrite active rights.
+  const { data, error } = await admin.rpc("cancel_pending_payment", {
+    p_subscription_id: sub.id,
+    p_payment_id: payment.id,
+  });
+  if (error) return {
+    http: 500,
+    body: { ok: false, error: isMissingFunction(error) ? "migration_missing" : "cancel_failed" },
   };
+  const r = data as { ok?: boolean; reason?: string; status?: string } | null;
+  if (!r || typeof r.ok !== "boolean" || (r.ok && typeof r.status !== "string")) {
+    return { http: 500, body: { ok: false, error: "cancel_failed" } };
+  }
+  return r.ok
+    ? { http: 200, body: { ok: true, subscriptionId: sub.id, status: r.status } }
+    : { http: 200, body: { ok: false, reason: r.reason ?? "cancel_refused" } };
 }

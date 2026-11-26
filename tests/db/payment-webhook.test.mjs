@@ -39,23 +39,25 @@ process.env.SUPABASE_SERVICE_ROLE_KEY = SERVICE_KEY;
 
 const CURRENT = buildRequire("./api/payment/webhook/route.js");
 
-/** Старый обработчик ДОСЛОВНО из базовой production; его зависимости с тех пор не менялись. */
+/** Freeze the historical handler AND its helpers: current provider parsing may
+ * evolve, but legacy-race evidence must continue to execute the historical code. */
 const LEGACY = (() => {
-  for (const dep of ["app/api/payment/_lib/supabase-admin.ts", "app/api/payment/_lib/yookassa.ts"]) {
-    assert.equal(gitShow(BASE_SHA, dep), read(dep), `${dep} не менялся с ${BASE_SHA}`);
-  }
   const ts = createRequire(path.join(root, "package.json"))("typescript");
-  const js = ts.transpileModule(gitShow(BASE_SHA, "app/api/payment/webhook/route.ts"), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2019, esModuleInterop: true },
-  }).outputText;
   const appRequire = createRequire(path.join(root, "package.json"));
-  const deps = {
-    "../_lib/supabase-admin": () => buildRequire("./api/payment/_lib/supabase-admin.js"),
-    "../_lib/yookassa": () => buildRequire("./api/payment/_lib/yookassa.js"),
-  };
-  const mod = { exports: {} };
-  new Function("exports", "require", "module", js)(mod.exports, (s) => (deps[s] ? deps[s]() : appRequire(s)), mod);
-  return mod.exports;
+  const cache = new Map();
+  function load(file) {
+    if (cache.has(file)) return cache.get(file).exports;
+    const mod = { exports: {} }; cache.set(file, mod);
+    const js = ts.transpileModule(gitShow(BASE_SHA, file), {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2019, esModuleInterop: true },
+    }).outputText;
+    const require = spec => spec.startsWith(".")
+      ? load(path.posix.normalize(path.posix.join(path.posix.dirname(file), spec + ".ts")))
+      : appRequire(spec);
+    new Function("exports", "require", "module", js)(mod.exports, require, mod);
+    return mod.exports;
+  }
+  return load("app/api/payment/webhook/route.ts");
 })();
 
 const net = installFetch();
@@ -113,7 +115,7 @@ beforeEach(() => net.reset());
 describe("текущий webhook (route.ts) → RPC grant_unlimited_payment", () => {
   let db;
   before(async () => {
-    db = await freshDb();
+    db = await freshDb({ extraMigrations: [read("supabase/migrations/20261125155702_payment_intents.sql")] });
   });
   beforeEach(() => {
     state.pool = db.pool(12);
@@ -247,7 +249,7 @@ describe("текущий webhook (route.ts) → RPC grant_unlimited_payment", ()
       const snap = await db.snapshot();
       // Подделанное тело «всё оплачено» не влияет: решает ответ ЮKassa.
       const out = await webhook(CURRENT, s.paymentId, {
-        event: "payment.succeeded",
+        type: "notification", event: "payment.succeeded",
         object: { id: s.paymentId, status: "succeeded", paid: true, amount: { value: "449.00", currency: "RUB" } },
       });
       assert.equal(out.status, status);
@@ -264,37 +266,130 @@ describe("текущий webhook (route.ts) → RPC grant_unlimited_payment", ()
     assert.deepEqual(state.log, []);
   });
 
-  it("разовый кредит: прежнее поведение (как у старого обработчика), RPC не вызывается", async () => {
-    const results = {};
-    for (const [name, handler] of [["старый", LEGACY], ["текущий", CURRENT]]) {
-      const u = await db.user({ premium: "6 days", plan: "unlimited" });
-      const before = await db.profile(u);
-      const s = await db.sub(u, "single");
-      paid(s, "single");
-      net.reset();
-      const first = await webhook(handler, s.paymentId);
-      const firstWrites = writes().map((r) => ({ method: r.method, path: r.path, keys: Object.keys(r.body ?? {}).sort() }));
-      net.reset();
-      const again = await webhook(handler, s.paymentId);
-      const againWrites = writes().length;
-      const credits = await db.main.query("select count(*)::int as n from public.subscriptions where user_id = $1 and plan = 'single' and status = 'active'", [u]);
-      assert.deepEqual(await db.profile(u), before, `${name}: безлимит не тронут`);
-      assert.equal((await db.subRow(s.id)).expires_at, null);
-      results[name] = {
-        first: { ...first, body: { ...first.body, subscriptionId: "…" } },
-        again: { ...again, body: { ...again.body, subscriptionId: "…" } },
-        firstWrites,
-        againWrites,
-        credits: credits.rows[0].n,
-        activations: (await db.activations(u)).length,
-      };
-    }
-    assert.deepEqual(results["текущий"], results["старый"]);
-    assert.deepEqual(results["текущий"].firstWrites, [{ method: "PATCH", path: "/rest/v1/subscriptions", keys: ["expires_at", "starts_at", "status"] }]);
-    assert.equal(results["текущий"].againWrites, 0);
-    assert.equal(results["текущий"].credits, 1);
-    assert.equal(results["текущий"].activations, 0);
+  it("разовый кредит: один атомарный receipt, повтор не начисляет заново и не меняет premium", async () => {
+    const u = await db.user({ premium: "6 days", plan: "unlimited" });
+    const before = await db.profile(u);
+    const s = await db.sub(u, "single"); paid(s, "single");
+    const first = await webhook(CURRENT, s.paymentId);
+    assert.equal(first.status, 200); assert.equal(first.body.granted, true);
+    const again = await webhook(CURRENT, s.paymentId);
+    assert.equal(again.status, 200); assert.equal(again.body.granted, false);
+    assert.deepEqual(await db.profile(u), before);
+    assert.equal((await db.subRow(s.id)).expires_at, null);
+    assert.equal((await db.main.query("select count(*)::int as n from public.subscriptions where user_id=$1 and plan='single' and status='active'", [u])).rows[0].n, 1);
+    assert.equal((await db.main.query("select count(*)::int as n from public.single_payment_activations where subscription_id=$1", [s.id])).rows[0].n, 1);
   });
+
+  for (const value of ["149garbage", "149.001", "1.49e2", "149.00 ", " 149.00"]) {
+    it(`строгая сумма отклоняет ${JSON.stringify(value)} без активации`, async () => {
+      const u = await db.user(); const s = await db.sub(u, "single");
+      paid(s, "single", { amount: { value, currency: "RUB" } });
+      const out = await webhook(CURRENT, s.paymentId);
+      assert.deepEqual(out, { status: 200, body: { ok: false, reason: "amount_mismatch" } });
+      assert.equal((await db.subRow(s.id)).status, "pending");
+      assert.equal(net.rpcCalls().length, 0);
+    });
+  }
+
+  it("GET ЮKassa обязан вернуть тот же payment_id, который проверяем", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single");
+    paid(s, "single", { id: "another-provider-payment" });
+    const out = await webhook(CURRENT, s.paymentId);
+    assert.deepEqual(out, { status: 502, body: { ok: false, error: "verification_failed" } });
+    assert.equal(net.rpcCalls().length, 0);
+    assert.equal((await db.subRow(s.id)).status, "pending");
+  });
+
+  it("другой подтверждённый платёж не активирует single-заказ через metadata fallback", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single");
+    paid({ id: s.id, paymentId: "another-provider-payment" }, "single");
+    const out = await webhook(CURRENT, "another-provider-payment");
+    assert.deepEqual(out, { status: 200, body: { ok: false, reason: "payment_mismatch" } });
+    assert.equal((await db.subRow(s.id)).status, "pending");
+    assert.equal(net.rpcCalls().length, 0);
+  });
+
+  it("четыре параллельных single webhook выдают один receipt и один кредит", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single"); paid(s, "single");
+    const out = await Promise.all([1,2,3,4].map(() => webhook(CURRENT, s.paymentId)));
+    assert.ok(out.every(x => x.status === 200 && x.body.ok));
+    assert.equal(out.filter(x => x.body.granted === true).length, 1);
+    assert.equal((await db.main.query("select count(*)::int as n from public.single_payment_activations where subscription_id=$1", [s.id])).rows[0].n, 1);
+    assert.equal((await db.main.query("select count(*)::int as n from public.subscriptions where user_id=$1 and plan='single' and status='active'", [u])).rows[0].n, 1);
+  });
+
+  it("single COMMIT с потерянным ответом восстанавливается без двойной выдачи", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single"); paid(s, "single");
+    state.dropAfterCommit = req => req.path === "/rest/v1/rpc/grant_single_payment";
+    const lost = await webhook(CURRENT, s.paymentId);
+    assert.equal(lost.status, 500); assert.equal((await db.subRow(s.id)).status, "active");
+    state.dropAfterCommit = null;
+    const retry = await webhook(CURRENT, s.paymentId);
+    assert.equal(retry.body.granted, false);
+    assert.equal((await db.main.query("select count(*)::int as n from public.single_payment_activations where subscription_id=$1", [s.id])).rows[0].n, 1);
+  });
+
+  it("устаревшая отмена не перезаписывает параллельную успешную активацию", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single");
+    paid(s, "single", { status: "canceled", paid: false });
+    const pause = gate(req => req.path === "/rest/v1/rpc/cancel_pending_payment");
+    state.gates.push(pause);
+    const cancel = webhook(CURRENT, s.paymentId);
+    await pause.reached;
+    paid(s, "single"); const activated = await webhook(CURRENT, s.paymentId);
+    assert.equal(activated.body.granted, true);
+    pause.open(); const canceled = await cancel;
+    assert.equal(canceled.status, 200); assert.equal(canceled.body.status, "active");
+    assert.equal((await db.subRow(s.id)).status, "active");
+  });
+
+  it("отмена другого provider payment не меняет связанный single-заказ", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single");
+    paid({ id: s.id, paymentId: "other-cancel" }, "single", { status: "canceled", paid: false });
+    const out = await webhook(CURRENT, "other-cancel");
+    assert.deepEqual(out, { status: 200, body: { ok: false, reason: "payment_mismatch" } });
+    assert.equal((await db.subRow(s.id)).status, "pending");
+  });
+
+  it("порядок event не заменяет актуальное подтверждённое состояние ЮKassa", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single"); paid(s, "single");
+    const out = await webhook(CURRENT, s.paymentId, { type: "notification", event: "payment.canceled", object: { id: s.paymentId } });
+    assert.equal(out.body.granted, true);
+    assert.equal((await db.subRow(s.id)).status, "active");
+  });
+
+  it("старый expired single не реактивируется и не получает новый receipt", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single", { status: "expired" }); paid(s, "single");
+    const out = await webhook(CURRENT, s.paymentId);
+    assert.equal(out.status, 200); assert.equal(out.body.granted, false); assert.equal(out.body.status, "expired");
+    assert.equal((await db.subRow(s.id)).status, "expired");
+    assert.equal((await db.main.query("select count(*)::int as n from public.single_payment_activations where subscription_id=$1", [s.id])).rows[0].n, 0);
+  });
+
+  it("поздний авторитетный succeeded после cancelled выдаёт single один раз", async () => {
+    const u = await db.user(); const s = await db.sub(u, "single");
+    paid(s, "single", { status: "canceled", paid: false });
+    const canceled = await webhook(CURRENT, s.paymentId);
+    assert.equal(canceled.body.status, "cancelled");
+    paid(s, "single"); const paidResult = await webhook(CURRENT, s.paymentId);
+    assert.equal(paidResult.body.granted, true);
+    assert.equal((await webhook(CURRENT, s.paymentId)).body.granted, false);
+    assert.equal((await db.subRow(s.id)).status, "active");
+  });
+
+  it("refund event требует отдельной политики: 503, никаких изменений прав или повторной выдачи", async () => {
+    const out = await webhook(CURRENT, "refund-test", { type: "notification", event: "refund.succeeded", object: { id: "refund-test", payment_id: "untrusted" } });
+    assert.deepEqual(out, { status: 503, body: { ok: false, error: "refund_review_required" } });
+    assert.deepEqual(state.log, []);
+  });
+
+  for (const body of [null, [], { object: { id: "x" } }, { type: "notification", event: "unknown", object: { id: "x" } }]) {
+    it(`неподдерживаемое/поддельное уведомление не запускает внешние запросы: ${JSON.stringify(body)}`, async () => {
+      const req = new Request("http://localhost/api/payment/webhook", { method: "POST", body: JSON.stringify(body) });
+      const res = await CURRENT.POST(req);
+      assert.equal(res.status, 400); assert.deepEqual(state.log, []);
+    });
+  }
 
   it("миграция не применена: RPC нет (PGRST202) → 500 migration_missing, доступ не выдан; после миграции повтор выдаёт один раз", async () => {
     const bare = await freshDb({ migrated: false });

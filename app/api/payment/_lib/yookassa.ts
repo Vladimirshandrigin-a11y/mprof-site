@@ -12,8 +12,6 @@
 // «ЮKassa не настроена», без сетевых запросов.
 // ============================================================================
 
-import { randomUUID } from "crypto";
-
 const YOOKASSA_API = "https://api.yookassa.ru/v3/payments";
 const REQUEST_TIMEOUT_MS = 20000;
 
@@ -49,7 +47,7 @@ export interface CreatePaymentInput {
   /** Куда ЮKassa вернёт пользователя после оплаты. */
   returnUrl: string;
   /** Ключ идемпотентности — защищает от двойного списания при ретраях. */
-  idempotenceKey?: string;
+  idempotenceKey: string;
   /** Прокидывается в платёж и приходит обратно в webhook. */
   metadata?: Record<string, string>;
 }
@@ -60,6 +58,7 @@ export interface CreatePaymentResult {
   confirmationUrl?: string;
   status?: string;
   error?: string;
+  payment?: YooKassaPayment;
 }
 
 // Реальный POST в ЮKassa v3. Basic-auth (shopId:secretKey), заголовок
@@ -80,7 +79,7 @@ export async function createYooKassaPayment(
       method: "POST",
       headers: {
         Authorization: `Basic ${auth}`,
-        "Idempotence-Key": input.idempotenceKey || randomUUID(),
+        "Idempotence-Key": input.idempotenceKey,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
@@ -97,24 +96,20 @@ export async function createYooKassaPayment(
     const raw = await res.text();
     if (!res.ok) {
       // eslint-disable-next-line no-console
-      console.error("[yookassa] upstream error", res.status, raw.slice(0, 300));
+      console.error("[yookassa] upstream error", res.status);
       return { ok: false, error: `ЮKassa ответила статусом ${res.status}` };
     }
 
-    const data = JSON.parse(raw) as {
-      id?: string;
-      status?: string;
-      confirmation?: { confirmation_url?: string };
-    };
-    const confirmationUrl = data.confirmation?.confirmation_url;
-    if (!data.id || !confirmationUrl) {
+    const payment = normalizePayment(JSON.parse(raw));
+    if (!payment) {
       return { ok: false, error: "ЮKassa вернула неполный ответ" };
     }
     return {
       ok: true,
-      paymentId: data.id,
-      confirmationUrl,
-      status: data.status,
+      paymentId: payment.id,
+      confirmationUrl: payment.confirmationUrl,
+      status: payment.status,
+      payment,
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : "сеть недоступна";
@@ -140,6 +135,20 @@ export interface YooKassaPayment {
   paid: boolean;
   amount: { value: string; currency: string };
   metadata: Record<string, string>;
+  confirmationUrl?: string;
+}
+
+function normalizePayment(value: unknown): YooKassaPayment | null {
+  if (!value || typeof value !== "object") return null;
+  const data = value as { id?: unknown; status?: unknown; paid?: unknown;
+    amount?: { value?: unknown; currency?: unknown }; metadata?: Record<string, string>;
+    confirmation?: { confirmation_url?: unknown } };
+  if (typeof data.id !== "string" || !data.id || typeof data.status !== "string"
+    || !["pending", "waiting_for_capture", "succeeded", "canceled"].includes(data.status)
+    || typeof data.amount?.value !== "string" || typeof data.amount?.currency !== "string") return null;
+  return { id: data.id, status: data.status, paid: data.paid === true,
+    amount: { value: data.amount.value, currency: data.amount.currency }, metadata: data.metadata ?? {},
+    ...(typeof data.confirmation?.confirmation_url === "string" ? { confirmationUrl: data.confirmation.confirmation_url } : {}) };
 }
 
 export interface FetchPaymentResult {
@@ -168,32 +177,17 @@ export async function getYooKassaPayment(
     const raw = await res.text();
     if (!res.ok) {
       // eslint-disable-next-line no-console
-      console.error("[yookassa] get payment error", res.status, raw.slice(0, 300));
+      console.error("[yookassa] get payment error", res.status);
       return { ok: false, error: `ЮKassa ответила статусом ${res.status}` };
     }
 
-    const data = JSON.parse(raw) as {
-      id?: string;
-      status?: string;
-      paid?: boolean;
-      amount?: { value?: string; currency?: string };
-      metadata?: Record<string, string>;
-    };
-    if (!data.id || typeof data.status !== "string" || !data.amount) {
+    const payment = normalizePayment(JSON.parse(raw));
+    if (!payment || payment.id !== paymentId) {
       return { ok: false, error: "ЮKassa вернула неполный ответ" };
     }
     return {
       ok: true,
-      payment: {
-        id: data.id,
-        status: data.status,
-        paid: data.paid === true,
-        amount: {
-          value: String(data.amount.value ?? ""),
-          currency: String(data.amount.currency ?? ""),
-        },
-        metadata: data.metadata ?? {},
-      },
+      payment,
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : "сеть недоступна";
