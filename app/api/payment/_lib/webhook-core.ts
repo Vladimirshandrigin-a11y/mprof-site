@@ -25,7 +25,7 @@
 // ============================================================================
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { PLAN_PRICING, type PaymentPlan, type YooKassaPayment } from "./yookassa";
+import { PLAN_PRICING, type PaymentPlan, type YooKassaPayment, type YooKassaRefund } from "./yookassa";
 
 const SUB_COLS = "id, user_id, plan, status, starts_at, expires_at, provider, provider_payment_id";
 
@@ -58,11 +58,14 @@ export function amountMatches(
   value: string,
   currency: string
 ): boolean {
-  if (currency !== "RUB") return false;
-  if (!/^(0|[1-9]\d*)(?:\.\d{1,2})?$/.test(value)) return false;
+  return rubKopecks(value, currency) === PLAN_PRICING[plan].amount * 100;
+}
+
+function rubKopecks(value: string, currency: string): number | null {
+  if (currency !== "RUB" || !/^(0|[1-9]\d*)(?:\.\d{1,2})?$/.test(value)) return null;
   const [whole, fractional = ""] = value.split(".");
   const kopecks = Number(whole) * 100 + Number(fractional.padEnd(2, "0"));
-  return Number.isSafeInteger(kopecks) && kopecks === PLAN_PRICING[plan].amount * 100;
+  return Number.isSafeInteger(kopecks) && kopecks > 0 ? kopecks : null;
 }
 
 async function findSubscription(
@@ -106,6 +109,41 @@ export async function handleVerifiedPayment(
   }
   // pending / waiting_for_capture / прочее — оплата не подтверждена, не активируем.
   return { http: 200, body: { ok: true, ignored: true, status: payment.status } };
+}
+
+export async function handleVerifiedRefund(
+  admin: SupabaseClient, refund: YooKassaRefund, payment: YooKassaPayment
+): Promise<Outcome> {
+  const amount = rubKopecks(refund.amount.value, refund.amount.currency);
+  const paid = rubKopecks(payment.amount.value, payment.amount.currency);
+  if (refund.paymentId !== payment.id || payment.status !== "succeeded" || !payment.paid
+    || amount === null || paid === null || amount > paid) {
+    return { http: 502, body: { ok: false, error: "refund_verification_failed" } };
+  }
+
+  const { sub, dbError } = await findSubscription(admin, payment.id, payment.metadata.subscription_id);
+  if (dbError) return { http: 500, body: { ok: false, error: "db_error" } };
+  if (!sub) return { http: 200, body: { ok: true, ignored: true, reason: "subscription_not_found" } };
+  if (sub.provider !== "yookassa" || (sub.provider_payment_id !== null && sub.provider_payment_id !== payment.id)
+    || (payment.metadata.subscription_id && payment.metadata.subscription_id !== sub.id)
+    || (payment.metadata.plan && payment.metadata.plan !== sub.plan)
+    || (sub.plan !== "single" && sub.plan !== "unlimited")
+    || !amountMatches(sub.plan, payment.amount.value, payment.amount.currency)) {
+    return { http: 200, body: { ok: false, reason: "refund_payment_mismatch" } };
+  }
+
+  const { data, error } = await admin.rpc("apply_payment_refund", {
+    p_refund_id: refund.id,
+    p_subscription_id: sub.id,
+    p_payment_id: payment.id,
+    p_amount_kopecks: amount,
+    p_is_full: amount === paid,
+  });
+  if (error || data?.ok !== true) {
+    console.error("[payment/webhook] refund receipt failed", error?.code ?? data?.reason);
+    return { http: 500, body: { ok: false, error: "refund_processing_failed" } };
+  }
+  return { http: 200, body: { ok: true, outcome: data.outcome } };
 }
 
 // Оставшиеся сверки (план/сумма/привязка) против верифицированного платежа, и

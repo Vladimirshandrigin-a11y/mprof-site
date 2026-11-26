@@ -377,10 +377,10 @@ describe("текущий webhook (route.ts) → RPC grant_unlimited_payment", ()
     assert.equal((await db.subRow(s.id)).status, "active");
   });
 
-  it("refund event требует отдельной политики: 503, никаких изменений прав или повторной выдачи", async () => {
+  it("неподтверждённый refund: запрос только к refunds API, никаких изменений прав", async () => {
     const out = await webhook(CURRENT, "refund-test", { type: "notification", event: "refund.succeeded", object: { id: "refund-test", payment_id: "untrusted" } });
-    assert.deepEqual(out, { status: 503, body: { ok: false, error: "refund_review_required" } });
-    assert.deepEqual(state.log, []);
+    assert.deepEqual(out, { status: 502, body: { ok: false, error: "refund_verification_failed" } });
+    assert.deepEqual(state.log.map(({ method, path }) => [method, path]), [["GET", "/v3/refunds/refund-test"]]);
   });
 
   for (const body of [null, [], { object: { id: "x" } }, { type: "notification", event: "unknown", object: { id: "x" } }]) {

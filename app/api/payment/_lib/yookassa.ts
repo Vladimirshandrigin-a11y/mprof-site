@@ -12,7 +12,7 @@
 // «ЮKassa не настроена», без сетевых запросов.
 // ============================================================================
 
-const YOOKASSA_API = "https://api.yookassa.ru/v3/payments";
+const YOOKASSA_API = "https://api.yookassa.ru/v3";
 const REQUEST_TIMEOUT_MS = 20000;
 
 // Локальный тип (не тянем из "use client"-модуля, чтобы серверный код был
@@ -75,7 +75,7 @@ export async function createYooKassaPayment(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(YOOKASSA_API, {
+    const res = await fetch(`${YOOKASSA_API}/payments`, {
       method: "POST",
       headers: {
         Authorization: `Basic ${auth}`,
@@ -160,38 +160,53 @@ export interface FetchPaymentResult {
 export async function getYooKassaPayment(
   paymentId: string
 ): Promise<FetchPaymentResult> {
+  const object = await getYooKassaObject("payments", paymentId);
+  const payment = normalizePayment(object);
+  return payment?.id === paymentId ? { ok: true, payment } : { ok: false };
+}
+
+export interface YooKassaRefund {
+  id: string;
+  paymentId: string;
+  amount: { value: string; currency: string };
+}
+
+export async function getYooKassaRefund(refundId: string): Promise<YooKassaRefund | null> {
+  const object = await getYooKassaObject("refunds", refundId) as {
+    id?: unknown;
+    payment_id?: unknown;
+    status?: unknown;
+    amount?: { value?: unknown; currency?: unknown };
+  } | null;
+  if (!object || object.id !== refundId || object.status !== "succeeded"
+    || typeof object.payment_id !== "string" || !object.payment_id.trim() || object.payment_id.length > 128
+    || typeof object.amount?.value !== "string" || typeof object.amount?.currency !== "string") return null;
+  return { id: refundId, paymentId: object.payment_id,
+    amount: { value: object.amount.value, currency: object.amount.currency } };
+}
+
+async function getYooKassaObject(collection: "payments" | "refunds", id: string): Promise<unknown> {
   const cfg = getConfig();
-  if (!cfg) return { ok: false, error: "ЮKassa не настроена" };
+  if (!cfg) return null;
 
   const auth = Buffer.from(`${cfg.shopId}:${cfg.secretKey}`).toString("base64");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const res = await fetch(`${YOOKASSA_API}/${encodeURIComponent(paymentId)}`, {
+    const res = await fetch(`${YOOKASSA_API}/${collection}/${encodeURIComponent(id)}`, {
       method: "GET",
       headers: { Authorization: `Basic ${auth}` },
       cache: "no-store",
       signal: controller.signal,
     });
 
-    const raw = await res.text();
     if (!res.ok) {
-      // eslint-disable-next-line no-console
-      console.error("[yookassa] get payment error", res.status);
-      return { ok: false, error: `ЮKassa ответила статусом ${res.status}` };
+      console.error("[yookassa] verification failed", collection, res.status);
+      return null;
     }
-
-    const payment = normalizePayment(JSON.parse(raw));
-    if (!payment || payment.id !== paymentId) {
-      return { ok: false, error: "ЮKassa вернула неполный ответ" };
-    }
-    return {
-      ok: true,
-      payment,
-    };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "сеть недоступна";
-    return { ok: false, error: `ЮKassa недоступна: ${msg}` };
+    return await res.json();
+  } catch {
+    return null;
   } finally {
     clearTimeout(timeout);
   }
