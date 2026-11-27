@@ -25,10 +25,12 @@ import {
   payTestEnv,
   pidOf,
   runScript,
+  read,
   waitForLock,
 } from "./helpers/pay-db.mjs";
 
 const WH = buildRequire("./api/payment/_lib/webhook-core.js");
+const DAY5_MIGRATION = read("supabase/migrations/20261125155702_payment_intents.sql");
 const { freshDb, client } = payTestEnv();
 
 /** Подмножество supabase-js, которое использует webhook-core, поверх одного pg-соединения. */
@@ -439,7 +441,7 @@ describe("сбои и повторы", () => {
 describe("webhook: сверки платежа и разовый кредит", () => {
   let db;
   before(async () => {
-    db = await freshDb();
+    db = await freshDb({ extraMigrations: [DAY5_MIGRATION] });
   });
 
   it("безлимит через webhook: 200, +30 дней, одновременная повторная доставка — одна выдача", async () => {
@@ -518,7 +520,12 @@ describe("webhook: сверки платежа и разовый кредит", 
       (await db.serviceMany(3)).map((c) => WH.handleVerifiedPayment(adminOver(c), yk(s, "single")))
     );
     const again = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(s, "single"));
-    for (const o of [...outs, again]) assert.deepEqual(o, { http: 200, body: { ok: true, subscriptionId: s.id, plan: "single", status: "active" } });
+    for (const o of [...outs, again]) {
+      assert.equal(o.http, 200);
+      assert.deepEqual({ ...o.body, granted: undefined }, { ok: true, subscriptionId: s.id, plan: "single", status: "active", granted: undefined });
+    }
+    assert.equal(outs.filter(o => o.body.granted === true).length, 1);
+    assert.equal(again.body.granted, false);
     assert.deepEqual(await db.profile(u), before, "безлимит не тронут");
     assert.equal((await db.subRow(s.id)).expires_at, null);
     assert.equal((await db.activations(u)).length, 0);
@@ -662,7 +669,7 @@ describe("миграция, read-only проверки и порядок вып�
     assert.equal(await describeDb(full.main), await describeDb(migrated.main));
   });
 
-  it("код раньше миграции: безлимит не выдаётся (500 migration_missing, ЮKassa повторит), разовый работает; после миграции повтор выдаёт один раз", async () => {
+  it("код до необходимых миграций закрывает оба grant; последовательное добавление SQL восстанавливает выдачу один раз", async () => {
     const db = await freshDb({ migrated: false });
     const u = await db.user({ premium: "10 days", plan: "unlimited" });
     const start = (await db.profile(u)).premium_until;
@@ -673,12 +680,20 @@ describe("миграция, read-only проверки и порядок вып�
     assert.deepEqual(out, { http: 500, body: { ok: false, error: "migration_missing" } });
     assert.equal(await db.snapshot(), snap);
     const outSingle = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(single, "single"));
-    assert.equal(outSingle.http, 200);
-    assert.equal((await db.subRow(single.id)).status, "active");
+    assert.deepEqual(outSingle, { http: 500, body: { ok: false, error: "migration_missing" } });
+    assert.equal((await db.subRow(single.id)).status, "pending");
 
     await runScript(db.main, MIGRATION);
     const retry = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(s, "unlimited"));
     assert.equal(retry.body.granted, true);
+    assert.ok(await db.holds("$1::timestamptz = $2::timestamptz + interval '30 days'", [(await db.profile(u)).premium_until, start]));
+    const stillMissing = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(single, "single"));
+    assert.deepEqual(stillMissing, { http: 500, body: { ok: false, error: "migration_missing" } });
+    await runScript(db.main, DAY5_MIGRATION);
+    const singleRetry = await WH.handleVerifiedPayment(adminOver(await db.service()), yk(single, "single"));
+    assert.equal(singleRetry.body.granted, true);
+    assert.equal((await WH.handleVerifiedPayment(adminOver(await db.service()), yk(single, "single"))).body.granted, false);
+    assert.equal((await db.subRow(single.id)).status, "active");
     assert.ok(await db.holds("$1::timestamptz = $2::timestamptz + interval '30 days'", [(await db.profile(u)).premium_until, start]));
   });
 });

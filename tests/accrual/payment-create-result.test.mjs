@@ -1,7 +1,7 @@
 // Сообщения окна оплаты (app/components/payment-create-result.ts + TariffModal):
 // причина называется только когда её задаёт статус/код ответа, технические тексты
 // сервера не показываются, в ЮKassa уходим только по https-адресу из ответа ok.
-// Запрос, сумма и тариф не меняются.
+// Сумма и тариф задаются сервером; повтор использует тот же intentId.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -74,14 +74,27 @@ describe("payment-create-result: ответ /api/payment/create → действ
   it("сообщение о сети — отдельное и без технических деталей", () => {
     assert.equal(M.network, "Проверьте интернет-соединение и повторите попытку.");
   });
+
+  it("202 и неопределённый результат требуют проверки прежней покупки", () => {
+    assert.deepEqual(out(202, { code: "payment_in_progress" }), { message: M.processing });
+    assert.deepEqual(out(409, { code: "reconciliation_required" }), { message: M.reconciliation });
+  });
+
+  it("новая осознанная покупка доступна только после подтверждённого терминального ответа", () => {
+    assert.deepEqual(out(409, { code: "payment_canceled" }), { message: M.canceled, terminal: "canceled" });
+    assert.deepEqual(out(200, { ok: true, code: "payment_succeeded" }), { message: M.succeeded, terminal: "succeeded" });
+    assert.deepEqual(out(200, { ok: false, code: "payment_succeeded" }), { message: M.failed });
+    assert.deepEqual(out(502, { code: "payment_canceled" }), { message: M.failed });
+  });
 });
 
 describe("TariffModal: запрос и защита от повторов (по исходному коду)", () => {
   const src = readFileSync(path.join(REPO_ROOT, "app/components/TariffModal.tsx"), "utf8");
 
-  it("в запрос уходит только тариф — сумма и цена задаются сервером", () => {
+  it("запрос содержит стабильное намерение; сумма и цена задаются сервером", () => {
     assert.ok(src.includes('fetch("/api/payment/create"'));
-    assert.ok(src.includes("body: JSON.stringify({ plan: payPlan })"));
+    assert.ok(src.includes("body: JSON.stringify(body)"));
+    assert.ok(src.includes("checkout.current!.pay(payPlan, newPurchase)"));
     assert.ok(!/amount\s*:/.test(src.slice(src.indexOf("handlePay"))), "amount в запросе");
   });
 

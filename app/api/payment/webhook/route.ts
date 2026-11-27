@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSupabaseAdmin } from "../_lib/supabase-admin";
-import { isYooKassaConfigured, getYooKassaPayment } from "../_lib/yookassa";
-import { handleVerifiedPayment } from "../_lib/webhook-core";
+import { isYooKassaConfigured, getYooKassaPayment, getYooKassaRefund } from "../_lib/yookassa";
+import { handleVerifiedPayment, handleVerifiedRefund } from "../_lib/webhook-core";
 
 // ЮKassa шлёт webhook обычным POST с JSON — Node-рантайм, без кеша.
 export const runtime = "nodejs";
@@ -37,22 +37,35 @@ export const dynamic = "force-dynamic";
 // Из тела берём ТОЛЬКО object.id — указатель на платёж. Статус/сумму/план НЕ
 // читаем из тела (его могли подделать); всё это берётся из API ЮKassa ниже.
 type Notification = {
-  object?: { id?: string };
+  type?: unknown;
+  event?: unknown;
+  object?: { id?: unknown };
 };
+const NO_STORE = { "Cache-Control": "no-store" } as const;
+const PAYMENT_EVENTS = new Set(["payment.succeeded", "payment.canceled", "payment.waiting_for_capture"]);
 
 export async function POST(req: NextRequest) {
-  let body: Notification;
+  let rawBody: unknown;
   try {
-    body = (await req.json()) as Notification;
+    rawBody = await req.json();
   } catch {
-    return NextResponse.json({ ok: false, error: "bad_json" }, { status: 400 });
+    return NextResponse.json({ ok: false, error: "bad_json" }, { status: 400, headers: NO_STORE });
   }
 
-  const paymentId = body.object?.id;
-  if (typeof paymentId !== "string" || !paymentId) {
+  const body = rawBody !== null && typeof rawBody === "object" && !Array.isArray(rawBody)
+    ? rawBody as Notification : null;
+  if (!body || body.type !== "notification" || typeof body.event !== "string") {
+    return NextResponse.json({ ok: false, error: "invalid_notification" }, { status: 400, headers: NO_STORE });
+  }
+  const isRefund = body.event === "refund.succeeded";
+  if (!isRefund && !PAYMENT_EVENTS.has(body.event)) {
+    return NextResponse.json({ ok: false, error: "unsupported_notification" }, { status: 400, headers: NO_STORE });
+  }
+  const objectId = body.object?.id;
+  if (typeof objectId !== "string" || !objectId.trim() || objectId.length > 128) {
     return NextResponse.json(
       { ok: false, error: "invalid_notification" },
-      { status: 400 }
+      { status: 400, headers: NO_STORE }
     );
   }
 
@@ -60,7 +73,7 @@ export async function POST(req: NextRequest) {
   if (!isYooKassaConfigured()) {
     return NextResponse.json(
       { ok: false, error: "yookassa_not_configured" },
-      { status: 503 }
+      { status: 503, headers: NO_STORE }
     );
   }
 
@@ -68,26 +81,35 @@ export async function POST(req: NextRequest) {
   if (!admin) {
     return NextResponse.json(
       { ok: false, error: "service_role_missing" },
-      { status: 500 }
+      { status: 500, headers: NO_STORE }
     );
   }
 
+  // An incoming refund identifies a refund object. Its payment ID, amount and
+  // status come from authenticated GETs to ЮKassa, never the webhook body.
+  const refund = isRefund ? await getYooKassaRefund(objectId) : null;
+  if (isRefund && !refund) {
+    return NextResponse.json({ ok: false, error: "refund_verification_failed" }, { status: 502, headers: NO_STORE });
+  }
+  const paymentId = refund?.paymentId ?? objectId;
+
   // АВТОРИТЕТНАЯ перепроверка: запрашиваем платёж напрямую у ЮKassa по id из тела.
   const verify = await getYooKassaPayment(paymentId);
-  if (!verify.ok || !verify.payment) {
+  if (!verify.ok || !verify.payment || verify.payment.id !== paymentId) {
     // Не смогли проверить (сеть / 5xx / 404). 502 → ЮKassa повторит уведомление,
     // реальная оплата не потеряется. Активация НЕ происходит.
     // eslint-disable-next-line no-console
     console.error("[payment/webhook] verification failed", {
-      paymentId,
-      error: verify.error,
+      reason: verify.payment && verify.payment.id !== paymentId ? "payment_id_mismatch" : "provider_unavailable",
     });
     return NextResponse.json(
       { ok: false, error: "verification_failed" },
-      { status: 502 }
+      { status: 502, headers: NO_STORE }
     );
   }
 
-  const outcome = await handleVerifiedPayment(admin, verify.payment);
-  return NextResponse.json(outcome.body, { status: outcome.http });
+  const outcome = refund
+    ? await handleVerifiedRefund(admin, refund, verify.payment)
+    : await handleVerifiedPayment(admin, verify.payment);
+  return NextResponse.json(outcome.body, { status: outcome.http, headers: NO_STORE });
 }

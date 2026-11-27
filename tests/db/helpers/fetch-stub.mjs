@@ -77,6 +77,8 @@ export function installFetch() {
     log: [],
     /** Ответ ЮKassa: (paymentId) => Response. */
     yookassa: null,
+    /** Ответ GET /v3/refunds/{id}. */
+    yookassaRefund: null,
     /** Ответ Ozon Seller API: (req) => Response; null — обращение к Ozon в тесте запрещено. */
     ozon: null,
     /** pg.Pool текущей тестовой базы. */
@@ -197,6 +199,10 @@ export function installFetch() {
     const body = init.body == null ? null : JSON.parse(String(init.body));
     const req = { method, url, path: new URL(url).pathname, headers, body };
     state.log.push(req);
+    if (url.startsWith(`${YOOKASSA}v3/refunds/`)) {
+      const id = decodeURIComponent(url.slice(`${YOOKASSA}v3/refunds/`.length));
+      return state.yookassaRefund?.(id, req) ?? json(404, { code: "not_found" });
+    }
     if (url.startsWith(YOOKASSA)) {
       const id = decodeURIComponent(url.slice(`${YOOKASSA}v3/payments/`.length));
       return state.yookassa(id, req);

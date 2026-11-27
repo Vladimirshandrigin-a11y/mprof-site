@@ -1,157 +1,84 @@
 import { NextRequest, NextResponse } from "next/server";
-import { randomUUID } from "crypto";
-import {
-  PLAN_PRICING,
-  isYooKassaConfigured,
-  createYooKassaPayment,
-  type PaymentPlan,
-} from "../_lib/yookassa";
+import { PLAN_PRICING, isYooKassaConfigured, createYooKassaPayment,
+  getYooKassaPayment, type PaymentPlan } from "../_lib/yookassa";
 import { getSupabaseAdmin } from "../_lib/supabase-admin";
+import { PAYMENT_INTENT_ID, paymentMatchesIntent, safeConfirmationUrl,
+  type PaymentIntentClaim } from "../_lib/payment-intent";
 
-// ЮKassa требует Node-рантайм (Basic-auth, произвольные заголовки, Buffer).
 export const runtime = "nodejs";
-// Платёж создаётся живым запросом — никогда не кешируем.
 export const dynamic = "force-dynamic";
-
-// ============================================================================
-// POST /api/payment/create
-//
-// Этап 1 (каркас). Что делает:
-//   1. валидирует plan ("single" | "unlimited") и берёт сумму с СЕРВЕРА
-//      (149 / 449 ₽) — цену с клиента не принимаем;
-//   2. если ЮKassa не настроена (нет YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY) —
-//      сразу отдаёт понятную ошибку «ЮKassa не настроена», без сетевых вызовов
-//      и без записи в БД (безопасный режим, пока ключей нет);
-//   3. когда ключи появятся: создаёт pending-подписку (service-role, в обход
-//      RLS), создаёт платёж в ЮKassa и возвращает confirmationUrl для редиректа.
-//
-// Любой сбой → JSON { ok:false, error } с осмысленным HTTP-статусом. Не бросает.
-// ============================================================================
-
-const VALID_PLANS: PaymentPlan[] = ["single", "unlimited"];
-
-function isValidPlan(v: unknown): v is PaymentPlan {
-  return typeof v === "string" && (VALID_PLANS as string[]).includes(v);
-}
+const NO_STORE = { "Cache-Control": "no-store" };
+const response = (status: number, body: Record<string, unknown>) =>
+  NextResponse.json(body, { status, headers: NO_STORE });
 
 export async function POST(req: NextRequest) {
-  // 1. Тело + валидация плана
-  let body: { plan?: unknown };
-  try {
-    body = (await req.json()) as { plan?: unknown };
-  } catch {
-    return NextResponse.json(
-      { ok: false, error: "Некорректный JSON в теле запроса" },
-      { status: 400 }
-    );
-  }
-  if (!isValidPlan(body.plan)) {
-    return NextResponse.json(
-      { ok: false, error: "plan должен быть 'single' или 'unlimited'" },
-      { status: 400 }
-    );
-  }
-  const plan = body.plan;
-  const { amount } = PLAN_PRICING[plan];
-
-  // 2. Главный gate этапа 1: без ключей ЮKassa ничего не делаем.
-  if (!isYooKassaConfigured()) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "ЮKassa не настроена",
-        code: "yookassa_not_configured",
-      },
-      { status: 503 }
-    );
-  }
-
-  // 3. Service-role клиент — нужен, чтобы писать в subscriptions в обход RLS.
+  let body: { plan?: unknown; intentId?: unknown };
+  try { body = await req.json(); } catch { return response(400, { ok: false, code: "bad_request" }); }
+  if (!body || (body.plan !== "single" && body.plan !== "unlimited"))
+    return response(400, { ok: false, code: "invalid_plan" });
+  if (typeof body.intentId !== "string" || !PAYMENT_INTENT_ID.test(body.intentId))
+    return response(400, { ok: false, code: "invalid_intent" });
+  const plan: PaymentPlan = body.plan;
+  const intentId = body.intentId.toLowerCase();
+  if (!isYooKassaConfigured()) return response(503, { ok: false, code: "yookassa_not_configured" });
   const admin = getSupabaseAdmin();
-  if (!admin) {
-    return NextResponse.json(
-      {
-        ok: false,
-        error: "Supabase service role не настроен (SUPABASE_SERVICE_ROLE_KEY)",
-        code: "service_role_missing",
-      },
-      { status: 500 }
-    );
-  }
-
-  // 4. Авторизация: токен пользователя из заголовка Authorization: Bearer <jwt>.
-  const authHeader = req.headers.get("authorization") || "";
-  const token = authHeader.toLowerCase().startsWith("bearer ")
-    ? authHeader.slice(7).trim()
-    : "";
-  if (!token) {
-    return NextResponse.json(
-      { ok: false, error: "Требуется авторизация" },
-      { status: 401 }
-    );
-  }
-  const { data: userData, error: userErr } = await admin.auth.getUser(token);
-  if (userErr || !userData.user) {
-    return NextResponse.json(
-      { ok: false, error: "Недействительная сессия" },
-      { status: 401 }
-    );
-  }
-  const userId = userData.user.id;
-
-  // 5. Создаём pending-подписку.
-  const { data: sub, error: insErr } = await admin
-    .from("subscriptions")
-    .insert([
-      { user_id: userId, plan, status: "pending", provider: "yookassa" },
-    ])
-    .select("id")
-    .single();
-  if (insErr || !sub) {
-    // eslint-disable-next-line no-console
-    console.error("[payment/create] subscriptions insert error", insErr);
-    return NextResponse.json(
-      { ok: false, error: "Не удалось создать подписку" },
-      { status: 500 }
-    );
-  }
-  const subscriptionId = (sub as { id: string }).id;
-
-  // 6. Создаём платёж в ЮKassa.
-  const siteUrl =
-    process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ||
-    "http://localhost:3000";
-  const returnUrl = `${siteUrl}/app?payment=return&sub=${subscriptionId}`;
-  const payment = await createYooKassaPayment({
-    plan,
-    returnUrl,
-    idempotenceKey: randomUUID(),
-    metadata: { subscription_id: subscriptionId, plan },
+  if (!admin) return response(503, { ok: false, code: "service_role_missing" });
+  const token = (req.headers.get("authorization") || "").match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  if (!token) return response(401, { ok: false, code: "unauthorized" });
+  const { data: user, error: authError } = await admin.auth.getUser(token);
+  if (authError || !user.user) return response(401, { ok: false, code: "unauthorized" });
+  const userId = user.user.id;
+  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") || "http://localhost:3000";
+  const { data, error } = await admin.rpc("claim_payment_intent", {
+    p_user_id: userId, p_intent_id: intentId, p_plan: plan, p_site_url: siteUrl,
+    p_shop_id: process.env.YOOKASSA_SHOP_ID,
   });
-
-  if (!payment.ok || !payment.confirmationUrl) {
-    // Платёж не создан — помечаем подписку failed, чтобы не висела в pending.
-    await admin
-      .from("subscriptions")
-      .update({ status: "failed" })
-      .eq("id", subscriptionId);
-    return NextResponse.json(
-      { ok: false, error: payment.error || "Не удалось создать платёж" },
-      { status: 502 }
-    );
+  if (error) {
+    console.error("[payment/create] claim failed", error.code);
+    return response(503, { ok: false, code: "payment_intent_unavailable" });
   }
+  const claim = data as PaymentIntentClaim | null;
+  if (!claim?.ok || !claim.subscription_id) return response(409, { ok: false,
+    code: claim?.reason ?? "intent_conflict" });
+  const subscriptionId = claim.subscription_id;
+  const common = { subscriptionId, intentId, plan, amount: PLAN_PRICING[plan].amount };
+  if (claim.action === "wait") return response(202, { ok: false, code: "payment_in_progress", ...common });
+  if (claim.action === "reconcile") return response(409, { ok: false, code: "reconciliation_required", ...common });
 
-  // 7. Сохраняем id платежа ЮKassa (webhook сопоставит по нему оплату).
-  await admin
-    .from("subscriptions")
-    .update({ provider_payment_id: payment.paymentId })
-    .eq("id", subscriptionId);
-
-  return NextResponse.json({
-    ok: true,
-    subscriptionId,
-    plan,
-    amount,
-    confirmationUrl: payment.confirmationUrl,
+  const result = claim.action === "lookup" && claim.provider_payment_id
+    ? await getYooKassaPayment(claim.provider_payment_id)
+    : claim.action === "create" && claim.provider_key && claim.lease_token && claim.return_url
+      ? await createYooKassaPayment({ plan, returnUrl: claim.return_url,
+        idempotenceKey: claim.provider_key,
+        metadata: { subscription_id: subscriptionId, plan, intent_id: intentId } })
+      : null;
+  if (!result?.ok || !result.payment) {
+    // A lost response is an unknown outcome, never evidence of a failed payment.
+    // Preserve the order and key; retries resume the same durable intent.
+    if (claim.lease_token) await admin.rpc("release_payment_intent", {
+      p_user_id: userId, p_intent_id: intentId, p_lease_token: claim.lease_token,
+    });
+    return response(502, { ok: false, code: "payment_verification_unavailable", ...common });
+  }
+  const payment = result.payment;
+  if (!paymentMatchesIntent(payment, plan, subscriptionId, intentId))
+    return response(502, { ok: false, code: "payment_binding_mismatch", ...common });
+  const bound = await admin.rpc("complete_payment_intent", {
+    p_user_id: userId, p_intent_id: intentId, p_lease_token: claim.lease_token ?? null,
+    p_payment_id: payment.id, p_confirmation_url: payment.confirmationUrl ?? null,
+    p_status: payment.status,
   });
+  if (bound.error || bound.data?.ok !== true) return response(503, {
+    ok: false, code: "payment_binding_unavailable", ...common,
+  });
+  // Redirects never grant rights. The independently verified webhook does that.
+  if (payment.status === "canceled") return response(409, { ok: false,
+    code: "payment_canceled", status: payment.status, ...common });
+  if (payment.status === "succeeded") return response(200, { ok: true,
+    code: "payment_succeeded", status: payment.status, ...common });
+  if (!safeConfirmationUrl(payment.confirmationUrl)) return response(502, {
+    ok: false, code: "payment_confirmation_unavailable", ...common,
+  });
+  return response(200, { ok: true, status: payment.status,
+    confirmationUrl: payment.confirmationUrl, ...common });
 }
