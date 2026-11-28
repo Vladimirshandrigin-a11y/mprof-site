@@ -2,6 +2,7 @@ import "./globals.css";
 import type { Metadata } from "next";
 import type { ReactNode } from "react";
 import { SITE_URL, pageMetadata } from "./seo";
+import PrivacyAnalytics from "./analytics/PrivacyAnalytics";
 
 // Главная: canonical и Open Graph. Остальные страницы задают свои (см. ./seo.ts).
 export const metadata: Metadata = {
@@ -17,7 +18,7 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="ru">
-      <body>{children}</body>
+      <body>{children}<PrivacyAnalytics /></body>
     </html>
   );
 }

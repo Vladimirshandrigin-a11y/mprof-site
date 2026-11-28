@@ -12,6 +12,7 @@ import type {
 } from "./accrual/save-flow";
 import { asAccrualSnapshot } from "./accrual/snapshot";
 import type { ManualCalcInputs } from "./calc-operation-keys";
+import { supabaseSignupFetch } from "./supabase-signup";
 
 // ============================================================================
 // Supabase client — module-scope с placeholder fallback'ом, чтобы build
@@ -31,6 +32,7 @@ const SUPABASE_KEY =
  * in the same browser context").
  */
 export const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  global: { fetch: supabaseSignupFetch(SUPABASE_URL) },
   auth: {
     persistSession: true,
     autoRefreshToken: true,

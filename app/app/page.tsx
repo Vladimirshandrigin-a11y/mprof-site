@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
 import type { User } from "@supabase/supabase-js"
+import { analyticsAvailable, rememberAnalyticsSignup, syncAnalyticsSession } from "../analytics/browser"
+import { ANALYTICS_CHANGED } from "../analytics/model"
 import appLoaderStyles from "./app-loader.module.css"
 import { LEGACY_DETAIL_UNAVAILABLE, readLegacyUpdProductDetail } from "./lib/legacy-upd-display"
 import type { ProductBreakdownRow } from "./lib/product-breakdown-calc"
@@ -1294,7 +1296,6 @@ export default function AppPage() {
   const [signingOut, setSigningOut] = useState(false);
   // Счётчик неудачных входов. Кнопку «Забыли пароль?» показываем только после
   // 3 ошибок подряд — чтобы не пугать обычного пользователя и не плодить спам.
-  const [failedAttempts, setFailedAttempts] = useState(0);
   // Идёт отправка письма восстановления (resetPasswordForEmail).
   const [resetSending, setResetSending] = useState(false);
   // Анти-спам: после отправки письма блокируем повторную отправку на 60 секунд.
@@ -2917,6 +2918,22 @@ export default function AppPage() {
   // (в отличие от magic-link). Supabase signInWithPassword при успехе сам выставит
   // сессию → onAuthStateChange(SIGNED_IN) подхватит user и покажет дашборд (форма
   // скрыта по `!user`), мы уже на /app — ручной редирект не нужен.
+  const analyticsUserId = user?.id;
+  useEffect(() => {
+    if (!analyticsUserId || !analyticsAvailable()) return;
+    const sync = () => {
+      void supabase.auth.getSession().then(({ data }) => {
+        const session = data.session;
+        if (session?.user.id === analyticsUserId) {
+          void syncAnalyticsSession(session.access_token, analyticsUserId);
+        }
+      }).catch(() => {});
+    };
+    sync();
+    window.addEventListener(ANALYTICS_CHANGED, sync);
+    return () => window.removeEventListener(ANALYTICS_CHANGED, sync);
+  }, [analyticsUserId]);
+
   const signIn = async () => {
     if (signingIn || signingUp) return; // защита от двойного клика
     const emailTrim = email.trim();
@@ -2950,7 +2967,7 @@ export default function AppPage() {
       ]);
 
       if (outcome === TIMED_OUT) {
-        // Не «неверный пароль» — счётчик неудач не трогаем. Если запрос всё же
+        // Если запрос всё же
         // завершится успехом позже, onAuthStateChange(SIGNED_IN) откроет /app.
         setAuthMessage(
           "Вход занимает слишком много времени. Проверьте интернет и попробуйте ещё раз."
@@ -2960,20 +2977,13 @@ export default function AppPage() {
 
       const { error } = outcome;
       if (error) {
-        // Неудачный вход → счётчик +1. На 3-й ошибке появится «Забыли пароль?».
-        setFailedAttempts((n) => n + 1);
         setAuthMessage(loginErrorRu(error.message));
-      } else {
-        // Успех: сбрасываем счётчик. onAuthStateChange(SIGNED_IN) покажет /app
-        // (форма скрыта по `!user`) — мы уже на /app, ручной редирект не нужен.
-        setFailedAttempts(0);
       }
     } catch (e) {
       // e не содержит пароль (его нет в ошибках signInWithPassword) — лог
       // безопасен; email отдельно не логируем.
       // eslint-disable-next-line no-console
       console.error("[auth] signInWithPassword error", e);
-      // Сетевая ошибка — это не «неверный пароль», счётчик не трогаем.
       const msg = e instanceof Error ? e.message : String(e);
       setAuthMessage(loginErrorRu(msg));
     } finally {
@@ -3005,6 +3015,10 @@ export default function AppPage() {
         email: emailTrim,
         password,
       });
+      if (!error && data.user?.identities?.length && analyticsAvailable()) {
+        rememberAnalyticsSignup(data.user.id);
+        if (data.session) void syncAnalyticsSession(data.session.access_token, data.user.id);
+      }
       if (error) {
         setAuthMessage(authErrorRu(error.message));
       } else if (!data.session) {
@@ -4598,7 +4612,6 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
 .auth-btn-2:disabled,.auth-btn-2:disabled:hover{opacity:.6;cursor:default;transform:none;box-shadow:none;border-color:var(--edge2)}
 .auth-hint{margin:.7rem 0 0;font-family:var(--mono);font-size:.66rem;color:var(--txt3);letter-spacing:.02em;line-height:1.5}
 .auth-reset{margin:.95rem 0 0;padding-top:.95rem;border-top:1px solid var(--edge)}
-.auth-reset-q{margin:0 0 .55rem;font-family:var(--mono);font-size:.7rem;color:var(--txt2);letter-spacing:.02em}
 .auth-reset-btn{font-family:var(--sans);font-size:.82rem;font-weight:600;color:var(--gold2);background:transparent;
   border:1px solid var(--edge2);border-radius:9px;padding:10px 16px;cursor:pointer;letter-spacing:.02em;transition:all .18s}
 .auth-reset-btn:hover{border-color:var(--gold);color:var(--gold);box-shadow:0 6px 20px rgba(201,168,76,.14)}
@@ -7811,12 +7824,7 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
                 autoComplete="email"
                 value={email}
                 disabled={signingIn || signingUp}
-                onChange={(e) => {
-                  setEmail(e.target.value);
-                  // Сменили email — возможно, другой аккаунт: сбрасываем счётчик
-                  // неудачных попыток (кнопка восстановления снова прячется).
-                  if (failedAttempts !== 0) setFailedAttempts(0);
-                }}
+                onChange={(e) => setEmail(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter") signIn();
                 }}
@@ -7877,28 +7885,23 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               оплаты. Рассылок не будет.
             </p>
 
-            {/* Кнопка восстановления появляется только после 3 неудачных входов —
-               чтобы не отвлекать обычного пользователя и не плодить спам. */}
-            {failedAttempts >= 3 && (
-              <div className="auth-reset">
-                <p className="auth-reset-q">Не получается войти?</p>
-                <button
-                  type="button"
-                  className="auth-reset-btn"
-                  onClick={requestPasswordReset}
-                  disabled={resetSending || resetCooldown > 0}
-                  aria-busy={resetSending}
-                >
-                  {resetSending
-                    ? "Отправляем…"
-                    : resetCooldown > 0
-                    ? `Отправить повторно через ${resetCooldown} с`
-                    : "Забыли пароль? Восстановить пароль"}
-                </button>
-              </div>
-            )}
+            <div className="auth-reset">
+              <button
+                type="button"
+                className="auth-reset-btn"
+                onClick={requestPasswordReset}
+                disabled={resetSending || resetCooldown > 0 || signingIn || signingUp}
+                aria-busy={resetSending}
+              >
+                {resetSending
+                  ? "Отправляем…"
+                  : resetCooldown > 0
+                  ? `Отправить повторно через ${resetCooldown} с`
+                  : "Забыли пароль?"}
+              </button>
+            </div>
 
-            {authMessage && <p className="auth-msg">{authMessage}</p>}
+            {authMessage && <p className="auth-msg" role="status">{authMessage}</p>}
           </div>
         )}
 
@@ -8588,9 +8591,10 @@ body{margin:0;background:var(--void);color:var(--txt);font-family:var(--sans);li
               <div className="mcalc-grid">
                 {FIELDS.map((f) => (
                   <div className="fld" key={f.key}>
-                    <label>{f.label}</label>
+                    <label htmlFor={`manual-${f.key}`}>{f.label}</label>
                     <div className="in-wrap">
                       <input
+                        id={`manual-${f.key}`}
                         type="text"
                         inputMode="decimal"
                         placeholder="0"
