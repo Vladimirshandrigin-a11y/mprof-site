@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ANALYTICS_CHANGED, ANALYTICS_PREFERENCE, safePath, safeReferrer, type Attribution } from "./model";
-import { analyticsAvailable, captureLanding, chooseAnalytics, parseAnalyticsPreference, trackingBlocked } from "./browser";
+import { analyticsAvailable, captureLanding, chooseAnalytics, parseAnalyticsPreference, readAnalyticsPreference, retryAnalyticsWithdrawals, trackingBlocked } from "./browser";
 import styles from "./privacy-analytics.module.css";
 
 function subscribe(refresh: () => void) {
@@ -34,9 +34,16 @@ export default function PrivacyAnalytics() {
   const [editing, setEditing] = useState(false);
 
   useEffect(() => {
-    if (!analyticsAvailable() || trackingBlocked()) return;
-    landing.current ??= captureLanding(window.location.search);
-    referrer.current = safeReferrer(document.referrer);
+    if (!analyticsAvailable()) return;
+    retryAnalyticsWithdrawals();
+    if (trackingBlocked()) {
+      if (readAnalyticsPreference()?.choice === "allow") chooseAnalytics(false);
+    } else {
+      landing.current ??= captureLanding(window.location.search);
+      referrer.current = safeReferrer(document.referrer);
+    }
+    window.addEventListener("online", retryAnalyticsWithdrawals);
+    return () => window.removeEventListener("online", retryAnalyticsWithdrawals);
   }, []);
 
   useEffect(() => {
@@ -53,14 +60,14 @@ export default function PrivacyAnalytics() {
     void fetch("/api/metrika/view", {
       method: "POST", credentials: "omit", cache: "no-store", keepalive: true,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId: preference.clientId, path, source, referrer: first ? referrer.current : null }),
+      body: JSON.stringify({ proof: preference.proof, path, source, referrer: first ? referrer.current : null }),
     }).catch(() => {});
   }, [pathname, preference]);
 
   if (stored === null) return null;
 
   const choose = (allowed: boolean) => {
-    chooseAnalytics(allowed, landing.current ?? {});
+    chooseAnalytics(allowed);
     setEditing(false);
     if (!allowed) lastView.current = null;
   };

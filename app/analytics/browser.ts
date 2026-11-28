@@ -1,6 +1,6 @@
-import { ANALYTICS_CHANGED, ANALYTICS_ORIGIN, ANALYTICS_PREFERENCE, ATTRIBUTION_FIELDS, CHOICE_ENABLED, attributionOf, validClientId, type Attribution } from "./model";
+import { ANALYTICS_CHANGED, ANALYTICS_ORIGIN, ANALYTICS_PREFERENCE, ATTRIBUTION_FIELDS, CHOICE_ENABLED, attributionOf, type Attribution } from "./model";
 
-type Preference = { choice: "allow"; clientId: string; attribution: Attribution } | { choice: "deny" };
+type Preference = { choice: "allow"; proof: string } | { choice: "deny" };
 const SIGNUP_MARKER = "mprof:analytics-signup:v1";
 
 export function analyticsAvailable() {
@@ -21,37 +21,55 @@ export function parseAnalyticsPreference(raw: string | null): Preference | null 
   try {
     const record = JSON.parse(raw || "null");
     if (record?.choice === "deny") return { choice: "deny" };
-    if (record?.choice === "allow" && validClientId(record.clientId)) {
-      return { choice: "allow", clientId: record.clientId, attribution: attributionOf(record.attribution) };
+    if (record?.choice === "allow" && typeof record.proof === "string" && /^[0-9a-f]{64}$/.test(record.proof)) {
+      return { choice: "allow", proof: record.proof };
     }
   } catch { /* Storage may be unavailable. */ }
   return null;
 }
 
-export function chooseAnalytics(allowed: boolean, landing: Attribution) {
+export function chooseAnalytics(allowed: boolean) {
   const previous = readAnalyticsPreference();
-  const randomId = () => {
-    const parts = crypto.getRandomValues(new Uint32Array(2));
-    return "1" + Array.from(parts, (value) => String(value % 1_000_000_000).padStart(9, "0")).join("");
-  };
   let preference: Preference = { choice: "deny" };
   try {
     if (allowed && !trackingBlocked()) {
-      preference = previous?.choice === "allow" ? previous
-        : { choice: "allow", clientId: randomId(), attribution: landing };
+      const proof = previous?.choice === "allow" ? previous.proof
+        : Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      preference = { choice: "allow", proof };
     }
     window.localStorage.setItem(ANALYTICS_PREFERENCE, JSON.stringify(preference));
     if (preference.choice === "deny") window.localStorage.removeItem(SIGNUP_MARKER);
   } catch { preference = { choice: "deny" }; }
-  if (preference.choice === "deny" && previous?.choice === "allow") {
-    void fetch("/api/metrika/session", {
-      method: "POST", cache: "no-store", credentials: "omit", keepalive: true,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allowed: false, clientId: previous.clientId }),
-    }).catch(() => {});
-  }
+  if (preference.choice === "deny" && previous?.choice === "allow") withdrawAnalytics(previous.proof);
   window.dispatchEvent(new Event(ANALYTICS_CHANGED));
   return preference;
+}
+
+const WITHDRAWALS = "mprof:analytics-withdrawals:v2";
+
+export function retryAnalyticsWithdrawals() {
+  try {
+    const pending = Object.keys(JSON.parse(window.localStorage.getItem(WITHDRAWALS) ?? "{}"));
+    for (const proof of pending) withdrawAnalytics(proof);
+  } catch { /* Browser storage is optional. */ }
+}
+
+function withdrawAnalytics(proof: string) {
+  try {
+    const pending = JSON.parse(window.localStorage.getItem(WITHDRAWALS) ?? "{}");
+    pending[proof] = true;
+    window.localStorage.setItem(WITHDRAWALS, JSON.stringify(pending));
+  } catch { /* Still attempt to withdraw if storage is unavailable. */ }
+  void fetch("/api/metrika/session", {
+    method: "POST", cache: "no-store", credentials: "omit", keepalive: true,
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify({ allowed: false, proof }),
+  }).then((response) => {
+    if (!response.ok) return;
+    const pending = JSON.parse(window.localStorage.getItem(WITHDRAWALS) ?? "{}");
+    delete pending[proof];
+    if (Object.keys(pending).length) window.localStorage.setItem(WITHDRAWALS, JSON.stringify(pending));
+    else window.localStorage.removeItem(WITHDRAWALS);
+  }).catch(() => {});
 }
 
 export function captureLanding(search: string): Attribution {
@@ -66,15 +84,17 @@ export function rememberAnalyticsSignup(userId: string) {
 
 export async function syncAnalyticsSession(token: string, userId: string) {
   const preference = readAnalyticsPreference();
-  if (!preference) return;
+  if (preference?.choice !== "allow") return;
+  if (trackingBlocked()) {
+    chooseAnalytics(false);
+    return;
+  }
   try {
     const registration = window.localStorage.getItem(SIGNUP_MARKER) === userId;
-    const deny = preference.choice === "deny" || trackingBlocked();
     const result = await fetch("/api/metrika/session", {
       method: "POST", credentials: "omit", cache: "no-store",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify(deny ? { allowed: false }
-        : { allowed: true, clientId: preference.clientId, registration }),
+      body: JSON.stringify({ allowed: true, proof: preference.proof, registration }),
     });
     if (registration && result.ok) window.localStorage.removeItem(SIGNUP_MARKER);
   } catch { /* Optional analytics cannot block authentication or checkout. */ }

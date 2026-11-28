@@ -1,5 +1,5 @@
 export const ANALYTICS_ORIGIN = "https://mprof-seller.ru";
-export const ANALYTICS_PREFERENCE = "mprof:analytics:v1";
+export const ANALYTICS_PREFERENCE = "mprof:analytics:v2";
 export const ANALYTICS_CHANGED = "mprof:analytics-changed";
 export const ATTRIBUTION_FIELDS = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "yclid"] as const;
 export type Attribution = Partial<Record<(typeof ATTRIBUTION_FIELDS)[number], string>>;
@@ -24,6 +24,14 @@ export function safeReferrer(value: unknown): string | null {
 
 export function validClientId(value: unknown): value is string {
   return typeof value === "string" && /^[1-9][0-9]{0,18}$/.test(value);
+}
+
+// The browser keeps the secret. Only the derived numeric identifier goes to Yandex.
+export async function clientIdForConsent(value: unknown): Promise<string | null> {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) return null;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  const number = new DataView(digest).getBigUint64(0) % BigInt("1000000000000000000");
+  return `1${number.toString().padStart(18, "0")}`;
 }
 
 export function attributionOf(value: unknown, approved: ReadonlySet<string> = CAMPAIGN_VALUES): Attribution {

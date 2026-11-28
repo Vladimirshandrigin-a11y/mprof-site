@@ -2412,7 +2412,13 @@ create table public.metrika_consent (
 create index metrika_consent_client on public.metrika_consent(client_id);
 alter table public.metrika_consent enable row level security;
 revoke all on public.metrika_consent from public, anon, authenticated, service_role;
-grant select, delete on public.metrika_consent to service_role;
+
+create table public.metrika_revoked_clients (
+  client_id text primary key check (client_id ~ '^[1-9][0-9]{0,18}$')
+);
+alter table public.metrika_revoked_clients enable row level security;
+revoke all on public.metrika_revoked_clients from public, anon, authenticated, service_role;
+grant select on public.metrika_revoked_clients to service_role;
 
 create table public.metrika_events (
   id uuid primary key default gen_random_uuid(),
@@ -2423,7 +2429,7 @@ create table public.metrika_events (
     'payment_confirmed','purchase_149','subscription_449','subscription_renewed','payment_failed')),
   plan text check (plan in ('single','unlimited')),
   occurred_at timestamptz not null,
-  state text not null default 'ready' check (state in ('ready','sending','sent','uncertain','rejected','expired')),
+  state text not null default 'ready' check (state in ('ready','sending','sent','uncertain','rejected','expired','revoked')),
   external_id text unique check (external_id ~ '^[0-9a-f]{64}$'),
   unique (source_id, name)
 );
@@ -2435,14 +2441,26 @@ grant select, update on public.metrika_events to service_role;
 create function public.register_metrika_consent(p_user_id uuid, p_client_id text, p_signup_confirmed_at timestamptz)
 returns void language plpgsql security definer set search_path=pg_catalog as $$
 begin
+  perform pg_advisory_xact_lock(hashtextextended('metrika:'||p_client_id,0));
+  if exists (select 1 from public.metrika_revoked_clients where client_id=p_client_id) then return; end if;
   insert into public.metrika_consent(user_id,client_id) values (p_user_id,p_client_id)
   on conflict (user_id) do nothing;
   if p_signup_confirmed_at is not null then
     insert into public.metrika_events(user_id,source_id,client_id,name,occurred_at)
     select user_id,user_id,client_id,'registration_confirmed',p_signup_confirmed_at
-    from public.metrika_consent where user_id=p_user_id
+    from public.metrika_consent where user_id=p_user_id and client_id=p_client_id
     on conflict (source_id,name) do nothing;
   end if;
+end $$;
+
+create function public.revoke_metrika_consent(p_client_id text)
+returns void language plpgsql security definer set search_path=pg_catalog as $$
+begin
+  perform pg_advisory_xact_lock(hashtextextended('metrika:'||p_client_id,0));
+  insert into public.metrika_revoked_clients(client_id) values (p_client_id) on conflict do nothing;
+  delete from public.metrika_consent where client_id=p_client_id;
+  update public.metrika_events set state='revoked'
+    where client_id=p_client_id and state in ('ready','sending') and external_id is null;
 end $$;
 
 -- Analytics records results in the transaction which creates the authoritative
@@ -2536,9 +2554,9 @@ language sql security definer set search_path=pg_catalog as $$
   returning e.id,e.name,e.plan,e.client_id,e.occurred_at
 $$;
 
-revoke all on function public.capture_metrika_event(), public.claim_metrika_events(),
+revoke all on function public.capture_metrika_event(), public.claim_metrika_events(), public.revoke_metrika_consent(text),
   public.register_metrika_consent(uuid,text,timestamptz) from public, anon, authenticated, service_role;
-grant execute on function public.claim_metrika_events(),
+grant execute on function public.claim_metrika_events(), public.revoke_metrika_consent(text),
   public.register_metrika_consent(uuid,text,timestamptz) to service_role;
 
 commit;
