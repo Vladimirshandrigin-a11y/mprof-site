@@ -23,10 +23,12 @@ export async function POST(request: Request) {
   if (error || !user) return new Response(null, { status: 401 });
   const confirmed = user.email_confirmed_at;
   const accountAge = Date.now() - Date.parse(user.created_at);
-  const register = body.registration === true && !!confirmed && accountAge >= 0 && accountAge < 7 * 86400_000;
+  const registration = body.registration === true && accountAge >= 0 && accountAge < 7 * 86400_000;
+  const waitingForConfirmation = registration && !confirmed;
   const result = await admin.rpc("register_metrika_consent", {
     p_user_id: user.id, p_client_id: clientId,
-    p_signup_confirmed_at: register ? confirmed : null,
+    p_signup_confirmed_at: registration ? confirmed ?? null : null,
   });
-  return new Response(null, { status: result.error ? 503 : 204 });
+  if (result.error) return new Response(null, { status: 503 });
+  return new Response(null, { status: waitingForConfirmation ? 202 : 204 });
 }

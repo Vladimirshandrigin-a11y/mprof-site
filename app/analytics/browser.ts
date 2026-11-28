@@ -78,7 +78,7 @@ export function captureLanding(search: string): Attribution {
 }
 
 export function rememberAnalyticsSignup(userId: string) {
-  if (readAnalyticsPreference()?.choice !== "allow") return;
+  if (readAnalyticsPreference()?.choice !== "allow" || trackingBlocked()) return;
   try { window.localStorage.setItem(SIGNUP_MARKER, userId); } catch { /* Optional. */ }
 }
 
@@ -96,6 +96,8 @@ export async function syncAnalyticsSession(token: string, userId: string) {
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ allowed: true, proof: preference.proof, registration }),
     });
-    if (registration && result.ok) window.localStorage.removeItem(SIGNUP_MARKER);
+    if (registration && result.status === 204 && window.localStorage.getItem(SIGNUP_MARKER) === userId) {
+      window.localStorage.removeItem(SIGNUP_MARKER);
+    }
   } catch { /* Optional analytics cannot block authentication or checkout. */ }
 }

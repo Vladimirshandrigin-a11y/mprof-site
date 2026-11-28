@@ -63,6 +63,7 @@ const tsc = spawnSync(
     "app/api/payment/webhook/route.ts",
     "app/api/payment/create/route.ts",
     "app/analytics/server.ts",
+    "app/analytics/browser.ts",
     "app/api/metrika/session/route.ts",
     "app/api/metrika/view/route.ts",
     "app/api/cloud/calculation-operations/route.ts",
